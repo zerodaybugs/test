@@ -1,0 +1,131 @@
+name: termmax-deep-audit-v2
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'termmax-deep-audit-v2-trigger.txt'
+
+permissions:
+  contents: write
+
+jobs:
+  deep-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 1
+
+      - name: Install tools and fetch sources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ripgrep jq poppler-utils tree
+          git clone https://github.com/term-structure/termmax-contract-v2.git termmax
+          cd termmax && git checkout e314f3f849577dfecd4614f148c4df81fdf8c72d && cd ..
+          git clone https://github.com/term-structure/audits.git audits
+          rm -rf termmax-deep-audit-result
+          mkdir -p termmax-deep-audit-result/audits-text
+          find audits -type f -iname '*.pdf' -print0 | while IFS= read -r -d '' f; do
+            pdftotext -layout "$f" "termmax-deep-audit-result/audits-text/$(echo "$f" | tr '/' '_').txt" 2>/dev/null || true
+          done
+
+      - name: Generate exact source and static triage
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT=termmax-deep-audit-result
+          cd termmax
+          git rev-parse HEAD > ../$OUT/SOURCE_COMMIT.txt
+          rg -n -C 18 'function afterSwap' contracts > ../$OUT/AFTER_SWAP_SOURCE.txt || true
+          rg -n -C 12 'function .*Callback|executeOperation|onMorphoFlashLoan|onlyCallbackAddress' contracts > ../$OUT/CALLBACK_SOURCE.txt || true
+          rg -n -C 10 'reinitializer\(' contracts > ../$OUT/REINITIALIZERS.txt || true
+          rg -n -C 15 'function withdrawFts|function dealBadDebt|function redeemOrder' contracts/v2/vault > ../$OUT/VAULT_SELECTIVE_WITHDRAWAL.txt || true
+          rg -n -C 20 '_getLiquidationInfo|function liquidate|LtvIncreasedAfterLiquidation' contracts/v2/tokens > ../$OUT/LIQUIDATION_SOURCE.txt || true
+          rg -n -C 12 'function initialize|function upgrade|delegatecall|\.call\{' contracts/v2 > ../$OUT/INIT_UPGRADE_CALL_SURFACE.txt || true
+          git diff --unified=100 64bd47b98e064c7fb91ab4a59b70520e0ec285d5..e314f3f849577dfecd4614f148c4df81fdf8c72d -- contracts > ../$OUT/POST_AUDIT_DIFF.patch
+          cd ..
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,json
+          root=Path('termmax/contracts')
+          out=Path('termmax-deep-audit-result')
+          rows=[]
+          for p in root.rglob('*.sol'):
+              text=p.read_text(errors='ignore')
+              for m in re.finditer(r'function\s+([A-Za-z0-9_]+)\s*\((.*?)\)([^;{]*)\{',text,re.S):
+                  name,args,tail=m.group(1),m.group(2),m.group(3)
+                  if 'external' not in tail and 'public' not in tail: continue
+                  brace=m.end()-1; depth=0; end=None
+                  for i in range(brace,len(text)):
+                      depth += (text[i]=='{')-(text[i]=='}')
+                      if depth==0: end=i+1; break
+                  if not end: continue
+                  body=text[brace:end]
+                  line=text.count('\n',0,m.start())+1
+                  auth=('onlyOwner','onlyRole','hasRole','onlyMarket','onlyOrder','onlyCallbackAddress','onlyWhitelisted','msg.sender !=','msg.sender ==','_msgSender() !=','_msgSender() ==','isOwnerOrDelegate','ownerOf(','_checkWhitelisted')
+                  asset=('safeTransfer','safeTransferFrom','delegatecall','.call(','_mint(','_burn(','transferFrom(')
+                  callback=any(x in name.lower() for x in ('callback','afterswap','executeoperation','onmorpho'))
+                  state=any(x in body for x in asset) or bool(re.search(r'\b_[A-Za-z0-9_]+\s*(?:\+=|-=|=|\+\+|--)',body))
+                  has_auth=any(x in tail or x in body[:1200] for x in auth)
+                  if (callback or state) and not has_auth:
+                      rows.append({'file':str(p.relative_to(root.parent)),'line':line,'name':name,'tail':' '.join(tail.split()),'callback':callback,'state_or_asset':state,'snippet':text[m.start():min(end,m.start()+4000)]})
+          (out/'UNAUTHENTICATED_MUTATORS.json').write_text(json.dumps(rows,indent=2))
+          md=['# Unauthenticated mutator candidates','',f'Count: {len(rows)}','']
+          for x in rows:
+              md += [f"## {x['file']}:{x['line']} `{x['name']}`",'',f"`{x['tail']}`",'','```solidity',x['snippet'][:2200],'```','']
+          (out/'UNAUTHENTICATED_MUTATORS.md').write_text('\n'.join(md))
+          PY
+
+      - name: Audit-corpus duplicate scan and deterministic verdict markers
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT=termmax-deep-audit-result
+          rg -ni -C 6 'afterSwap|callback|withdrawFts|specific order|bad debt|physical delivery|cherry|half liquidation|liquidat|reinitializer|arbitrary call|oracle|decimal|rounding|vault share' "$OUT/audits-text" > "$OUT/AUDIT_DEDUP_HITS.txt" || true
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,json
+          out=Path('termmax-deep-audit-result')
+          after=(out/'AFTER_SWAP_SOURCE.txt').read_text(errors='ignore') if (out/'AFTER_SWAP_SOURCE.txt').exists() else ''
+          auth_terms=('onlyOrder','onlyMarket','msg.sender','_msgSender','orderMaturity','_orderMaturity','whitelist','Unauthorized')
+          after_auth=any(x.lower() in after.lower() for x in auth_terms)
+          unauth=json.loads((out/'UNAUTHENTICATED_MUTATORS.json').read_text())
+          reinit=(out/'REINITIALIZERS.txt').read_text(errors='ignore')
+          status={
+            'afterSwapSourceFound': bool(after.strip()),
+            'afterSwapContainsCallerOrMembershipCheck': after_auth,
+            'unauthenticatedMutatorCandidateCount': len(unauth),
+            'reinitializerSurfacePresent': bool(reinit.strip()),
+            'sourceCommit': (out/'SOURCE_COMMIT.txt').read_text().strip(),
+          }
+          (out/'MACHINE_STATUS.json').write_text(json.dumps(status,indent=2))
+          marker='AFTERSWAP_AUTH_PRESENT' if after_auth else 'AFTERSWAP_AUTH_NOT_DETECTED'
+          (out/(marker+'.txt')).write_text(marker+'\n')
+          triage=['# TermMax deep-audit v2 result','',f"Pinned source: `{status['sourceCommit']}`",'',f"- afterSwap source found: {status['afterSwapSourceFound']}",f"- afterSwap caller/membership check detected: {status['afterSwapContainsCallerOrMembershipCheck']}",f"- unauthenticated mutator candidates: {status['unauthenticatedMutatorCandidateCount']}",f"- reinitializer surface present: {status['reinitializerSurfacePresent']}",'','No item is submission-ready from static detection alone. Exact exploit PoC and dedup are mandatory.']
+          (out/'TRIAGE.md').write_text('\n'.join(triage)+'\n')
+          PY
+          find "$OUT" -type f -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS.txt"
+          tree -a "$OUT" > "$OUT/FILE_TREE.txt"
+
+      - name: Persist result on research branch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'termmax-research-bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add termmax-deep-audit-result
+          git commit -m 'Persist TermMax deep audit v2 result' || exit 0
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: termmax-deep-audit-v2-result
+          path: termmax-deep-audit-result/
+          if-no-files-found: error
+          retention-days: 7
