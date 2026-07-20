@@ -1,0 +1,225 @@
+name: Digest-only Sui CLI for isolated fork
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/fork-cli-digest.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
+          df -h > disk-before.txt
+      - name: Build exact Sui CLI with isolated-fork compatibility
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/MystenLabs/sui.git sui-source
+          git -C sui-source checkout mainnet-v1.72.2
+          git -C sui-source rev-parse HEAD | tee SUI_SOURCE_COMMIT.txt
+          python3 - <<'PY' 2>&1 | tee PATCH_OUTPUT.txt
+          from pathlib import Path
+          import re
+
+          MAINNET_CHAIN_ID = "35834a8a"
+
+          # 1. Prefer the chain ID already pinned in client.yaml.
+          wallet = Path('sui-source/crates/sui-sdk/src/wallet_context.rs')
+          s = wallet.read_text()
+          pattern = re.compile(
+              r'(pub async fn cache_chain_id\(&self\) -> Result<String, anyhow::Error> \{\s*)'
+              r'self\.internal_load_or_cache_chain_id\(true\)\.await(\s*\})'
+          )
+          s, count = pattern.subn(
+              r'\1// Generic local-fork compatibility patch: prefer the chain ID\n'
+              r'        // already pinned in client.yaml.\n'
+              r'        self.internal_load_or_cache_chain_id(false).await\2',
+              s,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit(f'cache_chain_id replacements={count}, expected 1')
+          wallet.write_text(s)
+
+          # 2. Add a narrow execution method that asks only for the digest. This
+          # avoids response-side object enrichment; VM execution is unchanged.
+          rpc_client = Path('sui-source/crates/sui-rpc-api/src/client/mod.rs')
+          r = rpc_client.read_text()
+          anchor = '''    pub async fn execute_transaction(
+              &mut self,
+              transaction: &Transaction,
+          ) -> Result<ExecutedTransaction> {
+              let request = Self::create_executed_transaction_request(transaction)?;
+
+              let (metadata, response, _extentions) = self
+                  .0
+                  .execution_client()
+                  .execute_transaction(request)
+                  .await?
+                  .into_parts();
+
+              execute_transaction_response_try_from_proto(&response)
+                  .map_err(|e| status_from_error_with_metadata(e, metadata))
+          }
+          '''
+          if anchor not in r:
+              raise SystemExit('execute_transaction anchor not found')
+          addition = anchor + '''
+              /// Execute a transaction but request only its digest. Used by the
+              /// local fork CLI where broad response rendering may require remote
+              /// historical object lookups. Transaction validation and VM execution
+              /// are identical to `execute_transaction`.
+              pub async fn execute_transaction_digest_only(
+                  &mut self,
+                  transaction: &Transaction,
+              ) -> Result<String> {
+                  let mut request = Self::create_executed_transaction_request(transaction)?;
+                  request.read_mask = Some(FieldMask::from_paths(["digest"]));
+                  let response = self
+                      .0
+                      .execution_client()
+                      .execute_transaction(request)
+                      .await?
+                      .into_inner();
+                  response
+                      .transaction
+                      .and_then(|tx| tx.digest)
+                      .ok_or_else(|| tonic::Status::internal("missing transaction digest"))
+              }
+          '''
+          r = r.replace(anchor, addition, 1)
+          rpc_client.write_text(r)
+
+          # 3. Patch direct chain-ID calls used by ephemeral publication and
+          # package compilation against the isolated mainnet fork.
+          client = Path('sui-source/crates/sui/src/client_commands.rs')
+          s = client.read_text()
+          pattern = re.compile(
+              r'(?P<i>\s*)let client = context\.grpc_client\(\)\?;\s*'
+              r'let chain_id = client\.get_chain_identifier\(\)\.await\?\.to_string\(\);\s*'
+              r'(?P=i)let active_env = context\.get_active_env\(\)\?;'
+          )
+          s, count = pattern.subn(
+              lambda m: (
+                  f"{m.group('i')}let chain_id = "
+                  "context.try_load_chain_id_from_cache(None).await?;\n"
+                  f"{m.group('i')}let active_env = context.get_active_env()?;"
+              ),
+              s,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit(f'TestPublish chain-id replacements={count}, expected 1')
+
+          start = s.find('pub(crate) async fn compile_package(')
+          if start < 0:
+              raise SystemExit('compile_package function not found')
+          next_fn = s.find('\npub(crate) ', start + 1)
+          if next_fn < 0:
+              next_fn = len(s)
+          block = s[start:next_fn]
+          old = 'let chain_id = client.get_chain_identifier().await?.to_string();'
+          if block.count(old) != 1:
+              raise SystemExit(f'compile_package direct chain-id calls={block.count(old)}, expected 1')
+          block = block.replace(
+              old,
+              f'let chain_id = "{MAINNET_CHAIN_ID}".to_string(); '
+              '// Sui mainnet chain ID for isolated fork tests',
+              1,
+          )
+          s = s[:start] + block + s[next_fn:]
+
+          start = s.find('async fn publish_command(')
+          if start < 0:
+              raise SystemExit('publish_command function not found')
+          next_fn = s.find('\nasync fn ', start + 1)
+          if next_fn < 0:
+              next_fn = len(s)
+          block = s[start:next_fn]
+          old = 'let chain_id = client.get_chain_identifier().await?;'
+          if block.count(old) != 1:
+              raise SystemExit(f'publish_command direct chain-id calls={block.count(old)}, expected 1')
+          block = block.replace(
+              old,
+              f'let chain_id = "{MAINNET_CHAIN_ID}".parse()?; '
+              '// Sui mainnet chain ID for isolated fork tests',
+              1,
+          )
+          s = s[:start] + block + s[next_fn:]
+
+          # 4. In explicit --forking-mode execute with empty signatures and a
+          # digest-only read mask. The fork server performs sender impersonation.
+          needle = '''    } else {
+                  let signatures = if forking_mode {
+                      vec![]
+                  } else {
+          '''
+          if needle not in s:
+              raise SystemExit('forking-mode execution block not found')
+          replacement = '''    } else {
+                  if forking_mode {
+                      let transaction = Transaction::new(SenderSignedData::new(tx_data.clone(), vec![]));
+                      let returned_digest = context
+                          .grpc_client()?
+                          .execute_transaction_digest_only(&transaction)
+                          .await?;
+                      let expected_digest = tx_data.digest().to_string();
+                      ensure!(
+                          returned_digest == expected_digest,
+                          "fork RPC returned digest {} but expected {}",
+                          returned_digest,
+                          expected_digest
+                      );
+                      return Ok(SuiClientCommandResult::ComputeTransactionDigest(tx_data));
+                  }
+                  let signatures = if forking_mode {
+                      vec![]
+                  } else {
+          '''
+          s = s.replace(needle, replacement, 1)
+          client.write_text(s)
+          print('PATCH_COMPLETE')
+          PY
+          git -C sui-source diff -- \
+            crates/sui-sdk/src/wallet_context.rs \
+            crates/sui-rpc-api/src/client/mod.rs \
+            crates/sui/src/client_commands.rs | tee SUI_CLI_PATCH.diff
+          cd sui-source
+          cargo build --locked -p sui 2>&1 | tee "$GITHUB_WORKSPACE/SUI_CLI_BUILD_OUTPUT.txt"
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p out
+          cp sui-source/target/debug/sui out/sui
+          chmod +x out/sui
+          cp SUI_SOURCE_COMMIT.txt SUI_CLI_PATCH.diff PATCH_OUTPUT.txt out/
+          out/sui --version | tee out/SUI_VERSION.txt
+          sha256sum out/* > out/SHA256SUMS
+          df -h > disk-after.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: digest-only-sui-cli-1.72.2
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 6
+          path: |
+            out/
+            SUI_CLI_BUILD_OUTPUT.txt
+            SUI_SOURCE_COMMIT.txt
+            SUI_CLI_PATCH.diff
+            PATCH_OUTPUT.txt
+            disk-before.txt
+            disk-after.txt
