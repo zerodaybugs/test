@@ -34,10 +34,10 @@ jobs:
           python3 - <<'PY' 2>&1 | tee PATCH_OUTPUT.txt
           from pathlib import Path
           import re
+          import textwrap
 
           MAINNET_CHAIN_ID = "35834a8a"
 
-          # 1. Prefer the chain ID already pinned in client.yaml.
           wallet = Path('sui-source/crates/sui-sdk/src/wallet_context.rs')
           s = wallet.read_text()
           pattern = re.compile(
@@ -45,8 +45,8 @@ jobs:
               r'self\.internal_load_or_cache_chain_id\(true\)\.await(\s*\})'
           )
           s, count = pattern.subn(
-              r'\1// Generic local-fork compatibility patch: prefer the chain ID\n'
-              r'        // already pinned in client.yaml.\n'
+              r'\1// Generic local-fork compatibility patch: prefer the chain ID already\n'
+              r'        // pinned in client.yaml.\n'
               r'        self.internal_load_or_cache_chain_id(false).await\2',
               s,
               count=1,
@@ -55,30 +55,17 @@ jobs:
               raise SystemExit(f'cache_chain_id replacements={count}, expected 1')
           wallet.write_text(s)
 
-          # 2. Add a narrow execution method that asks only for the digest. This
-          # avoids response-side object enrichment; VM execution is unchanged.
           rpc_client = Path('sui-source/crates/sui-rpc-api/src/client/mod.rs')
           r = rpc_client.read_text()
-          anchor = '''    pub async fn execute_transaction(
-              &mut self,
-              transaction: &Transaction,
-          ) -> Result<ExecutedTransaction> {
-              let request = Self::create_executed_transaction_request(transaction)?;
-
-              let (metadata, response, _extentions) = self
-                  .0
-                  .execution_client()
-                  .execute_transaction(request)
-                  .await?
-                  .into_parts();
-
-              execute_transaction_response_try_from_proto(&response)
-                  .map_err(|e| status_from_error_with_metadata(e, metadata))
-          }
-          '''
-          if anchor not in r:
-              raise SystemExit('execute_transaction anchor not found')
-          addition = anchor + '''
+          pattern = re.compile(
+              r'(?ms)^    pub async fn execute_transaction\(\n'
+              r'.*?^    \}\n\n'
+              r'(?=    pub async fn execute_transaction_and_wait_for_checkpoint)'
+          )
+          match = pattern.search(r)
+          if not match:
+              raise SystemExit('execute_transaction method block not found')
+          addition = textwrap.dedent('''
               /// Execute a transaction but request only its digest. Used by the
               /// local fork CLI where broad response rendering may require remote
               /// historical object lookups. Transaction validation and VM execution
@@ -100,12 +87,11 @@ jobs:
                       .and_then(|tx| tx.digest)
                       .ok_or_else(|| tonic::Status::internal("missing transaction digest"))
               }
-          '''
-          r = r.replace(anchor, addition, 1)
+          ''')
+          addition = textwrap.indent(addition.strip('\n'), '    ') + '\n\n'
+          r = r[:match.end()] + addition + r[match.end():]
           rpc_client.write_text(r)
 
-          # 3. Patch direct chain-ID calls used by ephemeral publication and
-          # package compilation against the isolated mainnet fork.
           client = Path('sui-source/crates/sui/src/client_commands.rs')
           s = client.read_text()
           pattern = re.compile(
@@ -161,36 +147,35 @@ jobs:
           )
           s = s[:start] + block + s[next_fn:]
 
-          # 4. In explicit --forking-mode execute with empty signatures and a
-          # digest-only read mask. The fork server performs sender impersonation.
-          needle = '''    } else {
-                  let signatures = if forking_mode {
-                      vec![]
-                  } else {
-          '''
-          if needle not in s:
-              raise SystemExit('forking-mode execution block not found')
-          replacement = '''    } else {
-                  if forking_mode {
-                      let transaction = Transaction::new(SenderSignedData::new(tx_data.clone(), vec![]));
-                      let returned_digest = context
-                          .grpc_client()?
-                          .execute_transaction_digest_only(&transaction)
-                          .await?;
-                      let expected_digest = tx_data.digest().to_string();
-                      ensure!(
-                          returned_digest == expected_digest,
-                          "fork RPC returned digest {} but expected {}",
-                          returned_digest,
-                          expected_digest
-                      );
-                      return Ok(SuiClientCommandResult::ComputeTransactionDigest(tx_data));
-                  }
-                  let signatures = if forking_mode {
-                      vec![]
-                  } else {
-          '''
-          s = s.replace(needle, replacement, 1)
+          # Insert a dedicated forking-mode execution branch immediately before
+          # the existing signature-selection block.
+          pattern = re.compile(
+              r'(?m)^(?P<i>\s*)let signatures = if forking_mode \{\n'
+              r'(?P=i)    vec!\[\]\n'
+              r'(?P=i)\} else \{'
+          )
+          match = pattern.search(s)
+          if not match:
+              raise SystemExit('forking-mode signature block not found')
+          indent = match.group('i')
+          branch = (
+              f'{indent}if forking_mode {{\n'
+              f'{indent}    let transaction = Transaction::new(SenderSignedData::new(tx_data.clone(), vec![]));\n'
+              f'{indent}    let returned_digest = context\n'
+              f'{indent}        .grpc_client()?\n'
+              f'{indent}        .execute_transaction_digest_only(&transaction)\n'
+              f'{indent}        .await?;\n'
+              f'{indent}    let expected_digest = tx_data.digest().to_string();\n'
+              f'{indent}    ensure!(\n'
+              f'{indent}        returned_digest == expected_digest,\n'
+              f'{indent}        "fork RPC returned digest {{}} but expected {{}}",\n'
+              f'{indent}        returned_digest,\n'
+              f'{indent}        expected_digest\n'
+              f'{indent}    );\n'
+              f'{indent}    return Ok(SuiClientCommandResult::ComputeTransactionDigest(tx_data));\n'
+              f'{indent}}}\n'
+          )
+          s = s[:match.start()] + branch + s[match.start():]
           client.write_text(s)
           print('PATCH_COMPLETE')
           PY
