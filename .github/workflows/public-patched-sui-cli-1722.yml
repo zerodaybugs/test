@@ -31,7 +31,7 @@ jobs:
           set -euo pipefail
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
           df -h > disk-before.txt
-      - name: Build exact Sui CLI using cached chain ID
+      - name: Build exact Sui CLI with local-mainnet-fork compatibility
         run: |
           set -euo pipefail
           git clone --filter=blob:none --no-checkout https://github.com/MystenLabs/sui.git sui-source
@@ -39,8 +39,9 @@ jobs:
           git -C sui-source rev-parse HEAD | tee SUI_SOURCE_COMMIT.txt
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('sui-source/crates/sui-sdk/src/wallet_context.rs')
-          s = p.read_text()
+
+          wallet = Path('sui-source/crates/sui-sdk/src/wallet_context.rs')
+          s = wallet.read_text()
           old = '''    pub async fn cache_chain_id(&self) -> Result<String, anyhow::Error> {
                   self.internal_load_or_cache_chain_id(true).await
               }'''
@@ -52,9 +53,48 @@ jobs:
               }'''
           if old not in s:
               raise SystemExit('expected cache_chain_id block not found')
-          p.write_text(s.replace(old, new, 1))
+          wallet.write_text(s.replace(old, new, 1))
+
+          client = Path('sui-source/crates/sui/src/client_commands.rs')
+          s = client.read_text()
+
+          # `test-publish` asks the RPC for the chain identifier directly even when
+          # client.yaml already pins it. Use the cached identifier for local forks.
+          old = '''                let client = context.grpc_client()?;
+                      let chain_id = client.get_chain_identifier().await?.to_string();
+                      let active_env = context.get_active_env()?;'''
+          new = '''                let chain_id = context.try_load_chain_id_from_cache(None).await?;
+                      let active_env = context.get_active_env()?;'''
+          if old not in s:
+              raise SystemExit('expected TestPublish chain-id block not found')
+          s = s.replace(old, new, 1)
+
+          # Package compilation also performs a direct chain-id RPC call. The binary
+          # is purpose-built for an isolated mainnet fork, whose chain identifier is
+          # pinned in the local client config as 35834a8a.
+          marker = '''pub(crate) async fn compile_package(
+              client: Client,'''
+          start = s.find(marker)
+          if start < 0:
+              raise SystemExit('compile_package function not found')
+          end = s.find('\n}\n', start)
+          if end < 0:
+              raise SystemExit('compile_package function end not found')
+          block = s[start:end]
+          old_line = '    let chain_id = client.get_chain_identifier().await?.to_string();'
+          if old_line not in block:
+              raise SystemExit('expected compile_package chain-id call not found')
+          block = block.replace(
+              old_line,
+              '    let chain_id = "35834a8a".to_string(); // Sui mainnet chain ID for isolated fork tests',
+              1,
+          )
+          s = s[:start] + block + s[end:]
+          client.write_text(s)
           PY
-          git -C sui-source diff -- crates/sui-sdk/src/wallet_context.rs | tee SUI_CLI_PATCH.diff
+          git -C sui-source diff -- \
+            crates/sui-sdk/src/wallet_context.rs \
+            crates/sui/src/client_commands.rs | tee SUI_CLI_PATCH.diff
           cd sui-source
           cargo build --locked -p sui 2>&1 | tee "$GITHUB_WORKSPACE/SUI_CLI_BUILD_OUTPUT.txt"
           cd "$GITHUB_WORKSPACE"
@@ -67,7 +107,7 @@ jobs:
           df -h > disk-after.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: public-cached-chain-sui-cli-1.72.2
+          name: public-mainnet-fork-sui-cli-1.72.2
           if-no-files-found: error
           retention-days: 7
           compression-level: 6
