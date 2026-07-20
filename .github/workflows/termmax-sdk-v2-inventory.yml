@@ -1,0 +1,108 @@
+name: termmax-sdk-v2-inventory
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/termmax-sdk-v2-inventory.yml'
+      - 'termmax-sdk-v2-inventory-trigger.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - chain: ethereum
+            alias: eth
+            factories: '0xF2BDa87CA467eB90A1b68f824cB136baA68a8177:23430000,0x5b8B26a6734B5eABDBe6C5A19580Ab2D0424f027:23430000'
+          - chain: arbitrum
+            alias: arb
+            factories: '0xa7c93162962D050098f4BB44E88661517484C5EB:385228046,0x18b8A9433dBefcd15370F10a75e28149bcc2e301:385228046'
+          - chain: bsc
+            alias: bnb
+            factories: '0x1401049368eD6AD8194f8bb7E41732c4620F170b:63100000,0xdffE6De6de1dB8e1B5Ce77D3222eba401C2573b5:63100000'
+          - chain: base
+            alias: base
+            factories: '0xDA4aAF85Bb924B53DCc2DFFa9e1A9C2Ef97aCFDF:43289755'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install minimal SDK dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir sdk-run && cd sdk-run
+          npm init -y
+          npm install --no-audit --no-fund @defillama/sdk@5.0.219 ethers@5.7.2
+      - name: Enumerate V2 vaults and current order state
+        shell: bash
+        env:
+          CHAIN: ${{ matrix.chain }}
+          ALIAS: ${{ matrix.alias }}
+          FACTORIES: ${{ matrix.factories }}
+        run: |
+          set -euxo pipefail
+          mkdir -p evidence-${CHAIN}
+          cd sdk-run
+          node - <<'NODE' | tee ../evidence-${CHAIN}/EXECUTION.log
+          const fs=require('fs');
+          const sdk=require('@defillama/sdk');
+          const chain=process.env.CHAIN;
+          const factories=process.env.FACTORIES.split(',').map(x=>{const [address,from]=x.split(':');return {address,fromBlock:Number(from)}});
+          const V='event VaultCreated(address indexed vault,address indexed creator,(address admin,address curator,address guardian,uint256 timelock,address asset,address pool,uint256 maxCapacity,string name,string symbol,uint64 performanceFeeRate,uint64 minApy) initialParams)';
+          const N='event NewOrderCreated(address indexed caller,address indexed market,address indexed order)';
+          const R='event RedeemOrder(address indexed caller,address indexed order,uint256 badDebt,uint256 diliveryAmount)';
+          const W='event WithdrawFts(address indexed caller,address indexed recipient,address indexed order,uint256 amount,uint256 shares)';
+          const z='0x0000000000000000000000000000000000000000';
+          const call=async(target,abi,params=[])=>{try{return (await sdk.api.abi.call({target,abi,params,chain})).output}catch(e){return {error:String(e)}}};
+          const main=async()=>{
+            const latest=(await sdk.api.util.getLatestBlock(chain)).number;
+            const vaultMap=new Map();
+            for(const f of factories){
+              const logs=await sdk.getEventLogs({target:f.address,eventAbi:V,fromBlock:f.fromBlock,toBlock:latest,chain});
+              for(const l of logs){vaultMap.set(l.args.vault.toLowerCase(),{vault:l.args.vault,creator:l.args.creator,factory:f.address,createdBlock:Number(l.blockNumber||l.block_number||0),initialParams:l.args.initialParams||l.args[2]})}
+            }
+            const vaults=[];
+            for(const v of vaultMap.values()){
+              const [newLogs,redeemLogs,withdrawLogs]=await Promise.all([
+                sdk.getEventLogs({target:v.vault,eventAbi:N,fromBlock:v.createdBlock||factories[0].fromBlock,toBlock:latest,chain}),
+                sdk.getEventLogs({target:v.vault,eventAbi:R,fromBlock:v.createdBlock||factories[0].fromBlock,toBlock:latest,chain}),
+                sdk.getEventLogs({target:v.vault,eventAbi:W,fromBlock:v.createdBlock||factories[0].fromBlock,toBlock:latest,chain}),
+              ]);
+              const redeemed=new Map(redeemLogs.map(x=>[x.args.order.toLowerCase(),{badDebt:String(x.args.badDebt),delivery:String(x.args.diliveryAmount),block:Number(x.blockNumber||0),tx:x.transactionHash}]));
+              const orderMap=new Map();
+              for(const l of newLogs) orderMap.set(l.args.order.toLowerCase(),{order:l.args.order,marketEvent:l.args.market,createdBlock:Number(l.blockNumber||0),tx:l.transactionHash});
+              const asset=await call(v.vault,'address:asset');
+              const base={...v,name:await call(v.vault,'string:name'),symbol:await call(v.vault,'string:symbol'),asset,totalAssets:String(await call(v.vault,'uint256:totalAssets')),totalSupply:String(await call(v.vault,'uint256:totalSupply')),maxDeposit:String(await call(v.vault,'function maxDeposit(address) view returns (uint256)',[v.vault])),paused:await call(v.vault,'bool:paused'),apy:String(await call(v.vault,'uint256:apy')),pool:await call(v.vault,'address:pool'),withdrawFtsEventCount:withdrawLogs.length,redeemOrderEventCount:redeemLogs.length};
+              const orders=[];
+              for(const o of orderMap.values()){
+                const market=await call(o.order,'address:market');
+                const tokens=await call(market,'function tokens() view returns (address ft,address xt,address gt,address collateral,address debtToken)');
+                const maturity=await call(v.vault,'function orderMaturity(address) view returns (uint256)',[o.order]);
+                const reserves=await call(o.order,'function tokenReserves() view returns (uint256 ftReserve,uint256 xtReserve)');
+                const expiry=await call(o.order,'uint256:orderExpiryTimestamp');
+                let ft=null,collateral=null,debt=null;
+                if(tokens && !tokens.error){ft=tokens.ft||tokens[0];collateral=tokens.collateral||tokens[3];debt=tokens.debtToken||tokens[4]}
+                orders.push({...o,market,tokens,maturity:String(maturity),expiry:String(expiry),reserves,ftBalance:ft?String(await call(ft,'function balanceOf(address) view returns (uint256)',[o.order])):null,badDebtForCollateral:collateral?String(await call(v.vault,'function badDebtMapping(address) view returns (uint256)',[collateral])):null,redeemed:redeemed.get(o.order.toLowerCase())||null});
+              }
+              vaults.push({...base,orderCount:orders.length,activeOrderCount:orders.filter(o=>!o.redeemed).length,orders,withdrawFtsEvents:withdrawLogs.map(x=>({order:x.args.order,amount:String(x.args.amount),shares:String(x.args.shares),block:Number(x.blockNumber||0),tx:x.transactionHash}))});
+            }
+            const summary={chain,latest,vaultCount:vaults.length,totalAssetsRaw:vaults.map(v=>v.totalAssets),multiOrderVaults:vaults.filter(v=>v.activeOrderCount>=2).map(v=>v.vault),positiveBadDebtVaults:vaults.filter(v=>v.orders.some(o=>!o.redeemed && !o.badDebtForCollateral?.error && BigInt(o.badDebtForCollateral||0)>0n)).map(v=>v.vault),withdrawFtsUsedVaults:vaults.filter(v=>v.withdrawFtsEventCount>0).map(v=>v.vault),vaults};
+            fs.writeFileSync(`../evidence-${chain}/STATE.json`,JSON.stringify(summary,null,2));
+            console.log(JSON.stringify(summary,null,2));
+          };
+          main().catch(e=>{console.error(e);fs.writeFileSync(`../evidence-${chain}/ERROR.txt`,String(e.stack||e));process.exit(1)});
+          NODE
+          sha256sum ../evidence-${CHAIN}/* | sort > ../evidence-${CHAIN}/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: termmax-sdk-v2-${{ matrix.chain }}
+          path: evidence-${{ matrix.chain }}/
+          if-no-files-found: warn
+          retention-days: 3
