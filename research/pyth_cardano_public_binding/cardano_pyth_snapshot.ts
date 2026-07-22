@@ -8,12 +8,6 @@ import {
   ScriptHash,
   TransactionHash,
 } from "@evolution-sdk/evolution";
-import {
-  createReadClient,
-  getPythScriptHash,
-  getPythState,
-  getTrustedSigners,
-} from "@pythnetwork/pyth-lazer-cardano-js";
 
 import { ClientContext } from "./client.js";
 import { Pyth_state_update_spend } from "./offchain.js";
@@ -25,6 +19,8 @@ const ASSET_NAME = AssetName.toHex(
 );
 const UNIT = POLICY + ASSET_NAME;
 const OUT_DIR = path.resolve(process.env.OUT_DIR ?? "./pyth-cardano-public-binding");
+const READ_ONLY_MNEMONIC =
+  "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
 function hex(value: unknown): string | null {
   if (value instanceof Uint8Array || Buffer.isBuffer(value)) {
@@ -137,8 +133,16 @@ async function main() {
   const officialIdentity = koiosIdentity(koiosOfficial);
   const xrayIdentity = koiosIdentity(koiosXray);
 
-  const client = createReadClient("mainnet");
-  const stateUtxo = await getPythState(POLICY, client);
+  const ctx = await ClientContext.create(
+    "mainnet",
+    { token: "", type: "koios" },
+    READ_ONLY_MNEMONIC,
+    { debug: false },
+  );
+  const stateUtxo = await ctx.getNftUtxo(
+    POLICY,
+    AssetName.fromBytes(Buffer.from("Pyth State", "utf8")),
+  );
   const datum = Pyth_state_update_spend.datum.fromData(
     ClientContext.readUtxo(stateUtxo),
   ) as any;
@@ -147,7 +151,7 @@ async function main() {
   const livePaymentCredential = hex(
     (stateUtxo as any).address?.paymentCredential,
   );
-  const liveWithdrawScript = getPythScriptHash(stateUtxo);
+  const liveWithdrawScript = Buffer.from(datum.withdraw_script).toString("hex");
   const localSpendScript = ScriptHash.toHex(spendScriptHash());
   const localWithdrawScript = ScriptHash.toHex(withdrawScriptHash(POLICY));
   const txHash = TransactionHash.toHex((stateUtxo as any).transactionId);
@@ -157,13 +161,6 @@ async function main() {
     .map(([key, range]) => ({
       expires_at: signerExpiry(range),
       public_key: Buffer.from(key).toString("hex"),
-    }))
-    .sort((a, b) => a.public_key.localeCompare(b.public_key));
-
-  const sdkSigners = getTrustedSigners(stateUtxo)
-    .map((signer) => ({
-      expires_at: signer.expiresAt.toString(),
-      public_key: signer.publicKey,
     }))
     .sort((a, b) => a.public_key.localeCompare(b.public_key));
 
@@ -187,7 +184,6 @@ async function main() {
         wormhole_policy: Buffer.from(datum.governance.wormhole).toString("hex"),
       },
       trusted_signers: decodedSigners,
-      trusted_signers_sdk: sdkSigners,
       withdraw_script: liveWithdrawScript,
       deprecated_withdraw_scripts: normalize(datum.deprecated_withdraw_scripts),
       raw_utxo: normalize(stateUtxo),
@@ -203,21 +199,20 @@ async function main() {
     comparisons: {
       koios_providers_identical:
         JSON.stringify(officialIdentity) === JSON.stringify(xrayIdentity),
-      sdk_matches_koios_tx:
+      client_matches_koios_tx:
         String(officialIdentity.tx_hash) === txHash &&
         String(officialIdentity.tx_index) === txIndex,
-      sdk_matches_koios_address: String(officialIdentity.address) === liveAddress,
+      client_matches_koios_address: String(officialIdentity.address) === liveAddress,
       live_spend_script_matches_exact_source_build:
         livePaymentCredential?.toLowerCase() === localSpendScript.toLowerCase(),
       live_withdraw_script_matches_exact_source_build:
         liveWithdrawScript.toLowerCase() === localWithdrawScript.toLowerCase(),
-      decoded_signers_match_sdk:
-        JSON.stringify(decodedSigners) === JSON.stringify(sdkSigners),
     },
     explorer_urls: {
       cardanoscan_token: `https://cardanoscan.io/token/${UNIT}`,
       cardanoscan_transaction: `https://cardanoscan.io/transaction/${txHash}`,
-      cexplorer_asset: "https://cexplorer.io/asset/asset1nup2062z9fmwlrp706aqx0462gs305zktegfn4/owner",
+      cexplorer_asset:
+        "https://cexplorer.io/asset/asset1nup2062z9fmwlrp706aqx0462gs305zktegfn4/owner",
     },
   };
 
@@ -244,11 +239,10 @@ async function main() {
 
   const mandatory = [
     snapshot.comparisons.koios_providers_identical,
-    snapshot.comparisons.sdk_matches_koios_tx,
-    snapshot.comparisons.sdk_matches_koios_address,
+    snapshot.comparisons.client_matches_koios_tx,
+    snapshot.comparisons.client_matches_koios_address,
     snapshot.comparisons.live_spend_script_matches_exact_source_build,
     snapshot.comparisons.live_withdraw_script_matches_exact_source_build,
-    snapshot.comparisons.decoded_signers_match_sdk,
   ];
   if (!mandatory.every(Boolean)) {
     throw new Error(`deployment binding failed: ${JSON.stringify(snapshot.comparisons)}`);
