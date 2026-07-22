@@ -1,0 +1,220 @@
+name: Generic CREATE2 low-prefix address control
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/create2-low-prefix-control.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prove:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install generic local EVM dependencies
+        run: npm install --no-save --ignore-scripts ethers@6.15.0 solc@0.8.26 ganache@7.9.2
+      - name: Create generic factory and forwarder source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > Contracts.sol <<'EOF'
+          // SPDX-License-Identifier: MIT
+          pragma solidity 0.8.26;
+
+          contract Create2Factory {
+              event Deployed(address indexed deployed, bytes32 indexed salt);
+              function deploy(bytes32 salt, bytes memory initCode) external returns (address deployed) {
+                  assembly {
+                      deployed := create2(0, add(initCode, 0x20), mload(initCode), salt)
+                  }
+                  require(deployed != address(0), "CREATE2_FAILED");
+                  emit Deployed(deployed, salt);
+              }
+          }
+
+          contract GenericForwarder {
+              address internal constant TARGET = 0x00000000000000000000000000000000000000C1;
+              fallback() external payable {
+                  (bool ok, bytes memory ret) = TARGET.call{value: msg.value}(msg.data);
+                  assembly {
+                      switch ok
+                      case 0 { revert(add(ret, 0x20), mload(ret)) }
+                      default { return(add(ret, 0x20), mload(ret)) }
+                  }
+              }
+              receive() external payable {}
+          }
+          EOF
+      - name: Start local EVM and deploy factory
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx ganache --server.host 127.0.0.1 --server.port 8545 --chain.chainId 42101 --wallet.deterministic --logging.quiet > ganache.log 2>&1 &
+          echo $! > ganache.pid
+          for i in $(seq 1 60); do
+            if curl -sS -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' http://127.0.0.1:8545 | grep -q result; then break; fi
+            sleep 1
+          done
+          cat > prepare.mjs <<'JS'
+          import solc from 'solc';
+          import { JsonRpcProvider, Wallet, ContractFactory, keccak256 } from 'ethers';
+          import fs from 'node:fs';
+
+          const source=fs.readFileSync('Contracts.sol','utf8');
+          const input={language:'Solidity',sources:{'Contracts.sol':{content:source}},settings:{optimizer:{enabled:true,runs:200},outputSelection:{'*':{'*':['abi','evm.bytecode.object','evm.deployedBytecode.object']}}}};
+          const output=JSON.parse(solc.compile(JSON.stringify(input)));
+          if (output.errors?.some(x=>x.severity==='error')) throw new Error(JSON.stringify(output.errors,null,2));
+          const c=output.contracts['Contracts.sol'];
+          const provider=new JsonRpcProvider('http://127.0.0.1:8545',42101,{staticNetwork:true});
+          const initial=await provider.send('eth_accounts',[]);
+          const unlocked=await provider.getSigner(initial[0]);
+          const ff=new ContractFactory(c.Create2Factory.abi,'0x'+c.Create2Factory.evm.bytecode.object,unlocked);
+          const factory=await ff.deploy();
+          await factory.waitForDeployment();
+          const initCode='0x'+c.GenericForwarder.evm.bytecode.object;
+          const out={factory:await factory.getAddress(),factoryAbi:c.Create2Factory.abi,initCode,initCodeHash:keccak256(initCode),runtime:'0x'+c.GenericForwarder.evm.deployedBytecode.object,target:'0x00000000000000000000000000000000000000C1',thresholdLittleEndian:250000000000};
+          fs.writeFileSync('search-input.json',JSON.stringify(out,null,2)+'\n');
+          console.log(JSON.stringify(out,null,2));
+          JS
+          node prepare.mjs | tee prepare.log
+      - name: Build native parallel CREATE2 salt searcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p searcher/src
+          cat > searcher/Cargo.toml <<'EOF'
+          [package]
+          name = "create2-prefix-search"
+          version = "0.1.0"
+          edition = "2021"
+
+          [dependencies]
+          hex = "0.4"
+          rayon = "1.10"
+          serde = { version = "1", features = ["derive"] }
+          serde_json = "1"
+          tiny-keccak = { version = "2.0", features = ["keccak"] }
+          EOF
+          cat > searcher/src/main.rs <<'EOF'
+          use rayon::prelude::*;
+          use serde::Deserialize;
+          use std::{fs, sync::{atomic::{AtomicBool, Ordering}, Arc}};
+          use tiny_keccak::{Hasher, Keccak};
+
+          #[derive(Deserialize)]
+          struct Input {
+              factory: String,
+              #[serde(rename="initCodeHash")]
+              init_code_hash: String,
+              #[serde(rename="thresholdLittleEndian")]
+              threshold: u64,
+          }
+
+          fn decode20(s: &str) -> [u8;20] {
+              let v=hex::decode(s.trim_start_matches("0x")).unwrap();
+              v.try_into().unwrap()
+          }
+          fn decode32(s: &str) -> [u8;32] {
+              let v=hex::decode(s.trim_start_matches("0x")).unwrap();
+              v.try_into().unwrap()
+          }
+          fn create2(factory:&[u8;20], init_hash:&[u8;32], n:u64)->([u8;32],[u8;20],u64) {
+              let mut salt=[0u8;32];
+              salt[24..].copy_from_slice(&n.to_be_bytes());
+              let mut input=[0u8;85];
+              input[0]=0xff;
+              input[1..21].copy_from_slice(factory);
+              input[21..53].copy_from_slice(&salt);
+              input[53..85].copy_from_slice(init_hash);
+              let mut hash=[0u8;32];
+              let mut k=Keccak::v256();
+              k.update(&input);
+              k.finalize(&mut hash);
+              let mut address=[0u8;20];
+              address.copy_from_slice(&hash[12..]);
+              let prefix=u64::from_le_bytes(address[0..8].try_into().unwrap());
+              (salt,address,prefix)
+          }
+
+          fn main() {
+              let input:Input=serde_json::from_str(&fs::read_to_string("search-input.json").unwrap()).unwrap();
+              let factory=decode20(&input.factory);
+              let init_hash=decode32(&input.init_code_hash);
+              let found=Arc::new(AtomicBool::new(false));
+              let chunk:u64=25_000_000;
+              let mut base=0u64;
+              loop {
+                  let stop=found.clone();
+                  if let Some(hit)=(base..base+chunk).into_par_iter().find_any(|n| {
+                      if stop.load(Ordering::Relaxed) { return false; }
+                      let (_,_,p)=create2(&factory,&init_hash,*n);
+                      if p < input.threshold { stop.store(true,Ordering::Relaxed); true } else { false }
+                  }) {
+                      let (salt,address,prefix)=create2(&factory,&init_hash,hit);
+                      let out=serde_json::json!({"counter":hit,"salt":format!("0x{}",hex::encode(salt)),"address":format!("0x{}",hex::encode(address)),"prefixLittleEndian":prefix,"threshold":input.threshold});
+                      fs::write("search-result.json",serde_json::to_string_pretty(&out).unwrap()+"\n").unwrap();
+                      println!("{}",serde_json::to_string_pretty(&out).unwrap());
+                      break;
+                  }
+                  base+=chunk;
+                  eprintln!("searched {} salts",base);
+              }
+          }
+          EOF
+          cargo build --manifest-path searcher/Cargo.toml --release
+          time searcher/target/release/create2-prefix-search 2>&1 | tee search.log
+      - name: Deploy searched forwarder and verify exact address
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > verify.mjs <<'JS'
+          import { JsonRpcProvider, Contract, getCreate2Address, keccak256 } from 'ethers';
+          import fs from 'node:fs';
+          const input=JSON.parse(fs.readFileSync('search-input.json'));
+          const result=JSON.parse(fs.readFileSync('search-result.json'));
+          const provider=new JsonRpcProvider('http://127.0.0.1:8545',42101,{staticNetwork:true});
+          const accounts=await provider.send('eth_accounts',[]);
+          const signer=await provider.getSigner(accounts[0]);
+          const factory=new Contract(input.factory,input.factoryAbi,signer);
+          const expected=getCreate2Address(input.factory,result.salt,input.initCodeHash);
+          if(expected.toLowerCase()!==result.address.toLowerCase()) throw new Error(`address mismatch ${expected} ${result.address}`);
+          const tx=await factory.deploy(result.salt,input.initCode);
+          const receipt=await tx.wait();
+          const code=await provider.getCode(expected);
+          if(code.toLowerCase()!==input.runtime.toLowerCase()) throw new Error('runtime mismatch');
+          const prefix=Number(BigInt('0x'+expected.slice(2,18).match(/../g).reverse().join('')));
+          if(BigInt(prefix)>=BigInt(input.thresholdLittleEndian)) throw new Error('prefix above threshold');
+          const proof={...result,expected,factory:input.factory,initCodeHash:input.initCodeHash,runtimeHash:keccak256(input.runtime),deploymentTx:receipt.hash,deployedCodeBytes:(code.length-2)/2,prefixLittleEndianExact:prefix,threshold:input.thresholdLittleEndian};
+          fs.writeFileSync('deployment-proof.json',JSON.stringify(proof,null,2)+'\n');
+          console.log(JSON.stringify(proof,null,2));
+          JS
+          node verify.mjs 2>&1 | tee verify.log
+          sha256sum Contracts.sol prepare.mjs search-input.json searcher/Cargo.toml searcher/src/main.rs search-result.json deployment-proof.json prepare.log search.log verify.log > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: generic-create2-low-prefix-control-${{ github.run_id }}
+          path: |
+            Contracts.sol
+            prepare.mjs
+            search-input.json
+            searcher/Cargo.toml
+            searcher/Cargo.lock
+            searcher/src/main.rs
+            search-result.json
+            deployment-proof.json
+            prepare.log
+            search.log
+            verify.log
+            ganache.log
+            SHA256SUMS
+          compression-level: 0
+          retention-days: 3
