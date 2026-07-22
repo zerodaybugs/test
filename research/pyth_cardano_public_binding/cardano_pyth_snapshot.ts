@@ -85,8 +85,15 @@ async function writeJson(name: string, value: unknown): Promise<void> {
 }
 
 async function postKoios(baseUrl: string): Promise<unknown> {
+  // Koios expects each requested asset as a [policy_id, asset_name] pair.
+  // Passing the concatenated Cardano unit string returns an empty result even
+  // when the NFT exists, so keep the API request independent from the unit form
+  // used by Evolution SDK and explorers.
   const response = await fetch(`${baseUrl}/asset_utxos`, {
-    body: JSON.stringify({ _asset_list: [UNIT], _extended: "true" }),
+    body: JSON.stringify({
+      _asset_list: [[POLICY, ASSET_NAME]],
+      _extended: true,
+    }),
     headers: {
       accept: "application/json",
       "content-type": "application/json",
