@@ -1,0 +1,190 @@
+name: Pyth Cardano read-only deployment binding
+
+on:
+  push:
+    branches: [research/pyth-cardano-deployment-binding]
+    paths:
+      - '.github/workflows/pyth-cardano-public-binding.yml'
+      - 'research/pyth_cardano_public_binding/cardano_pyth_snapshot.ts'
+
+permissions:
+  contents: write
+
+jobs:
+  bind-live-deployment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      PYTH_COMMIT: 8545496cd33479cde2f320ea35fe5cd9c0393633
+      AIKEN_VERSION: v1.1.21
+      OUT_DIR: ${{ github.workspace }}/research/pyth_cardano_public_binding/output
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: research/pyth-cardano-deployment-binding
+          fetch-depth: 0
+
+      - name: Initialize evidence directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$OUT_DIR"
+          mkdir -p "$OUT_DIR"
+          {
+            echo "workflow_run_id=${GITHUB_RUN_ID}"
+            echo "workflow_run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "workflow_sha=${GITHUB_SHA}"
+            echo "pyth_source_commit=${PYTH_COMMIT}"
+            date -u +'%Y-%m-%dT%H:%M:%SZ'
+          } > "$OUT_DIR/provenance.txt"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.0.0'
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '10.28.0'
+          run_install: false
+
+      - name: Install exact Aiken compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin" /tmp/aiken
+          asset="https://github.com/aiken-lang/aiken/releases/download/${AIKEN_VERSION}/aiken-x86_64-unknown-linux-musl.tar.gz"
+          curl --fail --location --retry 4 --retry-all-errors "$asset" -o /tmp/aiken/aiken.tar.gz
+          tar -xzf /tmp/aiken/aiken.tar.gz -C /tmp/aiken
+          candidate="$(find /tmp/aiken -type f -name aiken -perm -111 | head -n1)"
+          test -n "$candidate"
+          cp "$candidate" "$HOME/.local/bin/aiken"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/aiken" --version | tee "$OUT_DIR/aiken-version.txt"
+          grep -F '1.1.21' "$OUT_DIR/aiken-version.txt"
+
+      - name: Fetch exact Pyth source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/pyth-network/pyth-crosschain.git pyth-crosschain
+          git -C pyth-crosschain fetch --depth 1 origin "$PYTH_COMMIT"
+          git -C pyth-crosschain checkout --detach "$PYTH_COMMIT"
+          test "$(git -C pyth-crosschain rev-parse HEAD)" = "$PYTH_COMMIT"
+          git -C pyth-crosschain rev-parse HEAD > "$OUT_DIR/pyth-source-head.txt"
+          cp research/pyth_cardano_public_binding/cardano_pyth_snapshot.ts \
+            pyth-crosschain/lazer/contracts/cardano/cli/js/src/cardano_pyth_snapshot.ts
+
+      - name: Install filtered workspace dependencies
+        shell: bash
+        working-directory: pyth-crosschain
+        run: |
+          set -euo pipefail
+          node --version | tee "$OUT_DIR/node-version.txt"
+          pnpm --version | tee "$OUT_DIR/pnpm-version.txt"
+          pnpm install --frozen-lockfile --filter @pythnetwork/pyth-lazer-cardano-cli... \
+            2>&1 | tee "$OUT_DIR/pnpm-install.log"
+
+      - name: Compile exact Cardano validators
+        shell: bash
+        working-directory: pyth-crosschain/lazer/contracts/cardano/cli/js
+        run: |
+          set -euo pipefail
+          pnpm cli build --env default --trace-level verbose \
+            2>&1 | tee "$OUT_DIR/aiken-build.log"
+          cp ../../../plutus.json "$OUT_DIR/plutus.json"
+          cp ../../../aiken.toml "$OUT_DIR/aiken.toml"
+          cp ../../../aiken.lock "$OUT_DIR/aiken.lock"
+          cp ../../../lib/pyth/governance.ak "$OUT_DIR/governance.ak"
+          cp ../../../validators/pyth_state.ak "$OUT_DIR/pyth_state.ak"
+          cp src/transactions.ts "$OUT_DIR/transactions.ts"
+          cp src/client.ts "$OUT_DIR/client.ts"
+          cp src/offchain.ts "$OUT_DIR/offchain-generated.ts"
+
+      - name: Query live state and bind exact source build
+        id: binding
+        shell: bash
+        working-directory: pyth-crosschain/lazer/contracts/cardano/cli/js
+        run: |
+          set +e
+          OUT_DIR="$OUT_DIR" pnpm tsx src/cardano_pyth_snapshot.ts \
+            > "$OUT_DIR/snapshot-console.log" 2>&1
+          rc=$?
+          echo "$rc" > "$OUT_DIR/snapshot-exit-code.txt"
+          cat "$OUT_DIR/snapshot-console.log"
+          exit 0
+
+      - name: Capture independent explorer pages
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          if [ -f "$OUT_DIR/deployment-binding.json" ]; then
+            for key in cardanoscan_token cardanoscan_transaction cexplorer_asset; do
+              url="$(jq -r ".explorer_urls.${key}" "$OUT_DIR/deployment-binding.json")"
+              printf '%s\n' "$url" > "$OUT_DIR/${key}.url.txt"
+              curl --location --fail --retry 3 --retry-all-errors \
+                --user-agent 'Mozilla/5.0 (read-only deployment verification)' \
+                --dump-header "$OUT_DIR/${key}.headers.txt" \
+                "$url" -o "$OUT_DIR/${key}.html" \
+                > "$OUT_DIR/${key}.curl.stdout.txt" \
+                2> "$OUT_DIR/${key}.curl.stderr.txt"
+              echo "$?" > "$OUT_DIR/${key}.curl.exit.txt"
+            done
+          fi
+          exit 0
+
+      - name: Finalize integrity manifest
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          {
+            uname -a
+            git --version
+            node --version
+            pnpm --version
+            aiken --version
+          } > "$OUT_DIR/environment.txt" 2>&1
+          find "$OUT_DIR" -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$OUT_DIR/SHA256SUMS"
+          tar -C "$OUT_DIR" -czf "$GITHUB_WORKSPACE/PYTH_CARDANO_PUBLIC_BINDING_EVIDENCE.tar.gz" .
+          sha256sum "$GITHUB_WORKSPACE/PYTH_CARDANO_PUBLIC_BINDING_EVIDENCE.tar.gz" \
+            > "$OUT_DIR/evidence-archive.sha256"
+          exit 0
+
+      - name: Persist read-only evidence on branch
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add research/pyth_cardano_public_binding/output
+          if git diff --cached --quiet; then
+            echo 'No output changes to commit.'
+          else
+            git commit -m 'Record Pyth Cardano read-only deployment binding [skip ci]'
+            git push origin HEAD:research/pyth-cardano-deployment-binding
+          fi
+
+      - name: Upload evidence archive
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyth-cardano-public-binding-${{ github.run_id }}
+          path: |
+            research/pyth_cardano_public_binding/output/
+            PYTH_CARDANO_PUBLIC_BINDING_EVIDENCE.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Enforce binding gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$OUT_DIR/snapshot-exit-code.txt"
+          test "$(cat "$OUT_DIR/snapshot-exit-code.txt")" = '0'
+          grep -F 'KOIOS_PROVIDERS_IDENTICAL=true' "$OUT_DIR/BINDING_MARKERS.txt"
+          grep -F 'SPEND_BINDING_PASS=true' "$OUT_DIR/BINDING_MARKERS.txt"
+          grep -F 'WITHDRAW_BINDING_PASS=true' "$OUT_DIR/BINDING_MARKERS.txt"
+          grep -F 'PUBLIC_CHAIN_MODE=READ_ONLY' "$OUT_DIR/BINDING_MARKERS.txt"
