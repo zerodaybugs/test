@@ -6,7 +6,7 @@ import { createCodegenConfig } from "@evolution-sdk/evolution/blueprint/codegen-
 import type { PlutusBlueprint } from "@evolution-sdk/evolution/blueprint/types";
 
 const cliSourceDir = path.resolve(process.cwd(), "src");
-const cardanoRoot = path.resolve(process.cwd(), "../../../");
+const cardanoRoot = path.resolve(process.cwd(), "../..");
 const blueprintPath = path.join(cardanoRoot, "plutus.json");
 const outputPath = path.join(cliSourceDir, "offchain.ts");
 
