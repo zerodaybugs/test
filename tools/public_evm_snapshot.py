@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import time
 import urllib.request
 from pathlib import Path
 
@@ -84,11 +83,9 @@ chain_id_raw, provider = rpc("eth_chainId", [])
 latest_raw, _ = rpc("eth_blockNumber", [])
 latest = int(latest_raw, 16)
 
-# ERC721 ownerOf(uint256), prev(uint128), next(uint128)
 addresses = {
-    "previous_bridge": owner_call("0x6e124804", 5),
+    "previous_bridge": owner_call("0xe2603dc2", 5),
     "current_bridge": owner_call("0x6352211e", 5),
-    "next_bridge": owner_call("0x264e2d66", 5),
     "multicall": MULTICALL,
     "cross_chain_factory": FACTORY,
     "nucleus_teller": TELLER,
@@ -128,7 +125,7 @@ for log in logs:
         "data": log["data"],
         "topics": log["topics"],
     }
-    for label in ("previous_bridge", "current_bridge", "next_bridge"):
+    for label in ("previous_bridge", "current_bridge"):
         address = addresses[label]
         if address:
             try:
