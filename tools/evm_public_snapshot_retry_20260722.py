@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Run the public EVM snapshot with transparent multi-provider fallback."""
+"""Run the public EVM snapshot with transparent multi-provider fallback.
+
+The wrapper prefers ordinary public RPCs, then Blockscout's Ethereum RPC endpoint, and
+finally Routescan's read-only Etherscan-compatible API. Historical-call failures are
+preserved per entry instead of aborting the full production snapshot.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +15,8 @@ from urllib.parse import urlencode
 
 import evm_public_snapshot_20260722 as snapshot
 
-_original_endpoints = list(snapshot.RPC_ENDPOINTS)
+BLOCKSCOUT_RPC = "https://eth.blockscout.com/api/eth-rpc"
+_original_endpoints = list(snapshot.RPC_ENDPOINTS) + [BLOCKSCOUT_RPC]
 _rpc_counter = 0
 
 
@@ -94,5 +100,26 @@ def robust_rpc(endpoint: str, method: str, params: list[Any], timeout: int = 60)
     raise RuntimeError(json.dumps({"method": method, "errors": errors}, sort_keys=True))
 
 
+_original_read_claim_state = snapshot.read_claim_state
+
+
+def safe_read_claim_state(endpoint: str, entry: dict[str, Any], block: int) -> dict[str, Any]:
+    try:
+        return _original_read_claim_state(endpoint, entry, block)
+    except Exception as exc:
+        return {
+            "block": block,
+            "error": repr(exc),
+            "proof_valid": None,
+            "claimed": None,
+            "merkle_root": None,
+            "get_claimable": None,
+            "distributor_token_balance": None,
+            "entitlement_delta": None,
+        }
+
+
+snapshot.RPC_ENDPOINTS = _original_endpoints
 snapshot.rpc = robust_rpc
+snapshot.read_claim_state = safe_read_claim_state
 snapshot.main()
