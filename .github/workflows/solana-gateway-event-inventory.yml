@@ -1,0 +1,175 @@
+name: Solana gateway event inventory
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/solana-gateway-event-inventory.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inventory finalized Anchor events emitted by the public gateway
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > inventory.py <<'PY'
+          import base64
+          import hashlib
+          import json
+          import re
+          import time
+          import urllib.error
+          import urllib.request
+
+          RPCS = [
+              'https://api.devnet.solana.com',
+              'https://api.devnet.solana.com/',
+          ]
+          GATEWAY = 'CFVSincHYbETh2k7w6u1ENEkjbSLtveRCEBupKidw2VS'
+          EVENTS = {
+              hashlib.sha256(b'event:UniversalTxFinalized').digest()[:8]: 'UniversalTxFinalized',
+              hashlib.sha256(b'event:RevertUniversalTx').digest()[:8]: 'RevertUniversalTx',
+              hashlib.sha256(b'event:FundsRescued').digest()[:8]: 'FundsRescued',
+              hashlib.sha256(b'event:UniversalTx').digest()[:8]: 'UniversalTx',
+          }
+
+          def rpc(method, params, tries=8):
+              last = None
+              for attempt in range(tries):
+                  url = RPCS[attempt % len(RPCS)]
+                  body = json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
+                  req = urllib.request.Request(url, data=body, headers={'content-type':'application/json','user-agent':'read-only-event-inventory/1.0'})
+                  try:
+                      with urllib.request.urlopen(req, timeout=35) as r:
+                          obj = json.load(r)
+                      if obj.get('error'):
+                          raise RuntimeError(obj['error'])
+                      return obj.get('result')
+                  except Exception as e:
+                      last = repr(e)
+                      time.sleep(min(8.0, 0.5 * (2 ** attempt)))
+              raise RuntimeError(f'{method} failed: {last}')
+
+          sigs = []
+          before = None
+          for _ in range(5):
+              cfg = {'limit': 200, 'commitment': 'finalized'}
+              if before:
+                  cfg['before'] = before
+              page = rpc('getSignaturesForAddress', [GATEWAY, cfg]) or []
+              if not page:
+                  break
+              sigs.extend(page)
+              before = page[-1]['signature']
+              if len(page) < 200:
+                  break
+
+          inv_re = re.compile(r'^Program ([1-9A-HJ-NP-Za-km-z]{32,44}) invoke \[\d+\]$')
+          end_re = re.compile(r'^Program ([1-9A-HJ-NP-Za-km-z]{32,44}) (?:success|failed: .*)$')
+          events = []
+          tx_examined = 0
+          tx_unavailable = 0
+          rpc_errors = []
+
+          for i, item in enumerate(sigs):
+              sig = item['signature']
+              try:
+                  tx = rpc('getTransaction', [sig, {'encoding':'json','commitment':'finalized','maxSupportedTransactionVersion':0}], tries=5)
+              except Exception as e:
+                  rpc_errors.append({'signature':sig,'error':repr(e)})
+                  continue
+              if tx is None:
+                  tx_unavailable += 1
+                  continue
+              tx_examined += 1
+              logs = ((tx.get('meta') or {}).get('logMessages') or [])
+              stack = []
+              for idx, line in enumerate(logs):
+                  m = inv_re.match(line)
+                  if m:
+                      stack.append(m.group(1))
+                      continue
+                  m = end_re.match(line)
+                  if m:
+                      pid = m.group(1)
+                      for j in range(len(stack)-1, -1, -1):
+                          if stack[j] == pid:
+                              del stack[j:]
+                              break
+                      continue
+                  if not line.startswith('Program data: '):
+                      continue
+                  emitter = stack[-1] if stack else None
+                  try:
+                      raw = base64.b64decode(line.split(': ',1)[1], validate=True)
+                  except Exception:
+                      continue
+                  name = EVENTS.get(raw[:8])
+                  if emitter != GATEWAY or not name:
+                      continue
+                  rec = {
+                      'signature': sig,
+                      'slot': tx.get('slot'),
+                      'block_time': tx.get('blockTime'),
+                      'log_index': idx,
+                      'emitter': emitter,
+                      'event': name,
+                      'length': len(raw),
+                      'discriminator_hex': raw[:8].hex(),
+                      'raw_base64': base64.b64encode(raw).decode(),
+                      'bytes_72_80_le': int.from_bytes(raw[72:80], 'little') if len(raw) >= 80 else None,
+                      'bytes_80_88_le': int.from_bytes(raw[80:88], 'little') if len(raw) >= 88 else None,
+                      'bytes_80_100_hex': raw[80:100].hex() if len(raw) >= 100 else None,
+                      'bytes_88_108_hex': raw[88:108].hex() if len(raw) >= 108 else None,
+                  }
+                  events.append(rec)
+              if len(events) >= 20:
+                  break
+              if i and i % 20 == 0:
+                  time.sleep(0.2)
+
+          summary = {
+              'rpc': RPCS[0],
+              'gateway': GATEWAY,
+              'signatures_discovered': len(sigs),
+              'transactions_examined': tx_examined,
+              'transactions_unavailable': tx_unavailable,
+              'matching_gateway_events': len(events),
+              'events_by_type': {n: sum(1 for e in events if e['event']==n) for n in sorted(set(e['event'] for e in events))},
+              'events': events,
+              'rpc_errors': rpc_errors[:20],
+          }
+          with open('event-inventory.json','w') as f:
+              json.dump(summary,f,indent=2)
+              f.write('\n')
+          with open('SUMMARY.md','w') as f:
+              f.write('# Solana gateway event inventory\n\n')
+              f.write(f"- Gateway: `{GATEWAY}`\n")
+              f.write(f"- Signatures discovered: {len(sigs)}\n")
+              f.write(f"- Transactions examined: {tx_examined}\n")
+              f.write(f"- Matching gateway-emitted Anchor events: {len(events)}\n\n")
+              for e in events:
+                  f.write(f"- `{e['event']}` len={e['length']} slot={e['slot']} signature=`{e['signature']}` bytes72..80={e['bytes_72_80_le']} bytes80..88={e['bytes_80_88_le']}\n")
+          print(json.dumps(summary,indent=2))
+          PY
+          python3 inventory.py 2>&1 | tee inventory.log
+          sha256sum inventory.py event-inventory.json SUMMARY.md inventory.log > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: solana-gateway-event-inventory-${{ github.run_id }}
+          path: |
+            inventory.py
+            event-inventory.json
+            SUMMARY.md
+            inventory.log
+            SHA256SUMS
+          compression-level: 0
+          retention-days: 3
