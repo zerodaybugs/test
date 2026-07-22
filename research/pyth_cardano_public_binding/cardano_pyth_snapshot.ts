@@ -10,8 +10,11 @@ import {
 } from "@evolution-sdk/evolution";
 
 import { ClientContext } from "./client.js";
-import { Pyth_state_update_spend } from "./offchain.js";
-import { spendScriptHash, withdrawScriptHash } from "./transactions.js";
+import {
+  Pyth_price_pyth_price_withdraw,
+  Pyth_state_update_spend,
+} from "./offchain.js";
+import { SpendingValidator, WithdrawingValidator } from "./utils.js";
 
 const POLICY = "c935c937d0deda8975142c7b77aeef8f8cd48791e89a8ca7a0edc154";
 const ASSET_NAME = AssetName.toHex(
@@ -21,6 +24,11 @@ const UNIT = POLICY + ASSET_NAME;
 const OUT_DIR = path.resolve(process.env.OUT_DIR ?? "./pyth-cardano-public-binding");
 const READ_ONLY_MNEMONIC =
   "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+const pythStateSpend = SpendingValidator.new(Pyth_state_update_spend);
+const pythPriceWithdraw = WithdrawingValidator.new(
+  Pyth_price_pyth_price_withdraw,
+);
 
 function hex(value: unknown): string | null {
   if (value instanceof Uint8Array || Buffer.isBuffer(value)) {
@@ -152,8 +160,10 @@ async function main() {
     (stateUtxo as any).address?.paymentCredential,
   );
   const liveWithdrawScript = Buffer.from(datum.withdraw_script).toString("hex");
-  const localSpendScript = ScriptHash.toHex(spendScriptHash());
-  const localWithdrawScript = ScriptHash.toHex(withdrawScriptHash(POLICY));
+  const localSpendScript = ScriptHash.toHex(pythStateSpend.script().hash);
+  const localWithdrawScript = ScriptHash.toHex(
+    pythPriceWithdraw.script(Buffer.from(POLICY, "hex")).hash,
+  );
   const txHash = TransactionHash.toHex((stateUtxo as any).transactionId);
   const txIndex = String((stateUtxo as any).index);
 
