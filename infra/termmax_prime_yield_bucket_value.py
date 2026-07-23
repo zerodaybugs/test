@@ -66,17 +66,13 @@ def uint(data: str, i: int=0) -> int:
     return int(word(data,i) or "0",16)
 
 
-def address_word(data: str, i: int=0) -> str:
-    return "0x"+word(data,i)[-40:].lower()
-
-
 def arg_address(address: str) -> str:
     return address.removeprefix("0x").lower().rjust(64,"0")
 
 
 def arg_bytes_uint(value: int) -> str:
-    # ABI for one dynamic bytes argument containing abi.encode(uint256(value)).
-    return ("0"*63+"20") + ("0"*63+"20") + f"{value:064x}"
+    # ABI for getCollateralValue(bytes) where bytes == abi.encode(uint256(value)).
+    return f"{32:064x}{32:064x}{value:064x}"
 
 
 def call(to: str, data: str, block: int|str="latest") -> dict[str,Any]:
