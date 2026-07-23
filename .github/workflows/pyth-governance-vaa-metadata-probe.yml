@@ -6,10 +6,12 @@ on:
     branches: [infra/pyth-cardano-vaa-inventory-20260723]
     paths:
       - '.github/workflows/pyth-governance-vaa-metadata-probe.yml'
+      - 'tools/pyth_vaa_metadata_probe.py'
   pull_request:
     branches: [main]
     paths:
       - '.github/workflows/pyth-governance-vaa-metadata-probe.yml'
+      - 'tools/pyth_vaa_metadata_probe.py'
 
 permissions:
   contents: read
@@ -20,166 +22,24 @@ jobs:
     timeout-minutes: 30
     env:
       EMITTER_HEX: 5635979a221c34931e32620b9293a463065555ea71fe97cd6237ade875b12e9e
+      OUT_DIR: out
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Capture paginated public list endpoint metadata
+      - name: Capture paginated metadata, production bursts, and selected Solana transactions
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p out/pages
-          cat > /tmp/probe.py <<'PY'
-          import json
-          import os
-          import urllib.error
-          import urllib.parse
-          import urllib.request
-          from pathlib import Path
-
-          emitter = os.environ['EMITTER_HEX'].lower()
-          out = Path('out')
-          pages = out / 'pages'
-          base = f'https://api.wormholescan.io/api/v1/vaas/1/{emitter}'
-
-          def fetch(url: str):
-              req = urllib.request.Request(
-                  url,
-                  headers={
-                      'Accept': 'application/json',
-                      'User-Agent': 'read-only-governance-metadata-probe/2.0',
-                  },
-              )
-              with urllib.request.urlopen(req, timeout=45) as response:
-                  return response.status, response.read(), dict(response.headers)
-
-          def list_candidates(parsed):
-              candidates = []
-              if isinstance(parsed, list):
-                  candidates.append(('root', parsed))
-              elif isinstance(parsed, dict):
-                  for key, value in parsed.items():
-                      if isinstance(value, list):
-                          candidates.append((key, value))
-                  data = parsed.get('data')
-                  if isinstance(data, dict):
-                      for key, value in data.items():
-                          if isinstance(value, list):
-                              candidates.append((f'data.{key}', value))
-              return candidates
-
-          def first(obj, names):
-              if not isinstance(obj, dict):
-                  return None
-              for name in names:
-                  value = obj.get(name)
-                  if value not in (None, ''):
-                      return value
-              for value in obj.values():
-                  if isinstance(value, dict):
-                      found = first(value, names)
-                      if found not in (None, ''):
-                          return found
-              return None
-
-          page_reports = []
-          all_items = []
-          selected_key = None
-          for page in range(0, 12):
-              params = urllib.parse.urlencode({
-                  'pageSize': 100,
-                  'sortOrder': 'ASC',
-                  'page': page,
-              })
-              url = f'{base}?{params}'
-              try:
-                  status, body, headers = fetch(url)
-                  text = body.decode('utf-8', errors='replace')
-                  (pages / f'page-{page:02d}.json').write_text(text)
-                  parsed = json.loads(text)
-                  candidates = list_candidates(parsed)
-                  if selected_key is None and candidates:
-                      selected_key = max(candidates, key=lambda item: len(item[1]))[0]
-                  matches = [value for key, value in candidates if key == selected_key]
-                  items = matches[0] if matches else (max(candidates, key=lambda item: len(item[1]))[1] if candidates else [])
-                  all_items.extend(items)
-                  page_reports.append({
-                      'page': page,
-                      'url': url,
-                      'status': status,
-                      'headers': {key: value for key, value in headers.items() if key.lower() in ('content-range', 'link', 'x-total-count')},
-                      'top_level_type': type(parsed).__name__,
-                      'top_level_keys': sorted(parsed.keys()) if isinstance(parsed, dict) else None,
-                      'list_candidates': [{'key': key, 'count': len(value)} for key, value in candidates],
-                      'selected_key': selected_key,
-                      'selected_count': len(items),
-                  })
-                  if page == 0:
-                      (out / 'FIRST_PAGE_PRETTY.json').write_text(json.dumps(parsed, indent=2, default=str) + '\n')
-                  if len(items) < 100:
-                      break
-              except urllib.error.HTTPError as exc:
-                  body = exc.read().decode('utf-8', errors='replace')
-                  (pages / f'page-{page:02d}-http-{exc.code}.txt').write_text(body)
-                  page_reports.append({'page': page, 'url': url, 'http_error': exc.code, 'body': body})
-                  break
-
-          normalized = []
-          for item in all_items:
-              if not isinstance(item, dict):
-                  continue
-              normalized.append({
-                  'id': first(item, ['id', '_id', 'vaaId']),
-                  'sequence': first(item, ['sequence', 'sequenceNumber']),
-                  'tx_hash': first(item, ['txHash', 'tx_hash', 'transactionHash', 'originTxHash']),
-                  'timestamp': first(item, ['timestamp', 'indexedAt', 'createdAt']),
-                  'emitter_chain': first(item, ['emitterChain']),
-                  'emitter_address': first(item, ['emitterAddr', 'emitterAddress']),
-                  'raw': item,
-              })
-
-          groups = {}
-          for item in normalized:
-              tx_hash = item.get('tx_hash')
-              if tx_hash:
-                  groups.setdefault(str(tx_hash), []).append(item)
-          multi = [
-              {
-                  'tx_hash': tx_hash,
-                  'count': len(items),
-                  'sequences': [item.get('sequence') for item in items],
-                  'timestamps': [item.get('timestamp') for item in items],
-              }
-              for tx_hash, items in groups.items()
-              if len(items) > 1
-          ]
-          multi.sort(key=lambda item: (-item['count'], item['tx_hash']))
-
-          summary = {
-              'mode': 'public_read_only',
-              'emitter': emitter,
-              'selected_list_key': selected_key,
-              'page_reports': page_reports,
-              'total_items': len(normalized),
-              'items_with_tx_hash': sum(1 for item in normalized if item.get('tx_hash')),
-              'distinct_tx_hashes': len(groups),
-              'multi_vaa_source_transactions': multi,
-          }
-          (out / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, default=str) + '\n')
-          (out / 'NORMALIZED_ITEMS.json').write_text(json.dumps(normalized, indent=2, default=str) + '\n')
-          print(json.dumps(summary, indent=2, default=str))
-          if not page_reports or page_reports[0].get('status') != 200:
-              raise SystemExit('first list page did not return HTTP 200')
-          if len(normalized) < 739:
-              raise SystemExit(f'incomplete metadata inventory: {len(normalized)} items')
-          PY
-          python /tmp/probe.py | tee out/console.log
+          python tools/pyth_vaa_metadata_probe.py | tee out/console.log
           {
             echo 'VAA_METADATA_PAGINATION_PASS'
             jq -r '"TOTAL_ITEMS=" + (.total_items|tostring)' out/SUMMARY.json
-            jq -r '"ITEMS_WITH_TX_HASH=" + (.items_with_tx_hash|tostring)' out/SUMMARY.json
-            jq -r '"MULTI_VAA_SOURCE_TX_COUNT=" + (.multi_vaa_source_transactions|length|tostring)' out/SUMMARY.json
+            jq -r '"MAX_SEQUENCE=" + (.max_sequence|tostring)' out/SUMMARY.json
+            jq -r '"RAPID_CONSECUTIVE_BURST_COUNT=" + (.rapid_consecutive_burst_count|tostring)' out/SUMMARY.json
+            jq -r '"LARGEST_BURST_COUNT=" + (.largest_burst_count|tostring)' out/SUMMARY.json
+            jq -r '"SELECTED_TRANSACTION_COMMON_ACCOUNT_COUNT=" + (.selected_transaction_common_accounts|length|tostring)' out/SUMMARY.json
           } | tee out/PASS_MARKERS.txt
           find out -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > out/SHA256SUMS
       - uses: actions/upload-artifact@v4
