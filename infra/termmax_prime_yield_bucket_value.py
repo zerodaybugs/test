@@ -32,9 +32,6 @@ SELECTORS = {
     "totalSupply": "0x18160ddd",
     "maxDeposit": "0x402d267d",
     "paused": "0x5c975abb",
-    "asset": "0x38d52e0f",
-    "decimals": "0x313ce567",
-    "symbol": "0x95d89b41",
 }
 
 
@@ -71,14 +68,20 @@ def arg_address(address: str) -> str:
 
 
 def arg_bytes_uint(value: int) -> str:
-    # ABI for getCollateralValue(bytes) where bytes == abi.encode(uint256(value)).
     return f"{32:064x}{32:064x}{value:064x}"
 
 
 def call(to: str, data: str, block: int|str="latest") -> dict[str,Any]:
     tag=hex(block) if isinstance(block,int) else block
     raw,url=rpc("eth_call",[{"to":to,"data":data},tag])
-    return {"raw":raw,"uint":uint(raw),"rpc":url,"blockTag":tag}
+    return {"ok":True,"raw":raw,"uint":uint(raw),"rpc":url,"blockTag":tag}
+
+
+def safe_call(to: str, data: str, block: int|str="latest") -> dict[str,Any]:
+    try:
+        return call(to,data,block)
+    except Exception as exc:
+        return {"ok":False,"error":f"{type(exc).__name__}: {exc}","blockTag":hex(block) if isinstance(block,int) else block}
 
 
 def block_meta(number: int) -> dict[str,Any]:
@@ -95,7 +98,9 @@ def snapshot(block: int|str) -> dict[str,Any]:
     paused=call(VAULT,SELECTORS["paused"],block)
     bad=call(VAULT,SELECTORS["badDebtMapping"]+arg_address(COLLATERAL),block)
     bal=call(COLLATERAL,SELECTORS["balanceOf"]+arg_address(VAULT),block)
-    value=call(GT,SELECTORS["getCollateralValue"]+arg_bytes_uint(bal["uint"]),block)
+    value={"ok":True,"uint":0,"rpc":bal["rpc"],"blockTag":tag} if bal["uint"]==0 else safe_call(GT,SELECTORS["getCollateralValue"]+arg_bytes_uint(bal["uint"]),block)
+    value_uint=value.get("uint") if value.get("ok") else None
+    bad_usd=bad["uint"]*100
     return {
         "blockTag":tag,
         "totalAssetsRaw":total_assets["uint"],
@@ -104,11 +109,11 @@ def snapshot(block: int|str) -> dict[str,Any]:
         "paused":bool(paused["uint"]),
         "badDebtRaw":bad["uint"],
         "collateralRaw":bal["uint"],
-        "collateralUsdBase1e8":value["uint"],
-        "badDebtUsdAssumingUSDCParBase1e8":bad["uint"]*100,
-        "recoveryMinusBadDebtUsdBase1e8":value["uint"]-bad["uint"]*100,
-        "recoveryRatio1e8":0 if bad["uint"]==0 else value["uint"]*10**8//(bad["uint"]*100),
-        "rpc":value["rpc"],
+        "collateralValueCall":value,
+        "collateralUsdBase1e8":value_uint,
+        "badDebtUsdAssumingUSDCParBase1e8":bad_usd,
+        "recoveryMinusBadDebtUsdBase1e8":None if value_uint is None else value_uint-bad_usd,
+        "recoveryRatio1e8":None if value_uint is None or bad_usd==0 else value_uint*10**8//bad_usd,
     }
 
 
@@ -119,28 +124,26 @@ def main() -> int:
     receipt,_=rpc("eth_getTransactionReceipt",[SETTLEMENT_TX])
     receipt_block=int(receipt["blockNumber"],16)
     result={
-        "schema":"termmax-prime-yield-bucket-value/v1",
+        "schema":"termmax-prime-yield-bucket-value/v2",
         "generatedAtUtc":dt.datetime.now(dt.timezone.utc).isoformat(),
         "safety":{"signedTransactions":0,"broadcastTransactions":0},
         "addresses":{"vault":VAULT,"market":MARKET,"order":ORDER,"gt":GT,"collateral":COLLATERAL},
         "event":{"tx":SETTLEMENT_TX,"expectedBlock":SETTLEMENT_BLOCK,"receiptBlock":receipt_block,"badDebtRaw":BAD_DEBT_RAW,"deliveryAmountRaw":COLLATERAL_RAW},
         "blocks":{"beforeSettlement":block_meta(receipt_block-1),"settlement":block_meta(receipt_block),"latest":block_meta(latest)},
-        "snapshots":{
-            "beforeSettlement":snapshot(receipt_block-1),
-            "afterSettlement":snapshot(receipt_block),
-            "latest":snapshot(latest),
-        },
+        "snapshots":{"beforeSettlement":snapshot(receipt_block-1),"afterSettlement":snapshot(receipt_block),"latest":snapshot(latest)},
     }
     latest_s=result["snapshots"]["latest"]
-    result["classification"]=(
-        "SNAV1_UNDERRECOVERY" if latest_s["collateralUsdBase1e8"] < latest_s["badDebtUsdAssumingUSDCParBase1e8"]
-        else "TMV1_OVERRECOVERY" if latest_s["collateralUsdBase1e8"] > latest_s["badDebtUsdAssumingUSDCParBase1e8"]
-        else "PAR_RECOVERY"
-    )
-    result["status"]="PASS"
+    value=latest_s["collateralUsdBase1e8"]
+    bad=latest_s["badDebtUsdAssumingUSDCParBase1e8"]
+    if value is None:
+        result["classification"]="ORACLE_VALUE_UNAVAILABLE"
+        result["status"]="INCOMPLETE"
+    else:
+        result["classification"]="SNAV1_UNDERRECOVERY" if value<bad else "TMV1_OVERRECOVERY" if value>bad else "PAR_RECOVERY"
+        result["status"]="PASS"
     (OUT/"SUMMARY.json").write_text(json.dumps(result,indent=2),encoding="utf-8")
     print(json.dumps({"status":result["status"],"classification":result["classification"],"latest":latest_s},indent=2))
-    return 0
+    return 0 if result["status"]=="PASS" else 2
 
 if __name__=="__main__":
     raise SystemExit(main())
