@@ -16,6 +16,7 @@ URLS = {
     "exchange_deposit_proxy": "https://exchange.synthetix.io/assets/DepositProxy-DKmIyX6Q.js",
     "exchange_deposit_modal": "https://exchange.synthetix.io/assets/DepositMarginModal-CZw7zE_R.js",
     "exchange_withdraw_modal": "https://exchange.synthetix.io/assets/WithdrawMarginModal-D5vtpQwT.js",
+    "exchange_query_keys": "https://exchange.synthetix.io/assets/query-keys-BXeEGN5P.js",
     "exchange_eip712": "https://exchange.synthetix.io/assets/eip712-d_WzdABq.js",
     "exchange_transfer_modal": "https://exchange.synthetix.io/assets/TransferModal-vq_joSi2.js",
     "exchange_submission_guard": "https://exchange.synthetix.io/assets/useSubmissionGuard-aeihgeSq.js",
