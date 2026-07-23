@@ -1,0 +1,166 @@
+name: Pyth governance VAA metadata pages
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [infra/pyth-cardano-vaa-inventory-20260723]
+    paths:
+      - '.github/workflows/pyth-governance-vaa-metadata-pages.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      EMITTER_HEX: 5635979a221c34931e32620b9293a463065555ea71fe97cd6237ade875b12e9e
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Fetch paginated public VAA metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/pages
+          cat > /tmp/pages.py <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          emitter = os.environ['EMITTER_HEX']
+          out = Path('out')
+          pages_dir = out / 'pages'
+          pages_dir.mkdir(parents=True, exist_ok=True)
+          base = f'https://api.wormholescan.io/api/v1/vaas/1/{emitter}'
+
+          def fetch(url):
+              req = urllib.request.Request(url, headers={
+                  'Accept': 'application/json',
+                  'User-Agent': 'read-only-governance-metadata/1.0',
+              })
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  return response.status, response.read()
+
+          probes = []
+          all_items = []
+          selected_list_key = None
+          for page in range(0, 12):
+              query = urllib.parse.urlencode({
+                  'pageSize': 100,
+                  'sortOrder': 'ASC',
+                  'page': page,
+              })
+              url = f'{base}?{query}'
+              try:
+                  status, body = fetch(url)
+                  text = body.decode('utf-8', errors='replace')
+                  (pages_dir / f'page-{page:02d}-http-{status}.json').write_text(text)
+                  parsed = json.loads(text)
+                  if page == 0:
+                      (out / 'FIRST_PAGE_PRETTY.json').write_text(json.dumps(parsed, indent=2) + '\n')
+                  candidates = []
+                  if isinstance(parsed, list):
+                      candidates.append(('root', parsed))
+                  elif isinstance(parsed, dict):
+                      for key, value in parsed.items():
+                          if isinstance(value, list):
+                              candidates.append((key, value))
+                      data = parsed.get('data')
+                      if isinstance(data, dict):
+                          for key, value in data.items():
+                              if isinstance(value, list):
+                                  candidates.append((f'data.{key}', value))
+                  if selected_list_key is None and candidates:
+                      selected_list_key, items = max(candidates, key=lambda kv: len(kv[1]))
+                  else:
+                      match = [value for key, value in candidates if key == selected_list_key]
+                      items = match[0] if match else (max(candidates, key=lambda kv: len(kv[1]))[1] if candidates else [])
+                  all_items.extend(items)
+                  probes.append({
+                      'page': page,
+                      'url': url,
+                      'http_status': status,
+                      'top_level_type': type(parsed).__name__,
+                      'top_level_keys': list(parsed.keys()) if isinstance(parsed, dict) else None,
+                      'list_candidates': [{'key': key, 'count': len(value)} for key, value in candidates],
+                      'selected_list_key': selected_list_key,
+                      'selected_count': len(items),
+                  })
+                  if len(items) == 0:
+                      break
+              except urllib.error.HTTPError as exc:
+                  body = exc.read().decode('utf-8', errors='replace')
+                  (pages_dir / f'page-{page:02d}-http-{exc.code}.txt').write_text(body)
+                  probes.append({'page': page, 'url': url, 'http_error': exc.code, 'body': body})
+                  break
+
+          def first(obj, names):
+              if not isinstance(obj, dict):
+                  return None
+              for name in names:
+                  if name in obj and obj[name] not in (None, ''):
+                      return obj[name]
+              for value in obj.values():
+                  if isinstance(value, dict):
+                      found = first(value, names)
+                      if found not in (None, ''):
+                          return found
+              return None
+
+          normalized = []
+          for item in all_items:
+              if not isinstance(item, dict):
+                  continue
+              normalized.append({
+                  'id': first(item, ['id', '_id', 'vaaId']),
+                  'sequence': first(item, ['sequence', 'sequenceNumber']),
+                  'tx_hash': first(item, ['txHash', 'tx_hash', 'transactionHash']),
+                  'timestamp': first(item, ['timestamp', 'indexedAt', 'createdAt']),
+                  'emitter_chain': first(item, ['emitterChain']),
+                  'emitter_address': first(item, ['emitterAddr', 'emitterAddress']),
+                  'raw': item,
+              })
+
+          groups = {}
+          for item in normalized:
+              tx = item.get('tx_hash')
+              if tx:
+                  groups.setdefault(str(tx), []).append(item)
+          multi = [
+              {'tx_hash': tx, 'count': len(items), 'sequences': [item.get('sequence') for item in items]}
+              for tx, items in groups.items() if len(items) > 1
+          ]
+          multi.sort(key=lambda x: (-x['count'], x['tx_hash']))
+
+          summary = {
+              'mode': 'public_read_only',
+              'emitter': emitter,
+              'selected_list_key': selected_list_key,
+              'pages': probes,
+              'total_items': len(normalized),
+              'items_with_tx_hash': sum(1 for item in normalized if item.get('tx_hash')),
+              'distinct_tx_hashes': len(groups),
+              'multi_vaa_source_transactions': multi,
+          }
+          (out / 'SUMMARY.json').write_text(json.dumps(summary, indent=2) + '\n')
+          (out / 'NORMALIZED_ITEMS.json').write_text(json.dumps(normalized, indent=2) + '\n')
+          print(json.dumps(summary, indent=2))
+          if not probes or probes[0].get('http_status') != 200:
+              raise SystemExit('first metadata page did not return HTTP 200')
+          PY
+          python /tmp/pages.py | tee out/console.log
+          find out -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > out/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pyth-governance-vaa-metadata-pages-${{ github.run_id }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
