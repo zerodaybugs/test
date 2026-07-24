@@ -1,0 +1,300 @@
+name: Temporary Katana initialization takeover gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-katana-init-gate.yml'
+      - 'tmp-katana-init-gate-trigger.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Read proxy initialization state and simulate hostile initialization
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > /tmp/init_gate.py <<'PY'
+          from __future__ import annotations
+
+          import json
+          import subprocess
+          import traceback
+          from pathlib import Path
+
+          KAT_RPC = "https://rpc.katana.network/"
+          ETH_RPC = "https://ethereum-rpc.publicnode.com"
+          ATTACKER = "0x00000000000000000000000000000000BEEFCAFE"
+          INIT_SLOT = "0xf0c57e16840df040f15088dc2f81fe391c3923bec73e23a9662efc9c229c6a00"
+          IMPL_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+
+          TOKENS = [
+              ("eth", "0xEE7D8BCFb72bC1880D0Cf19822eB0A2e6577aB62", "0xa6b0db1293144ebe9478b6a84f75dd651e45914a"),
+              ("usdc", "0x203A662b0BD271A6ed5a60EdFbd04bFce608FD36", "0x97a3500083348A147F419b8a65717909762c389f"),
+              ("usdt", "0x2DCa96907fde857dd3D816880A0df407eeB2D2F2", "0x053FA9b934b83E1E0ffc7e98a41aAdc3640bB462"),
+              ("wbtc", "0x0913DA6Da4b42f538B445599b46Bb4622342Cf52", "0xb00aa68b87256E2F22058fB2Ba3246EEc54A44fc"),
+              ("usds", "0x62D6A123E8D19d06d68cf0d2294F9A3A0362c6b3", "0x639f13D5f30B47c792b6851238c05D0b623C77DE"),
+          ]
+          ADAPTERS = [
+              ("eth", "0x694d1697f6909361775139357d99fb60b5cab683", TOKENS[0][1]),
+              ("usdc", "0x807275727dd3e640c5f2b5de7d1ec72b4dd293c0", TOKENS[1][1]),
+              ("usdt", "0x4690f346337ed8737bea462ac71ff16ef95b985e", TOKENS[2][1]),
+              ("wbtc", "0x8169e532bc781985e155037db1f96c267a520dfc", TOKENS[3][1]),
+              ("usds", "0xb42ab636ac69f073970a94d1ace13379e7621665", TOKENS[4][1]),
+          ]
+          MIGRATION_MANAGER = "0x417d01B64Ea30C4E163873f3a1f77b727c689e02"
+          VB_TOKENS = [
+              ("eth", "0x2DC70fb75b88d2eB4715bc06E1595E6D97c34DFF"),
+              ("usdc", "0x53E82ABbb12638F09d9e624578ccB666217a765e"),
+              ("usdt", "0x6d4f9f9f8f0155509ecd6Ac6c544fF27999845CC"),
+              ("wbtc", "0x2C24B57e2CCd1f273045Af6A5f632504C432374F"),
+              ("usds", "0x3DD459dE96F9C28e3a343b831cbDC2B93c8C4855"),
+          ]
+
+          def execute(args: list[str], timeout: int = 120) -> dict:
+              process = subprocess.run(args, text=True, capture_output=True, timeout=timeout)
+              return {
+                  "success": process.returncode == 0,
+                  "returnCode": process.returncode,
+                  "stdout": process.stdout.strip(),
+                  "stderr": process.stderr.strip(),
+              }
+
+          def cast(*args: object, rpc: str) -> dict:
+              return execute(["cast", *[str(arg) for arg in args], "--rpc-url", rpc])
+
+          def call(address: str, signature: str, *args: object, rpc: str, sender: str | None = None) -> dict:
+              command = ["cast", "call", address, signature, *[str(arg) for arg in args]]
+              if sender:
+                  command += ["--from", sender]
+              command += ["--rpc-url", rpc]
+              return execute(command)
+
+          def storage(address: str, slot: str, rpc: str) -> dict:
+              return cast("storage", address, slot, rpc=rpc)
+
+          def first_value(result: dict) -> str | None:
+              if not result["success"] or not result["stdout"]:
+                  return None
+              return result["stdout"].split()[0]
+
+          def int_value(result: dict) -> int | None:
+              value = first_value(result)
+              if value is None:
+                  return None
+              try:
+                  return int(value, 16 if value.startswith("0x") else 10)
+              except Exception:
+                  return None
+
+          def address_value(result: dict) -> str | None:
+              value = first_value(result)
+              return value if value and value.startswith("0x") and len(value) == 42 else None
+
+          def initialized_version(address: str, rpc: str) -> tuple[int | None, dict]:
+              raw = storage(address, INIT_SLOT, rpc)
+              word = int_value(raw)
+              return (None if word is None else word & ((1 << 64) - 1), raw)
+
+          report: dict = {
+              "attacker": ATTACKER,
+              "initializableStorageSlot": INIT_SLOT,
+              "customTokens": [],
+              "nativeConverters": [],
+              "adapters": [],
+              "migrationManager": {},
+              "vbTokens": [],
+              "takeoverCandidates": [],
+          }
+
+          try:
+              for name, token, converter in TOKENS:
+                  decimals_call = call(token, "decimals()(uint8)", rpc=KAT_RPC)
+                  decimals = int_value(decimals_call)
+                  lxly_call = call(token, "lxlyBridge()(address)", rpc=KAT_RPC)
+                  lxly = address_value(lxly_call)
+                  native_converter_call = call(token, "nativeConverter()(address)", rpc=KAT_RPC)
+                  native_converter = address_value(native_converter_call)
+                  version_call = call(token, "version()(string)", rpc=KAT_RPC)
+                  init_version, init_raw = initialized_version(token, KAT_RPC)
+                  implementation = storage(token, IMPL_SLOT, KAT_RPC)
+
+                  hostile = call(
+                      token,
+                      "reinitialize(address,string,string,uint8,address,address)",
+                      ATTACKER,
+                      "Attacker Token",
+                      "ATK",
+                      decimals or 18,
+                      lxly or ATTACKER,
+                      native_converter or converter,
+                      rpc=KAT_RPC,
+                      sender=ATTACKER,
+                  )
+                  row = {
+                      "name": name,
+                      "proxy": token,
+                      "implementationSlot": implementation,
+                      "versionCall": version_call,
+                      "initializedVersion": init_version,
+                      "initializableSlotRaw": init_raw,
+                      "decimals": decimals,
+                      "lxlyBridge": lxly,
+                      "nativeConverter": native_converter,
+                      "hostileReinitializeCall": hostile,
+                      "takeoverCallable": hostile["success"],
+                  }
+                  report["customTokens"].append(row)
+                  if hostile["success"] or init_version is None or init_version < 2:
+                      report["takeoverCandidates"].append({"type": "CustomToken", "name": name, "address": token, "initializedVersion": init_version, "callSucceeded": hostile["success"]})
+
+                  custom_call = call(converter, "customToken()(address)", rpc=KAT_RPC)
+                  custom = address_value(custom_call)
+                  underlying_call = call(converter, "underlyingToken()(address)", rpc=KAT_RPC)
+                  underlying = address_value(underlying_call)
+                  converter_lxly_call = call(converter, "lxlyBridge()(address)", rpc=KAT_RPC)
+                  converter_lxly = address_value(converter_lxly_call)
+                  layer_x_call = call(converter, "layerXLxlyId()(uint32)", rpc=KAT_RPC)
+                  layer_x = int_value(layer_x_call)
+                  non_migratable_call = call(converter, "nonMigratableBackingPercentage()(uint256)", rpc=KAT_RPC)
+                  non_migratable = int_value(non_migratable_call)
+                  migration_manager_call = call(converter, "migrationManager()(address)", rpc=KAT_RPC)
+                  migration_manager = address_value(migration_manager_call)
+                  converter_version_call = call(converter, "version()(string)", rpc=KAT_RPC)
+                  converter_init_version, converter_init_raw = initialized_version(converter, KAT_RPC)
+                  converter_implementation = storage(converter, IMPL_SLOT, KAT_RPC)
+
+                  hostile_converter = call(
+                      converter,
+                      "initialize(address,uint8,address,address,address,uint32,uint256,address)",
+                      ATTACKER,
+                      decimals or 18,
+                      custom or token,
+                      underlying or token,
+                      converter_lxly or lxly or ATTACKER,
+                      layer_x or 1,
+                      non_migratable or 1,
+                      migration_manager or ATTACKER,
+                      rpc=KAT_RPC,
+                      sender=ATTACKER,
+                  )
+                  converter_row = {
+                      "name": name,
+                      "proxy": converter,
+                      "implementationSlot": converter_implementation,
+                      "versionCall": converter_version_call,
+                      "initializedVersion": converter_init_version,
+                      "initializableSlotRaw": converter_init_raw,
+                      "customToken": custom,
+                      "underlyingToken": underlying,
+                      "lxlyBridge": converter_lxly,
+                      "layerXLxlyId": layer_x,
+                      "nonMigratableBackingPercentage": non_migratable,
+                      "migrationManager": migration_manager,
+                      "hostileInitializeCall": hostile_converter,
+                      "takeoverCallable": hostile_converter["success"],
+                  }
+                  report["nativeConverters"].append(converter_row)
+                  if hostile_converter["success"] or converter_init_version is None or converter_init_version < 1:
+                      report["takeoverCandidates"].append({"type": "NativeConverter", "name": name, "address": converter, "initializedVersion": converter_init_version, "callSucceeded": hostile_converter["success"]})
+
+              for name, adapter, token in ADAPTERS:
+                  init_version, init_raw = initialized_version(adapter, KAT_RPC)
+                  implementation = storage(adapter, IMPL_SLOT, KAT_RPC)
+                  global_counter_call = call(adapter, "globalInitializationCounter()(uint64)", rpc=KAT_RPC)
+                  global_counter = int_value(global_counter_call)
+                  hostile = call(
+                      adapter,
+                      "reinitialize1(address,bool,address,address)",
+                      token,
+                      False,
+                      ATTACKER,
+                      ATTACKER,
+                      rpc=KAT_RPC,
+                      sender=ATTACKER,
+                  )
+                  row = {
+                      "name": name,
+                      "proxy": adapter,
+                      "implementationSlot": implementation,
+                      "initializedVersion": init_version,
+                      "initializableSlotRaw": init_raw,
+                      "globalInitializationCounter": global_counter,
+                      "globalInitializationCounterCall": global_counter_call,
+                      "hostileReinitialize1Call": hostile,
+                      "takeoverCallable": hostile["success"],
+                  }
+                  report["adapters"].append(row)
+                  if hostile["success"] or init_version is None or init_version < 1 or global_counter is None or global_counter < 1:
+                      report["takeoverCandidates"].append({"type": "BridgeAdapter", "name": name, "address": adapter, "initializedVersion": init_version, "globalCounter": global_counter, "callSucceeded": hostile["success"]})
+
+              mm_init_version, mm_init_raw = initialized_version(MIGRATION_MANAGER, ETH_RPC)
+              mm_implementation = storage(MIGRATION_MANAGER, IMPL_SLOT, ETH_RPC)
+              mm_bridge_call = call(MIGRATION_MANAGER, "lxlyBridge()(address)", rpc=ETH_RPC)
+              mm_bridge = address_value(mm_bridge_call)
+              hostile_mm = call(
+                  MIGRATION_MANAGER,
+                  "initialize(address,address)",
+                  ATTACKER,
+                  mm_bridge or ATTACKER,
+                  rpc=ETH_RPC,
+                  sender=ATTACKER,
+              )
+              report["migrationManager"] = {
+                  "proxy": MIGRATION_MANAGER,
+                  "implementationSlot": mm_implementation,
+                  "initializedVersion": mm_init_version,
+                  "initializableSlotRaw": mm_init_raw,
+                  "lxlyBridge": mm_bridge,
+                  "hostileInitializeCall": hostile_mm,
+                  "takeoverCallable": hostile_mm["success"],
+              }
+              if hostile_mm["success"] or mm_init_version is None or mm_init_version < 1:
+                  report["takeoverCandidates"].append({"type": "MigrationManager", "address": MIGRATION_MANAGER, "initializedVersion": mm_init_version, "callSucceeded": hostile_mm["success"]})
+
+              for name, vb_token in VB_TOKENS:
+                  init_version, init_raw = initialized_version(vb_token, ETH_RPC)
+                  implementation = storage(vb_token, IMPL_SLOT, ETH_RPC)
+                  version_call = call(vb_token, "version()(string)", rpc=ETH_RPC)
+                  report["vbTokens"].append({
+                      "name": name,
+                      "proxy": vb_token,
+                      "implementationSlot": implementation,
+                      "initializedVersion": init_version,
+                      "initializableSlotRaw": init_raw,
+                      "versionCall": version_call,
+                  })
+
+              report["allHostileCallsReverted"] = not any(candidate.get("callSucceeded") for candidate in report["takeoverCandidates"])
+              Path("evidence/initialization-gate.json").write_text(json.dumps(report, indent=2, sort_keys=True))
+              Path("evidence/run-status.json").write_text(json.dumps({"success": True}, indent=2))
+              print(json.dumps(report, indent=2, sort_keys=True))
+          except Exception as exc:
+              failure = {"success": False, "error": repr(exc), "traceback": traceback.format_exc(), "partialReport": report}
+              Path("evidence/run-status.json").write_text(json.dumps(failure, indent=2, sort_keys=True))
+              print(json.dumps(failure, indent=2, sort_keys=True))
+              raise
+          PY
+
+          python3 /tmp/init_gate.py 2>&1 | tee evidence/run.log
+          find evidence -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-initialization-gate-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 3
