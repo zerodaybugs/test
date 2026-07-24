@@ -24,6 +24,7 @@ ACTORS = {
     "actor_sp1c72": "SP1C72K3FP2VCMW6814TGPG2Q07A54597WW6HB1YR",
 }
 OUT = Path("public-data/stacks-contract-history.json")
+SUMMARY_OUT = Path("public-data/stacks-contract-history-summary.json")
 
 
 def get_json(url: str, attempts: int = 6) -> dict[str, Any]:
@@ -34,7 +35,7 @@ def get_json(url: str, attempts: int = 6) -> dict[str, Any]:
                 url,
                 headers={
                     "Accept": "application/json",
-                    "User-Agent": "public-stacks-history-collector/1.0",
+                    "User-Agent": "public-stacks-history-collector/1.1",
                 },
             )
             with urllib.request.urlopen(req, timeout=45) as response:
@@ -201,6 +202,7 @@ def main() -> None:
             "disable-trading",
         }
     ]
+    pairs = pair_sweeps(sweeps, rewards, deposits)
 
     payload = {
         "source": "Hiro public Stacks API",
@@ -215,11 +217,25 @@ def main() -> None:
             "deposits": deposits,
             "claim_calls": claim_calls,
             "state_controls": controls,
-            "sweep_reward_pairs": pair_sweeps(sweeps, rewards, deposits),
+            "sweep_reward_pairs": pairs,
         },
+    }
+    compact = {
+        "source": payload["source"],
+        "contracts": CONTRACTS,
+        "counts": payload["counts"],
+        "direct_call_counts": {label: len(rows) for label, rows in direct.items()},
+        "sweeps": sweeps,
+        "rewards": rewards,
+        "deposits": deposits,
+        "claim_calls": claim_calls,
+        "state_controls": controls,
+        "sweep_reward_pairs": pairs,
+        "actor_calls": actor_direct,
     }
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    SUMMARY_OUT.write_text(json.dumps(compact, indent=2, sort_keys=True), encoding="utf-8")
 
 
 if __name__ == "__main__":
