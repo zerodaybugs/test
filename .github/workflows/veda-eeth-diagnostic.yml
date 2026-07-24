@@ -1,0 +1,136 @@
+name: veda-eeth-diagnostic
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Run staged local-fork diagnostic
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -u
+          RPC="https://ethereum-rpc.publicnode.com"
+          BLOCK="25604283"
+          LOCAL="http://127.0.0.1:8545"
+          anvil --fork-url "$RPC" --fork-block-number "$BLOCK" --port 8545 >anvil-diagnostic.log 2>&1 &
+          ANVIL_PID=$!
+          echo "$ANVIL_PID" > anvil.pid
+          for _ in $(seq 1 60); do
+            if cast chain-id --rpc-url "$LOCAL" >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          python3 - <<'PY' >diagnostic.stdout 2>diagnostic.stderr
+          import json
+          import subprocess
+          import time
+          import traceback
+          import urllib.request
+
+          RPC="http://127.0.0.1:8545"
+          EETH="0x35fA164735182de50811E8e2E824cFb9B6118ac2"
+          WEETH="0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee"
+          VAULT="0xf0bb20865277aBd641a307eCe5Ee04E79073416C"
+          TELLER="0x9AA79C84b79816ab920bBcE20f8f74557B514734"
+          ACCOUNTANT="0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198"
+          ATTACKER="0x1111111111111111111111111111111111111111"
+          out={"stages":[],"ok":False}
+
+          def save():
+              with open("veda-eeth-diagnostic.json","w",encoding="utf-8") as f:
+                  json.dump(out,f,indent=2,sort_keys=True); f.write("\n")
+          def stage(name,**data):
+              out["stages"].append({"name":name,**data}); save()
+          def rpc(method,params):
+              payload=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
+              req=urllib.request.Request(RPC,data=payload,method="POST",headers={"content-type":"application/json"})
+              with urllib.request.urlopen(req,timeout=45) as response:
+                  result=json.loads(response.read().decode())
+              if "error" in result: raise RuntimeError({"method":method,"error":result["error"]})
+              return result["result"]
+          def cmd(*args): return subprocess.check_output(list(args),text=True).strip()
+          def sig(text): return cmd("cast","sig",text)
+          def calldata(signature,*args): return cmd("cast","calldata",signature,*map(str,args))
+          def strip0(v): return v[2:] if v.startswith("0x") else v
+          def aw(a): return strip0(a).lower().rjust(64,"0")
+          def call_uint(target,data): return int(rpc("eth_call",[{"to":target,"data":data},"latest"]),16)
+          def call_addr(target,data): return "0x"+strip0(rpc("eth_call",[{"to":target,"data":data},"latest"]))[-40:]
+          def balance(token,user): return call_uint(token,sig("balanceOf(address)")+aw(user))
+          def shares(user): return call_uint(EETH,sig("shares(address)")+aw(user))
+          def send(sender,target,data):
+              tx=rpc("eth_sendTransaction",[{"from":sender,"to":target,"data":data,"gas":hex(12_000_000)}])
+              for _ in range(100):
+                  receipt=rpc("eth_getTransactionReceipt",[tx])
+                  if receipt is not None:
+                      if int(receipt["status"],16)!=1: raise RuntimeError({"failed_tx":tx,"receipt":receipt})
+                      return receipt
+                  time.sleep(0.05)
+              raise RuntimeError("receipt timeout")
+
+          try:
+              stage("rpc",chain_id=int(rpc("eth_chainId",[]),16),block=int(rpc("eth_blockNumber",[]),16))
+              code={name:(len(rpc("eth_getCode",[address,"latest"]))-2)//2 for name,address in {
+                  "eeth":EETH,"weeth":WEETH,"vault":VAULT,"teller":TELLER,"accountant":ACCOUNTANT}.items()}
+              stage("code",code_bytes=code)
+              initial={
+                  "weeth_eeth_balance":balance(EETH,WEETH),
+                  "vault_eeth_balance":balance(EETH,VAULT),
+                  "vault_eeth_shares":shares(VAULT),
+                  "teller_paused":bool(call_uint(TELLER,sig("isPaused()"))),
+                  "asset_data_raw":rpc("eth_call",[{"to":TELLER,"data":calldata("assetData(address)",EETH)},"latest"]),
+                  "rate":call_uint(ACCOUNTANT,calldata("getRateInQuoteSafe(address)",EETH)),
+                  "pool":call_addr(EETH,sig("liquidityPool()")),
+              }
+              stage("initial",**initial)
+              rpc("anvil_impersonateAccount",[WEETH]); rpc("anvil_impersonateAccount",[ATTACKER])
+              rpc("anvil_setBalance",[WEETH,hex(100*10**18)]); rpc("anvil_setBalance",[ATTACKER,hex(100*10**18)])
+              stage("impersonation")
+              seed=min(10**20,initial["weeth_eeth_balance"]//1000)
+              receipt=send(WEETH,EETH,calldata("transfer(address,uint256)",ATTACKER,seed))
+              stage("seed",seed_nominal=seed,gas_used=int(receipt["gasUsed"],16),attacker_balance=balance(EETH,ATTACKER),attacker_shares=shares(ATTACKER))
+              receipt=send(ATTACKER,EETH,calldata("approve(address,uint256)",VAULT,2**256-1))
+              stage("approve",gas_used=int(receipt["gasUsed"],16),allowance=call_uint(EETH,calldata("allowance(address,address)",ATTACKER,VAULT)))
+              amount=10**18
+              before={"attacker_eeth":balance(EETH,ATTACKER),"vault_eeth":balance(EETH,VAULT),"liquideth":balance(VAULT,ATTACKER),"attacker_shares":shares(ATTACKER),"vault_shares":shares(VAULT)}
+              preview=rpc("eth_call",[{"from":ATTACKER,"to":TELLER,"data":calldata("deposit(address,uint256,uint256)",EETH,amount,0)},"latest"])
+              stage("preview",amount=amount,raw_return=preview)
+              receipt=send(ATTACKER,TELLER,calldata("deposit(address,uint256,uint256)",EETH,amount,0))
+              after={"attacker_eeth":balance(EETH,ATTACKER),"vault_eeth":balance(EETH,VAULT),"liquideth":balance(VAULT,ATTACKER),"attacker_shares":shares(ATTACKER),"vault_shares":shares(VAULT)}
+              stage("deposit",amount=amount,gas_used=int(receipt["gasUsed"],16),before=before,after=after,deltas={
+                  "attacker_eeth":before["attacker_eeth"]-after["attacker_eeth"],
+                  "vault_eeth":after["vault_eeth"]-before["vault_eeth"],
+                  "liquideth":after["liquideth"]-before["liquideth"],
+                  "attacker_internal":before["attacker_shares"]-after["attacker_shares"],
+                  "vault_internal":after["vault_shares"]-before["vault_shares"],
+              })
+              out["ok"]=True; save()
+          except Exception as exc:
+              out["error"]=repr(exc); out["traceback"]=traceback.format_exc(); save(); raise
+          finally:
+              print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+          STATUS=$?
+          kill "$ANVIL_PID" 2>/dev/null || true
+          exit "$STATUS"
+      - name: Upload diagnostic
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-eeth-diagnostic
+          path: |
+            veda-eeth-diagnostic.json
+            diagnostic.stdout
+            diagnostic.stderr
+            anvil-diagnostic.log
+          if-no-files-found: warn
+          retention-days: 1
