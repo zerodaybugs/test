@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Passively collect same-origin public web assets for static review.
 
-No crawling beyond links embedded in the two in-scope landing pages, no form
-submissions, no authentication, and no state-changing requests.
+No crawling beyond static assets embedded in the three in-scope landing pages,
+no form submissions, no authentication, and no state-changing requests.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from html.parser import HTMLParser
 
 OUT = pathlib.Path("web_assets")
 TARGETS = {
+    "synthetix": "https://synthetix.io/",
     "exchange": "https://exchange.synthetix.io/",
     "governance": "https://governance.synthetix.io/",
 }
