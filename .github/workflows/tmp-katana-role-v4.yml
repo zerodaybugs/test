@@ -1,0 +1,334 @@
+name: Temporary Katana bridge-domain accounting gate v4
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-katana-role-v4.yml'
+      - 'tmp-katana-role-v4-trigger.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  accounting:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Reconstruct every historical minter-burner liability
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > /tmp/scan.py <<'PY'
+          from __future__ import annotations
+
+          import concurrent.futures
+          import json
+          import subprocess
+          import time
+          import traceback
+          from pathlib import Path
+
+          RPC = "https://rpc.katana.network/"
+          START_BLOCK = 15_000_000
+          STEP = 30_000
+          WORKERS = 10
+          IMPL_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+          CT_MAPPING_SLOT = int("0300d81ec8b5c42d6bd2cedd81ce26f1003c52753656b7512a8eef168b702500", 16) + 3
+
+          TOKENS = [
+              ("eth", "0xEE7D8BCFb72bC1880D0Cf19822eB0A2e6577aB62", "0xa6b0db1293144ebe9478b6a84f75dd651e45914a"),
+              ("usdc", "0x203A662b0BD271A6ed5a60EdFbd04bFce608FD36", "0x97a3500083348A147F419b8a65717909762c389f"),
+              ("usdt", "0x2DCa96907fde857dd3D816880A0df407eeB2D2F2", "0x053FA9b934b83E1E0ffc7e98a41aAdc3640bB462"),
+              ("wbtc", "0x0913DA6Da4b42f538B445599b46Bb4622342Cf52", "0xb00aa68b87256E2F22058fB2Ba3246EEc54A44fc"),
+              ("usds", "0x62D6A123E8D19d06d68cf0d2294F9A3A0362c6b3", "0x639f13D5f30B47c792b6851238c05D0b623C77DE"),
+          ]
+          TOKEN_BY_ADDRESS = {token.lower(): (name, converter) for name, token, converter in TOKENS}
+
+          def run_cmd(args: list[str], timeout: int = 120) -> tuple[str | None, str | None]:
+              proc = subprocess.run(args, text=True, capture_output=True, timeout=timeout)
+              if proc.returncode == 0:
+                  return proc.stdout.strip(), None
+              return None, proc.stderr.strip() or proc.stdout.strip() or f"exit={proc.returncode}"
+
+          def cast(*args: object, timeout: int = 120) -> tuple[str | None, str | None]:
+              return run_cmd(["cast", *[str(a) for a in args]], timeout=timeout)
+
+          def call(address: str, signature: str, *args: object) -> tuple[str | None, str | None]:
+              return cast("call", address, signature, *args, "--rpc-url", RPC)
+
+          def parse_number(value: str | None) -> int | None:
+              if not value:
+                  return None
+              first = value.split()[0]
+              try:
+                  return int(first, 16 if first.startswith("0x") else 10)
+              except Exception:
+                  return None
+
+          def rpc(payload: dict, retries: int = 8) -> dict:
+              encoded = json.dumps(payload, separators=(",", ":"))
+              last_error = None
+              for attempt in range(retries):
+                  stdout, stderr = run_cmd(
+                      [
+                          "curl", "-sS", "--fail-with-body", "--retry", "2", "--retry-all-errors",
+                          "--connect-timeout", "20", "--max-time", "90",
+                          "-H", "content-type: application/json", "--data", encoded, RPC,
+                      ],
+                      timeout=120,
+                  )
+                  if stderr is None and stdout:
+                      try:
+                          decoded = json.loads(stdout)
+                          if isinstance(decoded, dict):
+                              return decoded
+                          last_error = {"message": "non-object JSON", "body": decoded}
+                      except Exception as exc:
+                          last_error = {"message": f"JSON decode: {exc}", "body": stdout[:1000]}
+                  else:
+                      last_error = {"message": stderr or "empty response"}
+                  time.sleep(min(2 ** attempt, 12))
+              return {"error": last_error or {"message": "unknown RPC failure"}}
+
+          def fetch_range(block_range: tuple[int, int], addresses: list[str], grant_topic: str, revoke_topic: str, role: str) -> dict:
+              start, end = block_range
+              common = {
+                  "fromBlock": hex(start),
+                  "toBlock": hex(end),
+                  "topics": [[grant_topic, revoke_topic], role],
+              }
+              combined = rpc({
+                  "jsonrpc": "2.0",
+                  "id": start,
+                  "method": "eth_getLogs",
+                  "params": [{**common, "address": addresses}],
+              })
+              if not combined.get("error"):
+                  return {"from": start, "to": end, "mode": "address-array", "response": combined}
+
+              # Some RPC implementations reject an address array. Fall back to one request per token.
+              logs: list[dict] = []
+              errors: list[dict] = []
+              for address in addresses:
+                  response = rpc({
+                      "jsonrpc": "2.0",
+                      "id": f"{start}-{address}",
+                      "method": "eth_getLogs",
+                      "params": [{**common, "address": address}],
+                  })
+                  if response.get("error"):
+                      errors.append({"address": address, "error": response["error"]})
+                  else:
+                      logs.extend(response.get("result") or [])
+              response = {"jsonrpc": "2.0", "id": start, "result": logs}
+              if errors:
+                  response["partialErrors"] = errors
+              return {"from": start, "to": end, "mode": "per-token-fallback", "response": response}
+
+          def mapping_slot(account: str) -> tuple[str | None, str | None]:
+              encoded = "0x" + account[2:].lower().rjust(64, "0") + hex(CT_MAPPING_SLOT)[2:].rjust(64, "0")
+              return cast("keccak", encoded)
+
+          try:
+              latest_raw, error = cast("block-number", "--rpc-url", RPC)
+              if error or latest_raw is None:
+                  raise RuntimeError(f"cannot read block number: {error}")
+              latest = int(latest_raw.split()[0])
+
+              role_raw, error = call(TOKENS[0][1], "MINTER_BURNER_ROLE()(bytes32)")
+              if error or role_raw is None:
+                  raise RuntimeError(f"cannot read MINTER_BURNER_ROLE: {error}")
+              role = role_raw.split()[0].lower()
+
+              grant_topic, error = cast("keccak", "RoleGranted(bytes32,address,address)")
+              if error or grant_topic is None:
+                  raise RuntimeError(f"cannot hash RoleGranted: {error}")
+              revoke_topic, error = cast("keccak", "RoleRevoked(bytes32,address,address)")
+              if error or revoke_topic is None:
+                  raise RuntimeError(f"cannot hash RoleRevoked: {error}")
+              grant_topic = grant_topic.lower()
+              revoke_topic = revoke_topic.lower()
+              addresses = [token for _, token, _ in TOKENS]
+
+              ranges = [(start, min(start + STEP - 1, latest)) for start in range(START_BLOCK, latest + 1, STEP)]
+              raw_ranges: list[dict] = []
+              with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
+                  future_map = {
+                      executor.submit(fetch_range, block_range, addresses, grant_topic, revoke_topic, role): block_range
+                      for block_range in ranges
+                  }
+                  for future in concurrent.futures.as_completed(future_map):
+                      block_range = future_map[future]
+                      try:
+                          raw_ranges.append(future.result())
+                      except Exception as exc:
+                          raw_ranges.append({
+                              "from": block_range[0], "to": block_range[1], "mode": "exception",
+                              "response": {"error": {"message": repr(exc), "traceback": traceback.format_exc()}},
+                          })
+              raw_ranges.sort(key=lambda item: item["from"])
+              Path("evidence/raw-ranges.json").write_text(json.dumps(raw_ranges, indent=2, sort_keys=True))
+
+              grouped = {name: {"events": [], "rangeErrors": []} for name, _, _ in TOKENS}
+              for item in raw_ranges:
+                  response = item["response"]
+                  if response.get("error"):
+                      for name in grouped:
+                          grouped[name]["rangeErrors"].append({
+                              "from": item["from"], "to": item["to"], "mode": item["mode"], "error": response["error"],
+                          })
+                      continue
+                  if response.get("partialErrors"):
+                      for partial in response["partialErrors"]:
+                          token_meta = TOKEN_BY_ADDRESS.get(partial["address"].lower())
+                          if token_meta:
+                              grouped[token_meta[0]]["rangeErrors"].append({
+                                  "from": item["from"], "to": item["to"], "mode": item["mode"], "error": partial["error"],
+                              })
+                  for log in response.get("result") or []:
+                      token_meta = TOKEN_BY_ADDRESS.get(log.get("address", "").lower())
+                      topics = [topic.lower() for topic in log.get("topics") or []]
+                      if not token_meta or len(topics) < 3:
+                          continue
+                      name, _ = token_meta
+                      grouped[name]["events"].append({
+                          "kind": "grant" if topics[0] == grant_topic else "revoke",
+                          "account": "0x" + topics[2][-40:],
+                          "block": int(log["blockNumber"], 16),
+                          "transactionIndex": int(log["transactionIndex"], 16),
+                          "logIndex": int(log["logIndex"], 16),
+                          "transactionHash": log["transactionHash"],
+                      })
+
+              result: dict = {
+                  "katanaBlock": latest,
+                  "startBlock": START_BLOCK,
+                  "rangeCount": len(ranges),
+                  "minterBurnerRole": role,
+                  "tokens": [],
+              }
+
+              for name, token, converter in TOKENS:
+                  events = sorted(
+                      grouped[name]["events"],
+                      key=lambda event: (event["block"], event["transactionIndex"], event["logIndex"]),
+                  )
+                  historical_holders = sorted({event["account"].lower() for event in events})
+                  global_extra = parse_number(call(token, "totalNetMintedByAdditionalMintersBurners()(uint256)")[0])
+                  token_supply = parse_number(call(token, "totalSupply()(uint256)")[0])
+                  converter_backing = parse_number(call(converter, "backingOnLayerY()(uint256)")[0])
+                  converter_migratable = parse_number(call(converter, "migratableBacking()(uint256)")[0])
+
+                  holders: list[dict] = []
+                  per_minter_sum = 0
+                  adapter_balance_sum = 0
+                  for account in historical_holders:
+                      active_raw, active_error = call(token, "hasRole(bytes32,address)(bool)", role, account)
+                      active = active_raw == "true"
+
+                      slot, slot_error = mapping_slot(account)
+                      per_minter = None
+                      if slot_error is None and slot is not None:
+                          storage_raw, storage_error = cast("storage", token, slot, "--rpc-url", RPC)
+                          if storage_error is None:
+                              per_minter = parse_number(storage_raw)
+                          else:
+                              slot_error = storage_error
+
+                      secondary_raw, secondary_error = call(account, "secondaryChainBalance()(uint256)")
+                      secondary = None if secondary_error else parse_number(secondary_raw)
+                      adapted_token, token_error = call(account, "token()(address)")
+                      approval_required, approval_error = call(account, "approvalRequired()(bool)")
+                      owner, owner_error = call(account, "owner()(address)")
+                      version, version_error = call(account, "version()(string)")
+                      protocol, protocol_error = call(account, "VAULT_BRIDGE_PROTOCOL()(string)")
+                      init_counter, init_error = call(account, "globalInitializationCounter()(uint64)")
+                      implementation, implementation_error = cast("storage", account, IMPL_SLOT, "--rpc-url", RPC)
+                      code, code_error = cast("code", account, "--rpc-url", RPC)
+
+                      if per_minter is not None:
+                          per_minter_sum += per_minter
+                      if secondary is not None:
+                          adapter_balance_sum += secondary
+
+                      holders.append({
+                          "address": account,
+                          "currentlyActive": active,
+                          "perMinterNet": per_minter,
+                          "secondaryChainBalance": secondary,
+                          "perMinterMinusSecondary": (
+                              None if per_minter is None or secondary is None else per_minter - secondary
+                          ),
+                          "adaptedToken": None if token_error else adapted_token,
+                          "approvalRequired": None if approval_error else approval_required,
+                          "owner": None if owner_error else owner,
+                          "version": None if version_error else version,
+                          "protocol": None if protocol_error else protocol,
+                          "globalInitializationCounter": None if init_error else init_counter,
+                          "implementationSlot": None if implementation_error else implementation,
+                          "hasCode": bool(code and code != "0x"),
+                          "mappingSlot": slot,
+                          "errors": {
+                              "hasRole": active_error,
+                              "mapping": slot_error,
+                              "secondaryChainBalance": secondary_error,
+                              "token": token_error,
+                              "approvalRequired": approval_error,
+                              "owner": owner_error,
+                              "version": version_error,
+                              "protocol": protocol_error,
+                              "globalInitializationCounter": init_error,
+                              "implementation": implementation_error,
+                              "code": code_error,
+                          },
+                      })
+
+                  result["tokens"].append({
+                      "name": name,
+                      "customToken": token,
+                      "nativeConverter": converter,
+                      "customSupply": token_supply,
+                      "converterBacking": converter_backing,
+                      "converterMigratable": converter_migratable,
+                      "globalExtraNet": global_extra,
+                      "sumHistoricalPerMinterNet": per_minter_sum,
+                      "globalMinusPerMinterSum": (
+                          None if global_extra is None else global_extra - per_minter_sum
+                      ),
+                      "sumAdapterSecondaryChainBalance": adapter_balance_sum,
+                      "globalMinusAdapterBalanceSum": (
+                          None if global_extra is None else global_extra - adapter_balance_sum
+                      ),
+                      "roleEvents": events,
+                      "rangeErrors": grouped[name]["rangeErrors"],
+                      "historicalMinterBurners": holders,
+                  })
+
+              Path("evidence/bridge-domain-accounting.json").write_text(json.dumps(result, indent=2, sort_keys=True))
+              Path("evidence/run-status.json").write_text(json.dumps({"success": True}, indent=2))
+              print(json.dumps(result, indent=2, sort_keys=True))
+          except Exception as exc:
+              failure = {"success": False, "error": repr(exc), "traceback": traceback.format_exc()}
+              Path("evidence/run-status.json").write_text(json.dumps(failure, indent=2, sort_keys=True))
+              print(json.dumps(failure, indent=2, sort_keys=True))
+              raise
+          PY
+
+          python3 /tmp/scan.py 2>&1 | tee evidence/run.log
+          find evidence -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-bridge-domain-accounting-v4-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 3
