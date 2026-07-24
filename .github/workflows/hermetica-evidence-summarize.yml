@@ -1,0 +1,170 @@
+name: Hermetica evidence summarizer
+
+on:
+  push:
+    branches:
+      - hermetica-passive-audit-20260724
+    paths:
+      - '.github/workflows/hermetica-evidence-summarize.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  summarize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: hermetica-passive-audit-20260724
+          fetch-depth: 0
+
+      - name: Decode read-only evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import re
+          from collections import Counter
+          from pathlib import Path
+
+          root = Path('evidence/hermetica-passive')
+          raw = json.loads((root / 'stxer/read-results.json').read_text())
+
+          def decode_cv(value):
+              if not isinstance(value, str):
+                  return value
+              h = value.lower().removeprefix('0x')
+              if h == '03':
+                  return True
+              if h == '04':
+                  return False
+              if h.startswith('0701') and len(h) == 36:
+                  return int(h[4:], 16)
+              if h.startswith('0801') and len(h) == 36:
+                  return {'err_uint': int(h[4:], 16)}
+              if h.startswith('01') and len(h) == 34:
+                  return int(h[2:], 16)
+              if h.startswith('0703'):
+                  return {'ok': True}
+              if h.startswith('0704'):
+                  return {'ok': False}
+              return {'clarity_hex': value}
+
+          flat = []
+          for batch in raw:
+              requests = batch.get('request', [])
+              response = batch.get('response', {})
+              body = response.get('json') or {}
+              steps = body.get('steps') or []
+              values = []
+              if steps and isinstance(steps[0], dict):
+                  values = steps[0].get('Reads') or []
+              for idx, req in enumerate(requests):
+                  item = {'offset': batch.get('offset'), 'index': idx, 'request': req}
+                  if idx < len(values):
+                      result = values[idx]
+                      item['wire_result'] = result
+                      if isinstance(result, dict) and 'Ok' in result:
+                          item['decoded'] = decode_cv(result['Ok'])
+                      elif isinstance(result, dict) and 'Err' in result:
+                          item['decoded'] = {'read_error': result['Err']}
+                  flat.append(item)
+
+          roles = {}
+          balances = {}
+          state = {}
+          globals_ = {}
+          for item in flat:
+              req = item.get('request', {})
+              ev = req.get('EvalReadonly') if isinstance(req, dict) else None
+              if not ev or len(ev) != 4:
+                  continue
+              _, _, target, expr = ev
+              decoded = item.get('decoded')
+              m = re.fullmatch(r"\((get-(?:protocol|trader|rewarder|manager|fee-setter|guardian)) '([^']+)\)", expr)
+              if m:
+                  fn, principal = m.groups()
+                  roles.setdefault(principal, {})[fn.removeprefix('get-')] = decoded
+                  continue
+              m = re.fullmatch(r"\(get-balance '([^']+)\)", expr)
+              if m:
+                  principal = m.group(1)
+                  asset = 'hbtc' if target.endswith('.token-hbtc') else ('sbtc' if target.endswith('.sbtc-token') else target)
+                  balances.setdefault(principal, {})[asset] = decoded
+                  continue
+              if target.endswith('.state-hbtc-v1'):
+                  state[expr] = decoded
+              elif target.endswith('.hq-v1'):
+                  globals_[expr] = decoded
+
+          activity = {}
+          activity_root = root / 'activity'
+          if activity_root.exists():
+              for contract_dir in sorted(p for p in activity_root.iterdir() if p.is_dir()):
+                  name = contract_dir.name
+                  record = {}
+                  balance_file = contract_dir / 'balances.json'
+                  if balance_file.exists():
+                      wrapper = json.loads(balance_file.read_text())
+                      data = wrapper.get('json') or {}
+                      record['stx'] = data.get('stx')
+                      record['fungible_tokens'] = data.get('fungible_tokens')
+                  tx_file = contract_dir / 'transactions-v2.json'
+                  if tx_file.exists():
+                      wrapper = json.loads(tx_file.read_text())
+                      data = wrapper.get('json') or {}
+                      principal = f"SP1S1HSFH0SQQGWKB69EYFNY0B1MHRMGXR3J1FH4D.{name}"
+                      calls = []
+                      for row in data.get('results') or []:
+                          tx = row.get('tx') or row
+                          cc = tx.get('contract_call') or {}
+                          if cc.get('contract_id') != principal:
+                              continue
+                          calls.append({
+                              'tx_id': tx.get('tx_id'),
+                              'block_height': tx.get('block_height'),
+                              'block_time_iso': tx.get('block_time_iso'),
+                              'sender': tx.get('sender_address'),
+                              'status': tx.get('tx_status'),
+                              'result': (tx.get('tx_result') or {}).get('repr'),
+                              'function': cc.get('function_name'),
+                              'args': [a.get('repr') for a in (cc.get('function_args') or [])],
+                          })
+                      record['direct_call_count_in_page'] = len(calls)
+                      record['direct_call_functions'] = dict(Counter(c.get('function') for c in calls))
+                      record['direct_calls'] = calls
+                      record['index_total_related_transactions'] = data.get('total')
+                  activity[name] = record
+
+          summary = {
+              'roles': roles,
+              'balances_from_isolated_tip': balances,
+              'hq_globals': globals_,
+              'state': state,
+              'activity': activity,
+              'decoder_notes': {
+                  '03': 'Clarity true',
+                  '04': 'Clarity false',
+                  '0701...': '(ok uint)',
+              },
+          }
+          (root / 'decoded-summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True), encoding='utf-8')
+          PY
+
+      - name: Commit summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add evidence/hermetica-passive/decoded-summary.json
+          if git diff --cached --quiet; then
+            echo 'No summary changes.'
+            exit 0
+          fi
+          git commit -m 'chore: decode Hermetica passive evidence [skip ci]'
+          git push origin HEAD:hermetica-passive-audit-20260724
