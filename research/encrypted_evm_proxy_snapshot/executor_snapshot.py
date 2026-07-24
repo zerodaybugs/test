@@ -15,6 +15,7 @@ from Crypto.Hash import keccak
 from snapshot import EIP1967_IMPLEMENTATION_SLOT, rpc_request, result_or_error
 
 OUT = Path(os.environ.get("PRIVATE_OUT", "private_out"))
+CALLER = "0x0000000000000000000000000000000000000001"
 
 
 def selector(signature: str) -> str:
@@ -23,14 +24,42 @@ def selector(signature: str) -> str:
     return "0x" + h.hexdigest()[:8]
 
 
-def call(url: str, to: str, signature: str, request_id: int) -> dict[str, Any]:
-    return result_or_error(
-        rpc_request(
-            url,
-            "eth_call",
-            [{"from": "0x0000000000000000000000000000000000000001", "to": to, "data": selector(signature)}, "latest"],
-            request_id,
-        )
+def rpc_candidates(lazer: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    for value in [lazer.get("chosen_rpc"), *(lazer.get("chainlist_entry", {}).get("rpc") or [])]:
+        if not isinstance(value, str):
+            continue
+        value = value.rstrip("/")
+        if not value.startswith("http") or "${" in value:
+            continue
+        if value not in candidates:
+            candidates.append(value)
+    return candidates
+
+
+def safe_rpc(
+    candidates: list[str], method: str, params: list[Any], request_id: int
+) -> tuple[dict[str, Any], str | None]:
+    errors: list[dict[str, str]] = []
+    for url in candidates:
+        try:
+            result = result_or_error(rpc_request(url, method, params, request_id))
+            if result.get("status") == "RESULT":
+                return result, url
+            errors.append({"rpc": url, "error": json.dumps(result, sort_keys=True)[:1000]})
+        except Exception as exc:  # Public RPC providers can rate-limit or reject a method.
+            errors.append({"rpc": url, "error": repr(exc)[:1000]})
+    return {"status": "ALL_RPC_ATTEMPTS_FAILED", "attempts": errors}, None
+
+
+def call(
+    candidates: list[str], to: str, signature: str, request_id: int
+) -> tuple[dict[str, Any], str | None]:
+    return safe_rpc(
+        candidates,
+        "eth_call",
+        [{"from": CALLER, "to": to, "data": selector(signature)}, "latest"],
+        request_id,
     )
 
 
@@ -76,7 +105,7 @@ def decode_string(obj: dict[str, Any]) -> str | None:
         return None
 
 
-def code_hashes(code_hex: str | None) -> dict[str, str | None]:
+def code_hashes(code_hex: str | None) -> dict[str, str | int | None]:
     if not code_hex or not code_hex.startswith("0x"):
         return {"sha256": None, "keccak256": None, "bytes": None}
     raw = bytes.fromhex(code_hex[2:])
@@ -87,19 +116,24 @@ def code_hashes(code_hex: str | None) -> dict[str, str | None]:
 
 def main() -> None:
     source = json.loads((OUT / "RESULTS.json").read_text())
-    scanned = [x for x in source["results"] if x.get("status") == "SCANNED"]
+    scanned = [x for x in source["results"] if x.get("status") == "SCANNED" and x.get("owner")]
     results = []
+
     for index, lazer in enumerate(scanned):
         rid = 90000 + index * 100
-        url = lazer["chosen_rpc"]
+        candidates = rpc_candidates(lazer)
         owner = lazer["owner"].lower()
-        code_obj = result_or_error(rpc_request(url, "eth_getCode", [owner, "latest"], rid)); rid += 1
-        impl_obj = result_or_error(rpc_request(url, "eth_getStorageAt", [owner, EIP1967_IMPLEMENTATION_SLOT, "latest"], rid)); rid += 1
-        version_obj = call(url, owner, "version()", rid); rid += 1
-        self_owner_obj = call(url, owner, "owner()", rid); rid += 1
-        chain_obj = call(url, owner, "getOwnerChainId()", rid); rid += 1
-        emitter_obj = call(url, owner, "getOwnerEmitterAddress()", rid); rid += 1
-        sequence_obj = call(url, owner, "getLastExecutedSequence()", rid); rid += 1
+
+        code_obj, code_rpc = safe_rpc(candidates, "eth_getCode", [owner, "latest"], rid); rid += 1
+        impl_obj, impl_rpc = safe_rpc(
+            candidates, "eth_getStorageAt", [owner, EIP1967_IMPLEMENTATION_SLOT, "latest"], rid
+        ); rid += 1
+        version_obj, version_rpc = call(candidates, owner, "version()", rid); rid += 1
+        self_owner_obj, owner_rpc = call(candidates, owner, "owner()", rid); rid += 1
+        chain_obj, chain_rpc = call(candidates, owner, "getOwnerChainId()", rid); rid += 1
+        emitter_obj, emitter_rpc = call(candidates, owner, "getOwnerEmitterAddress()", rid); rid += 1
+        sequence_obj, sequence_rpc = call(candidates, owner, "getLastExecutedSequence()", rid); rid += 1
+
         code = code_obj.get("result") if code_obj.get("status") == "RESULT" else None
         implementation = decode_address(impl_obj)
         self_owner = decode_address(self_owner_obj)
@@ -130,7 +164,16 @@ def main() -> None:
                 "executor_owner_emitter_address": owner_emitter,
                 "executor_last_executed_sequence": last_sequence,
                 "executor_code_hashes": code_hashes(code),
-                "rpc": url,
+                "rpc_candidates": candidates,
+                "rpc_used": {
+                    "code": code_rpc,
+                    "implementation_slot": impl_rpc,
+                    "version": version_rpc,
+                    "owner": owner_rpc,
+                    "owner_chain_id": chain_rpc,
+                    "owner_emitter_address": emitter_rpc,
+                    "last_executed_sequence": sequence_rpc,
+                },
                 "raw": {
                     "code": code_obj,
                     "implementation_slot": impl_obj,
@@ -146,9 +189,11 @@ def main() -> None:
 
     group_by_impl: dict[str, list[str]] = defaultdict(list)
     group_by_owner_chain: dict[str, list[str]] = defaultdict(list)
+    group_by_executor: dict[str, list[str]] = defaultdict(list)
     for row in results:
         group_by_impl[str(row["executor_implementation"])].append(row["chain_name"])
         group_by_owner_chain[str(row["executor_owner_chain_id"])].append(row["chain_name"])
+        group_by_executor[row["executor_address"]].append(row["chain_name"])
     failing = {
         key: [r["chain_name"] for r in results if not r["checks"][key]]
         for key in sorted(results[0]["checks"] if results else {})
@@ -158,12 +203,7 @@ def main() -> None:
         "mode": "PUBLIC_CHAIN_READ_ONLY_ETH_CALL_AND_ETH_GETSTORAGEAT",
         "signed_or_broadcast_transactions": 0,
         "scanned_count": len(results),
-        "all_executor_addresses_match_lazer_owner": all(
-            r["executor_address"] == next(
-                x["owner"].lower() for x in scanned if x["target"]["name"] == r["chain_name"]
-            )
-            for r in results
-        ),
+        "executor_address_groups": group_by_executor,
         "executor_implementation_groups": group_by_impl,
         "owner_chain_id_groups": group_by_owner_chain,
         "failing_checks": failing,
