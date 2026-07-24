@@ -1,0 +1,165 @@
+name: Pyth EVM Executor exact source deployment binding
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/pyth-evm-executor-source-binding.yml'
+  push:
+    branches: [research/encrypted-evm-proxy-init-snapshot-20260724]
+    paths:
+      - '.github/workflows/pyth-evm-executor-source-binding.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  bind:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      PYTH_COMMIT: 4a596e7adff552afaf5687ce791764019f2d3719
+      EXECUTOR_PROXY: 0x26dd80569a8b23768a1d80869ed7339e07595e85
+      EIP1967_IMPLEMENTATION_SLOT: 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc
+      OUT_DIR: ${{ github.workspace }}/out
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.0.0'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '10.28.0'
+          run_install: false
+      - name: Install pinned Foundry and solc
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$OUT_DIR" toolchain pyth-crosschain
+          mkdir -p "$OUT_DIR" toolchain/bin
+          curl -fL --retry 5 \
+            https://github.com/foundry-rs/foundry/releases/download/v1.7.1/foundry_v1.7.1_linux_amd64.tar.gz \
+            -o toolchain/foundry.tar.gz
+          tar -xzf toolchain/foundry.tar.gz -C toolchain/bin
+          curl -fL --retry 5 \
+            https://github.com/ethereum/solidity/releases/download/v0.8.29/solc-static-linux \
+            -o toolchain/bin/solc-0.8.29
+          chmod 0755 toolchain/bin/*
+          toolchain/bin/forge --version | tee "$OUT_DIR/forge-version.txt"
+          toolchain/bin/solc-0.8.29 --version | tee "$OUT_DIR/solc-version.txt"
+          sha256sum toolchain/bin/* > "$OUT_DIR/toolchain-sha256.txt"
+      - name: Fetch exact source and install exact workspace dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/pyth-network/pyth-crosschain.git pyth-crosschain
+          git -C pyth-crosschain fetch --depth 1 origin "$PYTH_COMMIT"
+          git -C pyth-crosschain checkout --detach "$PYTH_COMMIT"
+          test "$(git -C pyth-crosschain rev-parse HEAD)" = "$PYTH_COMMIT"
+          git -C pyth-crosschain status --porcelain=v1 > "$OUT_DIR/source-status.txt"
+          test ! -s "$OUT_DIR/source-status.txt"
+          git -C pyth-crosschain show -s --format='%H%n%aI%n%an%n%s' HEAD > "$OUT_DIR/source-commit.txt"
+          cd pyth-crosschain
+          pnpm install --frozen-lockfile --filter @pythnetwork/pyth-evm-contract...
+      - name: Compile exact Executor implementation
+        shell: bash
+        working-directory: pyth-crosschain/target_chains/ethereum/contracts
+        run: |
+          set -euo pipefail
+          export PATH="$GITHUB_WORKSPACE/toolchain/bin:$PATH"
+          forge build --use "$GITHUB_WORKSPACE/toolchain/bin/solc-0.8.29" \
+            --skip test 2>&1 | tee "$OUT_DIR/forge-build.log"
+          forge inspect contracts/executor/ExecutorUpgradable.sol:ExecutorUpgradable deployedBytecode \
+            > "$OUT_DIR/compiled-runtime.hex"
+          forge inspect contracts/executor/ExecutorUpgradable.sol:ExecutorUpgradable storageLayout \
+            > "$OUT_DIR/executor-storage-layout.json"
+          test -s "$OUT_DIR/compiled-runtime.hex"
+      - name: Query BSC live Executor from independent public RPC providers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib,json,os,time,urllib.request
+          from pathlib import Path
+          from Crypto.Hash import keccak
+          out=Path(os.environ['OUT_DIR'])
+          proxy=os.environ['EXECUTOR_PROXY'].lower()
+          slot=os.environ['EIP1967_IMPLEMENTATION_SLOT']
+          providers=[
+            'https://bsc-dataseed.binance.org',
+            'https://bsc-rpc.publicnode.com',
+          ]
+          def rpc(url,method,params,i):
+            req=urllib.request.Request(url,data=json.dumps({'jsonrpc':'2.0','id':i,'method':method,'params':params}).encode(),headers={'content-type':'application/json','user-agent':'pyth-readonly-binding/1.0'})
+            with urllib.request.urlopen(req,timeout=45) as r: data=json.load(r)
+            if 'error' in data: raise RuntimeError(data['error'])
+            return data['result']
+          rows=[]
+          for n,url in enumerate(providers):
+            impl_word=rpc(url,'eth_getStorageAt',[proxy,slot,'latest'],100+n*10)
+            impl='0x'+impl_word[-40:]
+            code=rpc(url,'eth_getCode',[impl,'latest'],101+n*10)
+            proxy_code=rpc(url,'eth_getCode',[proxy,'latest'],102+n*10)
+            block=rpc(url,'eth_getBlockByNumber',['latest',False],103+n*10)
+            version_raw=rpc(url,'eth_call',[{'to':proxy,'data':'0x54fd4d50'},'latest'],104+n*10)
+            rows.append({'rpc':url,'implementation':impl.lower(),'implementation_code':code.lower(),'proxy_code':proxy_code.lower(),'latest_block':block,'version_raw':version_raw})
+          compiled=(out/'compiled-runtime.hex').read_text().strip().lower()
+          if not compiled.startswith('0x'): compiled='0x'+compiled
+          def raw(h): return bytes.fromhex(h.removeprefix('0x'))
+          def strip_cbor(h):
+            b=raw(h)
+            if len(b)<2: return b
+            n=int.from_bytes(b[-2:],'big')
+            return b[:-(n+2)] if n+2<=len(b) else b
+          def hashes(h):
+            b=raw(h); k=keccak.new(digest_bits=256); k.update(b)
+            return {'bytes':len(b),'sha256':hashlib.sha256(b).hexdigest(),'keccak256':k.hexdigest()}
+          onchain_identical=len({r['implementation'] for r in rows})==1 and len({r['implementation_code'] for r in rows})==1 and len({r['proxy_code'] for r in rows})==1
+          full_match=all(r['implementation_code']==compiled for r in rows)
+          stripped_match=all(strip_cbor(r['implementation_code'])==strip_cbor(compiled) for r in rows)
+          result={
+            'mode':'BSC_READ_ONLY_ETH_GETSTORAGEAT_ETH_GETCODE_ETH_CALL',
+            'signed_or_broadcast_transactions':0,
+            'source_commit':os.environ['PYTH_COMMIT'],
+            'executor_proxy':proxy,
+            'compiled_runtime_hashes':hashes(compiled),
+            'compiled_runtime_cbor_stripped_sha256':hashlib.sha256(strip_cbor(compiled)).hexdigest(),
+            'providers_identical':onchain_identical,
+            'full_runtime_match':full_match,
+            'cbor_stripped_runtime_match':stripped_match,
+            'rows':[{**r,'implementation_code_hashes':hashes(r['implementation_code']),'proxy_code_hashes':hashes(r['proxy_code']),'implementation_code_cbor_stripped_sha256':hashlib.sha256(strip_cbor(r['implementation_code'])).hexdigest()} for r in rows],
+          }
+          (out/'SOURCE_DEPLOYMENT_BINDING.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          markers=[
+            'PYTH_EVM_EXECUTOR_SOURCE_DEPLOYMENT_BINDING_CAPTURED',
+            'PUBLIC_CHAIN_MODE=READ_ONLY',
+            'SIGNED_OR_BROADCAST_TRANSACTIONS=0',
+            f"PROVIDERS_IDENTICAL={str(onchain_identical).lower()}",
+            f"FULL_RUNTIME_MATCH={str(full_match).lower()}",
+            f"CBOR_STRIPPED_RUNTIME_MATCH={str(stripped_match).lower()}",
+            f"EXECUTOR_IMPLEMENTATION={rows[0]['implementation'] if rows else 'MISSING'}",
+          ]
+          (out/'BINDING_MARKERS.txt').write_text('\n'.join(markers)+'\n')
+          print('\n'.join(markers))
+          PY
+      - name: Finalize evidence and enforce read-only consistency
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            uname -a
+            git --version
+            node --version
+            pnpm --version
+          } > "$OUT_DIR/ENVIRONMENT.txt"
+          find "$OUT_DIR" -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$OUT_DIR/SHA256SUMS"
+          grep -F 'PROVIDERS_IDENTICAL=true' "$OUT_DIR/BINDING_MARKERS.txt"
+          grep -F 'SIGNED_OR_BROADCAST_TRANSACTIONS=0' "$OUT_DIR/BINDING_MARKERS.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pyth-evm-executor-source-binding-${{ github.run_id }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
