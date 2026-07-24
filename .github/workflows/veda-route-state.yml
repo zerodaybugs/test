@@ -1,0 +1,275 @@
+name: veda-route-state
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Query pinned route bindings and active requests
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import time
+          import urllib.request
+
+          CHAIN_ID = 534352
+          RPCS = [
+              "https://rpc.scroll.io",
+              "https://scroll.drpc.org",
+              "https://scroll-rpc.publicnode.com",
+          ]
+          A = {
+              "attacker": "0x1111111111111111111111111111111111111111",
+              "source_vault": "0x5f46d540b6eD704C3c8789105F30E075AA900726",
+              "source_accountant": "0xEa23aC6D7D11f6b181d6B98174D334478ADAe6b0",
+              "source_queue": "0x77A2fd42F8769d8063F2E75061FC200014E41Edf",
+              "source_solver": "0x7102C6889B0BB93Acf4A895f3EbeB17080D91d29",
+              "source_active_teller": "0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353",
+              "source_legacy_teller": "0x9E88C603307fdC33aA5F26E38b6f6aeF3eE92d48",
+              "target_vault": "0x657e8C867D8B37dCC18fA4Caead9C45EB088C642",
+              "target_accountant": "0x1b293DC39F94157fA0D1D36d7e0090C8B8B8c13F",
+              "target_teller": "0xe19a43B1b8af6CeE71749Af2332627338B3242D1",
+              "wbtc": "0x3C1BCa5a656e69edCD0D4E36BEbb3FcDAcA60Cf1",
+          }
+
+          def sig(text):
+              return subprocess.check_output(["cast", "sig", text], text=True).strip()
+
+          S = {
+              "authority": sig("authority()"),
+              "vault": sig("vault()"),
+              "accountant": sig("accountant()"),
+              "base": sig("base()"),
+              "decimals": sig("decimals()"),
+              "totalSupply": sig("totalSupply()"),
+              "getRateSafe": sig("getRateSafe()"),
+              "getRateInQuoteSafe": sig("getRateInQuoteSafe(address)"),
+              "assetData": sig("assetData(address)"),
+              "withdrawAssets": sig("withdrawAssets(address)"),
+              "getRequestIds": sig("getRequestIds()"),
+              "request": sig("requestOnChainWithdraw(address,uint128,uint16,uint24)"),
+              "requestPermit": sig("requestOnChainWithdrawWithPermit(address,uint128,uint16,uint24,uint256,uint8,bytes32,bytes32)"),
+              "cancel": sig("cancelOnChainWithdraw((uint96,address,address,uint128,uint128,uint40,uint24,uint24))"),
+              "replace": sig("replaceOnChainWithdraw((uint96,address,address,uint128,uint128,uint40,uint24,uint24),uint16,uint24)"),
+              "solve": sig("solveOnChainWithdraws((uint96,address,address,uint128,uint128,uint40,uint24,uint24)[],bytes,address)"),
+              "selfSolve": sig("boringRedeemSelfSolve((uint96,address,address,uint128,uint128,uint40,uint24,uint24),address)"),
+              "selfMintSolve": sig("boringRedeemMintSelfSolve((uint96,address,address,uint128,uint128,uint40,uint24,uint24),address,address,address)"),
+              "deposit": sig("deposit(address,uint256,uint256)"),
+              "depositPermit": sig("depositWithPermit(address,uint256,uint256,uint256,uint8,bytes32,bytes32)"),
+              "bulkDeposit": sig("bulkDeposit(address,uint256,uint256,address)"),
+              "bulkWithdraw": sig("bulkWithdraw(address,uint256,uint256,address)"),
+              "enter": sig("enter(address,address,uint256,address,uint256)"),
+              "exit": sig("exit(address,address,uint256,address,uint256)"),
+          }
+          AUTH_PUBLIC = "0x2f47571f"
+          AUTH_CAN_CALL = "0xb7009613"
+
+          def rpc(endpoint, method, params, timeout=35):
+              payload = json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
+              req = urllib.request.Request(endpoint, data=payload, method="POST", headers={
+                  "content-type":"application/json", "user-agent":"veda-route-state/1.0"
+              })
+              with urllib.request.urlopen(req, timeout=timeout) as response:
+                  result = json.loads(response.read().decode())
+              if "error" in result:
+                  raise RuntimeError(result["error"])
+              return result["result"]
+
+          def select_rpc():
+              failures = {}
+              for endpoint in RPCS:
+                  try:
+                      if int(rpc(endpoint, "eth_chainId", []), 16) == CHAIN_ID:
+                          return endpoint
+                  except Exception as exc:
+                      failures[endpoint] = repr(exc)
+              raise RuntimeError(failures)
+
+          def strip0(value): return value[2:] if value.startswith("0x") else value
+          def aw(address): return strip0(address).lower().rjust(64, "0")
+          def sw(selector): return strip0(selector).lower().ljust(64, "0")
+          def call(endpoint, block, target, data):
+              try:
+                  return {"result": rpc(endpoint, "eth_call", [{"to":target,"data":data}, block])}
+              except Exception as exc:
+                  return {"error": repr(exc)}
+          def words(raw):
+              if not isinstance(raw, str): return None
+              value = strip0(raw)
+              return [int(value[i:i+64], 16) for i in range(0, len(value), 64)] if value else []
+          def addr(raw):
+              return "0x" + strip0(raw)[-40:] if isinstance(raw, str) and len(strip0(raw)) >= 40 else None
+          def uint(raw): return int(raw, 16) if isinstance(raw, str) else None
+          def boolv(raw): return bool(int(raw, 16)) if isinstance(raw, str) else None
+          def dynamic_bytes32(raw):
+              if not isinstance(raw, str): return []
+              value = strip0(raw)
+              if len(value) < 128: return []
+              offset = int(value[:64], 16) * 2
+              length = int(value[offset:offset+64], 16)
+              start = offset + 64
+              return ["0x" + value[start+i*64:start+(i+1)*64] for i in range(length)]
+
+          endpoint = select_rpc()
+          block = rpc(endpoint, "eth_blockNumber", [])
+          out = {
+              "queried_at_unix": int(time.time()),
+              "endpoint": endpoint,
+              "block": int(block, 16),
+              "addresses": {k:v.lower() for k,v in A.items()},
+              "selectors": S,
+              "contracts": {},
+              "capabilities": {},
+              "active_requests": [],
+          }
+
+          for name in ["source_vault","source_accountant","source_queue","source_solver","source_active_teller","source_legacy_teller","target_vault","target_accountant","target_teller"]:
+              target = A[name]
+              code = rpc(endpoint, "eth_getCode", [target, block])
+              state = {"code_bytes": max(0, (len(code)-2)//2)}
+              for field in ["authority","vault","accountant","base","decimals","totalSupply","getRateSafe"]:
+                  result = call(endpoint, block, target, S[field])
+                  if "result" in result:
+                      if field in ["authority","vault","accountant","base"]: state[field] = addr(result["result"])
+                      else: state[field] = uint(result["result"])
+                  else: state[field] = result
+              out["contracts"][name] = state
+
+          def authority_of(target):
+              result = call(endpoint, block, target, S["authority"])
+              return addr(result.get("result")) if "result" in result else None
+          def public(auth, target, selector):
+              result = call(endpoint, block, auth, AUTH_PUBLIC + aw(target) + sw(selector))
+              return boolv(result.get("result")) if "result" in result else result
+          def can(auth, user, target, selector):
+              result = call(endpoint, block, auth, AUTH_CAN_CALL + aw(user) + aw(target) + sw(selector))
+              return boolv(result.get("result")) if "result" in result else result
+          def cap(label, user, target, selector):
+              auth = authority_of(target)
+              out["capabilities"][label] = {
+                  "authority": auth,
+                  "user": user.lower(),
+                  "target": target.lower(),
+                  "selector": selector,
+                  "public": public(auth, target, selector) if auth else None,
+                  "can_call": can(auth, user, target, selector) if auth else None,
+              }
+
+          for key in ["request","requestPermit","cancel","replace","solve"]:
+              cap("attacker_queue_"+key, A["attacker"], A["source_queue"], S[key])
+          for key in ["selfSolve","selfMintSolve"]:
+              cap("attacker_solver_"+key, A["attacker"], A["source_solver"], S[key])
+          for teller_name in ["source_active_teller","source_legacy_teller"]:
+              for key in ["deposit","depositPermit"]:
+                  cap("attacker_"+teller_name+"_"+key, A["attacker"], A[teller_name], S[key])
+              cap("solver_"+teller_name+"_bulkWithdraw", A["source_solver"], A[teller_name], S["bulkWithdraw"])
+          cap("solver_target_bulkDeposit", A["source_solver"], A["target_teller"], S["bulkDeposit"])
+          cap("solver_target_bulkWithdraw", A["source_solver"], A["target_teller"], S["bulkWithdraw"])
+          cap("target_teller_enter", A["target_teller"], A["target_vault"], S["enter"])
+          cap("target_teller_exit", A["target_teller"], A["target_vault"], S["exit"])
+
+          for accountant_name, quotes in {
+              "source_accountant": ["wbtc","target_vault"],
+              "target_accountant": ["wbtc","source_vault"],
+          }.items():
+              target = A[accountant_name]
+              out["contracts"][accountant_name]["quotes"] = {}
+              for quote_name in quotes:
+                  result = call(endpoint, block, target, S["getRateInQuoteSafe"] + aw(A[quote_name]))
+                  out["contracts"][accountant_name]["quotes"][quote_name] = uint(result.get("result")) if "result" in result else result
+
+          for teller_name in ["source_active_teller","source_legacy_teller","target_teller"]:
+              out["contracts"][teller_name]["asset_data"] = {}
+              for asset_name in ["wbtc","source_vault","target_vault"]:
+                  result = call(endpoint, block, A[teller_name], S["assetData"] + aw(A[asset_name]))
+                  out["contracts"][teller_name]["asset_data"][asset_name] = words(result.get("result")) if "result" in result else result
+
+          for asset_name in ["wbtc","target_vault"]:
+              result = call(endpoint, block, A["source_queue"], S["withdrawAssets"] + aw(A[asset_name]))
+              out["contracts"]["source_queue"].setdefault("withdraw_assets", {})[asset_name] = words(result.get("result")) if "result" in result else result
+
+          ids_result = call(endpoint, block, A["source_queue"], S["getRequestIds"])
+          request_ids = dynamic_bytes32(ids_result.get("result")) if "result" in ids_result else []
+          out["contracts"]["source_queue"]["request_ids"] = request_ids
+
+          requested_topic = subprocess.check_output([
+              "cast", "keccak",
+              "OnChainWithdrawRequested(bytes32,address,address,uint96,uint128,uint128,uint40,uint24,uint24)"
+          ], text=True).strip()
+
+          def get_request_logs(request_id):
+              params = {
+                  "fromBlock": hex(12000000),
+                  "toBlock": block,
+                  "address": A["source_queue"],
+                  "topics": [requested_topic, request_id],
+              }
+              failures = {}
+              for ep in RPCS:
+                  try:
+                      return ep, rpc(ep, "eth_getLogs", [params], timeout=45)
+                  except Exception as exc:
+                      failures[ep] = repr(exc)
+              # Last resort: bounded chunks on the selected endpoint.
+              found = []
+              latest = int(block, 16)
+              step = 250000
+              for start in range(12000000, latest + 1, step):
+                  chunk = dict(params)
+                  chunk["fromBlock"] = hex(start)
+                  chunk["toBlock"] = hex(min(latest, start + step - 1))
+                  try:
+                      found.extend(rpc(endpoint, "eth_getLogs", [chunk], timeout=45))
+                  except Exception as exc:
+                      failures[f"{endpoint}:{start}"] = repr(exc)
+              return endpoint, found
+
+          for request_id in request_ids:
+              log_endpoint, logs = get_request_logs(request_id)
+              for log in logs:
+                  data_words = words(log.get("data", "0x")) or []
+                  topics = log.get("topics", [])
+                  out["active_requests"].append({
+                      "request_id": request_id,
+                      "log_endpoint": log_endpoint,
+                      "block_number": int(log["blockNumber"], 16),
+                      "tx_hash": log["transactionHash"],
+                      "user": "0x" + strip0(topics[2])[-40:] if len(topics) > 2 else None,
+                      "asset_out": "0x" + strip0(topics[3])[-40:] if len(topics) > 3 else None,
+                      "nonce": data_words[0] if len(data_words) > 0 else None,
+                      "amount_of_shares": data_words[1] if len(data_words) > 1 else None,
+                      "amount_of_assets": data_words[2] if len(data_words) > 2 else None,
+                      "creation_time": data_words[3] if len(data_words) > 3 else None,
+                      "seconds_to_maturity": data_words[4] if len(data_words) > 4 else None,
+                      "seconds_to_deadline": data_words[5] if len(data_words) > 5 else None,
+                  })
+
+          with open("veda-route-state.json", "w", encoding="utf-8") as handle:
+              json.dump(out, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+          print(json.dumps({
+              "block": out["block"],
+              "request_ids": request_ids,
+              "active_requests": out["active_requests"],
+              "capabilities": out["capabilities"],
+          }, indent=2, sort_keys=True))
+          PY
+      - name: Upload route state
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-route-state
+          path: veda-route-state.json
+          if-no-files-found: error
+          retention-days: 1
