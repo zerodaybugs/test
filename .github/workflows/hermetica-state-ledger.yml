@@ -1,0 +1,303 @@
+name: Hermetica state asset and external ledger
+
+on:
+  push:
+    branches:
+      - hermetica-passive-audit-20260724
+    paths:
+      - '.github/workflows/hermetica-state-ledger.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  collect-state-ledger:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: hermetica-passive-audit-20260724
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Clarity decoder
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/hermetica-state-ledger-node
+          mkdir -p /tmp/hermetica-state-ledger-node
+          cd /tmp/hermetica-state-ledger-node
+          npm init -y >/dev/null 2>&1
+          npm install --no-save @stacks/transactions >/dev/null 2>&1
+
+      - name: Reconstruct asset and external governance state
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf evidence/hermetica-state-ledger
+          mkdir -p evidence/hermetica-state-ledger
+          cd /tmp/hermetica-state-ledger-node
+          GITHUB_WORKSPACE="$GITHUB_WORKSPACE" node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { deserializeCV, cvToJSON, cvToString } from '@stacks/transactions';
+
+          const workspace = process.env.GITHUB_WORKSPACE;
+          const outDir = path.join(workspace, 'evidence', 'hermetica-state-ledger');
+          fs.mkdirSync(outDir, { recursive: true });
+
+          const DEPLOYER = 'SP1S1HSFH0SQQGWKB69EYFNY0B1MHRMGXR3J1FH4D';
+          const STATE = `${DEPLOYER}.state-hbtc-v1`;
+          const ZERO = 'SP000000000000000000002Q6VF78';
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+          async function api(method, url, payload, attempts = 5) {
+            let last;
+            for (let i = 0; i < attempts; i++) {
+              try {
+                const response = await fetch(url, {
+                  method,
+                  headers: {
+                    Accept: 'application/json',
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'zerodaybugs-hermetica-state-ledger/1.0',
+                  },
+                  body: payload === undefined ? undefined : JSON.stringify(payload),
+                });
+                const text = await response.text();
+                let json = null;
+                try { json = JSON.parse(text); } catch {}
+                if (response.ok) return { ok: true, status: response.status, json, text, url };
+                last = new Error(`${method} ${url}: ${response.status}: ${text.slice(0, 500)}`);
+                if (![408, 429, 500, 502, 503, 504].includes(response.status)) throw last;
+              } catch (error) {
+                last = error;
+              }
+              await sleep(2 ** i * 1000);
+            }
+            throw last;
+          }
+
+          function write(name, value) {
+            fs.writeFileSync(path.join(outDir, name), JSON.stringify(value, null, 2));
+          }
+
+          function normalize(value) {
+            if (Array.isArray(value)) return value.map(normalize);
+            if (value && typeof value === 'object') {
+              if ('success' in value) return value.success ? { ok: normalize(value.value) } : { err: normalize(value.value) };
+              if ('type' in value && 'value' in value) return normalize(value.value);
+              return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, normalize(v)]));
+            }
+            return value;
+          }
+
+          function decode(hex) {
+            const cv = deserializeCV(hex);
+            return { repr: cvToString(cv, 'tryAscii'), normalized: normalize(cvToJSON(cv)) };
+          }
+
+          const qp = encodeURIComponent(STATE);
+          const pages = [];
+          let offset = 0;
+          let total = null;
+          while (total === null || offset < total) {
+            const response = await api('GET', `https://api.hiro.so/extended/v2/addresses/${qp}/transactions?limit=50&offset=${offset}`);
+            pages.push({ offset, response: response.json });
+            total = Number(response.json?.total ?? 0);
+            if (!(response.json?.results?.length > 0)) break;
+            offset += 50;
+          }
+          write('state-transaction-pages.json', pages);
+
+          const calls = [];
+          for (const page of pages) {
+            for (const row of page.response?.results ?? []) {
+              const tx = row.tx ?? row;
+              const cc = tx.contract_call ?? {};
+              if (cc.contract_id !== STATE) continue;
+              calls.push({
+                txId: tx.tx_id,
+                height: tx.block_height,
+                index: tx.tx_index,
+                time: tx.block_time_iso,
+                sender: tx.sender_address,
+                status: tx.tx_status,
+                result: tx.tx_result?.repr,
+                function: cc.function_name,
+                args: (cc.function_args ?? []).map(a => a.repr),
+              });
+            }
+          }
+          calls.sort((a, b) => (a.height - b.height) || (a.index - b.index) || a.txId.localeCompare(b.txId));
+          write('state-direct-calls.json', calls);
+
+          const pendingAssets = new Map();
+          const pendingExternals = new Map();
+          const assets = new Map();
+          const externals = new Map();
+          const transitions = [];
+
+          const principal = repr => String(repr ?? '').replace(/^'/, '');
+          const bool = repr => String(repr).toLowerCase() === 'true';
+
+          for (const call of calls) {
+            if (call.status !== 'success') continue;
+            const fn = call.function;
+            const a = call.args;
+
+            if (fn === 'request-asset-add' && a.length >= 5) {
+              const address = principal(a[0]);
+              const config = { address, priceFeedId: a[1], decimals: a[2], maxSlippage: a[3], stablecoin: bool(a[4]), add: true };
+              pendingAssets.set(address, config);
+              transitions.push({ ...call, kind: 'request-asset-add', address, config });
+            } else if (fn === 'request-asset-remove' && a.length >= 1) {
+              const address = principal(a[0]);
+              pendingAssets.set(address, { address, add: false });
+              transitions.push({ ...call, kind: 'request-asset-remove', address });
+            } else if (fn === 'cancel-asset-request' && a.length >= 1) {
+              const address = principal(a[0]);
+              const pending = pendingAssets.get(address) ?? null;
+              pendingAssets.delete(address);
+              transitions.push({ ...call, kind: 'cancel-asset', address, pending });
+            } else if (fn === 'confirm-asset-request' && a.length >= 1) {
+              const address = principal(a[0]);
+              const pending = pendingAssets.get(address) ?? null;
+              if (pending) {
+                assets.set(address, pending.add ? { ...pending, active: true } : { address, active: false });
+                pendingAssets.delete(address);
+              }
+              transitions.push({ ...call, kind: 'confirm-asset', address, applied: pending });
+            } else if (fn === 'request-external-add' && a.length >= 1) {
+              const address = principal(a[0]);
+              pendingExternals.set(address, true);
+              transitions.push({ ...call, kind: 'request-external-add', address });
+            } else if (fn === 'request-external-remove' && a.length >= 1) {
+              const address = principal(a[0]);
+              pendingExternals.set(address, false);
+              transitions.push({ ...call, kind: 'request-external-remove', address });
+            } else if (fn === 'cancel-external-request' && a.length >= 1) {
+              const address = principal(a[0]);
+              const pending = pendingExternals.get(address) ?? null;
+              pendingExternals.delete(address);
+              transitions.push({ ...call, kind: 'cancel-external', address, pending });
+            } else if (fn === 'confirm-external-request' && a.length >= 1) {
+              const address = principal(a[0]);
+              const pending = pendingExternals.get(address);
+              if (pending !== undefined) {
+                externals.set(address, pending);
+                pendingExternals.delete(address);
+              }
+              transitions.push({ ...call, kind: 'confirm-external', address, applied: pending ?? null });
+            }
+          }
+          write('governance-transitions.json', transitions);
+
+          const discoveredAssets = [...new Set([
+            ...assets.keys(),
+            ...pendingAssets.keys(),
+            ...transitions.filter(t => t.address && t.kind.includes('asset')).map(t => t.address),
+          ])].sort();
+          const discoveredExternals = [...new Set([
+            ...externals.keys(),
+            ...pendingExternals.keys(),
+            ...transitions.filter(t => t.address && t.kind.includes('external')).map(t => t.address),
+          ])].sort();
+
+          const session = await api('POST', 'https://api.stxer.xyz/devtools/v2/simulations', { skip_tracing: true });
+          const sessionId = session.json?.id;
+          if (!sessionId) throw new Error('No Stxer session id');
+
+          const reads = [];
+          for (const address of discoveredAssets) reads.push({ EvalReadonly: [ZERO, '', STATE, `(get-asset '${address})`] });
+          for (const address of discoveredExternals) reads.push({ EvalReadonly: [ZERO, '', STATE, `(get-external '${address})`] });
+          reads.push({ EvalReadonly: [ZERO, '', STATE, '(get-max-slippage)'] });
+          reads.push({ EvalReadonly: [ZERO, '', STATE, '(get-staleness-window)'] });
+
+          const resultRows = [];
+          for (let i = 0; i < reads.length; i += 40) {
+            const batch = reads.slice(i, i + 40);
+            const response = await api('POST', `https://api.stxer.xyz/devtools/v2/simulations/${sessionId}`, { steps: [{ Reads: batch }] });
+            const results = response.json?.steps?.[0]?.Reads ?? [];
+            for (let j = 0; j < batch.length; j++) {
+              const item = { request: batch[j], wire: results[j] ?? null };
+              if (results[j]?.Ok) item.decoded = decode(results[j].Ok);
+              if (results[j]?.Err) item.error = results[j].Err;
+              resultRows.push(item);
+            }
+          }
+          write('live-read-results.json', resultRows);
+
+          const liveAssets = {};
+          const liveExternals = {};
+          const globals = {};
+          for (const row of resultRows) {
+            const [, , , expr] = row.request.EvalReadonly;
+            const value = row.decoded?.normalized;
+            let m = /^\(get-asset '([^']+)\)$/.exec(expr);
+            if (m) liveAssets[m[1]] = value;
+            m = /^\(get-external '([^']+)\)$/.exec(expr);
+            if (m) liveExternals[m[1]] = value;
+            if (expr === '(get-max-slippage)' || expr === '(get-staleness-window)') globals[expr] = value;
+          }
+
+          const activeAssets = Object.entries(liveAssets)
+            .filter(([, v]) => v?.active === true)
+            .map(([address, config]) => ({ address, ...config }));
+          const activeExternals = Object.entries(liveExternals)
+            .filter(([, v]) => v === true)
+            .map(([address]) => address);
+
+          write('summary.json', {
+            sessionId,
+            totalRelatedTransactions: total,
+            directCalls: calls.length,
+            activeAssets,
+            activeExternals,
+            liveAssets,
+            liveExternals,
+            globals,
+            unresolvedPendingAssets: Object.fromEntries(pendingAssets),
+            unresolvedPendingExternals: Object.fromEntries(pendingExternals),
+          });
+
+          const sourceTargets = [...new Set([...activeAssets.map(a => a.address), ...activeExternals])];
+          for (const contractId of sourceTargets) {
+            if (!contractId.includes('.')) continue;
+            const [deployer, ...rest] = contractId.split('.');
+            const name = rest.join('.');
+            const safe = contractId.replaceAll('.', '__');
+            const endpoints = {
+              source: `https://api.hiro.so/v2/contracts/source/${deployer}/${name}?proof=0`,
+              interface: `https://api.hiro.so/v2/contracts/interface/${deployer}/${name}`,
+            };
+            fs.mkdirSync(path.join(outDir, 'active-targets', safe), { recursive: true });
+            for (const [label, url] of Object.entries(endpoints)) {
+              try {
+                const response = await api('GET', url);
+                fs.writeFileSync(path.join(outDir, 'active-targets', safe, `${label}.json`), JSON.stringify(response, null, 2));
+              } catch (error) {
+                fs.writeFileSync(path.join(outDir, 'active-targets', safe, `${label}.json`), JSON.stringify({ error: String(error), url }, null, 2));
+              }
+            }
+          }
+          JS
+
+      - name: Commit state-ledger evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add evidence/hermetica-state-ledger
+          if git diff --cached --quiet; then
+            echo 'No state-ledger changes.'
+            exit 0
+          fi
+          git commit -m 'chore: reconstruct Hermetica state ledger [skip ci]'
+          git push origin HEAD:hermetica-passive-audit-20260724
