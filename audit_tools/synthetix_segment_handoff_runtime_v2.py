@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Intercepted Segment/session-handoff probe with a synthetic EIP-6963 wallet.
 
-Only the intended top-level navigation may contain the synthetic handoff token.
-Any other secret-bearing request, telemetry ingestion, PAPI trade request, or
-transaction RPC request is aborted before transmission.
+Secret-bearing GET requests to the intended in-scope Exchange origin are allowed
+and recorded so the page can load normally. Every cross-origin secret-bearing
+request, telemetry ingestion request, PAPI trade request, or transaction RPC
+request is aborted before transmission.
 """
 
 from __future__ import annotations
@@ -185,23 +186,26 @@ async def run(browser: Browser) -> None:
     async def route_handler(route: Route, request: Request) -> None:
         parsed = urllib.parse.urlparse(request.url)
         host = (parsed.hostname or "").lower()
+        method = request.method.upper()
         item = record(request, "observed", token)
         secret = bool(item["secretMatches"])
-        intended = secret and request.is_navigation_request() and host == TARGET_HOST
+        same_origin_secret_get = secret and host == TARGET_HOST and method == "GET"
         telemetry = any(part in host for part in TELEMETRY_PARTS)
         papi_trade = host == "papi.synthetix.io" and parsed.path.lower().endswith("/trade")
-        transaction = request.method.upper() == "POST" and any(
+        transaction = method == "POST" and any(
             key in (item.get("postData") or "") for key in ("eth_sendTransaction", "eth_sendRawTransaction")
         )
-        if intended:
-            item["disposition"] = "allowed-intended-target-navigation"
+        if same_origin_secret_get:
+            item["disposition"] = "allowed-target-same-origin-secret"
             requests.append(item)
-            await route.continue_(); return
-        if secret or (telemetry and request.method.upper() != "GET") or papi_trade or transaction:
+            await route.continue_()
+            return
+        if secret or (telemetry and method != "GET") or papi_trade or transaction:
             item["disposition"] = "intercepted-before-transmission"
             requests.append(item)
-            await route.abort("blockedbyclient"); return
-        if telemetry or host == "papi.synthetix.io" or request.method.upper() != "GET":
+            await route.abort("blockedbyclient")
+            return
+        if telemetry or host == "papi.synthetix.io" or method != "GET":
             requests.append(item)
         await route.continue_()
 
