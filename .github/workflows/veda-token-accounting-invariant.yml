@@ -1,0 +1,268 @@
+name: veda-token-accounting-invariant
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Run pinned local-fork balance-delta invariant
+        shell: bash
+        run: |
+          set -euo pipefail
+          RPC="https://ethereum-rpc.publicnode.com"
+          BLOCK="25604283"
+          LOCAL="http://127.0.0.1:8545"
+          anvil --fork-url "$RPC" --fork-block-number "$BLOCK" --port 8545 --silent >anvil.log 2>&1 &
+          ANVIL_PID=$!
+          trap 'kill "$ANVIL_PID" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 60); do
+            if cast chain-id --rpc-url "$LOCAL" >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          cast chain-id --rpc-url "$LOCAL" >/dev/null
+
+          python3 - <<'PY'
+          import json
+          import math
+          import random
+          import subprocess
+          import time
+          import urllib.request
+
+          RPC = "http://127.0.0.1:8545"
+          BLOCK = 25_604_283
+          EETH = "0x35fA164735182de50811E8e2E824cFb9B6118ac2"
+          WEETH = "0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee"
+          VAULT = "0xf0bb20865277aBd641a307eCe5Ee04E79073416C"
+          TELLER = "0x9AA79C84b79816ab920bBcE20f8f74557B514734"
+          ACCOUNTANT = "0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198"
+          ATTACKER = "0x1111111111111111111111111111111111111111"
+          MAX_UINT = 2**256 - 1
+
+          def rpc(method, params):
+              payload = json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
+              request = urllib.request.Request(RPC, data=payload, method="POST", headers={
+                  "content-type":"application/json", "user-agent":"veda-local-fork-invariant/1.0"
+              })
+              with urllib.request.urlopen(request, timeout=45) as response:
+                  result = json.loads(response.read().decode())
+              if "error" in result:
+                  raise RuntimeError({"method":method,"params":params,"error":result["error"]})
+              return result["result"]
+
+          def sig(text):
+              return subprocess.check_output(["cast","sig",text], text=True).strip()
+          def calldata(signature, *args):
+              return subprocess.check_output(["cast","calldata",signature,*map(str,args)], text=True).strip()
+          def strip0(value): return value[2:] if value.startswith("0x") else value
+          def aw(address): return strip0(address).lower().rjust(64,"0")
+          def call_uint(target, data):
+              raw = rpc("eth_call", [{"to":target,"data":data}, "latest"])
+              return int(raw,16)
+          def call_address(target, data):
+              raw = rpc("eth_call", [{"to":target,"data":data}, "latest"])
+              return "0x" + strip0(raw)[-40:]
+          def balance(token, user): return call_uint(token, sig("balanceOf(address)") + aw(user))
+          def token_shares(user): return call_uint(EETH, sig("shares(address)") + aw(user))
+          def send(sender, target, data):
+              tx = rpc("eth_sendTransaction", [{
+                  "from":sender,"to":target,"data":data,"gas":hex(12_000_000)
+              }])
+              for _ in range(60):
+                  receipt = rpc("eth_getTransactionReceipt", [tx])
+                  if receipt is not None:
+                      if int(receipt["status"],16) != 1:
+                          raise RuntimeError({"tx":tx,"receipt":receipt})
+                      return receipt
+                  time.sleep(0.1)
+              raise RuntimeError("receipt timeout")
+
+          # Everything below runs against a local Anvil fork. No live-chain transaction is sent.
+          rpc("anvil_impersonateAccount", [WEETH])
+          rpc("anvil_impersonateAccount", [ATTACKER])
+          rpc("anvil_setBalance", [WEETH, hex(100 * 10**18)])
+          rpc("anvil_setBalance", [ATTACKER, hex(100 * 10**18)])
+
+          weeth_eeth_balance = balance(EETH, WEETH)
+          seed_nominal = min(100 * 10**18, weeth_eeth_balance // 1000)
+          if seed_nominal < 10**18:
+              raise RuntimeError({"reason":"insufficient seed holder balance","balance":weeth_eeth_balance})
+          send(WEETH, EETH, calldata("transfer(address,uint256)", ATTACKER, seed_nominal))
+          send(ATTACKER, EETH, calldata("approve(address,uint256)", VAULT, MAX_UINT))
+
+          pool = call_address(EETH, sig("liquidityPool()"))
+          total_pooled = call_uint(pool, sig("getTotalPooledEther()"))
+          total_eeth_shares = call_uint(EETH, sig("totalShares()"))
+          veda_quote_rate = call_uint(ACCOUNTANT, calldata("getRateInQuoteSafe(address)", EETH))
+          attacker_internal = token_shares(ATTACKER)
+          vault_internal = token_shares(VAULT)
+          attacker_balance = balance(EETH, ATTACKER)
+          vault_balance = balance(EETH, VAULT)
+
+          def eeth_balance_for(internal_shares):
+              return (total_pooled * internal_shares) // total_eeth_shares
+          def model(nominal):
+              moved = (nominal * total_eeth_shares) // total_pooled
+              if moved > attacker_internal:
+                  return None
+              sender_delta = eeth_balance_for(attacker_internal) - eeth_balance_for(attacker_internal - moved)
+              receiver_delta = eeth_balance_for(vault_internal + moved) - eeth_balance_for(vault_internal)
+              minted = (nominal * 10**18) // veda_quote_rate
+              claim_value = (minted * veda_quote_rate) // 10**18
+              return {
+                  "nominal": nominal,
+                  "eeth_internal_shares_moved": moved,
+                  "sender_balance_delta": sender_delta,
+                  "vault_balance_delta": receiver_delta,
+                  "liquideth_shares_minted": minted,
+                  "liquideth_claim_value_eeth": claim_value,
+                  "claim_minus_sender_delta": claim_value - sender_delta,
+                  "claim_minus_vault_delta": claim_value - receiver_delta,
+                  "nominal_minus_vault_delta": nominal - receiver_delta,
+              }
+
+          candidates = set(range(1, 1_000_001))
+          for power in range(0, 25):
+              base = 10**power
+              for delta in range(-8,9):
+                  if base + delta > 0: candidates.add(base + delta)
+          for k in range(1, 20_001):
+              e_boundary = (k * total_pooled + total_eeth_shares - 1) // total_eeth_shares
+              v_boundary = (k * veda_quote_rate + 10**18 - 1) // 10**18
+              for value in (e_boundary-2,e_boundary-1,e_boundary,e_boundary+1,e_boundary+2,
+                            v_boundary-2,v_boundary-1,v_boundary,v_boundary+1,v_boundary+2):
+                  if value > 0: candidates.add(value)
+          rng = random.Random(0x56454441)
+          for _ in range(50_000):
+              exponent = rng.randrange(0, 25)
+              upper = min(10**exponent, attacker_balance)
+              if upper > 0: candidates.add(rng.randrange(1, upper+1))
+          candidates.update({10**18, 10**18-1, 10**18+1, 10**20, seed_nominal//2})
+
+          modeled = [result for value in candidates if (result := model(value)) is not None]
+          by_profit = sorted(modeled, key=lambda row:(row["claim_minus_sender_delta"], row["claim_minus_vault_delta"], -row["nominal"]), reverse=True)
+          by_backing = sorted(modeled, key=lambda row:(row["claim_minus_vault_delta"], row["nominal_minus_vault_delta"], -row["nominal"]), reverse=True)
+
+          verify_amounts = []
+          for row in by_profit[:8] + by_backing[:8]:
+              if row["nominal"] not in verify_amounts: verify_amounts.append(row["nominal"])
+          for value in [1,2,3,4,5,10,100,1000,10**6,10**12,10**18]:
+              if value <= attacker_balance and value not in verify_amounts: verify_amounts.append(value)
+          verify_amounts = verify_amounts[:24]
+
+          verified = []
+          base_snapshot = rpc("evm_snapshot", [])
+          for amount in verify_amounts:
+              rpc("evm_revert", [base_snapshot])
+              base_snapshot = rpc("evm_snapshot", [])
+              before = {
+                  "attacker_eeth": balance(EETH, ATTACKER),
+                  "vault_eeth": balance(EETH, VAULT),
+                  "attacker_liquideth": balance(VAULT, ATTACKER),
+                  "attacker_internal": token_shares(ATTACKER),
+                  "vault_internal": token_shares(VAULT),
+              }
+              error = None
+              try:
+                  receipt = send(ATTACKER, TELLER, calldata("deposit(address,uint256,uint256)", EETH, amount, 0))
+              except Exception as exc:
+                  receipt = None
+                  error = repr(exc)
+              after = {
+                  "attacker_eeth": balance(EETH, ATTACKER),
+                  "vault_eeth": balance(EETH, VAULT),
+                  "attacker_liquideth": balance(VAULT, ATTACKER),
+                  "attacker_internal": token_shares(ATTACKER),
+                  "vault_internal": token_shares(VAULT),
+              }
+              actual = {
+                  "nominal": amount,
+                  "success": error is None,
+                  "error": error,
+                  "sender_balance_delta": before["attacker_eeth"] - after["attacker_eeth"],
+                  "vault_balance_delta": after["vault_eeth"] - before["vault_eeth"],
+                  "eeth_internal_shares_moved": before["attacker_internal"] - after["attacker_internal"],
+                  "liquideth_shares_minted": after["attacker_liquideth"] - before["attacker_liquideth"],
+              }
+              actual["liquideth_claim_value_eeth"] = (actual["liquideth_shares_minted"] * veda_quote_rate) // 10**18
+              actual["claim_minus_sender_delta"] = actual["liquideth_claim_value_eeth"] - actual["sender_balance_delta"]
+              actual["claim_minus_vault_delta"] = actual["liquideth_claim_value_eeth"] - actual["vault_balance_delta"]
+              actual["model"] = model(amount)
+              actual["matches_model"] = (
+                  actual["model"] is not None and
+                  actual["sender_balance_delta"] == actual["model"]["sender_balance_delta"] and
+                  actual["vault_balance_delta"] == actual["model"]["vault_balance_delta"] and
+                  actual["eeth_internal_shares_moved"] == actual["model"]["eeth_internal_shares_moved"] and
+                  actual["liquideth_shares_minted"] == actual["model"]["liquideth_shares_minted"]
+              ) if actual["success"] else False
+              verified.append(actual)
+
+          successful = [row for row in verified if row["success"]]
+          report = {
+              "environment": {
+                  "fork_chain_id": 1,
+                  "fork_block": BLOCK,
+                  "local_rpc": RPC,
+                  "live_transaction_sent": False,
+                  "eeth": EETH.lower(),
+                  "seed_holder": WEETH.lower(),
+                  "veda_vault": VAULT.lower(),
+                  "veda_teller": TELLER.lower(),
+                  "veda_accountant": ACCOUNTANT.lower(),
+              },
+              "state": {
+                  "liquidity_pool": pool.lower(),
+                  "total_pooled_ether": total_pooled,
+                  "total_eeth_internal_shares": total_eeth_shares,
+                  "eeth_amount_per_internal_share_floor": total_pooled // total_eeth_shares,
+                  "veda_rate_in_eeth": veda_quote_rate,
+                  "seed_holder_eeth_balance": weeth_eeth_balance,
+                  "seed_nominal": seed_nominal,
+                  "attacker_eeth_balance_after_seed": attacker_balance,
+                  "attacker_eeth_internal_shares": attacker_internal,
+                  "vault_eeth_balance": vault_balance,
+                  "vault_eeth_internal_shares": vault_internal,
+              },
+              "search": {
+                  "candidate_count": len(modeled),
+                  "top_by_claim_minus_sender_delta": by_profit[:25],
+                  "top_by_claim_minus_vault_delta": by_backing[:25],
+                  "max_claim_minus_sender_delta": by_profit[0]["claim_minus_sender_delta"] if by_profit else None,
+                  "max_claim_minus_vault_delta": by_backing[0]["claim_minus_vault_delta"] if by_backing else None,
+              },
+              "verified_transactions": verified,
+              "verification_summary": {
+                  "successful_count": len(successful),
+                  "all_successful_match_model": all(row["matches_model"] for row in successful),
+                  "max_verified_claim_minus_sender_delta": max((row["claim_minus_sender_delta"] for row in successful), default=None),
+                  "max_verified_claim_minus_vault_delta": max((row["claim_minus_vault_delta"] for row in successful), default=None),
+              },
+          }
+          with open("veda-token-accounting-invariant.json","w",encoding="utf-8") as handle:
+              json.dump(report, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+          print(json.dumps({
+              "state": report["state"],
+              "search": report["search"],
+              "verification_summary": report["verification_summary"],
+          }, indent=2, sort_keys=True))
+          PY
+      - name: Upload invariant result
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-token-accounting-invariant
+          path: |
+            veda-token-accounting-invariant.json
+            anvil.log
+          if-no-files-found: error
+          retention-days: 1
