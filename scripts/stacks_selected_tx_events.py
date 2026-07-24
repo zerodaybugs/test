@@ -9,8 +9,7 @@ from pathlib import Path
 from typing import Any
 
 BASE = "https://api.hiro.so"
-HISTORY = Path("public-data/stacks-contract-history.json")
-OUT = Path("public-data/stacks-selected-tx-events.json")
+OUT = Path("public-data/selected-transactions")
 
 TXS = {
     "2026-04-28-sweep": "0xcd7f96d9e3eb2ab04c402de41ee62eac5a312bc441a59261a93cc7d7ce73fbe5",
@@ -28,88 +27,46 @@ def get_json(url: str, attempts: int = 6) -> dict[str, Any]:
         try:
             request = urllib.request.Request(
                 url,
-                headers={"Accept": "application/json", "User-Agent": "public-stacks-history-collector/1.2"},
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "public-stacks-history-collector/1.3",
+                },
             )
             with urllib.request.urlopen(request, timeout=45) as response:
                 return json.loads(response.read().decode("utf-8"))
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
             last = exc
-            if isinstance(exc, urllib.error.HTTPError) and exc.code not in {408, 429, 500, 502, 503, 504}:
+            if isinstance(exc, urllib.error.HTTPError) and exc.code not in {
+                408,
+                429,
+                500,
+                502,
+                503,
+                504,
+            }:
                 raise
             time.sleep(min(30, 2**i))
     raise RuntimeError(f"request failed: {url}: {last!r}")
 
 
-def trim_event(event: dict[str, Any]) -> dict[str, Any]:
-    keep = {
-        "event_index": event.get("event_index"),
-        "event_type": event.get("event_type"),
-        "tx_id": event.get("tx_id"),
-    }
-    for key in (
-        "contract_log",
-        "ft_transfer",
-        "ft_mint",
-        "ft_burn",
-        "stx_transfer",
-        "stx_mint",
-        "stx_burn",
-    ):
-        if key in event:
-            keep[key] = event[key]
-    # Some API revisions use *_event keys.
-    for key, value in event.items():
-        if key.endswith("_event") or key == "contract_log":
-            keep[key] = value
-    return keep
-
-
-def trim_tx(tx: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "tx_id": tx.get("tx_id"),
-        "block_height": tx.get("block_height"),
-        "block_time": tx.get("block_time"),
-        "block_time_iso": tx.get("block_time_iso"),
-        "tx_index": tx.get("tx_index"),
-        "sender_address": tx.get("sender_address"),
-        "tx_status": tx.get("tx_status"),
-        "tx_result": tx.get("tx_result"),
-        "contract_call": tx.get("contract_call"),
-        "events": [trim_event(x) for x in tx.get("events") or []],
-    }
-
-
 def main() -> None:
-    selected: dict[str, Any] = {}
+    OUT.mkdir(parents=True, exist_ok=True)
+    index: dict[str, Any] = {"source": "Hiro public Stacks API", "transactions": {}}
     for label, txid in TXS.items():
         url = f"{BASE}/extended/v1/tx/{txid}?event_offset=0&event_limit=100"
-        selected[label] = trim_tx(get_json(url))
+        payload = get_json(url)
+        filename = f"{label}.json"
+        (OUT / filename).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        index["transactions"][label] = {
+            "tx_id": txid,
+            "file": filename,
+            "block_height": payload.get("block_height"),
+            "block_time_iso": payload.get("block_time_iso"),
+            "status": payload.get("tx_status"),
+            "event_count": payload.get("event_count"),
+        }
         time.sleep(0.15)
-
-    history = json.loads(HISTORY.read_text(encoding="utf-8"))
-    state_calls = (history.get("direct_calls") or {}).get("state") or []
-    config_functions = {
-        "set-deposit-cap",
-        "set-min-deposit",
-        "set-reserve-rate",
-        "set-custom-cooldown",
-        "remove-custom-cooldown",
-        "request-mgmt-fee-update",
-        "confirm-mgmt-fee-request",
-        "request-perf-fee-update",
-        "confirm-perf-fee-request",
-        "request-exit-fee-update",
-        "confirm-exit-fee-request",
-        "request-express-fee-update",
-        "confirm-express-fee-request",
-        "set-request-redeem-enabled",
-        "set-redeem-enabled",
-        "disable-redeem",
-    }
-    selected["state-configuration-calls"] = [
-        row for row in state_calls if row.get("function") in config_functions
-    ]
-    OUT.write_text(json.dumps(selected, indent=2, sort_keys=True), encoding="utf-8")
+    (OUT / "index.json").write_text(json.dumps(index, indent=2, sort_keys=True), encoding="utf-8")
 
 
 if __name__ == "__main__":
