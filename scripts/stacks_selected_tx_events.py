@@ -21,49 +21,77 @@ TXS = {
 }
 
 
-def get_json(url: str, attempts: int = 6) -> dict[str, Any]:
-    last: Exception | None = None
+def request_json(url: str, attempts: int = 4) -> dict[str, Any]:
+    last: dict[str, Any] | None = None
     for i in range(attempts):
         try:
             request = urllib.request.Request(
                 url,
                 headers={
                     "Accept": "application/json",
-                    "User-Agent": "public-stacks-history-collector/1.3",
+                    "User-Agent": "public-stacks-history-collector/1.4",
                 },
             )
             with urllib.request.urlopen(request, timeout=45) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
-            last = exc
-            if isinstance(exc, urllib.error.HTTPError) and exc.code not in {
-                408,
-                429,
-                500,
-                502,
-                503,
-                504,
-            }:
-                raise
-            time.sleep(min(30, 2**i))
-    raise RuntimeError(f"request failed: {url}: {last!r}")
+                body = response.read().decode("utf-8", errors="replace")
+                try:
+                    payload = json.loads(body)
+                except json.JSONDecodeError:
+                    payload = None
+                return {
+                    "ok": True,
+                    "status": response.status,
+                    "url": url,
+                    "json": payload,
+                    "body": body if payload is None else None,
+                }
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                payload = None
+            last = {
+                "ok": False,
+                "status": exc.code,
+                "url": url,
+                "json": payload,
+                "body": body if payload is None else None,
+                "error": repr(exc),
+            }
+            if exc.code not in {408, 429, 500, 502, 503, 504}:
+                return last
+        except Exception as exc:
+            last = {
+                "ok": False,
+                "status": None,
+                "url": url,
+                "error": repr(exc),
+            }
+        time.sleep(min(20, 2**i))
+    return last or {"ok": False, "status": None, "url": url, "error": "unknown"}
 
 
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     index: dict[str, Any] = {"source": "Hiro public Stacks API", "transactions": {}}
     for label, txid in TXS.items():
-        url = f"{BASE}/extended/v1/tx/{txid}?event_offset=0&event_limit=100"
-        payload = get_json(url)
+        # No pagination query is required for these low-event-count transactions.
+        url = f"{BASE}/extended/v1/tx/{txid}"
+        response = request_json(url)
         filename = f"{label}.json"
-        (OUT / filename).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        (OUT / filename).write_text(json.dumps(response, indent=2, sort_keys=True), encoding="utf-8")
+        payload = response.get("json") if isinstance(response.get("json"), dict) else {}
         index["transactions"][label] = {
             "tx_id": txid,
             "file": filename,
+            "ok": response.get("ok"),
+            "http_status": response.get("status"),
             "block_height": payload.get("block_height"),
             "block_time_iso": payload.get("block_time_iso"),
-            "status": payload.get("tx_status"),
+            "tx_status": payload.get("tx_status"),
             "event_count": payload.get("event_count"),
+            "error": response.get("error"),
         }
         time.sleep(0.15)
     (OUT / "index.json").write_text(json.dumps(index, indent=2, sort_keys=True), encoding="utf-8")
