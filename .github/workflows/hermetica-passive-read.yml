@@ -1,0 +1,211 @@
+name: Hermetica passive audit collector
+
+on:
+  push:
+    branches:
+      - hermetica-passive-audit-20260724
+    paths:
+      - '.github/workflows/hermetica-passive-read.yml'
+      - 'trigger-hermetica-passive-read.txt'
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: hermetica-passive-audit-20260724
+          fetch-depth: 0
+
+      - name: Collect public read-only Hermetica evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf evidence/hermetica-passive
+          mkdir -p evidence/hermetica-passive
+
+          python3 - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          OUT = Path('evidence/hermetica-passive')
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          DEPLOYER = 'SP1S1HSFH0SQQGWKB69EYFNY0B1MHRMGXR3J1FH4D'
+          CONTRACTS = [
+              'airdrop-v1',
+              'hq-v1',
+              'state-hbtc-v1',
+              'token-hbtc',
+              'reserve-hbtc-v1',
+              'vault-hbtc-v1',
+              'vault-hbtc-v1-1',
+              'vault-hbtc-v1-2',
+              'controller-hbtc-v1',
+              'fee-collector-hbtc-v1',
+              'reserve-fund-hbtc-v1',
+              'trading-hbtc-v1',
+              'hermetica-interface-hbtc-v1',
+              'zest-interface-hbtc-v1',
+          ]
+          PRINCIPALS = [f'{DEPLOYER}.{name}' for name in CONTRACTS]
+          SBTC = 'SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token'
+
+          def request(method, url, payload=None, attempts=4):
+              data = None
+              headers = {
+                  'Accept': 'application/json',
+                  'User-Agent': 'zerodaybugs-hermetica-passive-audit/1.0',
+              }
+              if payload is not None:
+                  data = json.dumps(payload).encode('utf-8')
+                  headers['Content-Type'] = 'application/json'
+              last = None
+              for i in range(attempts):
+                  try:
+                      req = urllib.request.Request(url, data=data, headers=headers, method=method)
+                      with urllib.request.urlopen(req, timeout=45) as r:
+                          body = r.read().decode('utf-8', errors='replace')
+                          try:
+                              parsed = json.loads(body)
+                          except Exception:
+                              parsed = None
+                          return {
+                              'ok': True,
+                              'status': r.status,
+                              'url': url,
+                              'body': body,
+                              'json': parsed,
+                          }
+                  except urllib.error.HTTPError as e:
+                      body = e.read().decode('utf-8', errors='replace')
+                      last = {
+                          'ok': False,
+                          'status': e.code,
+                          'url': url,
+                          'body': body,
+                      }
+                      if e.code not in (408, 429, 500, 502, 503, 504):
+                          return last
+                  except Exception as e:
+                      last = {'ok': False, 'status': None, 'url': url, 'error': repr(e)}
+                  time.sleep(2 ** i)
+              return last
+
+          def save(name, value):
+              path = OUT / name
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(json.dumps(value, indent=2, sort_keys=True), encoding='utf-8')
+
+          manifest = {
+              'deployer': DEPLOYER,
+              'contracts': CONTRACTS,
+              'principals': PRINCIPALS,
+              'collection_mode': 'public read-only HTTP requests and isolated fork reads only',
+          }
+
+          # Exact immutable contract source, ABI/interface, metadata and parsed AST.
+          for name in CONTRACTS:
+              cid = f'{DEPLOYER}.{name}'
+              qcid = urllib.parse.quote(cid, safe='')
+              endpoints = {
+                  'hiro-source': f'https://api.hiro.so/v2/contracts/source/{DEPLOYER}/{name}?proof=0',
+                  'hiro-interface': f'https://api.hiro.so/v2/contracts/interface/{DEPLOYER}/{name}',
+                  'hiro-extended': f'https://api.hiro.so/extended/v1/contract/{qcid}',
+                  'stxer-ast': f'https://api.stxer.xyz/contracts/{qcid}',
+              }
+              for label, url in endpoints.items():
+                  save(f'contracts/{name}/{label}.json', request('GET', url))
+
+          # Contract balances and recent activity. These are passive index reads.
+          activity_contracts = [
+              'airdrop-v1', 'vault-hbtc-v1', 'vault-hbtc-v1-1', 'vault-hbtc-v1-2',
+              'hq-v1', 'state-hbtc-v1', 'reserve-hbtc-v1', 'token-hbtc',
+          ]
+          for name in activity_contracts:
+              principal = f'{DEPLOYER}.{name}'
+              qp = urllib.parse.quote(principal, safe='')
+              endpoints = {
+                  'balances': f'https://api.hiro.so/extended/v1/address/{qp}/balances',
+                  'transactions-v1': f'https://api.hiro.so/extended/v1/address/{qp}/transactions?limit=50&offset=0',
+                  'transactions-v2': f'https://api.hiro.so/extended/v2/addresses/{qp}/transactions?limit=50&offset=0',
+              }
+              for label, url in endpoints.items():
+                  save(f'activity/{name}/{label}.json', request('GET', url))
+
+          # Current role reachability and balances in an isolated fork. No transaction is broadcast.
+          session_result = request(
+              'POST',
+              'https://api.stxer.xyz/devtools/v2/simulations',
+              {'skip_tracing': True},
+          )
+          save('stxer/session-create.json', session_result)
+
+          session_id = None
+          if session_result and session_result.get('ok') and isinstance(session_result.get('json'), dict):
+              session_id = session_result['json'].get('id')
+
+          if session_id:
+              reads = []
+              hq = f'{DEPLOYER}.hq-v1'
+              state = f'{DEPLOYER}.state-hbtc-v1'
+              token = f'{DEPLOYER}.token-hbtc'
+              sender = 'SP000000000000000000002Q6VF78'
+
+              for principal in PRINCIPALS:
+                  for fn in ('get-protocol', 'get-trader', 'get-rewarder', 'get-manager', 'get-fee-setter', 'get-guardian'):
+                      reads.append({'EvalReadonly': [sender, '', hq, f'({fn} \'{principal})']})
+                  reads.append({'EvalReadonly': [sender, '', token, f'(get-balance \'{principal})']})
+                  reads.append({'EvalReadonly': [sender, '', SBTC, f'(get-balance \'{principal})']})
+
+              for expr in (
+                  '(get-owner)', '(get-protocol-enabled)', '(get-timelock)'
+              ):
+                  reads.append({'EvalReadonly': [sender, '', hq, expr]})
+
+              for expr in (
+                  '(get-total-assets)', '(get-net-assets)', '(get-pending)',
+                  '(get-claim-id)', '(get-share-price)', '(get-vault-enabled)',
+                  '(get-transfer-enabled)', '(get-deposit-enabled)',
+                  '(get-redeem-enabled)', '(get-request-redeem-enabled)',
+                  '(get-trading-enabled)', '(get-reward-enabled)'
+              ):
+                  reads.append({'EvalReadonly': [sender, '', state, expr]})
+
+              # Keep batches below common proxy/body limits.
+              all_results = []
+              for i in range(0, len(reads), 40):
+                  result = request(
+                      'POST',
+                      f'https://api.stxer.xyz/devtools/v2/simulations/{session_id}',
+                      {'steps': [{'Reads': reads[i:i+40]}]},
+                  )
+                  all_results.append({'offset': i, 'request': reads[i:i+40], 'response': result})
+              save('stxer/read-results.json', all_results)
+
+          save('manifest.json', manifest)
+          PY
+
+      - name: Commit collected evidence to the audit branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add evidence/hermetica-passive
+          if git diff --cached --quiet; then
+            echo 'No evidence changes to commit.'
+            exit 0
+          fi
+          git commit -m 'chore: capture passive Hermetica on-chain evidence [skip ci]'
+          git push origin HEAD:hermetica-passive-audit-20260724
