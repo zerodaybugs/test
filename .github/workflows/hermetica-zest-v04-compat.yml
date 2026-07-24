@@ -1,0 +1,295 @@
+name: Hermetica Zest v0.4 compatibility audit
+
+on:
+  push:
+    branches:
+      - hermetica-passive-audit-20260724
+    paths:
+      - '.github/workflows/hermetica-zest-v04-compat.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  audit-zest-v04:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: hermetica-passive-audit-20260724
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Extract and diff immutable v0.3 and v0.4 market sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf evidence/hermetica-zest-v04
+          mkdir -p evidence/hermetica-zest-v04
+          python3 - <<'PY'
+          import difflib
+          import json
+          import re
+          import urllib.request
+          from pathlib import Path
+
+          out = Path('evidence/hermetica-zest-v04')
+          deployer = 'SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7'
+
+          def fetch_source(name):
+              url = f'https://api.hiro.so/v2/contracts/source/{deployer}/{name}?proof=0'
+              req = urllib.request.Request(url, headers={'Accept': 'application/json', 'User-Agent': 'zerodaybugs-zest-v04-compat/1.0'})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.loads(response.read().decode())['source']
+
+          v03 = fetch_source('v0-3-market')
+          v04 = fetch_source('v0-4-market')
+          (out / 'v0-3-market.clar').write_text(v03, encoding='utf-8')
+          (out / 'v0-4-market.clar').write_text(v04, encoding='utf-8')
+
+          diff = ''.join(difflib.unified_diff(
+              v03.splitlines(keepends=True),
+              v04.splitlines(keepends=True),
+              fromfile='v0-3-market.clar',
+              tofile='v0-4-market.clar',
+              n=6,
+          ))
+          (out / 'v0-3-to-v0-4.diff').write_text(diff, encoding='utf-8')
+
+          def extract_form(source, marker):
+              start = source.find(marker)
+              if start < 0:
+                  return None
+              depth = 0
+              in_string = False
+              escaped = False
+              for i in range(start, len(source)):
+                  ch = source[i]
+                  if in_string:
+                      if escaped:
+                          escaped = False
+                      elif ch == '\\':
+                          escaped = True
+                      elif ch == '"':
+                          in_string = False
+                      continue
+                  if ch == '"':
+                      in_string = True
+                  elif ch == '(':
+                      depth += 1
+                  elif ch == ')':
+                      depth -= 1
+                      if depth == 0:
+                          return source[start:i+1]
+              return source[start:]
+
+          functions = [
+              'collateral-add', 'collateral-remove', 'supply-collateral-add',
+              'collateral-remove-redeem', 'borrow', 'repay', 'liquidate',
+          ]
+          function_summary = {}
+          for fn in functions:
+              marker = f'(define-public ({fn}'
+              a = extract_form(v03, marker)
+              b = extract_form(v04, marker)
+              function_summary[fn] = {
+                  'present_v03': a is not None,
+                  'present_v04': b is not None,
+                  'identical': a == b,
+                  'v03_lines': 0 if a is None else len(a.splitlines()),
+                  'v04_lines': 0 if b is None else len(b.splitlines()),
+              }
+              if a is not None:
+                  (out / f'{fn}.v03.clar').write_text(a, encoding='utf-8')
+              if b is not None:
+                  (out / f'{fn}.v04.clar').write_text(b, encoding='utf-8')
+              if a is not None and b is not None and a != b:
+                  fdiff = ''.join(difflib.unified_diff(
+                      a.splitlines(keepends=True), b.splitlines(keepends=True),
+                      fromfile=f'{fn}.v03', tofile=f'{fn}.v04', n=6,
+                  ))
+                  (out / f'{fn}.diff').write_text(fdiff, encoding='utf-8')
+
+          public_sig = re.compile(r'\(define-public\s+\(([^\s()]+)([^\n]*)')
+          sig03 = public_sig.findall(v03)
+          sig04 = public_sig.findall(v04)
+          summary = {
+              'sources_identical': v03 == v04,
+              'v03_bytes': len(v03.encode()),
+              'v04_bytes': len(v04.encode()),
+              'diff_lines': len(diff.splitlines()),
+              'functions': function_summary,
+              'public_function_names_v03': [x[0] for x in sig03],
+              'public_function_names_v04': [x[0] for x in sig04],
+              'public_names_added': sorted(set(x[0] for x in sig04) - set(x[0] for x in sig03)),
+              'public_names_removed': sorted(set(x[0] for x in sig03) - set(x[0] for x in sig04)),
+          }
+          (out / 'source-diff-summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True), encoding='utf-8')
+          PY
+
+      - name: Install isolated fork tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/hermetica-zest-v04-node
+          mkdir -p /tmp/hermetica-zest-v04-node
+          cd /tmp/hermetica-zest-v04-node
+          npm init -y >/dev/null 2>&1
+          npm install --no-save stxer @stacks/transactions >/dev/null 2>&1
+
+      - name: Run production-fork compatibility calls
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/hermetica-zest-v04-node
+          GITHUB_WORKSPACE="$GITHUB_WORKSPACE" node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { Cl, cvToString, deserializeCV } from '@stacks/transactions';
+          import {
+            callContract,
+            createSimulationSession,
+            ftPrincipal,
+            getFtBalance,
+            getSimulationTip,
+            submitSimulationSteps,
+          } from 'stxer';
+
+          const workspace = process.env.GITHUB_WORKSPACE;
+          const outDir = path.join(workspace, 'evidence', 'hermetica-zest-v04');
+          const API_OPTIONS = { stxerApi: 'https://api.stxer.xyz' };
+          const DEPLOYER = 'SP1S1HSFH0SQQGWKB69EYFNY0B1MHRMGXR3J1FH4D';
+          const INTERFACE = `${DEPLOYER}.zest-interface-hbtc-v1`;
+          const RESERVE = `${DEPLOYER}.reserve-hbtc-v1`;
+          const MARKET03 = 'SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-3-market';
+          const MARKET04 = 'SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-4-market';
+          const MARKET_VAULT = 'SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-market-vault';
+          const SBTC = 'SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token';
+          const TRADER = 'SM1QXYXZG78DCWJZJKY0901KTK3350071W9YYRPMT';
+
+          const stringify = value => JSON.stringify(value, (_, v) => typeof v === 'bigint' ? v.toString() : v, 2);
+          const save = (name, value) => fs.writeFileSync(path.join(outDir, name), stringify(value));
+
+          function decodeReadStep(step) {
+            const reads = step?.Reads;
+            if (!Array.isArray(reads)) return step;
+            return reads.map(item => {
+              if (item?.Ok) {
+                const cv = deserializeCV(item.Ok);
+                return { wire: item, repr: cvToString(cv, 'tryAscii') };
+              }
+              return { wire: item };
+            });
+          }
+
+          async function snapshot(sessionId, label) {
+            const reads = await submitSimulationSteps(sessionId, {
+              steps: [{ Reads: [
+                { EvalReadonly: [TRADER, '', MARKET03, `(get-position '${INTERFACE})`] },
+                { EvalReadonly: [TRADER, '', MARKET04, `(get-position '${INTERFACE})`] },
+                { EvalReadonly: [TRADER, '', MARKET03, `(get-full-position '${INTERFACE})`] },
+                { EvalReadonly: [TRADER, '', MARKET04, `(get-full-position '${INTERFACE})`] },
+              ] }],
+            }, API_OPTIONS);
+            const balances = {
+              reserveSbtc: await getFtBalance(sessionId, SBTC, RESERVE, API_OPTIONS),
+              interfaceSbtc: await getFtBalance(sessionId, SBTC, INTERFACE, API_OPTIONS),
+              marketVaultSbtc: await getFtBalance(sessionId, SBTC, MARKET_VAULT, API_OPTIONS),
+            };
+            return { label, tip: await getSimulationTip(sessionId, API_OPTIONS), reads: decodeReadStep(reads.steps[0]), balances };
+          }
+
+          async function freshSession() {
+            return createSimulationSession({ skip_tracing: true }, API_OPTIONS);
+          }
+
+          const report = { generatedAt: new Date().toISOString(), scenarios: [] };
+
+          // Scenario 1: add one sat of canonical sBTC collateral through Hermetica into active v0.4.
+          {
+            const sessionId = await freshSession();
+            const before = await snapshot(sessionId, 'before-v04-collateral-add');
+            const receipt = await callContract(sessionId, {
+              sender: TRADER,
+              contract: INTERFACE,
+              functionName: 'zest-collateral-add',
+              functionArgs: [
+                ftPrincipal(MARKET04),
+                ftPrincipal(SBTC),
+                Cl.uint(1),
+                Cl.none(),
+                Cl.none(),
+              ],
+              fee: 500_000,
+            }, API_OPTIONS);
+            const after = await snapshot(sessionId, 'after-v04-collateral-add');
+            report.scenarios.push({ name: 'active-v04-collateral-add-1-sat', sessionId, before, receipt, after });
+          }
+
+          // Scenario 2: the deactivated v0.3 address must fail Hermetica's State external check.
+          {
+            const sessionId = await freshSession();
+            const before = await snapshot(sessionId, 'before-v03-negative-control');
+            const receipt = await callContract(sessionId, {
+              sender: TRADER,
+              contract: INTERFACE,
+              functionName: 'zest-collateral-add',
+              functionArgs: [
+                ftPrincipal(MARKET03),
+                ftPrincipal(SBTC),
+                Cl.uint(1),
+                Cl.none(),
+                Cl.none(),
+              ],
+              fee: 500_000,
+            }, API_OPTIONS);
+            const after = await snapshot(sessionId, 'after-v03-negative-control');
+            report.scenarios.push({ name: 'inactive-v03-negative-control', sessionId, before, receipt, after });
+          }
+
+          // Scenario 3: add and then remove one sat on v0.4 to verify return and recipient semantics.
+          {
+            const sessionId = await freshSession();
+            const before = await snapshot(sessionId, 'before-v04-roundtrip');
+            const add = await callContract(sessionId, {
+              sender: TRADER,
+              contract: INTERFACE,
+              functionName: 'zest-collateral-add',
+              functionArgs: [ftPrincipal(MARKET04), ftPrincipal(SBTC), Cl.uint(1), Cl.none(), Cl.none()],
+              fee: 500_000,
+            }, API_OPTIONS);
+            let remove = null;
+            if (add.vmError == null && typeof add.result === 'string' && add.result.startsWith('(ok ')) {
+              remove = await callContract(sessionId, {
+                sender: TRADER,
+                contract: INTERFACE,
+                functionName: 'zest-collateral-remove',
+                functionArgs: [ftPrincipal(MARKET04), ftPrincipal(SBTC), Cl.uint(1), Cl.none(), Cl.none()],
+                fee: 500_000,
+              }, API_OPTIONS);
+            }
+            const after = await snapshot(sessionId, 'after-v04-roundtrip');
+            report.scenarios.push({ name: 'active-v04-add-remove-roundtrip', sessionId, before, add, remove, after });
+          }
+
+          save('fork-compatibility-report.json', report);
+          JS
+
+      - name: Commit Zest v0.4 audit evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add evidence/hermetica-zest-v04
+          if git diff --cached --quiet; then
+            echo 'No Zest v0.4 evidence changes.'
+            exit 0
+          fi
+          git commit -m 'chore: audit Hermetica against active Zest v0.4 [skip ci]'
+          git push origin HEAD:hermetica-passive-audit-20260724
