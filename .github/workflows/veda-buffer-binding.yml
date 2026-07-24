@@ -1,0 +1,183 @@
+name: veda-buffer-binding
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Query live Ink buffer bindings
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import time
+          import urllib.request
+
+          RPCS = [
+              "https://rpc-gel.inkonchain.com",
+              "https://rpc-qnd.inkonchain.com",
+              "https://ink.drpc.org",
+          ]
+
+          def request(endpoint, method, params):
+              payload = json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
+              req = urllib.request.Request(
+                  endpoint,
+                  data=payload,
+                  method="POST",
+                  headers={"content-type":"application/json","user-agent":"veda-buffer-readonly/1.0"},
+              )
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  result = json.loads(response.read().decode())
+              if "error" in result:
+                  raise RuntimeError(result["error"])
+              return result["result"]
+
+          endpoint = None
+          failures = {}
+          for candidate in RPCS:
+              try:
+                  if int(request(candidate, "eth_chainId", []), 16) != 57073:
+                      raise RuntimeError("wrong chain")
+                  endpoint = candidate
+                  break
+              except Exception as exc:
+                  failures[candidate] = repr(exc)
+          if endpoint is None:
+              raise RuntimeError(failures)
+
+          block = request(endpoint, "eth_blockNumber", [])
+
+          def strip0(value): return value[2:] if value.startswith("0x") else value
+          def aw(address): return strip0(address).lower().rjust(64, "0")
+          def call(to, data): return request(endpoint, "eth_call", [{"to":to,"data":data}, block])
+          def address(raw): return "0x" + strip0(raw)[-40:]
+          def words(raw):
+              value = strip0(raw)
+              return [value[i:i+64] for i in range(0, len(value), 64)] if value else []
+          def safe(fn):
+              try: return fn()
+              except Exception as exc: return {"error":repr(exc)}
+
+          CURRENT_BUFFER = "c8285411"
+          ALLOWED_BUFFER = "a905ffb5"
+          VAULT = "fbfa77cf"
+          POOL = "86a06ff0"
+          AUTHORITY = "bf7e214f"
+          OWNER = "8da5cb5b"
+          ALLOWANCE = "dd62ed3e"
+
+          USDC = "0x2D270e6886d130D724215A266106e6832161EAEd"
+          USDT0 = "0x0200C29006150606B650577BBE7B6248F58470c1"
+          LEGACY_HELPER = "0xC2867bd44E58B43e74859cbd1c320477b3ca9f33"
+          REGISTRY_HELPERS = {
+              "balanced_registry": "0xc11c44c8b44355c41d7E7f88f07e9EA5b9625Eb4",
+              "boosted_registry": "0x1bAb9A7d8b56C2c67889466cc6dca6F5821f6dc7",
+          }
+          PRODUCTS = {
+              "balanced": {
+                  "vault":"0xcaae49fb7f74cCFBE8A05E6104b01c097a78789f",
+                  "teller":"0xC151E263d5c890FD0Bceb33a6525F1A76a8329fC",
+              },
+              "boosted": {
+                  "vault":"0xDbD87325D7b1189Dcc9255c4926076fF4a96A271",
+                  "teller":"0xc46f2443b3521632E2E2a903D6da8f965B46f6a0",
+              },
+          }
+
+          helper_addresses = {"legacy_scope": LEGACY_HELPER, **REGISTRY_HELPERS}
+          output = {
+              "queried_at_unix": int(time.time()),
+              "endpoint": endpoint,
+              "block": int(block, 16),
+              "helpers": {},
+              "products": {},
+          }
+
+          for label, helper in helper_addresses.items():
+              pool = safe(lambda helper=helper: address(call(helper, "0x"+POOL)))
+              helper_vault = safe(lambda helper=helper: address(call(helper, "0x"+VAULT)))
+              output["helpers"][label] = {
+                  "address": helper.lower(),
+                  "code_bytes": safe(lambda helper=helper: (len(request(endpoint, "eth_getCode", [helper, block]))-2)//2),
+                  "vault": helper_vault,
+                  "pool": pool,
+                  "owner": safe(lambda helper=helper: address(call(helper, "0x"+OWNER))),
+                  "authority": safe(lambda helper=helper: address(call(helper, "0x"+AUTHORITY))),
+              }
+
+          for name, config in PRODUCTS.items():
+              teller = config["teller"]
+              entry = {
+                  "vault": config["vault"].lower(),
+                  "teller": teller.lower(),
+                  "teller_vault": safe(lambda teller=teller: address(call(teller, "0x"+VAULT))),
+                  "assets": {},
+              }
+              for asset_name, asset in {"USDC":USDC,"USDT0":USDT0}.items():
+                  raw = safe(lambda teller=teller, asset=asset: call(teller, "0x"+CURRENT_BUFFER+aw(asset)))
+                  if isinstance(raw, str):
+                      ws = words(raw)
+                      deposit_helper = "0x" + ws[0][-40:] if len(ws) > 0 else None
+                      withdraw_helper = "0x" + ws[1][-40:] if len(ws) > 1 else None
+                  else:
+                      deposit_helper = withdraw_helper = raw
+                  asset_entry = {
+                      "address": asset.lower(),
+                      "deposit_helper": deposit_helper,
+                      "withdraw_helper": withdraw_helper,
+                      "allowlist": {},
+                  }
+                  for helper_label, helper in helper_addresses.items():
+                      data = "0x"+ALLOWED_BUFFER+aw(asset)+aw(helper)
+                      asset_entry["allowlist"][helper_label] = safe(lambda teller=teller, data=data: bool(int(call(teller, data),16)))
+                  entry["assets"][asset_name] = asset_entry
+              output["products"][name] = entry
+
+          for helper_label, helper_entry in output["helpers"].items():
+              pool = helper_entry["pool"]
+              if not isinstance(pool, str):
+                  continue
+              helper_entry["vault_allowances"] = {}
+              for product_name, product in PRODUCTS.items():
+                  helper_entry["vault_allowances"][product_name] = {}
+                  for asset_name, asset in {"USDC":USDC,"USDT0":USDT0}.items():
+                      data = "0x"+ALLOWANCE+aw(product["vault"])+aw(pool)
+                      helper_entry["vault_allowances"][product_name][asset_name] = safe(
+                          lambda asset=asset, data=data: int(call(asset, data),16)
+                      )
+
+          with open("veda-buffer-binding.json", "w", encoding="utf-8") as handle:
+              json.dump(output, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+
+          print(json.dumps({
+              "block": output["block"],
+              "helpers": {name:{"vault":data["vault"],"pool":data["pool"]} for name,data in output["helpers"].items()},
+              "bindings": {
+                  product: {
+                      asset: {
+                          "deposit": data["deposit_helper"],
+                          "withdraw": data["withdraw_helper"],
+                      }
+                      for asset, data in product_data["assets"].items()
+                  }
+                  for product, product_data in output["products"].items()
+              },
+          }, indent=2, sort_keys=True))
+          PY
+
+      - name: Upload buffer binding result
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-buffer-binding
+          path: veda-buffer-binding.json
+          if-no-files-found: error
+          retention-days: 1
