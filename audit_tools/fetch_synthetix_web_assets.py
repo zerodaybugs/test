@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Passively collect same-origin public web assets for static review.
 
-No crawling beyond static assets embedded in the three in-scope landing pages,
-no form submissions, no authentication, and no state-changing requests.
+No crawling beyond static assets explicitly embedded in the three in-scope
+landing pages, no form submissions, no authentication, and no state-changing
+requests.
 """
 
 from __future__ import annotations
@@ -40,6 +41,10 @@ class AssetParser(HTMLParser):
             href = values["href"] or ""
             if any(kind in rel for kind in ("modulepreload", "preload", "stylesheet")) or href.endswith((".js", ".mjs")):
                 self.urls.add(href)
+        # Astro hydrates client islands from these explicit static module URLs.
+        for attribute in ("component-url", "renderer-url", "before-hydration-url"):
+            if values.get(attribute):
+                self.urls.add(values[attribute] or "")
 
 
 def fetch(url: str) -> tuple[bytes, dict[str, str], int]:
