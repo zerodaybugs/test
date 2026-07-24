@@ -1,0 +1,133 @@
+name: veda-crosschain-limit-consistency
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Verify peer rate-limit consistency
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import time
+          import urllib.request
+
+          CHAINS={
+            "ethereum":{"id":1,"eid":30101,"rpcs":["https://ethereum-rpc.publicnode.com","https://eth.drpc.org","https://rpc.mevblocker.io"]},
+            "optimism":{"id":10,"eid":30111,"rpcs":["https://optimism-rpc.publicnode.com","https://mainnet.optimism.io","https://optimism.drpc.org"]},
+            "scroll":{"id":534352,"eid":30214,"rpcs":["https://rpc.scroll.io","https://scroll-rpc.publicnode.com","https://scroll.drpc.org"]},
+          }
+          TELLERS={
+            "liquidBTC":"0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353",
+            "liquidETH":"0x9AA79C84b79816ab920bBcE20f8f74557B514734",
+            "liquidUSD":"0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387",
+          }
+          VAULTS={
+            "liquidBTC":"0x5f46d540b6eD704C3c8789105F30E075AA900726",
+            "liquidETH":"0xf0bb20865277aBd641a307eCe5Ee04E79073416C",
+            "liquidUSD":"0x08c6F91e2B681FaF5e17227F2a44C307b3C1364C",
+          }
+          ATTACKER="0x1111111111111111111111111111111111111111"
+
+          def request(ep,method,params,timeout=35):
+            body=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
+            req=urllib.request.Request(ep,data=body,method="POST",headers={"content-type":"application/json","user-agent":"veda-limit-consistency/1.0"})
+            with urllib.request.urlopen(req,timeout=timeout) as r:o=json.loads(r.read().decode())
+            if "error" in o:raise RuntimeError(o["error"])
+            return o["result"]
+          def choose(c):
+            bad={}
+            for ep in c["rpcs"]:
+              try:
+                if int(request(ep,"eth_chainId",[]),16)==c["id"]:return ep
+              except Exception as e:bad[ep]=repr(e)
+            raise RuntimeError(bad)
+          def sig(s):return subprocess.check_output(["cast","sig",s],text=True).strip()
+          def strip0(x):return x[2:] if x.startswith("0x") else x
+          def aw(a):return strip0(a).lower().rjust(64,"0")
+          def sw(s):return strip0(s).lower().ljust(64,"0")
+          def uw(n):return hex(n)[2:].rjust(64,"0")
+          def words(x):
+            h=strip0(x);return [int(h[i:i+64],16) for i in range(0,len(h),64)] if h else []
+          def addr(x):return "0x"+strip0(x)[-40:]
+          def boolean(x):return bool(int(x,16))
+
+          S={"idToChains":sig("idToChains(uint32)"),"peers":sig("peers(uint32)"),"outbound":sig("outboundRateLimits(uint32)"),"inbound":sig("inboundRateLimits(uint32)"),"canSend":sig("getAmountCanBeSent(uint32)"),"canReceive":sig("getAmountCanBeReceived(uint32)"),"authority":sig("authority()"),"bridge":sig("bridge(uint96,address,bytes,address,uint256)"),"totalSupply":sig("totalSupply()"),"decimals":sig("decimals()")}
+          PUBLIC="0x2f47571f";CAN="0xb7009613"
+          selected={name:choose(c) for name,c in CHAINS.items()}
+          snapshots={}
+          for name,c in CHAINS.items():
+            ep=selected[name];block=request(ep,"eth_blockNumber",[])
+            snapshots[name]={"endpoint":ep,"block":int(block,16),"products":{}}
+            def call(to,data):return request(ep,"eth_call",[{"to":to,"data":data},block])
+            for prod,teller in TELLERS.items():
+              code=request(ep,"eth_getCode",[teller,block])
+              vault=VAULTS[prod]
+              auth=addr(call(teller,S["authority"])) if len(code)>2 else None
+              bridge_public=boolean(call(auth,PUBLIC+aw(teller)+sw(S["bridge"]))) if auth else None
+              bridge_attacker=boolean(call(auth,CAN+aw(ATTACKER)+aw(teller)+sw(S["bridge"]))) if auth else None
+              snapshots[name]["products"][prod]={
+                "teller":teller.lower(),"code_bytes":max(0,(len(code)-2)//2),"authority":auth,"bridge_public":bridge_public,"bridge_attacker":bridge_attacker,
+                "vault":vault.lower(),"vault_decimals":int(call(vault,S["decimals"]),16),"vault_total_supply":int(call(vault,S["totalSupply"]),16),"peers":{}
+              }
+              for remote,rc in CHAINS.items():
+                if remote==name:continue
+                eid=rc["eid"]
+                try:
+                  chainw=words(call(teller,S["idToChains"]+uw(eid)))
+                  peer=call(teller,S["peers"]+uw(eid))
+                  outw=words(call(teller,S["outbound"]+uw(eid)))
+                  inw=words(call(teller,S["inbound"]+uw(eid)))
+                  can_send=words(call(teller,S["canSend"]+uw(eid)))
+                  can_recv=words(call(teller,S["canReceive"]+uw(eid)))
+                  snapshots[name]["products"][prod]["peers"][remote]={"eid":eid,"chain_words":chainw,"peer":peer,"outbound_words":outw,"inbound_words":inw,"get_amount_can_send":can_send,"get_amount_can_receive":can_recv}
+                except Exception as e:
+                  snapshots[name]["products"][prod]["peers"][remote]={"eid":eid,"error":repr(e)}
+
+          comparisons=[]
+          for source in CHAINS:
+            for dest in CHAINS:
+              if source==dest:continue
+              for prod in TELLERS:
+                s=snapshots[source]["products"][prod]["peers"][dest]
+                d=snapshots[dest]["products"][prod]["peers"][source]
+                if "error" in s or "error" in d:continue
+                source_out_limit=s["outbound_words"][2]
+                dest_in_limit=d["inbound_words"][2]
+                source_can_send=s["get_amount_can_send"][1]
+                dest_can_receive=d["get_amount_can_receive"][1]
+                comparisons.append({
+                  "source":source,"destination":dest,"product":prod,
+                  "source_outbound_limit":source_out_limit,"destination_inbound_limit":dest_in_limit,
+                  "limit_delta":source_out_limit-dest_in_limit,
+                  "source_amount_can_send":source_can_send,"destination_amount_can_receive":dest_can_receive,
+                  "current_capacity_delta":source_can_send-dest_can_receive,
+                  "permanently_undeliverable_amount_exists":source_out_limit>dest_in_limit,
+                  "temporarily_undeliverable_amount_exists":source_can_send>dest_can_receive,
+                  "source_bridge_public":snapshots[source]["products"][prod]["bridge_public"],
+                  "source_total_supply":snapshots[source]["products"][prod]["vault_total_supply"],
+                  "source_decimals":snapshots[source]["products"][prod]["vault_decimals"],
+                })
+          result={"queried_at_unix":int(time.time()),"chains":snapshots,"comparisons":comparisons,"permanent_mismatches":[x for x in comparisons if x["permanently_undeliverable_amount_exists"]],"temporary_mismatches":[x for x in comparisons if x["temporarily_undeliverable_amount_exists"]]}
+          with open("veda-crosschain-limit-consistency.json","w",encoding="utf-8") as f:json.dump(result,f,indent=2,sort_keys=True);f.write("\n")
+          print(json.dumps({"comparisons":comparisons,"permanent_mismatches":result["permanent_mismatches"],"temporary_mismatches":result["temporary_mismatches"]},indent=2,sort_keys=True))
+          PY
+      - name: Upload consistency proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-crosschain-limit-consistency
+          path: veda-crosschain-limit-consistency.json
+          if-no-files-found: error
+          retention-days: 1
