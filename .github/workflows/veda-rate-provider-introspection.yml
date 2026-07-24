@@ -1,0 +1,109 @@
+name: veda-rate-provider-introspection
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Introspect live rate providers and targets
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import time
+          import urllib.request
+
+          CHAINS={
+            "ethereum":{"id":1,"rpcs":["https://ethereum-rpc.publicnode.com","https://eth.llamarpc.com"],"providers":{
+              "liquidBTC_LBTC":"0x94916a66fc119a0ac7d612927f0d909cac15314c",
+              "liquidETH_weETH":"0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee",
+              "liquidETH_wstETH":"0x8a4207bfc6fc475f172f929468acdd4a2c4c3c19"}},
+            "scroll":{"id":534352,"rpcs":["https://scroll-rpc.publicnode.com","https://rpc.scroll.io","https://scroll.drpc.org"],"providers":{
+              "liquidBTC_eBTC":"0x1b293dc39f94157fa0d1d36d7e0090c8b8b8c13f",
+              "liquidETH_weETH":"0xe8cdf5630b2d6cd3214118f82c4f6dd4297d22b4"}},
+            "optimism":{"id":10,"rpcs":["https://optimism-rpc.publicnode.com","https://mainnet.optimism.io","https://optimism.drpc.org"],"providers":{
+              "weETH_exchange_feed":"0x72ec6bf88effed88290c66dcf1be2321d80502f5"}},
+          }
+          SIGS={x:subprocess.check_output(["cast","sig",x+"()"],text=True).strip() for x in [
+            "getRate","target","selector","signed","inputDecimals","outputDecimals",
+            "staticArgument0","staticArgument1","staticArgument2","staticArgument3","staticArgument4","staticArgument5","staticArgument6","staticArgument7",
+            "decimals","name","symbol","owner","authority","vault","base","accountant","totalSupply","totalAssets","latestAnswer","latestRoundData"]}
+          def req(ep,m,p,attempts=4):
+            body=json.dumps({"jsonrpc":"2.0","id":1,"method":m,"params":p}).encode(); last=None
+            for i in range(attempts):
+              try:
+                q=urllib.request.Request(ep,data=body,method="POST",headers={"content-type":"application/json","user-agent":"veda-rate-provider-introspection/1.0"})
+                with urllib.request.urlopen(q,timeout=45) as r:d=json.loads(r.read().decode())
+                if "error" in d: raise RuntimeError(d["error"])
+                return d["result"]
+              except Exception as exc:last=exc;time.sleep(i+1)
+            raise RuntimeError(repr(last))
+          def choose(c):
+            errors={}
+            for ep in c["rpcs"]:
+              try:
+                if int(req(ep,"eth_chainId",[]),16)==c["id"]:return ep,errors
+              except Exception as exc:errors[ep]=repr(exc)
+            raise RuntimeError(errors)
+          def call(ep,to,data):return req(ep,"eth_call",[{"to":to,"data":data},"latest"])
+          def addr(raw):return "0x"+raw[2:][-40:] if raw not in ("0x",None) else None
+          def uint(raw):return int(raw,16) if raw not in ("0x",None) else None
+          def text(raw):
+            x=raw[2:]
+            try:o=int(x[:64],16)*2;n=int(x[o:o+64],16);return bytes.fromhex(x[o+64:o+64+n*2]).decode(errors="replace")
+            except Exception:
+              try:return bytes.fromhex(x[:64]).rstrip(b"\0").decode(errors="replace")
+              except Exception:return None
+          out={"generated_at_unix":int(time.time()),"chains":{},"selectors":SIGS}
+          for cn,c in CHAINS.items():
+            ep,errs=choose(c); co={"endpoint":ep,"block":int(req(ep,"eth_blockNumber",[]),16),"rpc_errors":errs,"providers":{}}
+            for label,p in c["providers"].items():
+              code=req(ep,"eth_getCode",[p,"latest"]); po={"address":p,"code_bytes":len(code[2:])//2,"calls":{}}
+              for fn,s in SIGS.items():
+                try:
+                  raw=call(ep,p,s)
+                  if fn in ("target","owner","authority","vault","base","accountant"):value=addr(raw)
+                  elif fn in ("name","symbol"):value=text(raw)
+                  else:value=uint(raw)
+                  po["calls"][fn]={"raw":raw,"value":value}
+                except Exception as exc:po["calls"][fn]={"error":repr(exc)}
+              target=po["calls"].get("target",{}).get("value")
+              selector_value=po["calls"].get("selector",{}).get("value")
+              if target:
+                tc=req(ep,"eth_getCode",[target,"latest"]); po["target"]={"address":target,"code_bytes":len(tc[2:])//2,"calls":{}}
+                for fn in ("name","symbol","decimals","owner","authority","vault","base","accountant","totalSupply","totalAssets","getRate","latestAnswer","latestRoundData"):
+                  try:
+                    raw=call(ep,target,SIGS[fn]); value=addr(raw) if fn in ("owner","authority","vault","base","accountant") else text(raw) if fn in ("name","symbol") else uint(raw)
+                    po["target"]["calls"][fn]={"raw":raw,"value":value}
+                  except Exception as exc:po["target"]["calls"][fn]={"error":repr(exc)}
+                if selector_value is not None:
+                  selector_hex="0x"+selector_value.to_bytes(32,"big")[:4].hex()
+                  po["target"]["configured_selector"]=selector_hex
+                  args="".join((po["calls"].get(f"staticArgument{i}",{}).get("raw") or "0x"+"00"*32)[2:] for i in range(8))
+                  try:po["target"]["configured_call_raw"]=call(ep,target,selector_hex+args)
+                  except Exception as exc:po["target"]["configured_call_error"]=repr(exc)
+                  try:po["target"]["selector_signature_candidates"]=subprocess.check_output(["cast","4byte",selector_hex],text=True,stderr=subprocess.STDOUT,timeout=20).strip().splitlines()
+                  except Exception as exc:po["target"]["selector_signature_candidates"]=[repr(exc)]
+              co["providers"][label]=po
+            out["chains"][cn]=co
+          with open("veda-rate-provider-introspection.json","w") as f:json.dump(out,f,indent=2,sort_keys=True);f.write("\n")
+          print(json.dumps({cn:{label:{"provider":p["address"],"rate":p["calls"].get("getRate",{}).get("value"),"target":p.get("target",{}).get("address"),"selector":p.get("target",{}).get("configured_selector"),"candidates":p.get("target",{}).get("selector_signature_candidates")} for label,p in co["providers"].items()} for cn,co in out["chains"].items()},indent=2,sort_keys=True))
+          PY
+      - name: Upload rate provider introspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-rate-provider-introspection
+          path: veda-rate-provider-introspection.json
+          if-no-files-found: error
+          retention-days: 1
