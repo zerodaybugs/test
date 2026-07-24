@@ -1,0 +1,148 @@
+name: veda-rate-sync-history
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Reconstruct cross-chain rate update ordering
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import time
+          import urllib.parse
+          import urllib.request
+
+          CHAINS = {1:"ethereum", 10:"optimism", 534352:"scroll"}
+          PRODUCTS = {
+              "liquidBTC":"0xea23ac6d7d11f6b181d6b98174d334478adae6b0",
+              "liquidETH":"0x0d05d94a5f1e76c18fbeb7a13d17c8a314088198",
+              "liquidUSD":"0xc315d6e14ddcdc7407784e2caf815d131bc1d3e7",
+          }
+
+          def sig(text): return subprocess.check_output(["cast","keccak",text],text=True).strip().lower()
+          TOPIC = sig("ExchangeRateUpdated(uint96,uint96,uint64)")
+
+          def get_json(url, attempts=5):
+              last=None
+              for i in range(attempts):
+                  try:
+                      req=urllib.request.Request(url,headers={"accept":"application/json","user-agent":"veda-rate-sync-history/1.0"})
+                      with urllib.request.urlopen(req,timeout=60) as r:
+                          return json.loads(r.read().decode())
+                  except Exception as exc:
+                      last=exc; time.sleep(1+i*2)
+              raise RuntimeError({"url":url,"error":repr(last)})
+
+          def logs(chain_id,address):
+              out=[]
+              for page in range(1,101):
+                  params=urllib.parse.urlencode({
+                      "module":"logs","action":"getLogs","address":address,"fromBlock":0,"toBlock":"latest",
+                      "topic0":TOPIC,"page":page,"offset":1000,
+                  })
+                  url=f"https://api.routescan.io/v2/network/mainnet/evm/{chain_id}/etherscan/api?{params}"
+                  d=get_json(url); result=d.get("result")
+                  if isinstance(result,str):
+                      if d.get("status")=="0" or "No records" in result: break
+                      raise RuntimeError(d)
+                  if not result: break
+                  out.extend(result)
+                  if len(result)<1000: break
+                  time.sleep(.55)
+              return out
+
+          def iv(v):
+              if isinstance(v,int): return v
+              return int(v,16) if str(v).startswith("0x") else int(v)
+          def words(data):
+              x=data[2:] if data.startswith("0x") else data
+              return [int(x[i:i+64],16) for i in range(0,len(x),64)]
+
+          output={"topic":TOPIC,"chains":{},"products":{},"generated_at_unix":int(time.time())}
+          by_product={p:{} for p in PRODUCTS}
+          for chain_id,chain_name in CHAINS.items():
+              output["chains"][chain_name]={}
+              for product,address in PRODUCTS.items():
+                  raw=logs(chain_id,address)
+                  events=[]
+                  for log in raw:
+                      if not log.get("topics") or log["topics"][0].lower()!=TOPIC: continue
+                      w=words(log.get("data","0x"))
+                      if len(w)<3: continue
+                      events.append({
+                          "block":iv(log.get("blockNumber",0)),
+                          "log_index":iv(log.get("logIndex",0)),
+                          "tx":log.get("transactionHash"),
+                          "timestamp":iv(log.get("timeStamp",w[2])),
+                          "old_rate":w[0],"new_rate":w[1],"event_time":w[2],
+                      })
+                  events.sort(key=lambda e:(e["timestamp"],e["block"],e["log_index"]))
+                  output["chains"][chain_name][product]={"address":address,"events":events,"count":len(events)}
+                  by_product[product][chain_name]=events
+
+          for product,chains in by_product.items():
+              eth=chains.get("ethereum",[]); scroll=chains.get("scroll",[]); optimism=chains.get("optimism",[])
+              def state_at(events,ts):
+                  rate=None; event=None
+                  for e in events:
+                      if e["timestamp"]<=ts: rate=e["new_rate"]; event=e
+                      else: break
+                  return rate,event
+              matches=[]; windows=[]
+              all_rates=sorted(set(e["new_rate"] for es in chains.values() for e in es))
+              for rate in all_rates:
+                  rows={name:next((e for e in events if e["new_rate"]==rate),None) for name,events in chains.items()}
+                  matches.append({"rate":rate,"events":rows})
+              for ee in eth:
+                  sr,se=state_at(scroll,ee["timestamp"])
+                  orate,oe=state_at(optimism,ee["timestamp"])
+                  if sr and ee["new_rate"]>sr:
+                      catch=next((x for x in scroll if x["timestamp"]>=ee["timestamp"] and x["new_rate"]>=ee["new_rate"]),None)
+                      windows.append({
+                          "direction":"scroll_to_ethereum","ethereum_update":ee,"source_rate":sr,"source_state_event":se,
+                          "close_event":catch,"duration_seconds":None if not catch else catch["timestamp"]-ee["timestamp"],
+                          "gross_profit_bps":(ee["new_rate"]-sr)*10000/sr,
+                      })
+                  if orate and ee["new_rate"]>orate:
+                      catch=next((x for x in optimism if x["timestamp"]>=ee["timestamp"] and x["new_rate"]>=ee["new_rate"]),None)
+                      windows.append({
+                          "direction":"optimism_to_ethereum","ethereum_update":ee,"source_rate":orate,"source_state_event":oe,
+                          "close_event":catch,"duration_seconds":None if not catch else catch["timestamp"]-ee["timestamp"],
+                          "gross_profit_bps":(ee["new_rate"]-orate)*10000/orate,
+                      })
+              output["products"][product]={
+                  "matched_rates":matches,
+                  "profitable_source_windows":windows,
+                  "max_gross_profit_bps":max([w["gross_profit_bps"] for w in windows],default=0),
+                  "max_window_seconds":max([w["duration_seconds"] or 0 for w in windows],default=0),
+              }
+
+          with open("veda-rate-sync-history.json","w",encoding="utf-8") as f:
+              json.dump(output,f,indent=2,sort_keys=True); f.write("\n")
+          print(json.dumps({p:{
+              "events":{c:len(output["chains"][c][p]["events"]) for c in output["chains"]},
+              "profitable_windows":len(v["profitable_source_windows"]),
+              "max_gross_profit_bps":v["max_gross_profit_bps"],
+              "max_window_seconds":v["max_window_seconds"],
+          } for p,v in output["products"].items()},indent=2,sort_keys=True))
+          PY
+      - name: Upload rate synchronization history
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-rate-sync-history
+          path: veda-rate-sync-history.json
+          if-no-files-found: error
+          retention-days: 1
