@@ -36,6 +36,7 @@ URLS = {
     "exchange_referral_welcome": "https://exchange.synthetix.io/assets/ReferralWelcomeModal-Ya9ya9ID.js",
     "exchange_referrals_page": "https://exchange.synthetix.io/assets/ReferralsPage-D0iGROix.js",
     "governance_main": "https://governance.synthetix.io/main.js",
+    "governance_main_map": "https://governance.synthetix.io/main.js.map",
     "governance_manifest": "https://governance.synthetix.io/manifest.json",
 }
 
