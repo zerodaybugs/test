@@ -1,0 +1,134 @@
+name: veda-crosschain-delivery-invariants
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Verify peer and vault-role invariants
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import time
+          import urllib.request
+
+          CHAINS={
+            "ethereum":{"id":1,"eid":30101,"rpcs":["https://ethereum-rpc.publicnode.com","https://eth.drpc.org","https://rpc.mevblocker.io"]},
+            "optimism":{"id":10,"eid":30111,"rpcs":["https://optimism-rpc.publicnode.com","https://mainnet.optimism.io","https://optimism.drpc.org"]},
+            "scroll":{"id":534352,"eid":30214,"rpcs":["https://rpc.scroll.io","https://scroll-rpc.publicnode.com","https://scroll.drpc.org"]},
+          }
+          TELLERS={
+            "liquidBTC":"0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353",
+            "liquidETH":"0x9AA79C84b79816ab920bBcE20f8f74557B514734",
+            "liquidUSD":"0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387",
+          }
+          VAULTS={
+            "liquidBTC":"0x5f46d540b6eD704C3c8789105F30E075AA900726",
+            "liquidETH":"0xf0bb20865277aBd641a307eCe5Ee04E79073416C",
+            "liquidUSD":"0x08c6F91e2B681FaF5e17227F2a44C307b3C1364C",
+          }
+
+          def request(ep,method,params,timeout=35):
+            body=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
+            req=urllib.request.Request(ep,data=body,method="POST",headers={"content-type":"application/json","user-agent":"veda-delivery-invariants/1.0"})
+            with urllib.request.urlopen(req,timeout=timeout) as r:o=json.loads(r.read().decode())
+            if "error" in o:raise RuntimeError(o["error"])
+            return o["result"]
+          def choose(c):
+            failures={}
+            for ep in c["rpcs"]:
+              try:
+                if int(request(ep,"eth_chainId",[]),16)==c["id"]:return ep
+              except Exception as e:failures[ep]=repr(e)
+            raise RuntimeError(failures)
+          def sig(s):return subprocess.check_output(["cast","sig",s],text=True).strip()
+          def strip0(x):return x[2:] if x.startswith("0x") else x
+          def aw(a):return strip0(a).lower().rjust(64,"0")
+          def sw(s):return strip0(s).lower().ljust(64,"0")
+          def uw(n):return hex(n)[2:].rjust(64,"0")
+          def words(x):
+            h=strip0(x);return [int(h[i:i+64],16) for i in range(0,len(h),64)] if h else []
+          def addr(x):return "0x"+strip0(x)[-40:]
+          def boolean(x):return bool(int(x,16))
+
+          S={
+            "authority":sig("authority()"),"vault":sig("vault()"),"idToChains":sig("idToChains(uint32)"),"peers":sig("peers(uint32)"),
+            "enter":sig("enter(address,address,uint256,address,uint256)"),"exit":sig("exit(address,address,uint256,address,uint256)"),
+            "paused":sig("isPaused()"),"endpoint":sig("endpoint()"),
+          }
+          CAN="0xb7009613"
+          selected={name:choose(c) for name,c in CHAINS.items()}
+          state={}
+          for chain,c in CHAINS.items():
+            ep=selected[chain];block=request(ep,"eth_blockNumber",[])
+            def call(to,data):return request(ep,"eth_call",[{"to":to,"data":data},block])
+            state[chain]={"endpoint":ep,"block":int(block,16),"products":{}}
+            for product,teller in TELLERS.items():
+              vault=addr(call(teller,S["vault"]))
+              teller_authority=addr(call(teller,S["authority"]))
+              vault_authority=addr(call(vault,S["authority"]))
+              row={
+                "teller":teller.lower(),"vault":vault.lower(),"expected_vault":VAULTS[product].lower(),
+                "teller_authority":teller_authority.lower(),"vault_authority":vault_authority.lower(),
+                "endpoint":addr(call(teller,S["endpoint"])).lower(),"paused":boolean(call(teller,S["paused"])),
+                "teller_can_enter":boolean(call(vault_authority,CAN+aw(teller)+aw(vault)+sw(S["enter"]))),
+                "teller_can_exit":boolean(call(vault_authority,CAN+aw(teller)+aw(vault)+sw(S["exit"]))),
+                "peers":{},
+              }
+              for remote,rc in CHAINS.items():
+                if remote==chain:continue
+                eid=rc["eid"]
+                row["peers"][remote]={"eid":eid,"chain_words":words(call(teller,S["idToChains"]+uw(eid))),"peer":call(teller,S["peers"]+uw(eid)).lower()}
+              state[chain]["products"][product]=row
+
+          directions=[]
+          for source in CHAINS:
+            for destination in CHAINS:
+              if source==destination:continue
+              for product,teller in TELLERS.items():
+                source_row=state[source]["products"][product]
+                destination_row=state[destination]["products"][product]
+                source_peer=source_row["peers"][destination]
+                destination_peer=destination_row["peers"][source]
+                expected="0x"+("0"*24)+strip0(teller).lower()
+                configured=bool(source_peer["chain_words"][1])
+                complete=(
+                  source_peer["peer"]==expected and
+                  bool(destination_peer["chain_words"][0]) and
+                  destination_peer["peer"]==expected and
+                  source_row["teller_can_exit"] and
+                  destination_row["teller_can_enter"]
+                )
+                directions.append({
+                  "source":source,"destination":destination,"product":product,"configured":configured,
+                  "source_allow_to":bool(source_peer["chain_words"][1]),
+                  "destination_allow_from":bool(destination_peer["chain_words"][0]),
+                  "source_peer_matches":source_peer["peer"]==expected,
+                  "destination_peer_matches":destination_peer["peer"]==expected,
+                  "source_teller_can_exit":source_row["teller_can_exit"],
+                  "destination_teller_can_enter":destination_row["teller_can_enter"],
+                  "complete_when_configured":((not configured) or complete),
+                })
+          result={"queried_at_unix":int(time.time()),"state":state,"directions":directions,"broken_configured_directions":[d for d in directions if d["configured"] and not d["complete_when_configured"]]}
+          with open("veda-crosschain-delivery-invariants.json","w",encoding="utf-8") as f:json.dump(result,f,indent=2,sort_keys=True);f.write("\n")
+          print(json.dumps({"directions":directions,"broken":result["broken_configured_directions"]},indent=2,sort_keys=True))
+          PY
+      - name: Upload invariant proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-crosschain-delivery-invariants
+          path: veda-crosschain-delivery-invariants.json
+          if-no-files-found: error
+          retention-days: 1
