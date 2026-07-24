@@ -1,0 +1,713 @@
+================================================================================================
+Precision loss allows for a share price increase after funding a claim
+================================================================================================
+       [M-1] Blacklisting should be handled at the level of the hBTC token                   Resolved
+       [M-2] Lack of mechanism to cancel claim requests                                      Resolved
+       [M-3] Blacklist can be bypassed in a certain scenario                                 Resolved
+       [L-1] Blacklist should also be checked in redeem-internal                             Resolved
+       [L-2] The trading-v1 contracts do not check usdh-token-trait                          Resolved
+       [L-3] Activation delay can be bypassed                                                Resolved
+       [L-4] process-claim should not allow zero assets claims                               Resolved
+       [L-5] Rounding direction of convert-to-shares is in favour of user not protocol       Resolved
+       [L-6] Precision loss allows for a share price increase after funding a claim          Resolved
+       [I-1] controller-v1.handle-profit doesn’t use or require is-positive parameter        Resolved
+       [I-2] handle-loss-covered/exceeds can be simplified                                   Resolved
+       [I-3] zest-close can repay less than expected                                         Resolved
+
+
+
+                                                                4
+
+[I-4] sbtc’s get-balance does not return available balance                      Acknowledged
+[I-5] zest-deposit and zest-redeem refactor                                     Resolved
+[I-6] Remove unnecessary calls to as-contract                                   Resolved
+[I-7] Consider minimum redeem sizes to avoid potential attacks based on small   Resolved
+amounts
+[I-8] Inequivalence between fund-claim and fund-claim-many                      Resolved
+
+
+
+
+                                                      5
+
+7     Medium Findings
+[M-1] Blacklisting should be handled at the level of the hBTC token
+Description
+The blacklist is only enforced when calling deposit and request-redeem in the Vault contract. However, this provides limited
+protection if the hBTC contract itself does not also prevent blacklisted principals from receiving, sending, minting, or burning
+tokens.
+Without enforcement at the token level, a blacklisted address could still interact with hBTC and send their tokens to a "clean"
+address in order to perform a successful request-redeem call.
+
+Impact
+This issue is Medium, as it makes the entire blacklist functionality useless.
+
+Recommended Mitigation
+Implement blacklist checks directly in the hBTC token contract for all state-changing operations involving token transfers, mints,
+and burns.
+
+Comments
+Hermetica
+
+Fixed in PR 114.
+
+Greybeard Security
+
+The hbtc transfer function checks for the full blacklist, not the soft one, whereas both deposits and redemptions in the vault
+check for the soft blacklist. The fix still allows that a soft-blacklisted address (that is not full-blacklisted) transfers their tokens to
+a clean address to be able to deposit/redeem.
+Is it possible that the hbtc contract disallows transfers when soft-blacklisted? Otherwise the check for the soft-whitelist in
+deposits/redemptions is not effective.
+
+Hermetica
+
+This is the system we have in place for USDh as well. The soft blacklist just prevents unauthorized addresses from stak-
+ing/unstaking, think of this more like a compliance feature and less like a security feature. Any malicious actor would be full
+blacklisted which doesn't allow them to transfer or stake (implicitly).
+
+Greybeard Security
+
+Ok, if that's the case the scenario I'm talking about will never happen, so all good.
+
+
+
+
+                                                                    6
+
+[M-2] Lack of mechanism to cancel claim requests
+Description
+There is no mechanism to cancel claim requests. This poses a risk to users because claims are funded every 24 hours, and
+the cooldown period can last up to 30 days. If the funding process fails, claims could remain unfunded with no way for users to
+recover their shares. In such cases, if the price of hBTC begins to decline, users may miss the opportunity to sell their shares
+on secondary markets and could end up incurring losses.
+The funding of claims could fail for various reasons, such as a malfunction of the keeper bots or a temporary pause in the Zest
+protocol. In such scenarios, users would likely want the option to cancel their pending claims.
+A cancel-claim function could be implemented to delete an existing claim and return the corresponding hBTC to the user. Since
+claim funding is an asynchronous process, care should be taken to ensure that a cancelled claim will not make the call to
+fund-claim-many revert.
+
+Impact
+We assess the impact of this issue as Medium, as it can lead to losses for users of the protocol in certain low-likelihood
+scenarios.
+
+Recommended Mitigation
+Implement a cancel-claim function that deletes a non-funded claim and refunds the user.
+
+Comments
+Hermetica
+
+Fixed in PR 113.
+
+Greybeard Security
+
+The implementation looks correct, but I have the concern that a malicious user could frontrun calls to fund-claim-many and
+make the calls fail.
+
+Hermetica
+
+We refactored fund-claim-many in order to avoid a failed tx if there is a claim id in the list that doesn't exist anymore. Fixed in
+PR 113.
+
+
+
+[M-3] Blacklist can be bypassed in a certain scenario
+Description
+Blacklisting an address as full implies a soft blacklisting. We can see this in the blacklist-processor function, which is
+responsible for storing whether an address is blacklisted or not:
+(define-private (blacklist-processor (entry { address: principal, full: bool }))
+  (if (get full entry)
+    (begin
+      (print { action: "add-blacklist", user: contract-caller, data: { entry: entry } })
+      (map-set blacklist { address: (get address entry) } { soft: true, full: true })
+    )
+    (begin
+      (print { action: "add-blacklist", user: contract-caller, data: { entry: entry } })
+      (map-set blacklist { address: (get address entry) } { soft: true, full: false })
+    )
+  )
+)
+
+
+If the full value is true, the address is stored with both full and soft set to true. If it's false, only soft is set to true.
+This implies that the two blacklists are not independent, and the full blacklist (i.e., the list of fully blacklisted addresses) is a
+subgroup of the soft blacklist. Therefore, if an address is full blacklisted, a check for its soft blacklist status should also return
+true.
+
+
+
+                                                                     7
+
+This check can be bypassed for addresses that are fully blacklisted when the soft blacklist is not active.
+(define-read-only (check-is-not-soft (address principal))
+
+--- END MATCH WINDOW ---
+
+
+Comments
+Hermetica
+
+Fixed in PR 115.
+
+
+
+[L-6] Precision loss allows for a share price increase after funding a claim
+Description
+When funding a claim, the resulting assets that the user will receive are calculated like this:
+(define-private (process-claim
+  (claim-id uint)
+  (share-price uint)
+  (is-manager bool))
+  (let (
+    (claim (try! (get-claim claim-id)))
+    (shares (get shares claim))
+    (is-cooled-down (>= (get-current-ts) (get ts claim)))
+    (assets (/ (* shares share-price) share-base))
+    (fee (/ (* assets (get fee-bps claim)) bps-base))
+  )
+...
+
+
+Where share-price is obtained from get-share-price, which is:
+(define-read-only (get-share-price)
+  (let (
+    (net-assets (get-net-assets))
+    (total-supply (unwrap-panic (contract-call? .hbtc-token get-total-supply)))
+  )
+    (if (> total-supply u0)
+      (/ (* net-assets share-base) total-supply)
+      share-base ;; 1:1 for first deposit
+    )
+  )
+)
+
+
+In a scenario with very low liquidity in the vault and a share price that favors rounding errors — for example, a share price
+close to but below a 2:1 assets-to-shares ratio — a claim of 1 satoshi of shares could result in 1 asset being received. A large
+number of such claims would remove the same number of shares and assets from the vault, potentially impacting the share
+price significantly.
+
+Impact
+The impact is Low, because the likelihood of the vault entering such a specific state is very low, and we did not identify any
+practical way for an attacker to profit from this price change. However, we strongly encourage Hermetica to address this issue.
+Similar rounding-related inconsistencies have been exploited in high-profile incidents — such as the recent Balancer hack —
+and maintaining a defense-in-depth approach is always the safer path.
+
+Recommended Mitigation
+Enforce a minimum amount when requesting a redemption.
+
+
+
+
+                                                                     13
+
+Proof of Concept
+See file tests/hbtc/neumo.test.ts in the Appendix. The test claims of 1 wei: many fund-claim shows how, in a situation
+where the assets-to-shares ratio is 1.88:1 and liquidity in the vault is very low (18,800 satoshis), a malicious user could execute
+1,000 claims of 1 satoshi and cause a 5.5% increase in the share price.
+
+Comments
+Hermetica
+
+We implemented the fix with the recommended minimum redeem amount in finding I-7. Furthermore, remediation for finding
+I-8 adds another layer of protection allowing only the manager to execute fund-claim-many.
+
+
+
+
+                                                                14
+
+9        Informational Findings
+[I-1] controller-v1.handle-profit doesn't use or require is-positive parameter
+Description
+Function handle-profit is only called from log-reward if is-profit is true. Since this is defined as (and is-positive (>=
+reward total-fees)) this means that is-positive must also be true.
+Thus the is-positive parameter can be removed from handle-profit. In any case it's not even used as the function contains
+this print statement where it has constant value true.
+ (print {
+ ...
+ data: { case: (if (is-eq reward-after-fees u0) "zero" "profit"), reward: { gross: reward, net: reward-net, rf: reward-rf, is-positive: true,
+,→ is-add: true }, fees: { perf: perf-fee, mgmt: mgmt-fee }, rf: { old: total-rf, new: (+ total-rf reward-rf), required: reward-rf } }
+
+
+
+
+Comments
+Hermetica
+
+Fixed in PR 99.
+
+
+
+[I-2] handle-loss-covered/exceeds can be simplified
+Description
+An important invariant of the system is that share price should remain constant when handle-loss-covered is called.
+However, verifying this invariant was quite complex because of the amount of branch logic due to is-positive and other
+if-expressions involving reward and transfer-amount.
+The verification of the invariant also relies on the correct req-rf being passed in. This should be calculated locally as it only
+depends on is-positive and mgmt-fee which are already parameters.
+The logic in this section is particularly complex:
+        (reward-delta (if is-positive
+          { reward: (+ reward transfer-amount), is-add: true }
+          (if (>= reward transfer-amount)
+            { reward: (- reward transfer-amount), is-add: false }
+            { reward: (- transfer-amount reward), is-add: true })))
+    )
+
+
+This can be simplified. For the share price to remain the same the state-v1.get-net-assets must return the same before and
+after the call to handle-loss-covered.
+Thus the total-assets data variable needs to change by the same amount as the sum of pending-fees and pending-rf. The
+code below shows us these are changed by (positive) mgmt-fee and (negative) rf-decrease respectively.
+        (try! (contract-call? .state update-state
+          (list
+            { type: "pending-rf", amount: rf-decrease, is-add: false }
+            { type: "pending-fees", amount: mgmt-fee, is-add: true })
+          (some { reward: (get reward reward-delta), is-add: (get is-add reward-delta) })
+          none))
+
+
+Call the amount that total-assets will change by asset-delta. Using function state-v1.get-net-assets as our template we
+can now state the invariant as:
+asset-delta - mgmt-fee + rf-decrease == 0
+
+
+Using this invariant we can simplify the reward-deltas let-binding to:
+        (delta (if (> mgmt-fee rf-decrease)
+                  { asset-delta: (- mgmt-fee rf-decrease), is-add: true}
+                  { asset-delta: (- rf-decrease mgmt-fee), is-add: false}))
+        )
+
+
+
+
+
+--- END MATCH WINDOW ---
+
+================================================================================================
+Consider minimum redeem sizes to avoid potential attacks based on small amounts
+================================================================================================
+
+Comments
+Hermetica
+
+Fixed in PR 101.
+
+
+
+[I-7] Consider minimum redeem sizes to avoid potential attacks based on small amounts
+Description
+A defensive strategy that is gaining traction is to enforce minimum deposit/withdraw/redeem sizes in protocol. The system
+currently has a minimum deposit amount but not one for redemptions.
+Many subtle bugs occur due to the weaponisation of small positions (often of the minimum size of 1 satoshi). Since these kinds
+of deposits or redeems would never occur in practice it may make sense to prevent them altogether by implementing minimum
+sizes.
+This leads to some additional complexity and the consideration of how to handle dust positions.
+For instance, assume a minimum redeem size has been set. If a redeem would leave behind dust smaller than the minimum
+redeem it would need to be blocked. The user would need to redeem the full remaining shares in this case.
+Credit goes to Dacian from Cyfrin Audits for recently suggesting this.
+
+Comments
+Hermetica
+
+Fixed in PR 104.
+
+
+
+[I-8] Inequivalence between fund-claim and fund-claim-many
+Description
+fund-claim-many calculates the share price at the beginning and then calls the fold function with all the claim IDs:
+;; @desc - Optimized batch funding of claims
+(define-public (fund-claim-many (claim-ids (list 1000 uint)))
+  (let (
+    (is-manager (get manager (contract-call? .hq-hbtc get-keeper contract-caller)))
+    (share-price (contract-call? .state get-share-price))
+    (initial-accum { total-shares: u0, total-assets: u0, share-price: share-price, is-manager: is-manager })
+  )
+    (asserts! (> (len claim-ids) u0) ERR_EMPTY_LIST)
+    (match (fold fund-claim-iter claim-ids (ok initial-accum))
+...
+
+
+In a situation of very low liquidity, rounding errors in the calculation of assets inside process-claim could alter the share price
+in each iteration.
+(define-private (process-claim
+  (claim-id uint)
+  (share-price uint)
+  (is-manager bool))
+  (let (
+    (claim (try! (get-claim claim-id)))
+    (shares (get shares claim))
+    (is-cooled-down (>= (get-current-ts) (get ts claim)))
+
+
+
+                                                                     21
+
+      (assets (/ (* shares share-price) share-base))
+      (fee (/ (* assets (get fee-bps claim)) bps-base))
+  )
+...
+
+
+But the assets will continue to be calculated using the initial share price.
+This would create an inequivalence between calling fund-claim-many with a batch of claim IDs and calling fund-claim on each
+claim ID individually, because the resulting share price at the end of execution would differ between both approaches.
+
+Impact
+This is an Informational issue.
+
+Recommended Mitigation
+The correct solution to this issue would be to recalculate share-price on every iteration of fund-claim-iter. However, doing so
+would significantly increase computation costs and the number of external calls. Considering that this edge case requires both
+a very high share price and very low liquidity, and given that the protocol already includes a price deviation check preventing any
+meaningful manipulation of share price across up to 1000 claims processed in a single fund-claim-many call, we believe that
+enforcing a minimum claim amount is a sufficient and practical mitigation. This approach avoids unnecessary computational
+overhead while preventing zero-asset or near-zero-asset claims from introducing inconsistencies.
+
+Comments
+Hermetica
+
+Fixed in PR 108.
+
+
+
+
+                                                                 22
+
+10      Appendix
+This appendix contains the source code listings we used as Proof of Concept for our findings.
+
+tests/hbtc/neumo.test.ts
+import { describe, expect, it, beforeEach } from 'vitest';
+import { Cl, ClarityType, cvToValue } from '@stacks/transactions';
+import {
+  initHbtcProtocol,
+  setupVaultTokenPrice,
+  fundTestWalletsWithSBTC,
+} from './helper/init';
+import { errorCodes } from './settings/errors';
+import {
+  deployer,
+  base,
+  TESTS_TIMEOUT,
+  wallet_1,
+  getNextTestNumber,
+} from './settings/constants';
+import { CURRENT_TEST_CONTRACT } from './settings/contracts';
+
+describe('Greybeard Tests', () => {
+  beforeEach(() => {
+    initHbtcProtocol();
+  });
+
+  describe('PoCs', () => {
+
+     it(
+       `(Test ${getNextTestNumber()}) claims of 1 wei: fund-claim-many`,
+       async () => {
+         await fundTestWalletsWithSBTC();
+
+        setupVaultTokenPrice({
+          tokenPrice: 100000000, // 1:1 ratio
+        });
+
+        // Verify share price is 10^8 initially
+        let sharePrice = simnet.callReadOnlyFn(
+          CURRENT_TEST_CONTRACT.state,
+          'get-share-price', [], deployer
+        );
+        expect(sharePrice.result).toBeUint(100000000);
+
+        const setCapResult = simnet.callPublicFn(
+          CURRENT_TEST_CONTRACT.state,
+          'set-deposit-cap',
+          [Cl.uint(1000000000)],
+          deployer
+        );
+
+--- END MATCH WINDOW ---
+
+================================================================================================
+Inequivalence between fund-claim and fund-claim-many
+================================================================================================
+
+                                                                4
+
+[I-4] sbtc’s get-balance does not return available balance                      Acknowledged
+[I-5] zest-deposit and zest-redeem refactor                                     Resolved
+[I-6] Remove unnecessary calls to as-contract                                   Resolved
+[I-7] Consider minimum redeem sizes to avoid potential attacks based on small   Resolved
+amounts
+[I-8] Inequivalence between fund-claim and fund-claim-many                      Resolved
+
+
+
+
+                                                      5
+
+7     Medium Findings
+[M-1] Blacklisting should be handled at the level of the hBTC token
+Description
+The blacklist is only enforced when calling deposit and request-redeem in the Vault contract. However, this provides limited
+protection if the hBTC contract itself does not also prevent blacklisted principals from receiving, sending, minting, or burning
+tokens.
+Without enforcement at the token level, a blacklisted address could still interact with hBTC and send their tokens to a "clean"
+address in order to perform a successful request-redeem call.
+
+Impact
+This issue is Medium, as it makes the entire blacklist functionality useless.
+
+Recommended Mitigation
+Implement blacklist checks directly in the hBTC token contract for all state-changing operations involving token transfers, mints,
+and burns.
+
+Comments
+Hermetica
+
+Fixed in PR 114.
+
+Greybeard Security
+
+The hbtc transfer function checks for the full blacklist, not the soft one, whereas both deposits and redemptions in the vault
+check for the soft blacklist. The fix still allows that a soft-blacklisted address (that is not full-blacklisted) transfers their tokens to
+a clean address to be able to deposit/redeem.
+Is it possible that the hbtc contract disallows transfers when soft-blacklisted? Otherwise the check for the soft-whitelist in
+deposits/redemptions is not effective.
+
+Hermetica
+
+This is the system we have in place for USDh as well. The soft blacklist just prevents unauthorized addresses from stak-
+ing/unstaking, think of this more like a compliance feature and less like a security feature. Any malicious actor would be full
+blacklisted which doesn't allow them to transfer or stake (implicitly).
+
+Greybeard Security
+
+Ok, if that's the case the scenario I'm talking about will never happen, so all good.
+
+
+
+
+                                                                    6
+
+[M-2] Lack of mechanism to cancel claim requests
+Description
+There is no mechanism to cancel claim requests. This poses a risk to users because claims are funded every 24 hours, and
+the cooldown period can last up to 30 days. If the funding process fails, claims could remain unfunded with no way for users to
+recover their shares. In such cases, if the price of hBTC begins to decline, users may miss the opportunity to sell their shares
+on secondary markets and could end up incurring losses.
+The funding of claims could fail for various reasons, such as a malfunction of the keeper bots or a temporary pause in the Zest
+protocol. In such scenarios, users would likely want the option to cancel their pending claims.
+A cancel-claim function could be implemented to delete an existing claim and return the corresponding hBTC to the user. Since
+claim funding is an asynchronous process, care should be taken to ensure that a cancelled claim will not make the call to
+fund-claim-many revert.
+
+Impact
+We assess the impact of this issue as Medium, as it can lead to losses for users of the protocol in certain low-likelihood
+scenarios.
+
+Recommended Mitigation
+Implement a cancel-claim function that deletes a non-funded claim and refunds the user.
+
+Comments
+Hermetica
+
+Fixed in PR 113.
+
+Greybeard Security
+
+The implementation looks correct, but I have the concern that a malicious user could frontrun calls to fund-claim-many and
+make the calls fail.
+
+Hermetica
+
+We refactored fund-claim-many in order to avoid a failed tx if there is a claim id in the list that doesn't exist anymore. Fixed in
+PR 113.
+
+
+
+[M-3] Blacklist can be bypassed in a certain scenario
+Description
+Blacklisting an address as full implies a soft blacklisting. We can see this in the blacklist-processor function, which is
+responsible for storing whether an address is blacklisted or not:
+(define-private (blacklist-processor (entry { address: principal, full: bool }))
+  (if (get full entry)
+    (begin
+      (print { action: "add-blacklist", user: contract-caller, data: { entry: entry } })
+      (map-set blacklist { address: (get address entry) } { soft: true, full: true })
+    )
+    (begin
+      (print { action: "add-blacklist", user: contract-caller, data: { entry: entry } })
+      (map-set blacklist { address: (get address entry) } { soft: true, full: false })
+    )
+  )
+)
+
+
+If the full value is true, the address is stored with both full and soft set to true. If it's false, only soft is set to true.
+This implies that the two blacklists are not independent, and the full blacklist (i.e., the list of fully blacklisted addresses) is a
+subgroup of the soft blacklist. Therefore, if an address is full blacklisted, a check for its soft blacklist status should also return
+true.
+
+
+
+                                                                     7
+
+This check can be bypassed for addresses that are fully blacklisted when the soft blacklist is not active.
+(define-read-only (check-is-not-soft (address principal))
+  (ok (if (get-soft-blacklist-active)
+     (asserts! (not (get-soft-blacklist address)) ERR_SOFT_BLACKLISTED)
+     true
+  ))
+)
+
+
+When the soft blacklist is not active, the call to check-is-not-soft will return true, even if the address is fully blacklisted and
+the full blacklist is active.
+The call to check-is-not-soft is made in the Vault contract, specifically in the deposit and request-redeem functions. In this
+case, a fully blacklisted address could still deposit or request redemptions from the protocol if the soft blacklist is not active.
+
+Impact
+The likelihood is Moderate, and the impact is High, so we assessed this issue's severity as Medium.
+
+--- END MATCH WINDOW ---
+
+
+Comments
+Hermetica
+
+Fixed in PR 104.
+
+
+
+[I-8] Inequivalence between fund-claim and fund-claim-many
+Description
+fund-claim-many calculates the share price at the beginning and then calls the fold function with all the claim IDs:
+;; @desc - Optimized batch funding of claims
+(define-public (fund-claim-many (claim-ids (list 1000 uint)))
+  (let (
+    (is-manager (get manager (contract-call? .hq-hbtc get-keeper contract-caller)))
+    (share-price (contract-call? .state get-share-price))
+    (initial-accum { total-shares: u0, total-assets: u0, share-price: share-price, is-manager: is-manager })
+  )
+    (asserts! (> (len claim-ids) u0) ERR_EMPTY_LIST)
+    (match (fold fund-claim-iter claim-ids (ok initial-accum))
+...
+
+
+In a situation of very low liquidity, rounding errors in the calculation of assets inside process-claim could alter the share price
+in each iteration.
+(define-private (process-claim
+  (claim-id uint)
+  (share-price uint)
+  (is-manager bool))
+  (let (
+    (claim (try! (get-claim claim-id)))
+    (shares (get shares claim))
+    (is-cooled-down (>= (get-current-ts) (get ts claim)))
+
+
+
+                                                                     21
+
+      (assets (/ (* shares share-price) share-base))
+      (fee (/ (* assets (get fee-bps claim)) bps-base))
+  )
+...
+
+
+But the assets will continue to be calculated using the initial share price.
+This would create an inequivalence between calling fund-claim-many with a batch of claim IDs and calling fund-claim on each
+claim ID individually, because the resulting share price at the end of execution would differ between both approaches.
+
+Impact
+This is an Informational issue.
+
+Recommended Mitigation
+The correct solution to this issue would be to recalculate share-price on every iteration of fund-claim-iter. However, doing so
+would significantly increase computation costs and the number of external calls. Considering that this edge case requires both
+a very high share price and very low liquidity, and given that the protocol already includes a price deviation check preventing any
+meaningful manipulation of share price across up to 1000 claims processed in a single fund-claim-many call, we believe that
+enforcing a minimum claim amount is a sufficient and practical mitigation. This approach avoids unnecessary computational
+overhead while preventing zero-asset or near-zero-asset claims from introducing inconsistencies.
+
+Comments
+Hermetica
+
+Fixed in PR 108.
+
+
+
+
+                                                                 22
+
+10      Appendix
+This appendix contains the source code listings we used as Proof of Concept for our findings.
+
+tests/hbtc/neumo.test.ts
+import { describe, expect, it, beforeEach } from 'vitest';
+import { Cl, ClarityType, cvToValue } from '@stacks/transactions';
+import {
+  initHbtcProtocol,
+  setupVaultTokenPrice,
+  fundTestWalletsWithSBTC,
+} from './helper/init';
+import { errorCodes } from './settings/errors';
+import {
+  deployer,
+  base,
+  TESTS_TIMEOUT,
+  wallet_1,
+  getNextTestNumber,
+} from './settings/constants';
+import { CURRENT_TEST_CONTRACT } from './settings/contracts';
+
+describe('Greybeard Tests', () => {
+  beforeEach(() => {
+    initHbtcProtocol();
+  });
+
+  describe('PoCs', () => {
+
+     it(
+       `(Test ${getNextTestNumber()}) claims of 1 wei: fund-claim-many`,
+       async () => {
+         await fundTestWalletsWithSBTC();
+
+        setupVaultTokenPrice({
+          tokenPrice: 100000000, // 1:1 ratio
+        });
+
+        // Verify share price is 10^8 initially
+        let sharePrice = simnet.callReadOnlyFn(
+          CURRENT_TEST_CONTRACT.state,
+          'get-share-price', [], deployer
+        );
+        expect(sharePrice.result).toBeUint(100000000);
+
+        const setCapResult = simnet.callPublicFn(
+          CURRENT_TEST_CONTRACT.state,
+          'set-deposit-cap',
+          [Cl.uint(1000000000)],
+          deployer
+        );
+        expect(setCapResult.result).toBeOk(Cl.bool(true));
+
+        // Set deployer as manager
+        const setManagerResult = simnet.callPublicFn(
+          CURRENT_TEST_CONTRACT.hq,
+          'set-keeper',
+          [
+             Cl.principal(deployer),
+             Cl.bool(false),
+             Cl.bool(true),
+             Cl.bool(true),
+             Cl.bool(false),
+          ],
+          deployer
+        );
+        expect(setManagerResult.result).toBeOk(Cl.bool(true));
+
+        // Deposit to have tokens
+        const depositResult = simnet.callPublicFn(
+
+--- END MATCH WINDOW ---
