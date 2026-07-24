@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""Read-only audit of the EVM governance Executor that owns each Pyth Lazer proxy."""
+"""Focused read-only audit of live EVM governance Executors linked to Pyth Lazer."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 from Crypto.Hash import keccak
 
-from snapshot import EIP1967_IMPLEMENTATION_SLOT, rpc_request, result_or_error
+from snapshot import EIP1967_IMPLEMENTATION_SLOT
 
 OUT = Path(os.environ.get("PRIVATE_OUT", "private_out"))
 CALLER = "0x0000000000000000000000000000000000000001"
+DEFAULT_TARGET_NAMES = {"BNB Smart Chain", "Monad", "Robinhood Chain"}
 
 
 def selector(signature: str) -> str:
@@ -26,30 +29,64 @@ def selector(signature: str) -> str:
 
 def rpc_candidates(lazer: dict[str, Any]) -> list[str]:
     candidates: list[str] = []
-    for value in [lazer.get("chosen_rpc"), *(lazer.get("chainlist_entry", {}).get("rpc") or [])]:
+    source_values = [
+        lazer.get("chosen_rpc"),
+        *((lazer.get("target") or {}).get("fallback") or []),
+        *((lazer.get("chainlist_entry") or {}).get("rpc") or []),
+    ]
+    for value in source_values:
         if not isinstance(value, str):
             continue
         value = value.rstrip("/")
-        if not value.startswith("http") or "${" in value:
+        if not value.startswith("http") or "${" in value or "API_KEY" in value.upper():
             continue
         if value not in candidates:
             candidates.append(value)
-    return candidates
+    return candidates[:4]
+
+
+def one_rpc(url: str, method: str, params: list[Any], request_id: int) -> dict[str, Any]:
+    payload = json.dumps(
+        {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+    ).encode()
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "accept": "application/json",
+            "content-type": "application/json",
+            "user-agent": "pyth-focused-executor-snapshot/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=12) as response:
+            obj = json.loads(response.read())
+        if isinstance(obj, dict) and "result" in obj:
+            return {"status": "RESULT", "result": obj.get("result")}
+        if isinstance(obj, dict) and "error" in obj:
+            return {"status": "ERROR", "error": obj.get("error")}
+        return {"status": "MALFORMED_RESPONSE", "response": obj}
+    except urllib.error.HTTPError as exc:
+        return {
+            "status": "HTTP_ERROR",
+            "http": exc.code,
+            "body": exc.read()[:1000].decode("utf-8", "replace"),
+        }
+    except Exception as exc:
+        return {"status": "TRANSPORT_ERROR", "error": repr(exc)}
 
 
 def safe_rpc(
     candidates: list[str], method: str, params: list[Any], request_id: int
 ) -> tuple[dict[str, Any], str | None]:
-    errors: list[dict[str, str]] = []
-    for url in candidates:
-        try:
-            result = result_or_error(rpc_request(url, method, params, request_id))
-            if result.get("status") == "RESULT":
-                return result, url
-            errors.append({"rpc": url, "error": json.dumps(result, sort_keys=True)[:1000]})
-        except Exception as exc:  # Public RPC providers can rate-limit or reject a method.
-            errors.append({"rpc": url, "error": repr(exc)[:1000]})
-    return {"status": "ALL_RPC_ATTEMPTS_FAILED", "attempts": errors}, None
+    attempts = []
+    for offset, url in enumerate(candidates):
+        result = one_rpc(url, method, params, request_id + offset)
+        if result.get("status") == "RESULT":
+            return result, url
+        attempts.append({"rpc": url, "result": result})
+    return {"status": "ALL_RPC_ATTEMPTS_FAILED", "attempts": attempts}, None
 
 
 def call(
@@ -92,15 +129,10 @@ def decode_string(obj: dict[str, Any]) -> str | None:
     if not isinstance(value, str) or not value.startswith("0x"):
         return None
     try:
-        b = bytes.fromhex(value[2:])
-        if len(b) < 64:
-            return None
-        offset = int.from_bytes(b[:32], "big")
-        if offset + 32 > len(b):
-            return None
-        length = int.from_bytes(b[offset : offset + 32], "big")
-        raw = b[offset + 32 : offset + 32 + length]
-        return raw.decode("utf-8", "strict")
+        raw = bytes.fromhex(value[2:])
+        offset = int.from_bytes(raw[:32], "big")
+        length = int.from_bytes(raw[offset : offset + 32], "big")
+        return raw[offset + 32 : offset + 32 + length].decode("utf-8", "strict")
     except Exception:
         return None
 
@@ -111,12 +143,29 @@ def code_hashes(code_hex: str | None) -> dict[str, str | int | None]:
     raw = bytes.fromhex(code_hex[2:])
     k = keccak.new(digest_bits=256)
     k.update(raw)
-    return {"sha256": hashlib.sha256(raw).hexdigest(), "keccak256": k.hexdigest(), "bytes": len(raw)}
+    return {
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "keccak256": k.hexdigest(),
+        "bytes": len(raw),
+    }
 
 
 def main() -> None:
     source = json.loads((OUT / "RESULTS.json").read_text())
-    scanned = [x for x in source["results"] if x.get("status") == "SCANNED" and x.get("owner")]
+    requested = {
+        x.strip()
+        for x in os.environ.get(
+            "EXECUTOR_TARGET_NAMES", ",".join(sorted(DEFAULT_TARGET_NAMES))
+        ).split(",")
+        if x.strip()
+    }
+    scanned = [
+        x
+        for x in source["results"]
+        if x.get("status") == "SCANNED"
+        and x.get("owner")
+        and (x.get("target") or {}).get("name") in requested
+    ]
     results = []
 
     for index, lazer in enumerate(scanned):
@@ -124,15 +173,22 @@ def main() -> None:
         candidates = rpc_candidates(lazer)
         owner = lazer["owner"].lower()
 
-        code_obj, code_rpc = safe_rpc(candidates, "eth_getCode", [owner, "latest"], rid); rid += 1
+        code_obj, code_rpc = safe_rpc(candidates, "eth_getCode", [owner, "latest"], rid)
         impl_obj, impl_rpc = safe_rpc(
-            candidates, "eth_getStorageAt", [owner, EIP1967_IMPLEMENTATION_SLOT, "latest"], rid
-        ); rid += 1
-        version_obj, version_rpc = call(candidates, owner, "version()", rid); rid += 1
-        self_owner_obj, owner_rpc = call(candidates, owner, "owner()", rid); rid += 1
-        chain_obj, chain_rpc = call(candidates, owner, "getOwnerChainId()", rid); rid += 1
-        emitter_obj, emitter_rpc = call(candidates, owner, "getOwnerEmitterAddress()", rid); rid += 1
-        sequence_obj, sequence_rpc = call(candidates, owner, "getLastExecutedSequence()", rid); rid += 1
+            candidates,
+            "eth_getStorageAt",
+            [owner, EIP1967_IMPLEMENTATION_SLOT, "latest"],
+            rid + 10,
+        )
+        version_obj, version_rpc = call(candidates, owner, "version()", rid + 20)
+        self_owner_obj, owner_rpc = call(candidates, owner, "owner()", rid + 30)
+        chain_obj, chain_rpc = call(candidates, owner, "getOwnerChainId()", rid + 40)
+        emitter_obj, emitter_rpc = call(
+            candidates, owner, "getOwnerEmitterAddress()", rid + 50
+        )
+        sequence_obj, sequence_rpc = call(
+            candidates, owner, "getLastExecutedSequence()", rid + 60
+        )
 
         code = code_obj.get("result") if code_obj.get("status") == "RESULT" else None
         implementation = decode_address(impl_obj)
@@ -143,7 +199,9 @@ def main() -> None:
         version = decode_string(version_obj)
         checks = {
             "executor_code_nonempty": bool(code and code != "0x"),
-            "executor_is_proxy": bool(implementation and int(implementation, 16) != 0),
+            "executor_is_proxy": bool(
+                implementation and int(implementation, 16) != 0
+            ),
             "executor_self_owned": self_owner == owner,
             "owner_chain_id_readable": owner_chain_id is not None,
             "owner_emitter_readable": owner_emitter is not None,
@@ -192,7 +250,9 @@ def main() -> None:
     group_by_executor: dict[str, list[str]] = defaultdict(list)
     for row in results:
         group_by_impl[str(row["executor_implementation"])].append(row["chain_name"])
-        group_by_owner_chain[str(row["executor_owner_chain_id"])].append(row["chain_name"])
+        group_by_owner_chain[str(row["executor_owner_chain_id"])].append(
+            row["chain_name"]
+        )
         group_by_executor[row["executor_address"]].append(row["chain_name"])
     failing = {
         key: [r["chain_name"] for r in results if not r["checks"][key]]
@@ -202,6 +262,7 @@ def main() -> None:
         "candidate": "PYL-EVM-EXEC-GOV-ORDER",
         "mode": "PUBLIC_CHAIN_READ_ONLY_ETH_CALL_AND_ETH_GETSTORAGEAT",
         "signed_or_broadcast_transactions": 0,
+        "requested_target_names": sorted(requested),
         "scanned_count": len(results),
         "executor_address_groups": group_by_executor,
         "executor_implementation_groups": group_by_impl,
@@ -209,11 +270,14 @@ def main() -> None:
         "failing_checks": failing,
         "results": results,
     }
-    (OUT / "EXECUTOR_RESULTS.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    (OUT / "EXECUTOR_RESULTS.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n"
+    )
     markers = [
-        "PYTH_LAZER_EVM_LIVE_EXECUTOR_SNAPSHOT_PASS",
+        "PYTH_LAZER_EVM_LIVE_EXECUTOR_SNAPSHOT_CAPTURED",
         "PUBLIC_CHAIN_EXECUTOR_MODE=READ_ONLY_ETH_CALL_AND_ETH_GETSTORAGEAT",
         "SIGNED_OR_BROADCAST_TRANSACTIONS=0",
+        f"EXECUTOR_REQUESTED_COUNT={len(requested)}",
         f"EXECUTOR_SCANNED_COUNT={len(results)}",
         f"EXECUTOR_SELF_OWNED_COUNT={sum(r['checks']['executor_self_owned'] for r in results)}",
         f"EXECUTOR_LAST_SEQUENCE_READABLE_COUNT={sum(r['checks']['last_executed_sequence_readable'] for r in results)}",
