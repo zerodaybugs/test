@@ -5,7 +5,8 @@ Safety constraints:
 - deterministic synthetic EOA only;
 - preflight confirms that EOA has no Synthetix subaccounts;
 - a deliberately nonexistent high subaccount ID is used;
-- only withdraw requests with amount="0" and the synthetic EOA as destination;
+- only a minimal positive withdrawal amount and the synthetic EOA as destination;
+- every signature is produced by synthetic keys controlled by this probe;
 - no real account, credential, balance, position, order, or reward is touched;
 - only status/error metadata is retained.
 """
@@ -32,6 +33,7 @@ PRIVATE_KEY = "0x" + "55" * 32
 ACCOUNT = Account.from_key(PRIVATE_KEY)
 ALT_DESTINATION = Account.from_key("0x" + "56" * 32).address
 TARGET_SUBACCOUNT_ID = 999_999_999_999_999_937
+TRANSMITTED_AMOUNT = "1"
 UA = "Mozilla/5.0 (compatible; authorized-controlled-security-review/1.0)"
 MAX_BODY = 2 * 1024 * 1024
 
@@ -184,7 +186,7 @@ def withdraw_envelope(nonce: int, expires_after: int, signature: dict[str, Any])
             "subaccountId": str(TARGET_SUBACCOUNT_ID),
             "walletAddress": ACCOUNT.address,
             "symbol": "USDT",
-            "amount": "0",
+            "amount": TRANSMITTED_AMOUNT,
             "destination": ACCOUNT.address,
         },
     }
@@ -208,11 +210,12 @@ def account_count(response: Any) -> int | None:
 def main() -> None:
     evidence: dict[str, Any] = {
         "safety": (
-            "Synthetic empty EOA, nonexistent high subaccount ID, amount zero, and own destination only. "
-            "No real user or funds are involved."
+            "Synthetic empty EOA, deliberately nonexistent high subaccount ID, minimal positive amount, "
+            "and synthetic own destination only. No real user or funds are involved."
         ),
         "syntheticAddress": ACCOUNT.address,
         "targetSubaccountIdSha256": hashlib.sha256(str(TARGET_SUBACCOUNT_ID).encode()).hexdigest(),
+        "transmittedAmount": TRANSMITTED_AMOUNT,
         "domain": DOMAIN,
         "tests": [],
     }
@@ -239,69 +242,82 @@ def main() -> None:
         evidence["abortReason"] = "Synthetic EOA was not confirmed to have zero Synthetix accounts."
     else:
         base_nonce = int(time.time() * 1000)
-        cases: list[tuple[str, dict[str, Any] | None]] = []
+        cases: list[tuple[str, dict[str, Any]]] = []
 
-        # Missing-signature control.
         missing_nonce = base_nonce
         missing_expiry = missing_nonce + 60_000
-        missing = withdraw_envelope(missing_nonce, missing_expiry, {"v": 27, "r": "0x" + "00" * 32, "s": "0x" + "00" * 32})
+        missing = withdraw_envelope(
+            missing_nonce,
+            missing_expiry,
+            {"v": 27, "r": "0x" + "00" * 32, "s": "0x" + "00" * 32},
+        )
         missing.pop("signature")
         cases.append(("missing_signature_control", missing))
 
-        # Corrupted signature control.
         nonce = base_nonce + 10
         expiry = nonce + 60_000
-        correct_message = {
+        message = {
             "subAccountId": TARGET_SUBACCOUNT_ID,
             "symbol": "USDT",
-            "amount": "0",
+            "amount": TRANSMITTED_AMOUNT,
             "destination": ACCOUNT.address,
             "nonce": nonce,
             "expiresAfter": expiry,
         }
-        correct_signature = sign(WITHDRAW_TYPES, "WithdrawCollateral", correct_message)
+        correct_signature = sign(WITHDRAW_TYPES, "WithdrawCollateral", message)
         cases.append(("corrupted_withdraw_signature", withdraw_envelope(nonce, expiry, corrupt(correct_signature))))
 
-        # Correct action-specific signature.
         nonce = base_nonce + 20
         expiry = nonce + 60_000
         message = {
             "subAccountId": TARGET_SUBACCOUNT_ID,
             "symbol": "USDT",
-            "amount": "0",
+            "amount": TRANSMITTED_AMOUNT,
             "destination": ACCOUNT.address,
             "nonce": nonce,
             "expiresAfter": expiry,
         }
-        cases.append(("correct_withdraw_primary_type", withdraw_envelope(nonce, expiry, sign(WITHDRAW_TYPES, "WithdrawCollateral", message))))
+        cases.append(
+            (
+                "correct_withdraw_primary_type",
+                withdraw_envelope(nonce, expiry, sign(WITHDRAW_TYPES, "WithdrawCollateral", message)),
+            )
+        )
 
-        # Correct primary type, but signed amount differs from transmitted amount.
         nonce = base_nonce + 30
         expiry = nonce + 60_000
         message = {
             "subAccountId": TARGET_SUBACCOUNT_ID,
             "symbol": "USDT",
-            "amount": "1",
+            "amount": "2",
             "destination": ACCOUNT.address,
             "nonce": nonce,
             "expiresAfter": expiry,
         }
-        cases.append(("signed_amount_mismatch", withdraw_envelope(nonce, expiry, sign(WITHDRAW_TYPES, "WithdrawCollateral", message))))
+        cases.append(
+            (
+                "signed_amount_mismatch",
+                withdraw_envelope(nonce, expiry, sign(WITHDRAW_TYPES, "WithdrawCollateral", message)),
+            )
+        )
 
-        # Correct primary type, but signed destination differs from transmitted destination.
         nonce = base_nonce + 40
         expiry = nonce + 60_000
         message = {
             "subAccountId": TARGET_SUBACCOUNT_ID,
             "symbol": "USDT",
-            "amount": "0",
+            "amount": TRANSMITTED_AMOUNT,
             "destination": ALT_DESTINATION,
             "nonce": nonce,
             "expiresAfter": expiry,
         }
-        cases.append(("signed_destination_mismatch", withdraw_envelope(nonce, expiry, sign(WITHDRAW_TYPES, "WithdrawCollateral", message))))
+        cases.append(
+            (
+                "signed_destination_mismatch",
+                withdraw_envelope(nonce, expiry, sign(WITHDRAW_TYPES, "WithdrawCollateral", message)),
+            )
+        )
 
-        # Different write primary type, transmitted as withdrawal.
         nonce = base_nonce + 50
         expiry = nonce + 60_000
         message = {
@@ -311,9 +327,13 @@ def main() -> None:
             "nonce": nonce,
             "expiresAfter": expiry,
         }
-        cases.append(("wrong_update_leverage_primary_type", withdraw_envelope(nonce, expiry, sign(UPDATE_LEVERAGE_TYPES, "UpdateLeverage", message))))
+        cases.append(
+            (
+                "wrong_update_leverage_primary_type",
+                withdraw_envelope(nonce, expiry, sign(UPDATE_LEVERAGE_TYPES, "UpdateLeverage", message)),
+            )
+        )
 
-        # Generic type with the same outer action.
         nonce = base_nonce + 60
         expiry = nonce + 60_000
         message = {
@@ -322,9 +342,13 @@ def main() -> None:
             "nonce": nonce,
             "expiresAfter": expiry,
         }
-        cases.append(("generic_same_action_primary_type", withdraw_envelope(nonce, expiry, sign(SUBACCOUNT_ACTION_TYPES, "SubAccountAction", message))))
+        cases.append(
+            (
+                "generic_same_action_primary_type",
+                withdraw_envelope(nonce, expiry, sign(SUBACCOUNT_ACTION_TYPES, "SubAccountAction", message)),
+            )
+        )
 
-        # Generic read capability, but the outer request asks for withdrawal.
         nonce = base_nonce + 70
         expiry = nonce + 60_000
         message = {
@@ -333,10 +357,15 @@ def main() -> None:
             "nonce": nonce,
             "expiresAfter": expiry,
         }
-        cases.append(("generic_read_action_replayed_as_withdraw", withdraw_envelope(nonce, expiry, sign(SUBACCOUNT_ACTION_TYPES, "SubAccountAction", message))))
+        cases.append(
+            (
+                "generic_read_action_replayed_as_withdraw",
+                withdraw_envelope(nonce, expiry, sign(SUBACCOUNT_ACTION_TYPES, "SubAccountAction", message)),
+            )
+        )
 
         for name, payload in cases:
-            status, body, headers, elapsed = post_json(PAPI_TRADE, payload or {})
+            status, body, headers, elapsed = post_json(PAPI_TRADE, payload)
             evidence["tests"].append(summarize(name, status, body, headers, elapsed))
             time.sleep(0.65)
 
