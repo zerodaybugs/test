@@ -11,7 +11,12 @@ from typing import Any
 
 BASE = "https://api.hiro.so"
 DEPLOYER = "SP1S1HSFH0SQQGWKB69EYFNY0B1MHRMGXR3J1FH4D"
-HQ = f"{DEPLOYER}.hq-hbtc-v1"
+HQ_CANDIDATES = [
+    f"{DEPLOYER}.hq-hbtc-v1",
+    f"{DEPLOYER}.hq-hbtc",
+    f"{DEPLOYER}.hq-v1",
+    f"{DEPLOYER}.hq",
+]
 OUT = Path("public-data/hermetica-role-ledger.json")
 
 ROLES = ("guardian", "trader", "rewarder", "manager", "fee-setter", "protocol")
@@ -25,7 +30,7 @@ def get_json(url: str, attempts: int = 6) -> dict[str, Any]:
                 url,
                 headers={
                     "Accept": "application/json",
-                    "User-Agent": "hermetica-public-role-replay/1.0",
+                    "User-Agent": "hermetica-public-role-replay/1.1",
                 },
             )
             with urllib.request.urlopen(req, timeout=45) as response:
@@ -82,6 +87,17 @@ def normalize(tx: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def direct_calls(principal: str) -> tuple[list[dict[str, Any]], int]:
+    rows = address_transactions(principal)
+    calls: list[dict[str, Any]] = []
+    for row in rows:
+        tx = unwrap(row)
+        call = tx.get("contract_call") or {}
+        if tx.get("tx_type") == "contract_call" and call.get("contract_id") == principal:
+            calls.append(normalize(tx))
+    return calls, len(rows)
+
+
 def principal_arg(value: object) -> str | None:
     if not isinstance(value, str):
         return None
@@ -100,14 +116,25 @@ def key(row: dict[str, Any]) -> tuple[int, int]:
 
 
 def main() -> None:
-    calls: list[dict[str, Any]] = []
-    for row in address_transactions(HQ):
-        tx = unwrap(row)
-        call = tx.get("contract_call") or {}
-        if tx.get("tx_type") == "contract_call" and call.get("contract_id") == HQ:
-            calls.append(normalize(tx))
-    calls.sort(key=key)
+    candidate_stats: list[dict[str, Any]] = []
+    selected_hq: str | None = None
+    selected_calls: list[dict[str, Any]] = []
+    for candidate in HQ_CANDIDATES:
+        calls, related_count = direct_calls(candidate)
+        candidate_stats.append(
+            {
+                "contract": candidate,
+                "related_transaction_count": related_count,
+                "direct_call_count": len(calls),
+            }
+        )
+        if len(calls) > len(selected_calls):
+            selected_hq = candidate
+            selected_calls = calls
+    if selected_hq is None or not selected_calls:
+        raise RuntimeError(f"no HQ calls found for candidates: {candidate_stats}")
 
+    calls = sorted(selected_calls, key=key)
     pending: dict[tuple[str, str], bool] = {}
     active: dict[str, set[str]] = {role: set() for role in ROLES}
     timeline: list[dict[str, Any]] = []
@@ -116,7 +143,6 @@ def main() -> None:
         fn = str(call.get("function") or "")
         args = call.get("args") or []
         applied: dict[str, Any] | None = None
-        # Only committed successful calls mutate state.
         if call.get("status") == "success" and str(call.get("result") or "").startswith("(ok"):
             role = role_from_function(fn, "request", "update")
             if role and len(args) >= 2:
@@ -150,7 +176,8 @@ def main() -> None:
 
     payload = {
         "source": "Hiro public Stacks API",
-        "hq_contract": HQ,
+        "hq_contract": selected_hq,
+        "candidate_stats": candidate_stats,
         "direct_call_count": len(calls),
         "active_roles": {role: sorted(addresses) for role, addresses in active.items()},
         "roles_by_address": {address: sorted(roles) for address, roles in sorted(reverse.items())},
