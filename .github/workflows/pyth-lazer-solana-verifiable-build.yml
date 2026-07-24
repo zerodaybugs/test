@@ -1,0 +1,150 @@
+name: Pyth Lazer Solana exact verifiable build
+
+on:
+  push:
+    branches: [ci/pyth-lazer-solana-verifiable-build-20260724]
+    paths:
+      - '.github/workflows/pyth-lazer-solana-verifiable-build.yml'
+      - 'ci/pyth-lazer-solana-verifiable-build.trigger'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/pyth-lazer-solana-verifiable-build.yml'
+      - 'ci/pyth-lazer-solana-verifiable-build.trigger'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      PYTH_LAZER_COMMIT: 9c3811199468b91d60fc62b12870d53a7b12d8fb
+      PROGRAM_ID: pytd2yyk641x7ak7mkaasSJVXh6YYZnC7wTmtgAyxPt
+      LIB_NAME: pyth_lazer_solana_contract
+      OUT_DIR: ${{ github.workspace }}/out
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.91.1
+          cache: false
+      - name: Initialize evidence directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$OUT_DIR"
+          mkdir -p "$OUT_DIR"
+          {
+            echo "workflow_run_id=${GITHUB_RUN_ID}"
+            echo "workflow_sha=${GITHUB_SHA}"
+            echo "source_commit=${PYTH_LAZER_COMMIT}"
+            echo "program_id=${PROGRAM_ID}"
+            date -u +'%Y-%m-%dT%H:%M:%SZ'
+          } > "$OUT_DIR/PROVENANCE.txt"
+      - name: Install Solana Verify CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install solana-verify --locked 2>&1 | tee "$OUT_DIR/solana-verify-install.log"
+          solana-verify --version | tee "$OUT_DIR/solana-verify-version.txt"
+          docker version > "$OUT_DIR/docker-version.txt"
+      - name: Fetch exact public Pyth Lazer source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/pyth-network/pyth-lazer-public.git pyth-lazer-public
+          git -C pyth-lazer-public fetch --depth 1 origin "$PYTH_LAZER_COMMIT"
+          git -C pyth-lazer-public checkout --detach "$PYTH_LAZER_COMMIT"
+          test "$(git -C pyth-lazer-public rev-parse HEAD)" = "$PYTH_LAZER_COMMIT"
+          git -C pyth-lazer-public rev-parse HEAD > "$OUT_DIR/source-head.txt"
+          git -C pyth-lazer-public status --porcelain=v1 > "$OUT_DIR/source-status.txt"
+          test ! -s "$OUT_DIR/source-status.txt"
+          cp pyth-lazer-public/contracts/solana/Cargo.toml "$OUT_DIR/solana-workspace-Cargo.toml"
+          cp pyth-lazer-public/contracts/solana/Cargo.lock "$OUT_DIR/solana-workspace-Cargo.lock"
+          cp pyth-lazer-public/contracts/solana/programs/pyth-lazer-solana-contract/Cargo.toml "$OUT_DIR/program-Cargo.toml"
+      - name: Build exact program in deterministic container
+        shell: bash
+        working-directory: pyth-lazer-public/contracts/solana
+        run: |
+          set +e
+          solana-verify build --library-name "$LIB_NAME" > "$OUT_DIR/build.log" 2>&1
+          rc=$?
+          echo "$rc" > "$OUT_DIR/build-exit-code.txt"
+          cat "$OUT_DIR/build.log"
+          exit 0
+      - name: Hash build and compare public on-chain registry hash
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          SO_PATH="$(find pyth-lazer-public -type f -path '*/target/deploy/*.so' -name "${LIB_NAME}.so" | head -n1)"
+          printf '%s\n' "$SO_PATH" > "$OUT_DIR/so-path.txt"
+          if [ -n "$SO_PATH" ] && [ -f "$SO_PATH" ]; then
+            cp "$SO_PATH" "$OUT_DIR/${LIB_NAME}.so"
+            sha256sum "$SO_PATH" > "$OUT_DIR/raw-so-sha256.txt"
+            solana-verify get-executable-hash "$SO_PATH" > "$OUT_DIR/executable-hash.txt" 2> "$OUT_DIR/executable-hash.stderr.txt"
+          fi
+          curl --location --silent --show-error --max-time 60 \
+            "https://verify.osec.io/status/${PROGRAM_ID}" \
+            -o "$OUT_DIR/ottersec-status.json" \
+            2> "$OUT_DIR/ottersec-status.stderr.txt"
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          out=Path('out')
+          status={}
+          try:
+              status=json.loads((out/'ottersec-status.json').read_text())
+          except Exception as exc:
+              status={'parse_error':repr(exc)}
+          built=(out/'executable-hash.txt').read_text().strip() if (out/'executable-hash.txt').exists() else None
+          onchain=status.get('on_chain_hash')
+          result={
+              'built_executable_hash':built,
+              'on_chain_hash':onchain,
+              'hashes_match':bool(built and onchain and built==onchain),
+              'registry':status,
+          }
+          (out/'SOURCE_DEPLOYMENT_BINDING.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          (out/'BINDING_MARKERS.txt').write_text(
+              f"BUILD_HASH={built or 'MISSING'}\n"
+              f"ONCHAIN_HASH={onchain or 'MISSING'}\n"
+              f"SOURCE_DEPLOYMENT_BINDING_PASS={str(result['hashes_match']).lower()}\n"
+          )
+          print(json.dumps(result,indent=2,sort_keys=True))
+          PY
+          exit 0
+      - name: Finalize integrity manifest
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          {
+            uname -a
+            git --version
+            rustc --version
+            cargo --version
+            solana-verify --version
+            docker --version
+          } > "$OUT_DIR/ENVIRONMENT.txt" 2>&1
+          find "$OUT_DIR" -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$OUT_DIR/SHA256SUMS"
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pyth-lazer-solana-verifiable-build-${{ github.run_id }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      - name: Enforce build completion
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$OUT_DIR/build-exit-code.txt"
+          test "$(cat "$OUT_DIR/build-exit-code.txt")" = '0'
+          test -s "$OUT_DIR/${LIB_NAME}.so"
+          test -s "$OUT_DIR/executable-hash.txt"
