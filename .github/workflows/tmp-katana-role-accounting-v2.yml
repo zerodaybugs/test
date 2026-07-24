@@ -1,0 +1,183 @@
+name: Temporary Katana bridge-domain accounting gate v2
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-katana-role-accounting-v2.yml'
+      - 'tmp-katana-role-accounting-v2-trigger.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  accounting:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Reconstruct every minter-burner liability domain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > /tmp/scan.py <<'PY'
+          from __future__ import annotations
+          import json, subprocess, time, urllib.request, urllib.error
+          from pathlib import Path
+
+          RPC='https://rpc.katana.network/'
+          START=20_000_000
+          STEP=30_000
+          BATCH=40
+          IMPL_SLOT='0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
+          CT_MAPPING_SLOT=int('0300d81ec8b5c42d6bd2cedd81ce26f1003c52753656b7512a8eef168b702500',16)+3
+          TOKENS=[
+            ('eth','0xEE7D8BCFb72bC1880D0Cf19822eB0A2e6577aB62','0xa6b0db1293144ebe9478b6a84f75dd651e45914a'),
+            ('usdc','0x203A662b0BD271A6ed5a60EdFbd04bFce608FD36','0x97a3500083348A147F419b8a65717909762c389f'),
+            ('usdt','0x2DCa96907fde857dd3D816880A0df407eeB2D2F2','0x053FA9b934b83E1E0ffc7e98a41aAdc3640bB462'),
+            ('wbtc','0x0913DA6Da4b42f538B445599b46Bb4622342Cf52','0xb00aa68b87256E2F22058fB2Ba3246EEc54A44fc'),
+            ('usds','0x62D6A123E8D19d06d68cf0d2294F9A3A0362c6b3','0x639f13D5f30B47c792b6851238c05D0b623C77DE'),
+          ]
+
+          def rpc(payload, retries=8):
+              body=json.dumps(payload).encode()
+              for attempt in range(retries):
+                  try:
+                      req=urllib.request.Request(RPC,data=body,headers={'content-type':'application/json'})
+                      with urllib.request.urlopen(req,timeout=90) as r:
+                          return json.loads(r.read())
+                  except Exception:
+                      if attempt+1==retries: raise
+                      time.sleep(min(2**attempt,15))
+
+          def cast(*args):
+              p=subprocess.run(['cast',*map(str,args)],text=True,capture_output=True)
+              if p.returncode:
+                  return None, p.stderr.strip()
+              return p.stdout.strip(), None
+
+          def call(addr,sig,*args):
+              return cast('call',addr,sig,*args,'--rpc-url',RPC)
+
+          def as_int(v):
+              if v is None: return None
+              try: return int(v.split()[0],16 if v.split()[0].startswith('0x') else 10)
+              except Exception: return None
+
+          latest=int(rpc({'jsonrpc':'2.0','id':1,'method':'eth_blockNumber','params':[]})['result'],16)
+          grant=cast('keccak','RoleGranted(bytes32,address,address)')[0].lower()
+          revoke=cast('keccak','RoleRevoked(bytes32,address,address)')[0].lower()
+          result={'block':latest,'startBlock':START,'tokens':[]}
+          raw_all={}
+
+          for name,token,converter in TOKENS:
+              role,err=call(token,'MINTER_BURNER_ROLE()(bytes32)')
+              if err: raise RuntimeError((name,err))
+              role=role.split()[0]
+              requests=[]
+              rid=1
+              for start in range(START,latest+1,STEP):
+                  end=min(start+STEP-1,latest)
+                  requests.append({'jsonrpc':'2.0','id':rid,'method':'eth_getLogs','params':[{
+                    'fromBlock':hex(start),'toBlock':hex(end),'address':token,
+                    'topics':[[grant,revoke],role]
+                  }]})
+                  rid+=1
+              responses=[]
+              for i in range(0,len(requests),BATCH):
+                  batch=requests[i:i+BATCH]
+                  response=rpc(batch)
+                  if not isinstance(response,list): response=[response]
+                  responses.extend(response)
+              raw_all[name]=responses
+              errors=[x.get('error') for x in responses if x.get('error')]
+              logs=[]
+              for x in responses:
+                  logs.extend(x.get('result') or [])
+              events=[]
+              holders=set()
+              for log in logs:
+                  topics=[x.lower() for x in log.get('topics',[])]
+                  if len(topics)<3: continue
+                  account='0x'+topics[2][-40:]
+                  holders.add(account.lower())
+                  events.append({
+                    'kind':'grant' if topics[0]==grant else 'revoke',
+                    'account':account.lower(),
+                    'block':int(log['blockNumber'],16),
+                    'logIndex':int(log['logIndex'],16),
+                    'tx':log['transactionHash'],
+                  })
+              events.sort(key=lambda e:(e['block'],e['logIndex']))
+
+              global_extra=as_int(call(token,'totalNetMintedByAdditionalMintersBurners()(uint256)')[0])
+              token_supply=as_int(call(token,'totalSupply()(uint256)')[0])
+              holder_rows=[]
+              sum_per_minter=0
+              sum_adapter_balance=0
+              for account in sorted(holders):
+                  active_raw,_=call(token,'hasRole(bytes32,address)(bool)',role,account)
+                  active=(active_raw=='true')
+                  slot_raw,slot_err=cast('index','address',account,hex(CT_MAPPING_SLOT))
+                  per_net=None
+                  if not slot_err:
+                      storage_raw,storage_err=cast('storage',token,slot_raw.split()[0],'--rpc-url',RPC)
+                      if not storage_err: per_net=as_int(storage_raw)
+                  sec_raw,sec_err=call(account,'secondaryChainBalance()(uint256)')
+                  secondary=None if sec_err else as_int(sec_raw)
+                  token_raw,token_err=call(account,'token()(address)')
+                  appr_raw,appr_err=call(account,'approvalRequired()(bool)')
+                  version_raw,version_err=call(account,'version()(string)')
+                  owner_raw,owner_err=call(account,'owner()(address)')
+                  impl_raw,impl_err=cast('storage',account,IMPL_SLOT,'--rpc-url',RPC)
+                  code_raw,code_err=cast('code',account,'--rpc-url',RPC)
+                  if per_net is not None: sum_per_minter+=per_net
+                  if secondary is not None: sum_adapter_balance+=secondary
+                  holder_rows.append({
+                    'address':account,'active':active,'perMinterNet':per_net,
+                    'secondaryChainBalance':secondary,
+                    'perMinterMinusAdapter':None if per_net is None or secondary is None else per_net-secondary,
+                    'tokenCall':token_raw if not token_err else None,
+                    'approvalRequired':appr_raw if not appr_err else None,
+                    'version':version_raw if not version_err else None,
+                    'owner':owner_raw if not owner_err else None,
+                    'implementationSlot':impl_raw if not impl_err else None,
+                    'hasCode':bool(code_raw and code_raw!='0x'),
+                    'callErrors':{
+                      'secondary':sec_err,'token':token_err,'approval':appr_err,
+                      'version':version_err,'owner':owner_err,'implementation':impl_err,'code':code_err,
+                      'mappingSlot':slot_err,
+                    }
+                  })
+              backing=as_int(call(converter,'backingOnLayerY()(uint256)')[0])
+              migratable=as_int(call(converter,'migratableBacking()(uint256)')[0])
+              result['tokens'].append({
+                'name':name,'token':token,'converter':converter,'role':role,
+                'roleEvents':events,'roleQueryErrors':errors,
+                'customSupply':token_supply,'globalExtraNet':global_extra,
+                'sumPerMinterNet':sum_per_minter,'globalMinusPerMinterSum':None if global_extra is None else global_extra-sum_per_minter,
+                'sumAdapterSecondaryBalance':sum_adapter_balance,
+                'globalMinusAdapterSum':None if global_extra is None else global_extra-sum_adapter_balance,
+                'converterBacking':backing,'converterMigratable':migratable,
+                'holders':holder_rows,
+              })
+
+          Path('evidence/bridge-domain-accounting.json').write_text(json.dumps(result,indent=2,sort_keys=True))
+          Path('evidence/raw-role-responses.json').write_text(json.dumps(raw_all,indent=2,sort_keys=True))
+          print(json.dumps(result,indent=2,sort_keys=True))
+          PY
+          python3 /tmp/scan.py | tee evidence/run.log
+          find evidence -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-bridge-domain-accounting-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 3
