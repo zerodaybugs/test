@@ -1,0 +1,133 @@
+name: veda-postdeploy-fix-miner
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - name: Mine post-deployment fix history
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/Veda-Labs/boring-vault.git veda
+          cd veda
+          git checkout -q main
+          mkdir -p ../veda-postdeploy-fix-miner/patches
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import re
+          import subprocess
+
+          root=pathlib.Path('.').resolve()
+          outdir=(root.parent/'veda-postdeploy-fix-miner')
+          patchdir=outdir/'patches'
+          KEYWORDS=re.compile(r'(?i)(fix|audit|security|vuln|reentran|auth|permission|overflow|underflow|precision|round|decimal|incorrect|wrong|missing|bypass|loss|drain|stuck|freeze|insolv|share|rate|queue|bridge|limit|permit|replay)')
+          SCOPES={
+            'mainnet-stack':{
+              'deploy':'847d0cba0b778bd54f94754e93fa3224fac989ee',
+              'files':[
+                'src/base/BoringVault.sol',
+                'src/base/Roles/AccountantWithRateProviders.sol',
+                'src/base/Roles/TellerWithMultiAssetSupport.sol',
+                'src/base/Roles/BoringQueue/BoringOnChainQueue.sol',
+                'src/base/Roles/BoringQueue/BoringOnChainQueueWithTracking.sol',
+                'src/base/Roles/BoringQueue/BoringSolver.sol',
+                'src/base/Roles/ManagerWithMerkleVerification.sol',
+                'src/base/Roles/CrossChain/CrossChainTellerWithGenericBridge.sol',
+                'src/base/Roles/CrossChain/Bridges/LayerZero/LayerZeroTellerWithRateLimiting.sol',
+                'src/base/Roles/CrossChain/PairwiseRateLimiter.sol',
+                'src/base/Roles/CrossChain/MessageLib.sol',
+              ]},
+            'active-lz-teller':{
+              'deploy':'bf90271750b6b8d46326808e7af03f554fb53356',
+              'files':[
+                'src/base/BoringVault.sol',
+                'src/base/Roles/TellerWithMultiAssetSupport.sol',
+                'src/base/Roles/CrossChain/CrossChainTellerWithGenericBridge.sol',
+                'src/base/Roles/CrossChain/Bridges/LayerZero/LayerZeroTellerWithRateLimiting.sol',
+                'src/base/Roles/CrossChain/PairwiseRateLimiter.sol',
+                'src/base/Roles/CrossChain/MessageLib.sol',
+              ]},
+            'ink-yield-stack':{
+              'deploy':'568d9467202a7f6e478cb8967fcee3c2afb38730',
+              'files':[
+                'src/base/BoringVault.sol',
+                'src/base/Roles/AccountantWithRateProviders.sol',
+                'src/base/Roles/AccountantWithYieldStreaming.sol',
+                'src/base/Roles/TellerWithMultiAssetSupport.sol',
+                'src/base/Roles/TellerWithBuffer.sol',
+                'src/base/Roles/TellerWithYieldStreaming.sol',
+                'src/base/Roles/BoringQueue/BoringOnChainQueue.sol',
+                'src/base/Roles/BoringQueue/BoringOnChainQueueWithTracking.sol',
+                'src/base/Roles/BoringQueue/BoringSolver.sol',
+                'src/base/Roles/Buffer/AaveV3BufferHelper.sol',
+              ]},
+          }
+
+          def run(*args):
+            return subprocess.check_output(args,cwd=root,text=True,stderr=subprocess.STDOUT).strip()
+          head=run('git','rev-parse','HEAD')
+          result={'head':head,'scopes':{},'unique_candidates':{}}
+          unique={}
+          for scope,cfg in SCOPES.items():
+            deploy=cfg['deploy']
+            try: deploy=run('git','rev-parse',deploy)
+            except Exception as e:
+              result['scopes'][scope]={'error':repr(e)}; continue
+            entries=[]
+            for path in cfg['files']:
+              try:
+                raw=run('git','log','--format=%H%x09%aI%x09%s',f'{deploy}..{head}','--',path)
+              except subprocess.CalledProcessError:
+                raw=''
+              for line in raw.splitlines():
+                if not line: continue
+                sha,date,subject=(line.split('\t',2)+['',''])[:3]
+                stat=run('git','show','--format=','--numstat',sha,'--',path)
+                rec={'sha':sha,'date':date,'subject':subject,'path':path,'keyword_hit':bool(KEYWORDS.search(subject)),'numstat':stat}
+                entries.append(rec)
+                unique.setdefault(sha,{'sha':sha,'date':date,'subject':subject,'scopes':set(),'paths':set(),'keyword_hit':bool(KEYWORDS.search(subject))})
+                unique[sha]['scopes'].add(scope); unique[sha]['paths'].add(path)
+            # Include merge/PR commits with security keywords even if subject on path commit is generic.
+            result['scopes'][scope]={'deploy':deploy,'entry_count':len(entries),'entries':entries}
+
+          # Rank candidates: all keyword hits plus every behavior-changing commit touching critical files.
+          ranked=[]
+          for sha,u in unique.items():
+            paths=sorted(u['paths']); subject=u['subject']
+            try:
+              patch=run('git','show','--format=fuller','--find-renames','--find-copies',sha,'--',*paths)
+            except Exception as e:
+              patch=f'ERROR {e!r}'
+            behavior=bool(re.search(r'^[+-](?![+-])\s*(function|modifier|if\s*\(|require\s*\(|revert\s|[A-Za-z_][A-Za-z0-9_]*\s*[+\-*/]?=)',patch,re.M))
+            score=(50 if u['keyword_hit'] else 0)+(30 if behavior else 0)+min(20,len(paths)*3)
+            rec={'sha':sha,'date':u['date'],'subject':subject,'scopes':sorted(u['scopes']),'paths':paths,'keyword_hit':u['keyword_hit'],'behavior_change':behavior,'score':score}
+            ranked.append(rec)
+            if u['keyword_hit'] or behavior:
+              (patchdir/f'{sha}.patch').write_text(patch+'\n',encoding='utf-8')
+          ranked.sort(key=lambda x:(x['score'],x['date']),reverse=True)
+          result['ranked_candidates']=ranked
+          result['unique_candidate_count']=len(ranked)
+          result['patch_candidate_count']=sum(1 for x in ranked if x['keyword_hit'] or x['behavior_change'])
+          outdir.mkdir(exist_ok=True)
+          (outdir/'index.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          (outdir/'top.txt').write_text('\n'.join(f"{x['score']:3} {x['sha']} {x['date']} {x['subject']} :: {', '.join(x['paths'])}" for x in ranked[:200])+'\n')
+          print((outdir/'top.txt').read_text()[:30000])
+          PY
+          cd ..
+          find veda-postdeploy-fix-miner -type f -print0 | sort -z | xargs -0 sha256sum > veda-postdeploy-fix-miner/SHA256SUMS
+      - name: Upload post-deployment fix miner
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-postdeploy-fix-miner
+          path: veda-postdeploy-fix-miner
+          if-no-files-found: error
+          retention-days: 1
