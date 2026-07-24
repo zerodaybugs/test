@@ -1,0 +1,179 @@
+name: Temporary Katana cross-bridge accounting gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-katana-role-accounting.yml'
+      - 'tmp-katana-role-accounting-trigger.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  accounting:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Reconstruct live additional minter-burner domains
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/raw
+          RPC='https://rpc.katana.network/'
+          IMPL_SLOT='0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
+          NC_BASE='0xa14770e0debfe4b8406a01c33ee3a7bbe0acc66b3bde7c71854bf7d080a9c600'
+
+          cat > evidence/tokens.tsv <<'EOF'
+          eth|0xEE7D8BCFb72bC1880D0Cf19822eB0A2e6577aB62|0xa6b0db1293144ebe9478b6a84f75dd651e45914a
+          usdc|0x203A662b0BD271A6ed5a60EdFbd04bFce608FD36|0x97a3500083348A147F419b8a65717909762c389f
+          usdt|0x2DCa96907fde857dd3D816880A0df407eeB2D2F2|0x053FA9b934b83E1E0ffc7e98a41aAdc3640bB462
+          wbtc|0x0913DA6Da4b42f538B445599b46Bb4622342Cf52|0xb00aa68b87256E2F22058fB2Ba3246EEc54A44fc
+          usds|0x62D6A123E8D19d06d68cf0d2294F9A3A0362c6b3|0x639f13D5f30B47c792b6851238c05D0b623C77DE
+          EOF
+
+          latest=$(cast block-number --rpc-url "$RPC")
+          echo "$latest" > evidence/katana-block.txt
+          ROLE_EVENT=$(cast keccak 'RoleGranted(bytes32,address,address)')
+          REVOKE_EVENT=$(cast keccak 'RoleRevoked(bytes32,address,address)')
+
+          call() {
+            local label="$1" addr="$2" sig="$3"; shift 3
+            { printf 'address=%s\nsignature=%s\n' "$addr" "$sig"; cast call "$addr" "$sig" "$@" --rpc-url "$RPC"; } > "evidence/raw/${label}.txt" 2>&1 || true
+          }
+
+          while IFS='|' read -r name token converter; do
+            call "${name}-token-version" "$token" 'version()(string)'
+            call "${name}-token-lxlyBridge" "$token" 'lxlyBridge()(address)'
+            call "${name}-token-role" "$token" 'MINTER_BURNER_ROLE()(bytes32)'
+            call "${name}-token-extraNet" "$token" 'totalNetMintedByAdditionalMintersBurners()(uint256)'
+            call "${name}-token-supply" "$token" 'totalSupply()(uint256)'
+
+            call "${name}-nc-version" "$converter" 'version()(string)'
+            call "${name}-nc-backing" "$converter" 'backingOnLayerY()(uint256)'
+            call "${name}-nc-lxlyId" "$converter" 'lxlyId()(uint32)'
+            call "${name}-nc-lxlyBridge" "$converter" 'lxlyBridge()(address)'
+            call "${name}-nc-layerXId" "$converter" 'layerXLxlyId()(uint32)'
+            call "${name}-nc-migratable" "$converter" 'migratableBacking()(uint256)'
+
+            role=$(cast call "$token" 'MINTER_BURNER_ROLE()(bytes32)' --rpc-url "$RPC" | awk '{print $1}')
+            : > "evidence/raw/${name}-role-events.jsonl"
+            start=0
+            step=200000
+            while [ "$start" -le "$latest" ]; do
+              end=$((start+step-1)); [ "$end" -gt "$latest" ] && end="$latest"
+              payload=$(printf '{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{"fromBlock":"0x%x","toBlock":"0x%x","address":"%s","topics":[["%s","%s"],"%s"]}]}' "$start" "$end" "$token" "$ROLE_EVENT" "$REVOKE_EVENT" "$role")
+              curl -sS --retry 4 -H 'content-type: application/json' --data "$payload" "$RPC" >> "evidence/raw/${name}-role-events.jsonl"
+              printf '\n' >> "evidence/raw/${name}-role-events.jsonl"
+              start=$((end+1))
+            done
+          done < evidence/tokens.tsv
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, subprocess, re
+
+          root=Path('evidence')
+          raw=root/'raw'
+          rpc='https://rpc.katana.network/'
+          tokens=[]
+          for line in (root/'tokens.tsv').read_text().splitlines():
+              if line.strip():
+                  name,token,converter=line.split('|')
+                  tokens.append((name,token,converter))
+
+          def last(label):
+              p=raw/f'{label}.txt'
+              if not p.exists(): return None
+              vals=[x.strip() for x in p.read_text(errors='replace').splitlines() if x.strip() and not x.startswith(('address=','signature='))]
+              return vals[-1] if vals else None
+
+          def num(label):
+              v=last(label)
+              if not v or v.startswith('Error:'): return None
+              first=v.split()[0]
+              try: return int(first,16) if first.startswith('0x') else int(first)
+              except: return None
+
+          def cast_call(addr,sig,*args):
+              p=subprocess.run(['cast','call',addr,sig,*map(str,args),'--rpc-url',rpc],text=True,capture_output=True)
+              return p.stdout.strip() if p.returncode==0 else f'ERROR:{p.stderr.strip()}'
+
+          grant_topic=subprocess.check_output(['cast','keccak','RoleGranted(bytes32,address,address)'],text=True).strip().lower()
+          revoke_topic=subprocess.check_output(['cast','keccak','RoleRevoked(bytes32,address,address)'],text=True).strip().lower()
+          impl_slot='0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
+          out={'block':(root/'katana-block.txt').read_text().strip(),'tokens':[]}
+
+          for name,token,converter in tokens:
+              grants=[]; revokes=[]; errors=[]
+              for line in (raw/f'{name}-role-events.jsonl').read_text().splitlines():
+                  try: obj=json.loads(line)
+                  except Exception as e: errors.append(f'parse:{e}'); continue
+                  if obj.get('error'): errors.append(obj['error']); continue
+                  for log in obj.get('result',[]):
+                      topics=[x.lower() for x in log.get('topics',[])]
+                      if len(topics)<3: continue
+                      account='0x'+topics[2][-40:]
+                      entry={'account':account,'block':int(log['blockNumber'],16),'tx':log['transactionHash']}
+                      if topics[0]==grant_topic: grants.append(entry)
+                      elif topics[0]==revoke_topic: revokes.append(entry)
+              active={}
+              for e in sorted(grants+[{**x,'revoke':True} for x in revokes], key=lambda x:(x['block'],x['tx'])):
+                  active[e['account']]=not e.get('revoke',False)
+              holders=[a for a,v in active.items() if v]
+              holder_rows=[]
+              secondary_sum=0
+              for account in holders:
+                  code=subprocess.check_output(['cast','code',account,'--rpc-url',rpc],text=True).strip()
+                  sec=cast_call(account,'secondaryChainBalance()(uint256)')
+                  sec_n=None
+                  if not sec.startswith('ERROR:'):
+                      try: sec_n=int(sec.split()[0])
+                      except: pass
+                  if sec_n is not None: secondary_sum+=sec_n
+                  holder_rows.append({
+                      'address':account,
+                      'hasCode':code!='0x',
+                      'codeHash':subprocess.check_output(['cast','keccak',code],text=True).strip() if code!='0x' else None,
+                      'implementationSlot':subprocess.run(['cast','storage',account,impl_slot,'--rpc-url',rpc],text=True,capture_output=True).stdout.strip(),
+                      'token':cast_call(account,'token()(address)'),
+                      'secondaryChainBalance':sec_n,
+                      'approvalRequired':cast_call(account,'approvalRequired()(bool)'),
+                      'version':cast_call(account,'version()(string)'),
+                      'protocol':cast_call(account,'VAULT_BRIDGE_PROTOCOL()(string)'),
+                      'globalInitializationCounter':cast_call(account,'globalInitializationCounter()(uint64)'),
+                      'owner':cast_call(account,'owner()(address)'),
+                  })
+              extra=num(f'{name}-token-extraNet')
+              out['tokens'].append({
+                  'name':name,'token':token,'converter':converter,
+                  'tokenVersion':last(f'{name}-token-version'),
+                  'converterVersion':last(f'{name}-nc-version'),
+                  'customSupply':num(f'{name}-token-supply'),
+                  'extraNetMinted':extra,
+                  'activeMinterBurners':holder_rows,
+                  'adapterSecondaryBalanceSum':secondary_sum,
+                  'extraNetMinusAdapterSum':None if extra is None else extra-secondary_sum,
+                  'converterBacking':num(f'{name}-nc-backing'),
+                  'converterMigratable':num(f'{name}-nc-migratable'),
+                  'lxlyBridge':last(f'{name}-token-lxlyBridge'),
+                  'roleEventErrors':errors,
+              })
+          (root/'role-accounting-summary.json').write_text(json.dumps(out,indent=2,sort_keys=True))
+          print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+
+          find evidence -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-role-accounting-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 3
