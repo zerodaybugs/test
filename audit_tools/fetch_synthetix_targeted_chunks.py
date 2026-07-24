@@ -10,7 +10,7 @@ import urllib.request
 
 OUT = pathlib.Path("targeted_web_assets")
 UA = "Mozilla/5.0 (compatible; passive-security-review/1.0)"
-MAX_BYTES = 30 * 1024 * 1024
+MAX_BYTES = 100 * 1024 * 1024
 
 URLS = {
     "exchange_deposit_proxy": "https://exchange.synthetix.io/assets/DepositProxy-DKmIyX6Q.js",
@@ -35,6 +35,23 @@ URLS = {
     "exchange_trade_page": "https://exchange.synthetix.io/assets/TradePage-DIfy7GrB.js",
     "exchange_referral_welcome": "https://exchange.synthetix.io/assets/ReferralWelcomeModal-Ya9ya9ID.js",
     "exchange_referrals_page": "https://exchange.synthetix.io/assets/ReferralsPage-D0iGROix.js",
+    "exchange_referrals_content": "https://exchange.synthetix.io/assets/ReferralsContent-DDlk8y0Z.js",
+    "exchange_revoke_all_delegates": "https://exchange.synthetix.io/assets/RevokeAllDelegatesContent-kDarMhQk.js",
+    "exchange_share_position_icon": "https://exchange.synthetix.io/assets/SharePositionIcon-xuMn2mon.js",
+    "exchange_build_share_link": "https://exchange.synthetix.io/assets/buildShareLink-kGZlINfv.js",
+    "exchange_sanitize": "https://exchange.synthetix.io/assets/sanitize-DQ4CD9oS.js",
+    "exchange_shareable_position": "https://exchange.synthetix.io/assets/toShareableOpenPosition-CYf81nid.js",
+    "exchange_close_all_positions": "https://exchange.synthetix.io/assets/CloseAllPositionsModal-DFTOdP1i.js",
+    "exchange_close_position": "https://exchange.synthetix.io/assets/ClosePositionModal-Df0UmC4m.js",
+    "exchange_reverse_position": "https://exchange.synthetix.io/assets/ReversePositionModal-CHNSMQiI.js",
+    "exchange_use_submit_order": "https://exchange.synthetix.io/assets/useSubmitOrder-BspCsBTC.js",
+    "exchange_use_can_trade": "https://exchange.synthetix.io/assets/useCanTrade-sDrwBRe9.js",
+    "exchange_use_cancel_orders": "https://exchange.synthetix.io/assets/useCancelOrders-DqoxCRCW.js",
+    "exchange_use_cancel_all_orders": "https://exchange.synthetix.io/assets/useCancelAllOrders-CB6lcOdN.js",
+    "exchange_use_edit_order": "https://exchange.synthetix.io/assets/useEditOrder-D2lY9xCD.js",
+    "exchange_mobile_positions": "https://exchange.synthetix.io/assets/MobilePositionsList-C1-SHwx4.js",
+    "exchange_main_map": "https://exchange.synthetix.io/assets/index-BJrW6h18.js.map",
+    "exchange_trade_page_map": "https://exchange.synthetix.io/assets/TradePage-DIfy7GrB.js.map",
     "governance_main": "https://governance.synthetix.io/main.js",
     "governance_main_map": "https://governance.synthetix.io/main.js.map",
     "governance_manifest": "https://governance.synthetix.io/manifest.json",
@@ -43,7 +60,7 @@ URLS = {
 
 def fetch(url: str) -> tuple[bytes, dict[str, str], int]:
     request = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
-    with urllib.request.urlopen(request, timeout=60) as response:
+    with urllib.request.urlopen(request, timeout=90) as response:
         body = response.read(MAX_BYTES + 1)
         if len(body) > MAX_BYTES:
             raise ValueError(f"asset exceeds {MAX_BYTES} bytes")
