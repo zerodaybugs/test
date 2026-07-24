@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
+import re
 import time
 import urllib.error
 import urllib.request
@@ -22,6 +23,7 @@ from typing import Any
 
 from eth_account import Account
 from eth_account.messages import encode_typed_data
+from eth_utils import to_checksum_address
 
 OUT = pathlib.Path("read_auth_boundary")
 OUT.mkdir(parents=True, exist_ok=True)
@@ -87,6 +89,16 @@ def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def redact(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    text = re.sub(r"0x[a-fA-F0-9]{40}", "<address>", text)
+    text = re.sub(r"0x[a-fA-F0-9]{64,}", "<hex>", text)
+    text = re.sub(r"\b\d{6,}\b", "<number>", text)
+    return text[:300]
+
+
 def post_json(url: str, payload: dict[str, Any], timeout: int = 45) -> tuple[int, bytes]:
     req = urllib.request.Request(
         url,
@@ -144,7 +156,7 @@ def schema(value: Any, depth: int = 0) -> Any:
 
 
 def topic_address(topic: str) -> str:
-    return "0x" + topic[-40:]
+    return to_checksum_address("0x" + topic[-40:])
 
 
 def event_from_receipt(tx_hash: str) -> dict[str, Any] | None:
@@ -189,6 +201,9 @@ def account_ids(wallet: str) -> dict[str, list[str]]:
     )
     data = parse_json(body)
     response = data.get("response") if isinstance(data, dict) else None
+    error = data.get("error") if isinstance(data, dict) else None
+    error_code = error.get("code") if isinstance(error, dict) else None
+    error_message = error.get("message") if isinstance(error, dict) else error
     result = {"owned": [], "delegated": [], "managed": []}
     if status == 200 and isinstance(data, dict) and data.get("status") == "ok":
         if isinstance(response, list):
@@ -201,6 +216,8 @@ def account_ids(wallet: str) -> dict[str, list[str]]:
         {
             "http_status": status,
             "api_status": data.get("status") if isinstance(data, dict) else None,
+            "error_code": error_code,
+            "error_message_redacted": redact(error_message),
             "response_schema": schema(response),
             "owned_count": len(result["owned"]),
             "delegated_count": len(result["delegated"]),
@@ -275,6 +292,7 @@ def summarize(name: str, status: int, body: bytes) -> dict[str, Any]:
         "http_status": status,
         "api_success": success,
         "error_code": error_code,
+        "error_message_redacted": redact(error_message),
         "error_message_sha256": digest(str(error_message)) if error_message is not None else None,
         "body_sha256": hashlib.sha256(body).hexdigest(),
         "body_bytes": len(body),
@@ -345,6 +363,7 @@ def main() -> None:
             "unexpected_authorization_success": False,
             "probe_completed": False,
             "failure_type": type(exc).__name__,
+            "failure_message_redacted": redact(exc),
             "failure_message_sha256": digest(str(exc)),
             "diagnostics": DIAG,
         }
