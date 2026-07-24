@@ -2,8 +2,8 @@
 """Passively collect same-origin public web assets for static review.
 
 No crawling beyond static assets explicitly embedded in the three in-scope
-landing pages, no form submissions, no authentication, and no state-changing
-requests.
+landing pages or imported by those JavaScript modules, no form submissions,
+no authentication, and no state-changing requests.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import re
 import time
 import urllib.parse
 import urllib.request
+from collections import deque
 from html.parser import HTMLParser
 
 OUT = pathlib.Path("web_assets")
@@ -24,7 +25,13 @@ TARGETS = {
     "governance": "https://governance.synthetix.io/",
 }
 MAX_BYTES = 30 * 1024 * 1024
+MAX_ASSETS_PER_SITE = 250
 UA = "Mozilla/5.0 (compatible; passive-security-review/1.0)"
+IMPORT_RE = re.compile(
+    r"(?:from\s*|import\s*\()\s*['\"](?P<url>[^'\"]+)['\"]",
+    re.MULTILINE,
+)
+SOURCE_MAP_RE = re.compile(r"sourceMappingURL=([^\s*]+)")
 
 
 class AssetParser(HTMLParser):
@@ -69,6 +76,17 @@ def same_origin(base: str, candidate: str) -> bool:
     return (a.scheme, a.netloc) == (b.scheme, b.netloc)
 
 
+def add_if_static(queue: deque[str], enqueued: set[str], base: str, parent: str, value: str) -> None:
+    url = urllib.parse.urljoin(parent, value.strip())
+    if not same_origin(base, url) or url in enqueued:
+        return
+    suffix = pathlib.PurePosixPath(urllib.parse.urlparse(url).path).suffix.lower()
+    if suffix not in {".js", ".mjs", ".css", ".json", ".map", ".wasm", ".woff", ".woff2"}:
+        return
+    enqueued.add(url)
+    queue.append(url)
+
+
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     manifest: list[dict[str, object]] = []
@@ -83,11 +101,15 @@ def main() -> None:
 
         parser = AssetParser()
         parser.feed(html.decode("utf-8", errors="replace"))
-        queue = sorted({urllib.parse.urljoin(base, value) for value in parser.urls if value})
-        seen: set[str] = set()
+        queue: deque[str] = deque()
+        enqueued: set[str] = set()
+        for value in sorted(parser.urls):
+            add_if_static(queue, enqueued, base, base, value)
 
-        for url in queue[:250]:
-            if url in seen or not same_origin(base, url):
+        seen: set[str] = set()
+        while queue and len(seen) < MAX_ASSETS_PER_SITE:
+            url = queue.popleft()
+            if url in seen:
                 continue
             seen.add(url)
             path = target_dir / safe_name(url)
@@ -97,19 +119,13 @@ def main() -> None:
                 path.write_bytes(body)
                 record.update(status=asset_status, bytes=len(body), content_type=asset_headers.get("Content-Type", ""))
 
-                # Fetch only explicitly advertised source maps; do not guess paths.
                 text = body.decode("utf-8", errors="ignore")
-                matches = re.findall(r"(?:sourceMappingURL=)([^\s*]+)", text[-4096:])
-                for map_ref in matches[:1]:
-                    map_url = urllib.parse.urljoin(url, map_ref.strip())
-                    if same_origin(base, map_url):
-                        map_path = target_dir / safe_name(map_url)
-                        try:
-                            map_body, map_headers, map_status = fetch(map_url)
-                            map_path.write_bytes(map_body)
-                            manifest.append({"site": label, "url": map_url, "status": map_status, "bytes": len(map_body), "content_type": map_headers.get("Content-Type", ""), "path": str(map_path), "source_map_for": url})
-                        except Exception as exc:  # noqa: BLE001
-                            manifest.append({"site": label, "url": map_url, "error": repr(exc), "source_map_for": url})
+                for match in IMPORT_RE.finditer(text):
+                    add_if_static(queue, enqueued, base, url, match.group("url"))
+
+                # Fetch only explicitly advertised source maps; do not guess paths.
+                for map_ref in SOURCE_MAP_RE.findall(text[-4096:])[:1]:
+                    add_if_static(queue, enqueued, base, url, map_ref.rstrip("*/"))
             except Exception as exc:  # noqa: BLE001
                 record["error"] = repr(exc)
             manifest.append(record)
