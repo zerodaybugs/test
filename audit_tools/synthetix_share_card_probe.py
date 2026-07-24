@@ -26,7 +26,7 @@ MAX_BYTES = 12 * 1024 * 1024
 
 BASE_PARAMS: dict[str, str] = {
     "symbol": "BTC-USDT",
-    "side": "LONG",
+    "side": "long",
     "leverage": "1",
     "pnlPercent": "+0.00%",
     "entryPrice": "100000.00",
@@ -42,7 +42,7 @@ CASES: dict[str, dict[str, str]] = {
     "unknown_image_id": {"imageId": "synthetix-audit-unknown-image"},
     "relative_asset_canary": {"imageId": "../share-bg-dark"},
     "absolute_public_asset_canary": {"imageId": "/images/share-card/pepe.png"},
-    "markup_text_canary": {"symbol": "AUDIT_<tag>&quoted", "side": "SHORT"},
+    "markup_text_canary": {"symbol": "AUDIT_<tag>&quoted", "side": "short"},
     "referral_url_canary": {
         "referralCode": "AUDIT-CODE",
         "referralLink": "https://example.com/audit?x=1&y=2",
