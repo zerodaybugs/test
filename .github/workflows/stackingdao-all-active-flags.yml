@@ -1,0 +1,161 @@
+name: StackingDAO all active flags gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/stackingdao-all-active-flags.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout workflow
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Enumerate all deployed names and query DAO flags read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          npm init -y >/dev/null 2>&1
+          npm install --no-save --package-lock=false @stacks/transactions@6.17.0 >/dev/null 2>&1
+          cat > query.mjs <<'NODE'
+          import { contractPrincipalCV, cvToHex, cvToString, hexToCV } from '@stacks/transactions';
+          import { writeFile } from 'node:fs/promises';
+
+          const address = 'SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG';
+          const api = 'https://api.mainnet.hiro.so';
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+          async function fetchJson(url, options = {}, attempts = 8) {
+            let last;
+            for (let i = 1; i <= attempts; i += 1) {
+              try {
+                const response = await fetch(url, options);
+                const text = await response.text();
+                if (!response.ok) {
+                  const retry = Number(response.headers.get('retry-after') ?? 0);
+                  if ((response.status === 429 || response.status >= 500) && i < attempts) {
+                    await sleep(Math.max(1500 * i, retry * 1000));
+                    continue;
+                  }
+                  throw new Error(`${response.status}: ${text}`);
+                }
+                return JSON.parse(text);
+              } catch (error) {
+                last = error;
+                if (i < attempts) await sleep(1500 * i);
+              }
+            }
+            throw last;
+          }
+
+          async function daoCall(fn, args = []) {
+            const body = JSON.stringify({ sender: address, arguments: args.map(cvToHex) });
+            const json = await fetchJson(
+              `${api}/v2/contracts/call-read/${address}/dao/${fn}`,
+              { method: 'POST', headers: { 'content-type': 'application/json' }, body },
+            );
+            if (!json.result) throw new Error(JSON.stringify(json));
+            return { decoded: cvToString(hexToCV(json.result)), raw: json };
+          }
+
+          function contractId(tx) {
+            return tx.smart_contract?.contract_id
+              ?? tx.tx?.smart_contract?.contract_id
+              ?? tx.contract_id
+              ?? null;
+          }
+
+          const transactions = [];
+          let offset = 0;
+          const limit = 50;
+          let total = Infinity;
+          while (offset < total) {
+            const page = await fetchJson(
+              `${api}/extended/v2/addresses/${address}/transactions?limit=${limit}&offset=${offset}`,
+            );
+            const rows = page.results ?? [];
+            transactions.push(...rows);
+            total = Number(page.total ?? transactions.length);
+            if (rows.length === 0) break;
+            offset += rows.length;
+            await sleep(250);
+          }
+
+          const names = new Set();
+          for (const tx of transactions) {
+            const id = contractId(tx);
+            if (typeof id === 'string' && id.startsWith(`${address}.`)) names.add(id.slice(address.length + 1));
+          }
+          // Coverage backstop for contracts that can be absent from the address transaction index.
+          for (const name of [
+            'dao','reserve-v1','ststx-token','ststxbtc-token','ststxbtc-token-v2',
+            'stacking-dao-core-v1','stacking-dao-core-v2','stacking-dao-core-v3','stacking-dao-core-v4',
+            'stacking-dao-core-v5','stacking-dao-core-v6','stacking-dao-core-btc-v1',
+            'stacking-dao-core-btc-v2','stacking-dao-core-btc-v3','direct-helpers-v1','direct-helpers-v2',
+            'direct-helpers-v3','direct-helpers-v4','rewards-v1','rewards-v2','rewards-v3','rewards-v4',
+            'rewards-v5','rewards-v6','rewards-v7','strategy-v0','strategy-v2','strategy-v3','strategy-v4',
+            'staking-v0','staking-v1','commission-v1','commission-v2','commission-btc-v1',
+            'data-core-v1','data-core-v2','data-core-v3','data-pools-v1','data-direct-stacking-v1',
+            'delegates-handler-v1','stacking-pool-v1','stacking-pool-signer-v1','stacking-pool-payout-v1',
+            'swap-ststx-ststxbtc-v1','swap-ststx-ststxbtc-v2','ststxbtc-migration-v1',
+            'ststxbtc-tracking','ststxbtc-tracking-v2','ststxbtc-tracking-data','ststxbtc-tracking-data-v2',
+          ]) names.add(name);
+
+          const enabled = await daoCall('get-contracts-enabled');
+          const rows = [];
+          for (const name of [...names].sort()) {
+            try {
+              rows.push({ name, ...(await daoCall('get-contract-active', [contractPrincipalCV(address, name)])) });
+            } catch (error) {
+              rows.push({ name, error: String(error) });
+            }
+            await sleep(125);
+          }
+          const active = rows.filter(row => row.decoded === 'true');
+          const output = {
+            captured_at: new Date().toISOString(), address, enabled,
+            indexed_transactions: transactions.length, queried_names: rows.length,
+            active_count: active.length, active, rows,
+          };
+          await writeFile('evidence/active-flags.json', `${JSON.stringify(output, null, 2)}\n`);
+          const lines = [
+            `captured_at=${output.captured_at}`,
+            `dao_enabled=${enabled.decoded}`,
+            `indexed_transactions=${transactions.length}`,
+            `queried_names=${rows.length}`,
+            `active_count=${active.length}`,
+            ...active.map(row => `ACTIVE ${row.name}`),
+            ...rows.filter(row => row.error).map(row => `ERROR ${row.name} ${row.error}`),
+          ];
+          await writeFile('evidence/active-flags.txt', `${lines.join('\n')}\n`);
+          console.log(lines.join('\n'));
+          NODE
+          node query.mjs
+          sha256sum evidence/active-flags.json evidence/active-flags.txt query.mjs > evidence/SHA256SUMS
+
+      - name: Upload active flags evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackingdao-all-active-flags-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Enforce gate integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fx 'dao_enabled=true' evidence/active-flags.txt
+          grep -Fx 'ACTIVE reserve-v1' evidence/active-flags.txt
+          grep -Fx 'ACTIVE stacking-dao-core-v6' evidence/active-flags.txt
+          grep -Fx 'ACTIVE stacking-dao-core-btc-v3' evidence/active-flags.txt
