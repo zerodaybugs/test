@@ -1,0 +1,204 @@
+name: Hermetica role ledger collector
+
+on:
+  push:
+    branches:
+      - hermetica-passive-audit-20260724
+    paths:
+      - '.github/workflows/hermetica-role-ledger.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  collect-role-ledger:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: hermetica-passive-audit-20260724
+          fetch-depth: 0
+
+      - name: Reconstruct full HQ role ledger from public chain history
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import re
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          OUT = Path('evidence/hermetica-role-ledger')
+          OUT.mkdir(parents=True, exist_ok=True)
+          DEPLOYER = 'SP1S1HSFH0SQQGWKB69EYFNY0B1MHRMGXR3J1FH4D'
+          HQ = f'{DEPLOYER}.hq-v1'
+
+          def request(method, url, payload=None, attempts=5):
+              data = None
+              headers = {
+                  'Accept': 'application/json',
+                  'User-Agent': 'zerodaybugs-hermetica-role-ledger/1.0',
+              }
+              if payload is not None:
+                  data = json.dumps(payload).encode()
+                  headers['Content-Type'] = 'application/json'
+              last = None
+              for i in range(attempts):
+                  try:
+                      req = urllib.request.Request(url, data=data, headers=headers, method=method)
+                      with urllib.request.urlopen(req, timeout=45) as r:
+                          body = r.read().decode('utf-8', errors='replace')
+                          try:
+                              parsed = json.loads(body)
+                          except Exception:
+                              parsed = None
+                          return {'ok': True, 'status': r.status, 'url': url, 'json': parsed, 'body': body}
+                  except urllib.error.HTTPError as e:
+                      body = e.read().decode('utf-8', errors='replace')
+                      last = {'ok': False, 'status': e.code, 'url': url, 'body': body}
+                      if e.code not in (408, 429, 500, 502, 503, 504):
+                          return last
+                  except Exception as e:
+                      last = {'ok': False, 'status': None, 'url': url, 'error': repr(e)}
+                  time.sleep(2 ** i)
+              return last
+
+          def save(name, value):
+              p = OUT / name
+              p.parent.mkdir(parents=True, exist_ok=True)
+              p.write_text(json.dumps(value, indent=2, sort_keys=True), encoding='utf-8')
+
+          qp = urllib.parse.quote(HQ, safe='')
+          pages = []
+          offset = 0
+          limit = 50
+          total = None
+          while total is None or offset < total:
+              result = request('GET', f'https://api.hiro.so/extended/v2/addresses/{qp}/transactions?limit={limit}&offset={offset}')
+              pages.append({'offset': offset, 'response': result})
+              data = result.get('json') if result else None
+              if not result or not result.get('ok') or not isinstance(data, dict):
+                  break
+              total = int(data.get('total') or 0)
+              rows = data.get('results') or []
+              if not rows:
+                  break
+              offset += limit
+          save('hq-transaction-pages.json', pages)
+
+          calls = []
+          for page in pages:
+              data = (page.get('response') or {}).get('json') or {}
+              for row in data.get('results') or []:
+                  tx = row.get('tx') or row
+                  cc = tx.get('contract_call') or {}
+                  if cc.get('contract_id') != HQ:
+                      continue
+                  calls.append({
+                      'tx_id': tx.get('tx_id'),
+                      'block_height': tx.get('block_height'),
+                      'tx_index': tx.get('tx_index'),
+                      'block_time_iso': tx.get('block_time_iso'),
+                      'sender': tx.get('sender_address'),
+                      'status': tx.get('tx_status'),
+                      'result': (tx.get('tx_result') or {}).get('repr'),
+                      'function': cc.get('function_name'),
+                      'args': [a.get('repr') for a in (cc.get('function_args') or [])],
+                  })
+          calls.sort(key=lambda x: (x.get('block_height') or 0, x.get('tx_index') or 0, x.get('tx_id') or ''))
+          save('hq-direct-calls.json', calls)
+
+          roles = ('guardian', 'trader', 'rewarder', 'manager', 'fee-setter', 'protocol')
+          pending = {}
+          active = {r: {} for r in roles}
+          transitions = []
+
+          for call in calls:
+              if call.get('status') != 'success':
+                  continue
+              fn = call.get('function') or ''
+              args = call.get('args') or []
+
+              m = re.fullmatch(r'request-(guardian|trader|rewarder|manager|fee-setter|protocol)-update', fn)
+              if m and len(args) >= 2:
+                  role = m.group(1)
+                  address = args[0].lstrip("'")
+                  is_add = args[1].lower() == 'true'
+                  pending[(role, address)] = is_add
+                  transitions.append({**call, 'kind': 'request', 'role': role, 'address': address, 'is_add': is_add})
+                  continue
+
+              m = re.fullmatch(r'cancel-(guardian|trader|rewarder|manager|fee-setter|protocol)-request', fn)
+              if m and args:
+                  role = m.group(1)
+                  address = args[0].lstrip("'")
+                  old = pending.pop((role, address), None)
+                  transitions.append({**call, 'kind': 'cancel', 'role': role, 'address': address, 'pending_was': old})
+                  continue
+
+              m = re.fullmatch(r'confirm-(guardian|trader|rewarder|manager|fee-setter|protocol)-request', fn)
+              if m and args:
+                  role = m.group(1)
+                  address = args[0].lstrip("'")
+                  is_add = pending.pop((role, address), None)
+                  if is_add is not None:
+                      active[role][address] = bool(is_add)
+                  transitions.append({**call, 'kind': 'confirm', 'role': role, 'address': address, 'applied_is_add': is_add})
+                  continue
+
+          active_sets = {
+              role: sorted(address for address, enabled in entries.items() if enabled)
+              for role, entries in active.items()
+          }
+          inactive_seen = {
+              role: sorted(address for address, enabled in entries.items() if not enabled)
+              for role, entries in active.items()
+          }
+          save('role-transitions.json', transitions)
+          save('active-roles.json', {
+              'active': active_sets,
+              'inactive_seen': inactive_seen,
+              'unresolved_pending': [
+                  {'role': role, 'address': address, 'is_add': is_add}
+                  for (role, address), is_add in sorted(pending.items())
+              ],
+              'total_hq_related_transactions': total,
+              'total_direct_hq_calls': len(calls),
+          })
+
+          # Fetch immutable sources for every active protocol contract, including undocumented ones.
+          for address in active_sets.get('protocol', []):
+              if '.' not in address:
+                  continue
+              deployer, name = address.split('.', 1)
+              qcid = urllib.parse.quote(address, safe='')
+              endpoints = {
+                  'hiro-source': f'https://api.hiro.so/v2/contracts/source/{deployer}/{name}?proof=0',
+                  'hiro-interface': f'https://api.hiro.so/v2/contracts/interface/{deployer}/{name}',
+                  'hiro-extended': f'https://api.hiro.so/extended/v1/contract/{qcid}',
+                  'stxer-ast': f'https://api.stxer.xyz/contracts/{qcid}',
+              }
+              safe_name = address.replace('.', '__')
+              for label, url in endpoints.items():
+                  save(f'active-protocol-contracts/{safe_name}/{label}.json', request('GET', url))
+          PY
+
+      - name: Commit role ledger
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add evidence/hermetica-role-ledger
+          if git diff --cached --quiet; then
+            echo 'No role-ledger changes.'
+            exit 0
+          fi
+          git commit -m 'chore: reconstruct Hermetica role ledger [skip ci]'
+          git push origin HEAD:hermetica-passive-audit-20260724
