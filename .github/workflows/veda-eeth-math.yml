@@ -1,0 +1,217 @@
+name: veda-eeth-math
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Compute exact read-only accounting bounds
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import math
+          import random
+          import subprocess
+          import time
+          import urllib.request
+
+          ENDPOINTS = [
+              "https://ethereum-rpc.publicnode.com",
+              "https://eth.drpc.org",
+              "https://rpc.mevblocker.io",
+              "https://eth-mainnet.public.blastapi.io",
+              "https://1rpc.io/eth",
+          ]
+          EETH="0x35fA164735182de50811E8e2E824cFb9B6118ac2"
+          WEETH="0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee"
+          VAULT="0xf0bb20865277aBd641a307eCe5Ee04E79073416C"
+          TELLER="0x9AA79C84b79816ab920bBcE20f8f74557B514734"
+          ACCOUNTANT="0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198"
+          QUEUE="0x0D2dF071207E18Ca8638b4f04E98c53155eC2cE0"
+          U=10**18
+
+          def request(endpoint,method,params,timeout=35):
+              payload=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
+              req=urllib.request.Request(endpoint,data=payload,method="POST",headers={"content-type":"application/json","user-agent":"veda-eeth-math/1.0"})
+              with urllib.request.urlopen(req,timeout=timeout) as response:
+                  result=json.loads(response.read().decode())
+              if "error" in result: raise RuntimeError(result["error"])
+              return result["result"]
+
+          failures={}
+          endpoint=None
+          for candidate in ENDPOINTS:
+              try:
+                  if int(request(candidate,"eth_chainId",[]),16)==1:
+                      request(candidate,"eth_getCode",[EETH,"latest"])
+                      endpoint=candidate; break
+              except Exception as exc:
+                  failures[candidate]=repr(exc)
+          if endpoint is None: raise RuntimeError(failures)
+
+          def cmd(*args): return subprocess.check_output(list(args),text=True).strip()
+          def sig(text): return cmd("cast","sig",text)
+          def calldata(signature,*args): return cmd("cast","calldata",signature,*map(str,args))
+          def strip0(v): return v[2:] if v.startswith("0x") else v
+          def aw(a): return strip0(a).lower().rjust(64,"0")
+          def call_raw(target,data,block): return request(endpoint,"eth_call",[{"to":target,"data":data},block])
+          def call_uint(target,data,block): return int(call_raw(target,data,block),16)
+          def call_addr(target,data,block): return "0x"+strip0(call_raw(target,data,block))[-40:]
+          def words(raw):
+              value=strip0(raw)
+              return [int(value[i:i+64],16) for i in range(0,len(value),64)] if value else []
+
+          block_hex=request(endpoint,"eth_blockNumber",[])
+          block=int(block_hex,16)
+          pool=call_addr(EETH,sig("liquidityPool()"),block_hex)
+          P=call_uint(pool,sig("getTotalPooledEther()"),block_hex)
+          S=call_uint(EETH,sig("totalShares()"),block_hex)
+          vault_internal=call_uint(EETH,sig("shares(address)")+aw(VAULT),block_hex)
+          vault_eeth=call_uint(EETH,sig("balanceOf(address)")+aw(VAULT),block_hex)
+          q_eeth=call_uint(ACCOUNTANT,calldata("getRateInQuoteSafe(address)",EETH),block_hex)
+          q_weeth=call_uint(ACCOUNTANT,calldata("getRateInQuoteSafe(address)",WEETH),block_hex)
+          weeth_rate=call_uint(WEETH,sig("getRate()"),block_hex)
+          share_lock=call_uint(TELLER,sig("shareLockPeriod()"),block_hex)
+          queue_words=words(call_raw(QUEUE,calldata("withdrawAssets(address)",WEETH),block_hex))
+
+          # Exact value functions.
+          def eeth_amount(internal): return (P*internal)//S
+          def moved_internal(A): return (A*S)//P
+          def minimum_sender_cost(A):
+              m=moved_internal(A)
+              return (P*m)//S
+          def maximum_sender_cost(A):
+              m=moved_internal(A)
+              return (P*m + S - 1)//S
+          def vault_delta(A):
+              m=moved_internal(A)
+              return eeth_amount(vault_internal+m)-eeth_amount(vault_internal)
+          def liquid_shares(A): return (A*U)//q_eeth
+          def eeth_claim_direct(A): return (liquid_shares(A)*q_eeth)//U
+          def weeth_claim(A): return (liquid_shares(A)*q_weeth)//U
+          def eeth_value_via_weeth(A): return (weeth_claim(A)*weeth_rate)//U
+          def row(A):
+              return {
+                  "nominal":A,
+                  "eeth_internal_shares_moved":moved_internal(A),
+                  "minimum_possible_sender_cost_eeth":minimum_sender_cost(A),
+                  "maximum_possible_sender_cost_eeth":maximum_sender_cost(A),
+                  "current_vault_balance_delta_eeth":vault_delta(A),
+                  "liquideth_shares_minted":liquid_shares(A),
+                  "direct_eeth_claim_value":eeth_claim_direct(A),
+                  "weeth_claim_amount":weeth_claim(A),
+                  "eeth_value_via_weeth":eeth_value_via_weeth(A),
+                  "worst_case_profit_via_weeth":eeth_value_via_weeth(A)-minimum_sender_cost(A),
+                  "current_backing_gap_via_weeth":eeth_value_via_weeth(A)-vault_delta(A),
+                  "nominal_minus_vault_delta":A-vault_delta(A),
+              }
+
+          # Candidate set includes every discontinuity of the first 2m eETH internal shares,
+          # first 2m Veda shares, small amounts, scale boundaries, and deterministic random values.
+          candidates=set(range(1,2_000_001))
+          for k in range(1,2_000_001):
+              a=(k*P + S-1)//S
+              for d in (-2,-1,0,1,2):
+                  if a+d>0: candidates.add(a+d)
+              b=(k*q_eeth + U-1)//U
+              for d in (-2,-1,0,1,2):
+                  if b+d>0: candidates.add(b+d)
+          for power in range(0,31):
+              base=10**power
+              for d in range(-16,17):
+                  if base+d>0: candidates.add(base+d)
+          # Exact-claim amounts: A*U divisible by q_eeth.
+          gq=math.gcd(U,q_eeth)
+          claim_period=q_eeth//gq
+          max_nominal=min(P,10**30)
+          for k in range(1,min(2_000_000,max_nominal//claim_period)+1):
+              a=k*claim_period
+              for d in (-2,-1,0,1,2):
+                  if a+d>0: candidates.add(a+d)
+          # eETH exact-share boundary amounts: A*S divisible by P.
+          gp=math.gcd(S,P)
+          transfer_period=P//gp
+          for k in range(1,min(2_000_000,max_nominal//transfer_period)+1):
+              a=k*transfer_period
+              for d in (-2,-1,0,1,2):
+                  if a+d>0: candidates.add(a+d)
+          rng=random.Random(0x564544415F45455448)
+          for _ in range(250_000):
+              exp=rng.randrange(0,31)
+              hi=min(10**exp,max_nominal)
+              if hi>0: candidates.add(rng.randrange(1,hi+1))
+
+          rows=[row(a) for a in candidates if a<=max_nominal]
+          by_profit=sorted(rows,key=lambda x:(x["worst_case_profit_via_weeth"],x["current_backing_gap_via_weeth"],-x["nominal"]),reverse=True)
+          by_gap=sorted(rows,key=lambda x:(x["current_backing_gap_via_weeth"],x["nominal_minus_vault_delta"],-x["nominal"]),reverse=True)
+
+          # General proofs/bounds from floor arithmetic.
+          ceil_eeth_internal_share=(P+S-1)//S
+          ceil_liquid_share_price=(q_eeth+U-1)//U
+          ceil_weeth_roundtrip_unit=(q_weeth*weeth_rate + U*U-1)//(U*U)
+          theoretical_nominal_minus_min_cost_bound=max(0,ceil_eeth_internal_share-1)
+          theoretical_nominal_minus_direct_claim_bound=max(0,ceil_liquid_share_price-1)
+          # This is a conservative compositional bound, not a claim of attainability.
+          conservative_profit_bound=theoretical_nominal_minus_min_cost_bound
+
+          result={
+              "queried_at_unix":int(time.time()),
+              "endpoint":endpoint,
+              "block":block,
+              "addresses":{"eeth":EETH.lower(),"weeth":WEETH.lower(),"vault":VAULT.lower(),"teller":TELLER.lower(),"accountant":ACCOUNTANT.lower(),"queue":QUEUE.lower(),"liquidity_pool":pool.lower()},
+              "state":{
+                  "total_pooled_ether":P,
+                  "total_eeth_internal_shares":S,
+                  "eeth_rate_numerator_P":P,
+                  "eeth_rate_denominator_S":S,
+                  "ceil_eeth_value_per_internal_share":ceil_eeth_internal_share,
+                  "vault_eeth_internal_shares":vault_internal,
+                  "vault_eeth_balance":vault_eeth,
+                  "veda_rate_in_eeth":q_eeth,
+                  "veda_rate_in_weeth":q_weeth,
+                  "weeth_rate_in_eeth":weeth_rate,
+                  "share_lock_period":share_lock,
+                  "weeth_queue_words":queue_words,
+              },
+              "periods":{
+                  "exact_veda_claim_nominal_period":claim_period,
+                  "exact_eeth_share_transfer_nominal_period":transfer_period,
+                  "gcd_veda_rate_share_unit":gq,
+                  "gcd_eeth_total_shares_total_pooled":gp,
+              },
+              "bounds":{
+                  "nominal_minus_minimum_sender_cost_upper_bound":theoretical_nominal_minus_min_cost_bound,
+                  "nominal_minus_direct_claim_upper_bound":theoretical_nominal_minus_direct_claim_bound,
+                  "conservative_profit_upper_bound_eeth_wei_per_deposit":conservative_profit_bound,
+                  "ceil_weeth_roundtrip_value_per_liquid_share_unit":ceil_weeth_roundtrip_unit,
+              },
+              "search":{
+                  "candidate_count":len(rows),
+                  "max_worst_case_profit_via_weeth":by_profit[0]["worst_case_profit_via_weeth"],
+                  "max_current_backing_gap_via_weeth":by_gap[0]["current_backing_gap_via_weeth"],
+                  "top_profit_rows":by_profit[:50],
+                  "top_backing_gap_rows":by_gap[:50],
+              },
+          }
+          with open("veda-eeth-math.json","w",encoding="utf-8") as f:
+              json.dump(result,f,indent=2,sort_keys=True); f.write("\n")
+          print(json.dumps({"block":block,"state":result["state"],"periods":result["periods"],"bounds":result["bounds"],"search":{"candidate_count":len(rows),"max_profit":result["search"]["max_worst_case_profit_via_weeth"],"max_backing_gap":result["search"]["max_current_backing_gap_via_weeth"],"top":by_profit[:10]}},indent=2,sort_keys=True))
+          PY
+      - name: Upload eETH math
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-eeth-math
+          path: veda-eeth-math.json
+          if-no-files-found: error
+          retention-days: 1
