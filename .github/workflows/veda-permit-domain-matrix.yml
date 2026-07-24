@@ -1,0 +1,102 @@
+name: veda-permit-domain-matrix
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Verify EIP-2612 domains across identical-address vaults
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import time
+          import urllib.request
+
+          CHAINS={
+            "ethereum":{"id":1,"rpcs":["https://ethereum-rpc.publicnode.com","https://eth.llamarpc.com"]},
+            "optimism":{"id":10,"rpcs":["https://optimism-rpc.publicnode.com","https://mainnet.optimism.io","https://optimism.drpc.org"]},
+            "scroll":{"id":534352,"rpcs":["https://scroll-rpc.publicnode.com","https://rpc.scroll.io","https://scroll.drpc.org"]},
+          }
+          VAULTS={
+            "liquidBTC":"0x5f46d540b6eD704C3c8789105F30E075AA900726",
+            "liquidETH":"0xf0bb20865277aBd641a307eCe5Ee04E79073416C",
+            "liquidUSD":"0x08c6F91e2B681FaF5e17227F2a44C307b3C1364C",
+          }
+          SEL={
+            "domain":subprocess.check_output(["cast","sig","DOMAIN_SEPARATOR()"],text=True).strip(),
+            "name":subprocess.check_output(["cast","sig","name()"],text=True).strip(),
+            "symbol":subprocess.check_output(["cast","sig","symbol()"],text=True).strip(),
+            "nonces":subprocess.check_output(["cast","sig","nonces(address)"],text=True).strip(),
+          }
+          TEST_USER="0x1111111111111111111111111111111111111111"
+          def aw(a): return a[2:].lower().rjust(64,"0")
+          def req(ep,method,params,attempts=4):
+            body=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode(); last=None
+            for i in range(attempts):
+              try:
+                r=urllib.request.Request(ep,data=body,method="POST",headers={"content-type":"application/json","user-agent":"veda-permit-domain/1.0"})
+                with urllib.request.urlopen(r,timeout=45) as x: d=json.loads(x.read().decode())
+                if "error" in d: raise RuntimeError(d["error"])
+                return d["result"]
+              except Exception as exc: last=exc; time.sleep(i+1)
+            raise RuntimeError(repr(last))
+          def choose(c):
+            errors={}
+            for ep in c["rpcs"]:
+              try:
+                if int(req(ep,"eth_chainId",[]),16)==c["id"]: return ep,errors
+              except Exception as exc: errors[ep]=repr(exc)
+            raise RuntimeError(errors)
+          def call(ep,to,data): return req(ep,"eth_call",[{"to":to,"data":data},"latest"])
+          def string(raw):
+            x=raw[2:]
+            try:
+              off=int(x[:64],16)*2; n=int(x[off:off+64],16); return bytes.fromhex(x[off+64:off+64+n*2]).decode(errors="replace")
+            except Exception: return bytes.fromhex(x[:64]).rstrip(b"\0").decode(errors="replace")
+
+          out={"generated_at_unix":int(time.time()),"selectors":SEL,"chains":{},"collisions":[]}
+          for cn,c in CHAINS.items():
+            ep,errs=choose(c); block=int(req(ep,"eth_blockNumber",[]),16)
+            co={"chain_id":c["id"],"endpoint":ep,"rpc_errors":errs,"block":block,"vaults":{}}
+            for vn,v in VAULTS.items():
+              code=req(ep,"eth_getCode",[v,"latest"])
+              if code in ("0x","0x0"):
+                co["vaults"][vn]={"address":v.lower(),"code_bytes":0}; continue
+              co["vaults"][vn]={
+                "address":v.lower(),"code_bytes":len((code[2:]))//2,
+                "domain_separator":call(ep,v,SEL["domain"]),
+                "name":string(call(ep,v,SEL["name"])),
+                "symbol":string(call(ep,v,SEL["symbol"])),
+                "test_nonce":int(call(ep,v,SEL["nonces"]+aw(TEST_USER)),16),
+              }
+            out["chains"][cn]=co
+          for vn in VAULTS:
+            rows=[]
+            for cn,co in out["chains"].items():
+              v=co["vaults"].get(vn,{})
+              if v.get("domain_separator"): rows.append((cn,v["domain_separator"]))
+            for i in range(len(rows)):
+              for j in range(i+1,len(rows)):
+                if rows[i][1].lower()==rows[j][1].lower(): out["collisions"].append({"vault":vn,"chain_a":rows[i][0],"chain_b":rows[j][0],"domain":rows[i][1]})
+          with open("veda-permit-domain-matrix.json","w") as f: json.dump(out,f,indent=2,sort_keys=True); f.write("\n")
+          print(json.dumps({"domains":{vn:{cn:co["vaults"].get(vn,{}).get("domain_separator") for cn,co in out["chains"].items()} for vn in VAULTS},"collisions":out["collisions"]},indent=2,sort_keys=True))
+          PY
+      - name: Upload permit domain matrix
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-permit-domain-matrix
+          path: veda-permit-domain-matrix.json
+          if-no-files-found: error
+          retention-days: 1
