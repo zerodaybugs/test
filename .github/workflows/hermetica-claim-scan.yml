@@ -1,0 +1,381 @@
+name: Hermetica claim-state scanner
+
+on:
+  push:
+    branches:
+      - hermetica-passive-audit-20260724
+    paths:
+      - '.github/workflows/hermetica-claim-scan.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  scan-claims:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: hermetica-passive-audit-20260724
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Clarity decoder in an isolated temporary directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/hermetica-claim-scan-node
+          mkdir -p /tmp/hermetica-claim-scan-node
+          cd /tmp/hermetica-claim-scan-node
+          npm init -y >/dev/null 2>&1
+          npm install --no-save @stacks/transactions >/dev/null 2>&1
+
+      - name: Scan all claim IDs across all deployed Vault versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf evidence/hermetica-claim-scan
+          mkdir -p evidence/hermetica-claim-scan
+
+          cd /tmp/hermetica-claim-scan-node
+          GITHUB_WORKSPACE="$GITHUB_WORKSPACE" node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { deserializeCV, cvToJSON, cvToString } from '@stacks/transactions';
+
+          const workspace = process.env.GITHUB_WORKSPACE;
+          if (!workspace) throw new Error('GITHUB_WORKSPACE is missing');
+          const outDir = path.join(workspace, 'evidence', 'hermetica-claim-scan');
+          fs.mkdirSync(outDir, { recursive: true });
+
+          const API = 'https://api.stxer.xyz';
+          const ZERO = 'SP000000000000000000002Q6VF78';
+          const DEPLOYER = 'SP1S1HSFH0SQQGWKB69EYFNY0B1MHRMGXR3J1FH4D';
+          const STATE = `${DEPLOYER}.state-hbtc-v1`;
+          const TOKEN = `${DEPLOYER}.token-hbtc`;
+          const SBTC = 'SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token';
+          const VAULTS = [
+            `${DEPLOYER}.vault-hbtc-v1`,
+            `${DEPLOYER}.vault-hbtc-v1-1`,
+            `${DEPLOYER}.vault-hbtc-v1-2`,
+          ];
+
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+          async function api(method, url, payload, attempts = 5) {
+            let lastError;
+            for (let i = 0; i < attempts; i++) {
+              try {
+                const response = await fetch(url, {
+                  method,
+                  headers: {
+                    Accept: 'application/json',
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'zerodaybugs-hermetica-claim-scan/1.0',
+                  },
+                  body: payload === undefined ? undefined : JSON.stringify(payload),
+                });
+                const text = await response.text();
+                let json = null;
+                try { json = JSON.parse(text); } catch {}
+                if (!response.ok) {
+                  lastError = new Error(`${method} ${url}: HTTP ${response.status}: ${text.slice(0, 500)}`);
+                  if (![408, 429, 500, 502, 503, 504].includes(response.status)) throw lastError;
+                } else {
+                  return { status: response.status, json, text };
+                }
+              } catch (error) {
+                lastError = error;
+              }
+              await sleep(2 ** i * 1000);
+            }
+            throw lastError ?? new Error(`Request failed: ${method} ${url}`);
+          }
+
+          function normalize(value) {
+            if (Array.isArray(value)) return value.map(normalize);
+            if (value && typeof value === 'object') {
+              if (Object.prototype.hasOwnProperty.call(value, 'success')) {
+                return value.success
+                  ? { ok: normalize(value.value) }
+                  : { err: normalize(value.value) };
+              }
+              if (Object.prototype.hasOwnProperty.call(value, 'type') && Object.prototype.hasOwnProperty.call(value, 'value')) {
+                return normalize(value.value);
+              }
+              const out = {};
+              for (const [key, nested] of Object.entries(value)) out[key] = normalize(nested);
+              return out;
+            }
+            return value;
+          }
+
+          function decodeWire(hex) {
+            const cv = deserializeCV(hex);
+            return {
+              repr: cvToString(cv, 'tryAscii'),
+              json: cvToJSON(cv),
+              normalized: normalize(cvToJSON(cv)),
+            };
+          }
+
+          function writeJson(name, value) {
+            fs.writeFileSync(path.join(outDir, name), JSON.stringify(value, null, 2));
+          }
+
+          const session = await api('POST', `${API}/devtools/v2/simulations`, { skip_tracing: true });
+          const sessionId = session.json?.id;
+          if (!sessionId) throw new Error(`No session id: ${session.text}`);
+          writeJson('session.json', { id: sessionId, create: session.json });
+
+          let tip = null;
+          try {
+            tip = (await api('GET', `${API}/devtools/v2/simulations/${sessionId}/tip`)).json;
+          } catch (error) {
+            tip = { error: String(error) };
+          }
+          writeJson('tip.json', tip);
+
+          async function runReadBatch(reads) {
+            const response = await api(
+              'POST',
+              `${API}/devtools/v2/simulations/${sessionId}`,
+              { steps: [{ Reads: reads }] },
+            );
+            const results = response.json?.steps?.[0]?.Reads;
+            if (!Array.isArray(results) || results.length !== reads.length) {
+              throw new Error(`Read/result cardinality mismatch: expected ${reads.length}, got ${results?.length}`);
+            }
+            return results.map((result, index) => {
+              const item = { request: reads[index], wire: result };
+              if (result?.Ok) item.decoded = decodeWire(result.Ok);
+              if (result?.Err) item.readError = result.Err;
+              return item;
+            });
+          }
+
+          const headerReads = [
+            { EvalReadonly: [ZERO, '', STATE, '(get-claim-id)'] },
+            { EvalReadonly: [ZERO, '', STATE, '(get-share-price)'] },
+            { EvalReadonly: [ZERO, '', STATE, '(get-total-assets)'] },
+            { EvalReadonly: [ZERO, '', STATE, '(get-net-assets)'] },
+            { EvalReadonly: [ZERO, '', STATE, 'stacks-block-time'] },
+          ];
+          for (const vault of VAULTS) {
+            headerReads.push({ EvalReadonly: [ZERO, '', TOKEN, `(get-balance '${vault})`] });
+            headerReads.push({ EvalReadonly: [ZERO, '', SBTC, `(get-balance '${vault})`] });
+          }
+          const headerResults = await runReadBatch(headerReads);
+          writeJson('header-reads.json', headerResults);
+
+          function scalarFrom(result) {
+            const normalized = result?.decoded?.normalized;
+            if (normalized && typeof normalized === 'object' && Object.prototype.hasOwnProperty.call(normalized, 'ok')) {
+              return normalized.ok;
+            }
+            return normalized;
+          }
+
+          const claimIdRaw = scalarFrom(headerResults[0]);
+          const claimId = Number(claimIdRaw);
+          if (!Number.isSafeInteger(claimId) || claimId < 0 || claimId > 100000) {
+            throw new Error(`Invalid current claim id: ${JSON.stringify(claimIdRaw)}`);
+          }
+
+          const header = {
+            claimId,
+            sharePrice: scalarFrom(headerResults[1]),
+            totalAssets: scalarFrom(headerResults[2]),
+            netAssets: scalarFrom(headerResults[3]),
+            stacksBlockTime: scalarFrom(headerResults[4]),
+            vaultBalances: {},
+          };
+          let cursor = 5;
+          for (const vault of VAULTS) {
+            header.vaultBalances[vault] = {
+              hbtc: scalarFrom(headerResults[cursor++]),
+              sbtc: scalarFrom(headerResults[cursor++]),
+            };
+          }
+          writeJson('header.json', header);
+
+          const claimReads = [];
+          for (const vault of VAULTS) {
+            for (let id = 1; id <= claimId; id++) {
+              claimReads.push({ EvalReadonly: [ZERO, '', vault, `(get-claim u${id})`] });
+            }
+          }
+
+          const rawBatches = [];
+          const flat = [];
+          for (let offset = 0; offset < claimReads.length; offset += 40) {
+            const reads = claimReads.slice(offset, offset + 40);
+            const results = await runReadBatch(reads);
+            rawBatches.push({ offset, results });
+            flat.push(...results);
+          }
+          writeJson('raw-claim-batches.json', rawBatches);
+
+          const claimsByVault = Object.fromEntries(VAULTS.map(v => [v, []]));
+          for (const item of flat) {
+            const [, , vault, expr] = item.request.EvalReadonly;
+            const match = /^\(get-claim u(\d+)\)$/.exec(expr);
+            if (!match) throw new Error(`Unexpected claim expression: ${expr}`);
+            const id = Number(match[1]);
+            const normalized = item.decoded?.normalized;
+            const record = {
+              id,
+              vault,
+              repr: item.decoded?.repr ?? null,
+              normalized: normalized ?? null,
+              exists: Boolean(normalized && typeof normalized === 'object' && Object.prototype.hasOwnProperty.call(normalized, 'ok')),
+            };
+            if (record.exists) record.claim = normalized.ok;
+            else if (normalized && typeof normalized === 'object' && Object.prototype.hasOwnProperty.call(normalized, 'err')) record.error = normalized.err;
+            if (item.readError) record.readError = item.readError;
+            claimsByVault[vault].push(record);
+          }
+          writeJson('claims.json', claimsByVault);
+
+          const toBig = value => value === null || value === undefined ? null : BigInt(value);
+          const violations = [];
+          const summaryByVault = {};
+          const owners = new Map();
+          const idLocations = new Map();
+
+          for (const vault of VAULTS) {
+            const existing = claimsByVault[vault].filter(c => c.exists);
+            let unfundedShares = 0n;
+            let fundedShares = 0n;
+            let fundedAssets = 0n;
+            let fundedFees = 0n;
+            let fundedNet = 0n;
+            let expressCount = 0;
+            let cooledCount = 0;
+            let unfundedCount = 0;
+            let fundedCount = 0;
+
+            for (const record of existing) {
+              const c = record.claim;
+              const shares = toBig(c.shares);
+              const assets = toBig(c.assets);
+              const fee = toBig(c.fee);
+              const sharePrice = toBig(c['share-price']);
+              const feeBps = toBig(c['fee-bps']);
+              const ts = toBig(c.ts);
+              const now = toBig(header.stacksBlockTime ?? tip?.block_time);
+
+              if (shares === null || shares <= 0n) violations.push({ vault, id: record.id, type: 'non-positive-shares', value: c.shares });
+              if (c['is-express'] === true) expressCount++;
+              if (now !== null && ts !== null && ts <= now) cooledCount++;
+
+              if (!idLocations.has(record.id)) idLocations.set(record.id, []);
+              idLocations.get(record.id).push(vault);
+              if (c.user) owners.set(c.user, (owners.get(c.user) ?? 0) + 1);
+
+              const allFundingFieldsNull = assets === null && fee === null && sharePrice === null;
+              const allFundingFieldsSome = assets !== null && fee !== null && sharePrice !== null;
+              if (!allFundingFieldsNull && !allFundingFieldsSome) {
+                violations.push({ vault, id: record.id, type: 'partial-funding-state', claim: c });
+              }
+
+              if (allFundingFieldsNull) {
+                unfundedCount++;
+                unfundedShares += shares ?? 0n;
+              }
+
+              if (allFundingFieldsSome) {
+                fundedCount++;
+                fundedShares += shares ?? 0n;
+                fundedAssets += assets;
+                fundedFees += fee;
+                fundedNet += assets - fee;
+                if (fee > assets) violations.push({ vault, id: record.id, type: 'fee-exceeds-assets', assets: String(assets), fee: String(fee) });
+                const expectedAssets = ((shares ?? 0n) * sharePrice) / 100000000n;
+                if (assets !== expectedAssets) {
+                  violations.push({ vault, id: record.id, type: 'asset-formula-mismatch', expected: String(expectedAssets), actual: String(assets) });
+                }
+                const expectedFee = (assets * (feeBps ?? 0n)) / 10000n;
+                if (fee !== expectedFee) {
+                  violations.push({ vault, id: record.id, type: 'fee-formula-mismatch', expected: String(expectedFee), actual: String(fee) });
+                }
+              }
+            }
+
+            const hbtcBalance = toBig(header.vaultBalances[vault].hbtc) ?? 0n;
+            const sbtcBalance = toBig(header.vaultBalances[vault].sbtc) ?? 0n;
+            if (hbtcBalance !== unfundedShares) {
+              violations.push({
+                vault,
+                type: 'unfunded-share-escrow-mismatch',
+                hbtcBalance: String(hbtcBalance),
+                unfundedShares: String(unfundedShares),
+              });
+            }
+            if (sbtcBalance < fundedAssets) {
+              violations.push({
+                vault,
+                type: 'funded-liability-shortfall',
+                sbtcBalance: String(sbtcBalance),
+                fundedAssets: String(fundedAssets),
+              });
+            }
+
+            summaryByVault[vault] = {
+              existingCount: existing.length,
+              unfundedCount,
+              fundedCount,
+              expressCount,
+              cooledCount,
+              hbtcBalance: String(hbtcBalance),
+              sbtcBalance: String(sbtcBalance),
+              unfundedShares: String(unfundedShares),
+              fundedShares: String(fundedShares),
+              fundedAssets: String(fundedAssets),
+              fundedFees: String(fundedFees),
+              fundedNet: String(fundedNet),
+              escrowMatches: hbtcBalance === unfundedShares,
+              fundedAssetsCovered: sbtcBalance >= fundedAssets,
+              sbtcSurplusAfterFundedClaims: String(sbtcBalance - fundedAssets),
+              existingClaimIds: existing.map(c => c.id),
+            };
+          }
+
+          const duplicateIds = [];
+          for (const [id, locations] of idLocations.entries()) {
+            if (locations.length > 1) duplicateIds.push({ id, vaults: locations });
+          }
+          if (duplicateIds.length) violations.push({ type: 'claim-id-collision-across-vaults', collisions: duplicateIds });
+
+          const summary = {
+            collectedAt: new Date().toISOString(),
+            sessionId,
+            tip,
+            header,
+            vaults: summaryByVault,
+            duplicateIds,
+            ownerClaimCounts: Object.fromEntries([...owners.entries()].sort((a, b) => b[1] - a[1])),
+            violations,
+            clean: violations.length === 0,
+          };
+          writeJson('summary.json', summary);
+          JS
+
+      - name: Commit claim-state evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add evidence/hermetica-claim-scan
+          if git diff --cached --quiet; then
+            echo 'No claim-scan changes.'
+            exit 0
+          fi
+          git commit -m 'chore: capture Hermetica claim-state evidence [skip ci]'
+          git push origin HEAD:hermetica-passive-audit-20260724
