@@ -1,0 +1,122 @@
+name: veda-rate-sync-history-v3
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Reconstruct Ethereum, Optimism and Scroll rate chronology via RPC
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, time, urllib.request, traceback
+          CHAINS={
+            "ethereum":{"id":1,"rpcs":["https://ethereum-rpc.publicnode.com","https://eth.drpc.org","https://rpc.mevblocker.io"],"initial_chunk":250000},
+            "optimism":{"id":10,"rpcs":["https://optimism-rpc.publicnode.com","https://mainnet.optimism.io","https://optimism.drpc.org"],"initial_chunk":500000},
+            "scroll":{"id":534352,"rpcs":["https://scroll-rpc.publicnode.com","https://rpc.scroll.io","https://scroll.drpc.org"],"initial_chunk":250000},
+          }
+          PRODUCTS={"liquidBTC":"0xEa23aC6D7D11f6b181d6B98174D334478ADAe6b0","liquidETH":"0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198","liquidUSD":"0xc315D6e14DDCDC7407784e2Caf815d131Bc1D3E7"}
+          def run(*a):
+            p=subprocess.run([str(x) for x in a],text=True,capture_output=True);return p.stdout.strip()
+          TOPIC=run("cast","keccak","ExchangeRateUpdated(uint96,uint96,uint64)").lower()
+          def rpc(ep,m,p,t=60):
+            b=json.dumps({"jsonrpc":"2.0","id":1,"method":m,"params":p}).encode();q=urllib.request.Request(ep,data=b,method="POST",headers={"content-type":"application/json","user-agent":"veda-rate-history-v3/1.0"})
+            with urllib.request.urlopen(q,timeout=t) as r:o=json.loads(r.read().decode())
+            if "error" in o:raise RuntimeError(o["error"])
+            return o["result"]
+          def choose(c):
+            bad={}
+            for ep in c["rpcs"]:
+              try:
+                if int(rpc(ep,"eth_chainId",[]),16)==c["id"]:return ep,bad
+              except Exception as e:bad[ep]=repr(e)
+            raise RuntimeError(bad)
+          def first_code_block(ep,address,latest):
+            if rpc(ep,"eth_getCode",[address,hex(latest)]) in ("0x","0x0"):return None
+            lo,hi=0,latest
+            while lo<hi:
+              mid=(lo+hi)//2
+              try:present=rpc(ep,"eth_getCode",[address,hex(mid)]) not in ("0x","0x0")
+              except Exception:present=False
+              if present:hi=mid
+              else:lo=mid+1
+            return lo
+          def fetch_logs_adaptive(ep,addresses,start,end,initial):
+            logs=[];errors=[];pos=start;chunk=initial;calls=0
+            while pos<=end:
+              hi=min(end,pos+chunk-1);flt={"address":addresses,"fromBlock":hex(pos),"toBlock":hex(hi),"topics":[TOPIC]}
+              try:
+                r=rpc(ep,"eth_getLogs",[flt],90);logs.extend(r);pos=hi+1;calls+=1
+                if len(r)<100 and chunk<initial:chunk=min(initial,chunk*2)
+              except Exception as e:
+                calls+=1
+                if chunk<=1000:
+                  errors.append({"from":pos,"to":hi,"error":repr(e)});pos=hi+1
+                else:chunk=max(1000,chunk//2)
+              if calls%50==0:time.sleep(.2)
+            return logs,errors,calls
+          def words(raw):
+            h=raw[2:] if str(raw).startswith("0x") else str(raw);return [int(h[i:i+64],16) for i in range(0,len(h),64)] if h else []
+          addr_to_product={a.lower():p for p,a in PRODUCTS.items()}
+          out={"generated_at_unix":int(time.time()),"topic":TOPIC,"chains":{},"matched_updates":[],"asynchronous_windows":[],"errors":[]}
+          for cname,c in CHAINS.items():
+            cd={"products":{p:{"address":a.lower(),"events":[],"event_count":0} for p,a in PRODUCTS.items()}};out["chains"][cname]=cd
+            try:
+              ep,bad=choose(c);latest=int(rpc(ep,"eth_blockNumber",[]),16);cd.update({"endpoint":ep,"rpc_failures":bad,"latest_block":latest})
+              firsts={p:first_code_block(ep,a,latest) for p,a in PRODUCTS.items()};cd["first_code_blocks"]=firsts;start=min(x for x in firsts.values() if x is not None)
+              logs,errs,calls=fetch_logs_adaptive(ep,list(PRODUCTS.values()),start,latest,c["initial_chunk"]);cd["log_call_count"]=calls;cd["log_errors"]=errs;cd["raw_log_count"]=len(logs)
+              for l in logs:
+                try:
+                  p=addr_to_product.get(str(l.get("address","")).lower());w=words(l.get("data","0x"))
+                  if not p or len(w)<3:continue
+                  ev={"old_rate":w[0],"new_rate":w[1],"event_time":w[2],"block":int(l.get("blockNumber","0x0"),16),"tx":l.get("transactionHash"),"log_index":int(l.get("logIndex") or "0x0",16)}
+                  cd["products"][p]["events"].append(ev)
+                except Exception as e:cd.setdefault("decode_errors",[]).append({"error":repr(e),"log":l})
+              for p in PRODUCTS:
+                cd["products"][p]["events"].sort(key=lambda x:(x["event_time"],x["block"],x["log_index"]));cd["products"][p]["event_count"]=len(cd["products"][p]["events"])
+            except Exception as e:
+              cd["error"]=repr(e);cd["traceback"]=traceback.format_exc();out["errors"].append({"chain":cname,"error":repr(e)})
+          for pname in PRODUCTS:
+            by_rate={};histories={c:out["chains"][c]["products"][pname]["events"] for c in CHAINS}
+            for cname,h in histories.items():
+              for e in h:by_rate.setdefault(e["new_rate"],[]).append({"chain":cname,**e})
+            for rate,events in by_rate.items():
+              chains={e["chain"] for e in events}
+              if len(chains)<2:continue
+              events.sort(key=lambda x:x["event_time"]);m={"product":pname,"new_rate":rate,"chains":sorted(chains),"events":events,"first_time":events[0]["event_time"],"last_time":events[-1]["event_time"],"sync_gap_seconds":events[-1]["event_time"]-events[0]["event_time"],"order":[e["chain"] for e in events]};out["matched_updates"].append(m)
+              first_per={}
+              for e in events:first_per.setdefault(e["chain"],e)
+              for dest,de in first_per.items():
+                t=de["event_time"]
+                for source,h in histories.items():
+                  if source==dest:continue
+                  prev=[e for e in h if e["event_time"]<=t]
+                  if not prev:continue
+                  sr=prev[-1]["new_rate"]
+                  if sr>=rate:continue
+                  nxt=[e for e in h if e["event_time"]>t and e["new_rate"]==rate]
+                  end=nxt[0]["event_time"] if nxt else None
+                  out["asynchronous_windows"].append({"product":pname,"source":source,"destination":dest,"source_stale_rate":sr,"destination_fresh_rate":rate,"start_time":t,"end_time":end,"window_seconds":None if end is None else end-t,"gross_rate_edge_bps":(rate-sr)*10000/sr,"destination_event":de,"source_previous_event":prev[-1]})
+          out["matched_updates"].sort(key=lambda x:(x["product"],x["first_time"]));out["asynchronous_windows"].sort(key=lambda x:(-x["gross_rate_edge_bps"],-(x["window_seconds"] or -1)))
+          out["summary"]={"events":{c:{p:out["chains"][c]["products"][p]["event_count"] for p in PRODUCTS} for c in CHAINS},"matched_update_count":len(out["matched_updates"]),"async_window_count":len(out["asynchronous_windows"]),"max_edge_bps":max([x["gross_rate_edge_bps"] for x in out["asynchronous_windows"]],default=0),"longest_window_seconds":max([x["window_seconds"] or 0 for x in out["asynchronous_windows"]],default=0)}
+          with open("veda-rate-sync-history-v3.json","w",encoding="utf-8") as f:json.dump(out,f,indent=2,sort_keys=True);f.write("\n")
+          print(json.dumps({"summary":out["summary"],"top_windows":out["asynchronous_windows"][:100],"chain_state":{c:{"latest":d.get("latest_block"),"first":d.get("first_code_blocks"),"raw_logs":d.get("raw_log_count"),"calls":d.get("log_call_count"),"errors":d.get("log_errors"),"fatal":d.get("error")} for c,d in out["chains"].items()},"errors":out["errors"]},indent=2,sort_keys=True))
+          PY
+      - name: Upload full RPC rate chronology
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-rate-sync-history-v3
+          path: veda-rate-sync-history-v3.json
+          if-no-files-found: error
+          retention-days: 1
