@@ -1,0 +1,125 @@
+name: veda-rate-sync-history-v2
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Reconstruct cross-chain exchange-rate update windows
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, time, urllib.parse, urllib.request, traceback
+          CHAINS={
+            "ethereum":{"id":1,"rpcs":["https://ethereum-rpc.publicnode.com","https://eth.drpc.org"]},
+            "optimism":{"id":10,"rpcs":["https://optimism-rpc.publicnode.com","https://mainnet.optimism.io"]},
+            "scroll":{"id":534352,"rpcs":["https://scroll-rpc.publicnode.com","https://rpc.scroll.io"]},
+          }
+          PRODUCTS={"liquidBTC":"0xEa23aC6D7D11f6b181d6B98174D334478ADAe6b0","liquidETH":"0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198","liquidUSD":"0xc315D6e14DDCDC7407784e2Caf815d131Bc1D3E7"}
+          EVENT="ExchangeRateUpdated(uint96,uint96,uint64)"
+          def run(*a):
+            p=subprocess.run([str(x) for x in a],text=True,capture_output=True);return {"ok":p.returncode==0,"stdout":p.stdout.strip(),"stderr":p.stderr.strip(),"returncode":p.returncode}
+          TOPIC=run("cast","keccak",EVENT)["stdout"].lower()
+          def request(url,t=60):
+            q=urllib.request.Request(url,headers={"accept":"application/json","user-agent":"veda-rate-history-v2/1.0"})
+            with urllib.request.urlopen(q,timeout=t) as r:return json.loads(r.read().decode())
+          def rpc(ep,m,p,t=35):
+            b=json.dumps({"jsonrpc":"2.0","id":1,"method":m,"params":p}).encode();q=urllib.request.Request(ep,data=b,method="POST",headers={"content-type":"application/json","user-agent":"veda-rate-history-v2/1.0"})
+            with urllib.request.urlopen(q,timeout=t) as r:o=json.loads(r.read().decode())
+            if "error" in o:raise RuntimeError(o["error"])
+            return o["result"]
+          def choose(c):
+            bad={}
+            for ep in c["rpcs"]:
+              try:
+                if int(rpc(ep,"eth_chainId",[]),16)==c["id"]:return ep,bad
+              except Exception as e:bad[ep]=repr(e)
+            return None,bad
+          def explorer_logs(cid,address):
+            all_logs=[];errors=[]
+            for page in range(1,20):
+              params=urllib.parse.urlencode({"module":"logs","action":"getLogs","address":address,"fromBlock":0,"toBlock":"latest","topic0":TOPIC,"page":page,"offset":1000})
+              url=f"https://api.routescan.io/v2/network/mainnet/evm/{cid}/etherscan/api?{params}"
+              try:d=request(url)
+              except Exception as e:errors.append({"page":page,"error":repr(e)});break
+              r=d.get("result")
+              if isinstance(r,str):
+                if "No records" not in r and d.get("status")!="0":errors.append({"page":page,"response":d})
+                break
+              if not r:break
+              all_logs.extend(r)
+              if len(r)<1000:break
+              time.sleep(.2)
+            return all_logs,errors
+          def words(raw):
+            h=raw[2:] if str(raw).startswith("0x") else str(raw);return [int(h[i:i+64],16) for i in range(0,len(h),64)] if h else []
+          out={"generated_at_unix":int(time.time()),"topic":TOPIC,"chains":{},"products":{},"matched_updates":[],"asynchronous_windows":[],"errors":[]}
+          for cname,c in CHAINS.items():
+            ep,bad=choose(c);out["chains"][cname]={"endpoint":ep,"rpc_failures":bad,"products":{}}
+            for pname,acct in PRODUCTS.items():
+              logs,errs=explorer_logs(c["id"],acct);events=[]
+              for l in logs:
+                try:
+                  w=words(l.get("data","0x"))
+                  if len(w)<3:continue
+                  events.append({"old_rate":w[0],"new_rate":w[1],"event_time":w[2],"block":int(l.get("blockNumber","0x0"),16),"tx":l.get("transactionHash"),"log_index":int(l.get("logIndex","0x0"),16)})
+                except Exception as e:errs.append({"decode_error":repr(e),"log":l})
+              events.sort(key=lambda x:(x["event_time"],x["block"],x["log_index"]))
+              out["chains"][cname]["products"][pname]={"address":acct.lower(),"event_count":len(events),"events":events,"errors":errs}
+          for pname in PRODUCTS:
+            by_rate={}
+            for cname in CHAINS:
+              for e in out["chains"][cname]["products"][pname]["events"]:by_rate.setdefault(e["new_rate"],[]).append({"chain":cname,**e})
+            matched=[]
+            for rate,events in by_rate.items():
+              chains={e["chain"] for e in events}
+              if len(chains)<2:continue
+              events.sort(key=lambda x:x["event_time"]);first=events[0];last=events[-1]
+              item={"product":pname,"new_rate":rate,"chains":sorted(chains),"events":events,"first_time":first["event_time"],"last_time":last["event_time"],"sync_gap_seconds":last["event_time"]-first["event_time"],"order":[e["chain"] for e in events]}
+              matched.append(item);out["matched_updates"].append(item)
+            matched.sort(key=lambda x:x["first_time"])
+            out["products"][pname]={"matched_updates":matched}
+            # Build stale-low to fresh-high windows at the first update of each matched rate.
+            histories={c:out["chains"][c]["products"][pname]["events"] for c in CHAINS}
+            for m in matched:
+              new=m["new_rate"]
+              # Treat each chain's first transition to this rate as a possible fresh destination.
+              first_per_chain={}
+              for e in m["events"]:first_per_chain.setdefault(e["chain"],e)
+              for dest,de in first_per_chain.items():
+                t=de["event_time"]
+                for source,h in histories.items():
+                  if source==dest:continue
+                  prev=[e for e in h if e["event_time"]<=t]
+                  if not prev:continue
+                  source_rate=prev[-1]["new_rate"]
+                  if source_rate>=new:continue
+                  next_sync=[e for e in h if e["event_time"]>t and e["new_rate"]==new]
+                  end=next_sync[0]["event_time"] if next_sync else None
+                  gap=(end-t) if end is not None else None
+                  gross_bps=(new-source_rate)*10000/source_rate
+                  out["asynchronous_windows"].append({"product":pname,"source":source,"destination":dest,"source_stale_rate":source_rate,"destination_fresh_rate":new,"start_time":t,"end_time":end,"window_seconds":gap,"gross_rate_edge_bps":gross_bps,"destination_event":de,"source_previous_event":prev[-1]})
+          out["matched_updates"].sort(key=lambda x:(x["product"],x["first_time"]))
+          out["asynchronous_windows"].sort(key=lambda x:(-x["gross_rate_edge_bps"],-(x["window_seconds"] or -1)))
+          out["summary"]={"events":{c:{p:out["chains"][c]["products"][p]["event_count"] for p in PRODUCTS} for c in CHAINS},"matched_update_count":len(out["matched_updates"]),"async_window_count":len(out["asynchronous_windows"]),"max_edge_bps":max([x["gross_rate_edge_bps"] for x in out["asynchronous_windows"]],default=0),"longest_window_seconds":max([x["window_seconds"] or 0 for x in out["asynchronous_windows"]],default=0)}
+          with open("veda-rate-sync-history-v2.json","w",encoding="utf-8") as f:json.dump(out,f,indent=2,sort_keys=True);f.write("\n")
+          print(json.dumps({"summary":out["summary"],"top_windows":out["asynchronous_windows"][:100],"errors":out["errors"],"chain_errors":{c:{p:out["chains"][c]["products"][p]["errors"] for p in PRODUCTS} for c in CHAINS}},indent=2,sort_keys=True))
+          PY
+      - name: Upload cross-chain rate chronology
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-rate-sync-history-v2
+          path: veda-rate-sync-history-v2.json
+          if-no-files-found: error
+          retention-days: 1
