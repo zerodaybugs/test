@@ -109,6 +109,66 @@ def compiler_semver(value: str) -> str:
     return match.group(1)
 
 
+def flatten_immutable_ranges(refs: dict[str, Any]) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    for entries in refs.values():
+        if not isinstance(entries, list):
+            raise RuntimeError({"invalid_immutable_references": refs})
+        for entry in entries:
+            start = int(entry["start"])
+            length = int(entry["length"])
+            if start < 0 or length <= 0:
+                raise RuntimeError({"invalid_immutable_reference": entry})
+            ranges.append((start, length))
+    ranges.sort()
+    previous_end = -1
+    for start, length in ranges:
+        if start < previous_end:
+            raise RuntimeError({"overlapping_immutable_references": ranges})
+        previous_end = start + length
+    return ranges
+
+
+def zero_ranges(data: bytes, ranges: list[tuple[int, int]]) -> bytes:
+    normalized = bytearray(data)
+    for start, length in ranges:
+        end = start + length
+        if end > len(normalized):
+            raise RuntimeError(
+                {"immutable_reference_out_of_bounds": [start, length, len(normalized)]}
+            )
+        normalized[start:end] = bytes(length)
+    return bytes(normalized)
+
+
+def validate_implementation_immutables(
+    live: bytes, compiled: bytes, ranges: list[tuple[int, int]], implementation: str
+) -> tuple[bool, bool, list[dict[str, Any]]]:
+    expected_address_word = bytes(12) + bytes.fromhex(implementation.removeprefix("0x"))
+    compiled_zero = True
+    live_is_implementation = True
+    evidence: list[dict[str, Any]] = []
+    for start, length in ranges:
+        live_value = live[start : start + length]
+        compiled_value = compiled[start : start + length]
+        compiled_zero = compiled_zero and compiled_value == bytes(length)
+        live_is_implementation = (
+            live_is_implementation
+            and length == 32
+            and live_value == expected_address_word
+        )
+        evidence.append(
+            {
+                "start": start,
+                "length": length,
+                "live_value": "0x" + live_value.hex(),
+                "compiled_value": "0x" + compiled_value.hex(),
+                "expected_live_implementation_word": "0x" + expected_address_word.hex(),
+            }
+        )
+    return compiled_zero, live_is_implementation, evidence
+
+
 def normalize_standard_json(row: dict[str, Any]) -> dict[str, Any]:
     """Create exact compiler input from Etherscan/Blockscout source metadata."""
     source = str(row.get("SourceCode") or "").strip()
@@ -340,10 +400,24 @@ def main() -> None:
         raise RuntimeError("compiled runtime contains unresolved link references")
     compiled = bytes.fromhex(object_hex.removeprefix("0x"))
     immutable_refs = deployed.get("immutableReferences") or {}
+    immutable_ranges = flatten_immutable_ranges(immutable_refs)
+    compiled_placeholders_zero, live_immutables_are_implementation, immutable_evidence = (
+        validate_implementation_immutables(
+            live, compiled, immutable_ranges, implementation
+        )
+    )
     full_match = compiled == live
     stripped_live = strip_cbor(live)
     stripped_compiled = strip_cbor(compiled)
     stripped_match = stripped_compiled == stripped_live
+    normalized_live = zero_ranges(live, immutable_ranges)
+    normalized_compiled = zero_ranges(compiled, immutable_ranges)
+    normalized_full_match = normalized_compiled == normalized_live
+    stripped_normalized_live = strip_cbor(normalized_live)
+    stripped_normalized_compiled = strip_cbor(normalized_compiled)
+    stripped_normalized_match = (
+        stripped_normalized_compiled == stripped_normalized_live
+    )
 
     result = {
         "mode": "BSC_PINNED_BLOCK_READ_ONLY_SOURCE_DEPLOYMENT_BINDING",
@@ -363,6 +437,13 @@ def main() -> None:
         "compiled_source_name": source_name,
         "compiled_contract_name": contract_name,
         "immutable_references": immutable_refs,
+        "immutable_reference_ranges": [
+            {"start": start, "length": length}
+            for start, length in immutable_ranges
+        ],
+        "immutable_reference_evidence": immutable_evidence,
+        "compiled_immutable_placeholders_zero": compiled_placeholders_zero,
+        "live_immutable_values_are_implementation": live_immutables_are_implementation,
         "live_runtime_bytes": len(live),
         "compiled_runtime_bytes": len(compiled),
         "live_runtime_sha256": sha256(live),
@@ -373,6 +454,14 @@ def main() -> None:
         "compiled_stripped_sha256": sha256(stripped_compiled),
         "full_runtime_match": full_match,
         "cbor_stripped_runtime_match": stripped_match,
+        "normalized_full_runtime_match": normalized_full_match,
+        "normalized_live_runtime_sha256": sha256(normalized_live),
+        "normalized_compiled_runtime_sha256": sha256(normalized_compiled),
+        "cbor_stripped_normalized_runtime_match": stripped_normalized_match,
+        "cbor_stripped_normalized_live_sha256": sha256(stripped_normalized_live),
+        "cbor_stripped_normalized_compiled_sha256": sha256(
+            stripped_normalized_compiled
+        ),
         "provider_heads": heads,
         "rows": rows,
     }
@@ -388,14 +477,24 @@ def main() -> None:
         f"IMPLEMENTATION_NONZERO={str(int(implementation, 16) != 0).lower()}",
         f"IMPLEMENTATION_RUNTIME_NONEMPTY={str(bool(live)).lower()}",
         f"VERIFIED_SOURCE_UNIT_COUNT={len(standard.get('sources', {}))}",
+        f"IMMUTABLE_REFERENCE_COUNT={len(immutable_ranges)}",
+        f"COMPILED_IMMUTABLE_PLACEHOLDERS_ZERO={str(compiled_placeholders_zero).lower()}",
+        f"IMMUTABLE_VALUES_ARE_LIVE_IMPLEMENTATION={str(live_immutables_are_implementation).lower()}",
         f"FULL_RUNTIME_MATCH={str(full_match).lower()}",
         f"CBOR_STRIPPED_RUNTIME_MATCH={str(stripped_match).lower()}",
+        f"NORMALIZED_FULL_RUNTIME_MATCH={str(normalized_full_match).lower()}",
+        f"CBOR_STRIPPED_NORMALIZED_RUNTIME_MATCH={str(stripped_normalized_match).lower()}",
         f"IMPLEMENTATION={implementation}",
         f"COMPILER_VERSION={explorer_compiler}",
     ]
     (out / "BINDING_MARKERS.txt").write_text("\n".join(markers) + "\n")
     print("\n".join(markers))
-    if not providers_identical or not stripped_match:
+    if not (
+        providers_identical
+        and compiled_placeholders_zero
+        and live_immutables_are_implementation
+        and stripped_normalized_match
+    ):
         raise SystemExit(1)
 
 
