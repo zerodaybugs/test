@@ -70,6 +70,10 @@ def main() -> None:
 src = "src"
 test = "test"
 libs = ["lib"]
+remappings = [
+  "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+  "@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/"
+]
 solc = "0.8.30"
 evm_version = "prague"
 via_ir = true
