@@ -1,0 +1,182 @@
+name: StackingDAO DAO executor read-only gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/stackingdao-dao-executor-readonly.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Query executor and implementation state read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cd evidence
+          npm init -y >/dev/null 2>&1
+          npm install --no-save --package-lock=false @stacks/transactions@6.17.0 >/dev/null 2>&1
+
+          cat > query.mjs <<'NODE'
+          import {
+            contractPrincipalCV,
+            cvToHex,
+            cvToString,
+            hexToCV,
+          } from '@stacks/transactions';
+          import { writeFile } from 'node:fs/promises';
+
+          const API = 'https://api.mainnet.hiro.so';
+          const OWNER = 'SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG';
+          const EXECUTOR = `${OWNER}.dao-executor`;
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+          async function fetchJson(url, options = {}, attempts = 7) {
+            let last;
+            for (let i = 1; i <= attempts; i += 1) {
+              try {
+                const res = await fetch(url, options);
+                const text = await res.text();
+                if (!res.ok) throw new Error(`${res.status} ${res.statusText}: ${text.slice(0, 500)}`);
+                return JSON.parse(text);
+              } catch (e) {
+                last = e;
+                if (i < attempts) await sleep(1200 * i);
+              }
+            }
+            throw last;
+          }
+
+          function splitPrincipal(p) {
+            const i = p.indexOf('.');
+            return [p.slice(0, i), p.slice(i + 1)];
+          }
+
+          async function call(principal, fn, args = []) {
+            const [address, contract] = splitPrincipal(principal);
+            const body = JSON.stringify({ sender: OWNER, arguments: args.map(cvToHex) });
+            const json = await fetchJson(`${API}/v2/contracts/call-read/${address}/${contract}/${fn}`, {
+              method: 'POST', headers: { 'content-type': 'application/json' }, body,
+            });
+            return {
+              okay: Boolean(json.okay),
+              decoded: json.result ? cvToString(hexToCV(json.result)) : null,
+              raw: json,
+            };
+          }
+
+          async function addressTransactions(principal, max = 500) {
+            const rows = [];
+            for (let offset = 0; offset < max; offset += 50) {
+              const page = await fetchJson(`${API}/extended/v1/address/${principal}/transactions?limit=50&offset=${offset}`);
+              const batch = page.results ?? [];
+              rows.push(...batch);
+              if (batch.length < 50) break;
+              await sleep(250);
+            }
+            return rows;
+          }
+
+          function contractCallRow(row) {
+            const tx = row.tx ?? row;
+            const cc = tx.contract_call ?? row.contract_call;
+            if (!cc) return null;
+            return {
+              tx_id: tx.tx_id ?? row.tx_id,
+              status: tx.tx_status ?? row.tx_status,
+              sender: tx.sender_address ?? row.sender_address,
+              nonce: tx.nonce ?? row.nonce,
+              burn_block_time_iso: tx.burn_block_time_iso ?? row.burn_block_time_iso,
+              contract_id: cc.contract_id,
+              function_name: cc.function_name,
+              function_args: cc.function_args,
+              result: tx.tx_result?.repr ?? row.tx_result?.repr,
+            };
+          }
+
+          const implCall = await call(EXECUTOR, 'get-impl');
+          const match = String(implCall.decoded ?? '').match(/\(ok \(some ([^)]+)\)\)/);
+          const impl = match ? match[1] : null;
+
+          const result = {
+            captured_at: new Date().toISOString(),
+            api: API,
+            owner: OWNER,
+            executor: EXECUTOR,
+            executor_impl: implCall,
+            impl,
+          };
+
+          result.executor_account = await fetchJson(`${API}/extended/v1/address/${EXECUTOR}/stx`);
+          result.executor_transactions = (await addressTransactions(EXECUTOR, 1000)).map(contractCallRow).filter(Boolean);
+
+          result.executor_active = await call(`${OWNER}.dao`, 'get-contract-active', [contractPrincipalCV(OWNER, 'dao-executor')]);
+          result.executor_admin = await call(`${OWNER}.dao`, 'get-admin', [contractPrincipalCV(OWNER, 'dao-executor')]);
+
+          if (impl) {
+            const [ia, ic] = splitPrincipal(impl);
+            result.impl_account = await fetchJson(`${API}/extended/v1/address/${impl}/stx`);
+            result.impl_source = await fetchJson(`${API}/v2/contracts/source/${ia}/${ic}?proof=0`);
+            result.impl_interface = await fetchJson(`${API}/v2/contracts/interface/${ia}/${ic}`);
+            result.impl_transactions = (await addressTransactions(impl, 1000)).map(contractCallRow).filter(Boolean);
+            if (ia === OWNER) {
+              result.impl_active = await call(`${OWNER}.dao`, 'get-contract-active', [contractPrincipalCV(ia, ic)]);
+              result.impl_admin = await call(`${OWNER}.dao`, 'get-admin', [contractPrincipalCV(ia, ic)]);
+            }
+          }
+
+          const summary = {
+            captured_at: result.captured_at,
+            impl: result.impl,
+            executor_balance: result.executor_account.balance,
+            executor_locked: result.executor_account.locked,
+            executor_active: result.executor_active.decoded,
+            executor_admin: result.executor_admin.decoded,
+            executor_call_count: result.executor_transactions.length,
+            execute_proposal_successes: result.executor_transactions.filter(x => x.contract_id === EXECUTOR && x.function_name === 'execute-proposal' && x.status === 'success').length,
+            set_impl_successes: result.executor_transactions.filter(x => x.contract_id === EXECUTOR && x.function_name === 'set-impl' && x.status === 'success').length,
+            init_successes: result.executor_transactions.filter(x => x.contract_id === EXECUTOR && x.function_name === 'init' && x.status === 'success').length,
+            impl_balance: result.impl_account?.balance ?? null,
+            impl_active: result.impl_active?.decoded ?? null,
+            impl_admin: result.impl_admin?.decoded ?? null,
+            impl_call_count: result.impl_transactions?.length ?? null,
+            impl_public_functions: result.impl_interface?.functions?.filter(x => x.access === 'public').map(x => x.name) ?? [],
+          };
+          result.summary = summary;
+
+          await writeFile('snapshot.json', `${JSON.stringify(result, null, 2)}\n`);
+          await writeFile('summary.txt', `${Object.entries(summary).map(([k,v]) => `${k}=${Array.isArray(v) ? v.join(',') : v}`).join('\n')}\n`);
+          if (result.impl_source?.source) await writeFile('implementation.clar', result.impl_source.source);
+          console.log(await (await import('node:fs/promises')).readFile('summary.txt', 'utf8'));
+          NODE
+
+          node query.mjs
+          sha256sum snapshot.json summary.txt query.mjs implementation.clar 2>/dev/null > SHA256SUMS || \
+            sha256sum snapshot.json summary.txt query.mjs > SHA256SUMS
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackingdao-dao-executor-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Enforce integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd evidence && sha256sum -c SHA256SUMS)
+          grep -F 'impl=' evidence/summary.txt
+          grep -F 'executor_active=' evidence/summary.txt
