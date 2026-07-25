@@ -1,0 +1,140 @@
+name: veda-safe-deputy
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Inspect privileged Safe proxies, modules, guard and takeover gates
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, re, subprocess, time, urllib.request, traceback
+
+          RPCS=["https://ethereum-rpc.publicnode.com","https://eth.drpc.org","https://rpc.mevblocker.io"]
+          ATTACKER="0x1111111111111111111111111111111111111111"
+          SENTINEL="0x0000000000000000000000000000000000000001"
+          SAFES={
+            "oracle_ops":"0x41dfc53b13932a2690c9790527c1967d8579a6ae",
+            "strategist":"0x607d0c7e3578802eb46d388cb86cfba8ff657306",
+            "operations":"0x71e2d6c34f569cc4df5802d675b208fb8ae3bcd6",
+          }
+          CRITICAL_CAPS={
+            "oracle_ops":["accountant.updateExchangeRate","teller.refundDeposit","teller.updateAssetData","queue.cancelUserWithdraws","queue.stopWithdrawsInAsset"],
+            "strategist":["teller.refundDeposit","teller.updateAssetData","queue.cancelUserWithdraws","queue.stopWithdrawsInAsset","manager.manageVaultWithMerkleVerification"],
+            "operations":["accountant.updateExchangeRate","teller.refundDeposit","teller.updateAssetData","queue.cancelUserWithdraws","queue.stopWithdrawsInAsset"],
+          }
+
+          def rpc(ep, method, params, timeout=35):
+              body=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
+              req=urllib.request.Request(ep,data=body,method="POST",headers={"content-type":"application/json","user-agent":"veda-safe-deputy/1.0"})
+              with urllib.request.urlopen(req,timeout=timeout) as r: out=json.loads(r.read().decode())
+              if "error" in out: raise RuntimeError(out["error"])
+              return out["result"]
+          def choose():
+              failures={}
+              for ep in RPCS:
+                  try:
+                      if int(rpc(ep,"eth_chainId",[]),16)==1:return ep,failures
+                  except Exception as e:failures[ep]=repr(e)
+              raise RuntimeError(failures)
+          def run(*args):
+              p=subprocess.run(list(args),text=True,capture_output=True)
+              return {"ok":p.returncode==0,"stdout":p.stdout.strip(),"stderr":p.stderr.strip(),"returncode":p.returncode}
+          def cast_call(ep,to,sig,*args,frm=None):
+              cmd=["cast","call",to,sig,*map(str,args),"--rpc-url",ep]
+              if frm:cmd += ["--from",frm]
+              return run(*cmd)
+          def selector(sig):return run("cast","sig",sig)["stdout"]
+          def calldata(sig,*args):return run("cast","calldata",sig,*map(str,args))["stdout"]
+          def addresses(text):
+              seen=[]
+              for a in re.findall(r"0x[a-fA-F0-9]{40}",text or ""):
+                  a=a.lower()
+                  if a not in seen:seen.append(a)
+              return seen
+          def slot_for(label):
+              h=run("cast","keccak",label)["stdout"]
+              return "0x"+hex((int(h,16)-1)%(1<<256))[2:].rjust(64,"0")
+          def storage_addr(raw):return "0x"+raw[-40:].lower()
+          def common_probes(ep,address):
+              defs=[
+                ("owner","owner()(address)",[]),("avatar","avatar()(address)",[]),("target","target()(address)",[]),
+                ("safe","safe()(address)",[]),("module","module()(address)",[]),("paused","paused()(bool)",[]),
+                ("getOwners","getOwners()(address[])",[]),("getThreshold","getThreshold()(uint256)",[]),
+                ("nonce","nonce()(uint256)",[]),("VERSION","VERSION()(string)",[]),
+              ]
+              return {n:cast_call(ep,address,s,*a) for n,s,a in defs}
+
+          ep,rpc_failures=choose(); block_hex=rpc(ep,"eth_blockNumber",[]); block=int(block_hex,16)
+          fallback_slot=slot_for("fallback_manager.handler.address")
+          guard_slot=slot_for("guard_manager.guard.address")
+          out={"generated_at_unix":int(time.time()),"endpoint":ep,"rpc_failures":rpc_failures,"block":block,"slots":{"fallback":fallback_slot,"guard":guard_slot},"safes":{},"candidate_open_paths":[],"errors":[]}
+
+          for label,safe in SAFES.items():
+              row={"address":safe,"critical_capabilities":CRITICAL_CAPS[label]}
+              try:
+                  code=rpc(ep,"eth_getCode",[safe,block_hex]);row["code_bytes"]=(len(code)-2)//2;row["code_hash"]=run("cast","keccak",code)["stdout"]
+                  slot0=rpc(ep,"eth_getStorageAt",[safe,"0x0",block_hex]);row["singleton_slot0"]=storage_addr(slot0)
+                  row["masterCopy_special"]=cast_call(ep,safe,"masterCopy()(address)")
+                  row["VERSION"]=cast_call(ep,safe,"VERSION()(string)")
+                  row["owners_call"]=cast_call(ep,safe,"getOwners()(address[])");row["owners"]=addresses(row["owners_call"]["stdout"])
+                  row["threshold_call"]=cast_call(ep,safe,"getThreshold()(uint256)")
+                  row["nonce_call"]=cast_call(ep,safe,"nonce()(uint256)")
+                  mods=cast_call(ep,safe,"getModulesPaginated(address,uint256)(address[],address)",SENTINEL,100)
+                  row["modules_call"]=mods;row["modules"]=[a for a in addresses(mods["stdout"]) if a!=SENTINEL]
+                  fb=rpc(ep,"eth_getStorageAt",[safe,fallback_slot,block_hex]);gd=rpc(ep,"eth_getStorageAt",[safe,guard_slot,block_hex])
+                  row["fallback_handler"]=storage_addr(fb);row["guard"]=storage_addr(gd)
+                  row["is_owner_attacker"]=cast_call(ep,safe,"isOwner(address)(bool)",ATTACKER)
+                  row["is_owner_zero"]=cast_call(ep,safe,"isOwner(address)(bool)","0x0000000000000000000000000000000000000000")
+                  row["attacker_takeover_probes"]={
+                    "setup":cast_call(ep,safe,"setup(address[],uint256,address,bytes,address,address,uint256,address)",f"[{ATTACKER}]",1,"0x0000000000000000000000000000000000000000","0x","0x0000000000000000000000000000000000000000","0x0000000000000000000000000000000000000000",0,"0x0000000000000000000000000000000000000000",frm=ATTACKER),
+                    "enableModule":cast_call(ep,safe,"enableModule(address)",ATTACKER,frm=ATTACKER),
+                    "setGuard":cast_call(ep,safe,"setGuard(address)",ATTACKER,frm=ATTACKER),
+                    "setFallbackHandler":cast_call(ep,safe,"setFallbackHandler(address)",ATTACKER,frm=ATTACKER),
+                    "addOwner":cast_call(ep,safe,"addOwnerWithThreshold(address,uint256)",ATTACKER,1,frm=ATTACKER),
+                    "moduleExecution":cast_call(ep,safe,"execTransactionFromModule(address,uint256,bytes,uint8)(bool)",ATTACKER,0,"0x",0,frm=ATTACKER),
+                    "moduleExecutionReturnData":cast_call(ep,safe,"execTransactionFromModuleReturnData(address,uint256,bytes,uint8)(bool,bytes)",ATTACKER,0,"0x",0,frm=ATTACKER),
+                    "emptySignatureExec":cast_call(ep,safe,"execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)(bool)",ATTACKER,0,"0x",0,0,0,0,"0x0000000000000000000000000000000000000000","0x0000000000000000000000000000000000000000","0x",frm=ATTACKER),
+                  }
+                  row["module_details"]={}
+                  for module in row["modules"]:
+                      mcode=rpc(ep,"eth_getCode",[module,block_hex])
+                      md={"code_bytes":((len(mcode)-2)//2),"code_hash":run("cast","keccak",mcode)["stdout"],"common_probes":common_probes(ep,module)}
+                      md["attacker_calls"]={
+                        "execute3":cast_call(ep,module,"execute(address,uint256,bytes)",ATTACKER,0,"0x",frm=ATTACKER),
+                        "execute4":cast_call(ep,module,"execute(address,uint256,bytes,uint8)",ATTACKER,0,"0x",0,frm=ATTACKER),
+                        "execTransaction":cast_call(ep,module,"execTransaction(address,uint256,bytes,uint8)(bool)",ATTACKER,0,"0x",0,frm=ATTACKER),
+                        "execTransactionFromModule":cast_call(ep,module,"execTransactionFromModule(address,uint256,bytes,uint8)(bool)",ATTACKER,0,"0x",0,frm=ATTACKER),
+                        "trigger":cast_call(ep,module,"trigger(address,uint256,bytes,uint8)",ATTACKER,0,"0x",0,frm=ATTACKER),
+                      }
+                      row["module_details"][module]=md
+                      for name,res in md["attacker_calls"].items():
+                          if res["ok"]:out["candidate_open_paths"].append({"safe":safe,"module":module,"call":name,"result":res})
+                  for name,res in row["attacker_takeover_probes"].items():
+                      if res["ok"]:out["candidate_open_paths"].append({"safe":safe,"direct_call":name,"result":res})
+              except Exception as e:
+                  row["error"]=repr(e);row["traceback"]=traceback.format_exc();out["errors"].append({"safe":safe,"error":repr(e)})
+              out["safes"][label]=row
+
+          with open("veda-safe-deputy.json","w",encoding="utf-8") as f:json.dump(out,f,indent=2,sort_keys=True);f.write("\n")
+          print(json.dumps({"block":block,"candidate_open_paths":out["candidate_open_paths"],"errors":out["errors"],"safes":{k:{"owners":v.get("owners"),"threshold":v.get("threshold_call",{}).get("stdout"),"modules":v.get("modules"),"guard":v.get("guard"),"fallback":v.get("fallback_handler"),"takeover":{n:r.get("ok") for n,r in v.get("attacker_takeover_probes",{}).items()}} for k,v in out["safes"].items()}},indent=2,sort_keys=True))
+          PY
+      - name: Upload Safe deputy proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-safe-deputy
+          path: veda-safe-deputy.json
+          if-no-files-found: error
+          retention-days: 1
