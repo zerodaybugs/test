@@ -1,0 +1,103 @@
+name: Temporary Katana compound transaction history
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-katana-compound-history.yml'
+      - 'tmp-katana-compound-history-trigger.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  history:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Collect strategy and swapper history
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p evidence
+          cat > /tmp/history.py <<'PY'
+          from __future__ import annotations
+          import json, time, urllib.parse, urllib.request
+          from pathlib import Path
+
+          BASE='https://explorer.katanarpc.com/api/v2'
+          ACTIVE='0x60233D1c150F9C08D886906d597aA79a205b0463'
+          SWAPPER='0x92D2e00b6D2BB50B87a9BE971a82B1F00ac44768'
+          VAULT='0x7231dbaCdFc968E07656D12389AB20De82FbfCeB'
+          ADDRS={'active':ACTIVE,'swapper':SWAPPER,'vault':VAULT}
+
+          def get_json(url,retries=8):
+              last=None
+              for i in range(retries):
+                  try:
+                      req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'application/json'})
+                      with urllib.request.urlopen(req,timeout=90) as r:
+                          return json.loads(r.read())
+                  except Exception as e:
+                      last=repr(e); time.sleep(min(2**i,15))
+              return {'error':last,'url':url}
+
+          def paginate(endpoint,max_pages=100):
+              url=f'{BASE}{endpoint}'
+              pages=[]; items=[]
+              for _ in range(max_pages):
+                  data=get_json(url)
+                  pages.append(data)
+                  if data.get('error'): break
+                  batch=data.get('items') or []
+                  items.extend(batch)
+                  nxt=data.get('next_page_params')
+                  if not nxt: break
+                  url=f'{BASE}{endpoint}?'+urllib.parse.urlencode(nxt,doseq=True)
+              return {'items':items,'pages':pages,'final_url':url}
+
+          out={}
+          for name,address in ADDRS.items():
+              out[f'{name}_transactions']=paginate(f'/addresses/{address}/transactions')
+              out[f'{name}_internal_transactions']=paginate(f'/addresses/{address}/internal-transactions')
+              out[f'{name}_token_transfers']=paginate(f'/addresses/{address}/token-transfers')
+              out[f'{name}_logs']=paginate(f'/addresses/{address}/logs')
+
+          Path('evidence/blockscout-history.json').write_text(json.dumps(out,indent=2,sort_keys=True))
+
+          # Compact transaction inventory with selector, calldata, block, sender, status, and token movements.
+          compact={}
+          for key,value in out.items():
+              if not key.endswith('_transactions') or 'internal_' in key: continue
+              rows=[]
+              for tx in value.get('items',[]):
+                  raw=tx.get('raw_input') or tx.get('input') or '0x'
+                  rows.append({
+                    'hash':tx.get('hash'),'block':tx.get('block_number'),'timestamp':tx.get('timestamp'),
+                    'from':(tx.get('from') or {}).get('hash') if isinstance(tx.get('from'),dict) else tx.get('from'),
+                    'to':(tx.get('to') or {}).get('hash') if isinstance(tx.get('to'),dict) else tx.get('to'),
+                    'status':tx.get('status'),'method':tx.get('method'),'selector':raw[:10],
+                    'raw_input':raw,'value':tx.get('value'),'fee':tx.get('fee'),
+                  })
+              compact[key]=rows
+          Path('evidence/compact-transactions.json').write_text(json.dumps(compact,indent=2,sort_keys=True))
+          PY
+          python3 /tmp/history.py > evidence/run.log 2>&1 || true
+          cast sig 'claimAndCompound(address[],uint256[],bytes32[][],(address,uint256,bytes)[])' > evidence/claim-selector.txt 2>&1 || true
+          cast sig 'vote((uint256,address)[])' > evidence/vote-selector.txt 2>&1 || true
+          cast sig 'delegate(address)' > evidence/delegate-selector.txt 2>&1 || true
+          find evidence -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-compound-history-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 3
