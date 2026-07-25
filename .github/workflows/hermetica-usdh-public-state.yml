@@ -28,68 +28,47 @@ jobs:
           npm init -y >/dev/null
           npm install --ignore-scripts --no-audit --no-fund @stacks/transactions@7.2.0
 
-      - name: Capture public contract state
+      - name: Capture public staking and reward state
         shell: bash
         run: |
           set -euo pipefail
           cd /tmp/hermetica-state
           cat > snapshot.cjs <<'NODE'
           const fs = require('fs');
-          const {
-            principalCV,
-            cvToHex,
-            hexToCV,
-            cvToJSON,
-          } = require('@stacks/transactions');
+          const { hexToCV, cvToJSON } = require('@stacks/transactions');
 
           const API = 'https://api.hiro.so';
           const DEPLOYER = 'SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG';
-          const names = [
-            'hq-v1',
-            'minting-state-v1',
-            'minting-auto-state-v1',
-            'minting-auto-v1-2',
-            'minting-otc-v1-1',
-            'redeeming-reserve-v1-2',
-            'controller-v1-1',
-            'emergency-recover-v1',
-            'staking-v1-1',
-            'staking-silo-v1-1',
-            'staking-reserve-v1',
-            'staking-state-v1',
-            'usdh-token-v1',
-            'susdh-token-v1',
-          ];
-          const contracts = Object.fromEntries(names.map(n => [n, `${DEPLOYER}.${n}`]));
+          const CONTRACTS = {
+            controller: `${DEPLOYER}.controller-v1-1`,
+            staking: `${DEPLOYER}.staking-v1-1`,
+            stakingState: `${DEPLOYER}.staking-state-v1`,
+            stakingReserve: `${DEPLOYER}.staking-reserve-v1`,
+            stakingSilo: `${DEPLOYER}.staking-silo-v1-1`,
+            usdh: `${DEPLOYER}.usdh-token-v1`,
+            susdh: `${DEPLOYER}.susdh-token-v1`,
+          };
 
-          async function fetchRetry(url, options = {}, attempts = 6) {
+          async function fetchRetry(url, options = {}, attempts = 8) {
             let last;
             for (let i = 0; i < attempts; i++) {
               try {
                 const res = await fetch(url, options);
                 if (res.ok) return res;
-                last = new Error(`${res.status} ${res.statusText}: ${await res.text()}`);
+                const body = await res.text();
+                last = new Error(`${res.status} ${res.statusText}: ${body}`);
                 if (res.status < 500 && res.status !== 429) throw last;
-              } catch (e) {
-                last = e;
-              }
-              await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+              } catch (e) { last = e; }
+              await new Promise(r => setTimeout(r, 750 * (i + 1)));
             }
             throw last;
           }
 
-          async function sourceExists(name) {
-            const res = await fetch(`${API}/v2/contracts/source/${DEPLOYER}/${name}?proof=0`);
-            if (!res.ok) return { exists: false, status: res.status };
-            const body = await res.json();
-            return { exists: true, source_length: (body.source || '').length };
-          }
-
-          async function callRead(contractName, functionName, cvs = []) {
+          async function callRead(contractName, functionName) {
             const res = await fetchRetry(`${API}/v2/contracts/call-read/${DEPLOYER}/${contractName}/${functionName}`, {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ sender: DEPLOYER, arguments: cvs.map(cvToHex) }),
+              body: JSON.stringify({ sender: DEPLOYER, arguments: [] }),
             });
             const body = await res.json();
             let decoded = null;
@@ -100,46 +79,46 @@ jobs:
             return { okay: body.okay, cause: body.cause, result_raw: body.result, decoded };
           }
 
-          async function getTransactions(principal, max = 1000) {
-            const all = [];
-            for (let offset = 0; offset < max; offset += 50) {
-              const url = `${API}/extended/v1/address/${encodeURIComponent(principal)}/transactions?limit=50&offset=${offset}`;
-              const res = await fetchRetry(url);
-              const body = await res.json();
-              const rows = body.results || [];
-              all.push(...rows);
-              if (rows.length < 50 || all.length >= (body.total || max)) break;
-            }
-            return all.slice(0, max);
+          async function sourceMeta(contractName) {
+            const res = await fetchRetry(`${API}/v2/contracts/source/${DEPLOYER}/${contractName}?proof=0`);
+            const body = await res.json();
+            return { source_length: (body.source || '').length, publish_height: body.publish_height };
           }
 
-          async function getBalances(principal) {
+          async function getBalance(principal) {
             const res = await fetchRetry(`${API}/extended/v1/address/${encodeURIComponent(principal)}/balances`);
             return await res.json();
           }
 
-          function directCalls(txs, contractId) {
-            return txs.filter(tx => tx.tx_type === 'contract_call' && tx.contract_call?.contract_id === contractId);
-          }
-
-          function argsByName(tx) {
-            const out = {};
-            for (const a of tx.contract_call?.function_args || []) out[a.name || `arg${Object.keys(out).length}`] = a.repr;
+          async function getDirectCalls(contractId, max = 2000) {
+            const out = [];
+            for (let offset = 0; offset < max; offset += 50) {
+              const res = await fetchRetry(`${API}/extended/v1/address/${encodeURIComponent(contractId)}/transactions?limit=50&offset=${offset}`);
+              const body = await res.json();
+              const rows = body.results || [];
+              for (const tx of rows) {
+                if (tx.tx_type !== 'contract_call' || tx.contract_call?.contract_id !== contractId) continue;
+                out.push({
+                  tx_id: tx.tx_id,
+                  status: tx.tx_status,
+                  sender_address: tx.sender_address,
+                  nonce: tx.nonce,
+                  fee_rate: tx.fee_rate,
+                  block_height: tx.block_height,
+                  burn_block_time: tx.burn_block_time,
+                  burn_block_time_iso: tx.burn_block_time_iso,
+                  function_name: tx.contract_call.function_name,
+                  function_args: (tx.contract_call.function_args || []).map(a => ({ name: a.name, type: a.type, repr: a.repr })),
+                  tx_result: tx.tx_result?.repr,
+                });
+              }
+              if (rows.length < 50 || offset + rows.length >= (body.total || max)) break;
+            }
             return out;
           }
 
-          function principalsFrom(value) {
-            const text = typeof value === 'string' ? value : JSON.stringify(value);
-            const found = new Set();
-            const re = /'?((?:SP|SM)[0-9A-HJKMNP-TV-Z]{20,50}(?:\.[a-zA-Z0-9-]{1,40})?)/g;
-            let m;
-            while ((m = re.exec(text))) found.add(m[1]);
-            return [...found];
-          }
-
-          async function safeCall(out, key, contract, fn, cvs = []) {
-            try { out[key] = await callRead(contract, fn, cvs); }
-            catch (e) { out[key] = { error: String(e) }; }
+          function ftBalance(balances, assetId) {
+            return balances.fungible_tokens?.[assetId]?.balance ?? null;
           }
 
           (async () => {
@@ -147,138 +126,79 @@ jobs:
               generated_at: new Date().toISOString(),
               source: 'Hiro public read-only APIs',
               deployer: DEPLOYER,
-              contracts,
-              source_status: {},
-              transactions: {},
-              current_state: {},
+              contracts: CONTRACTS,
+              source_meta: {},
+              read_only: {},
               balances: {},
+              history: {},
+              errors: [],
             };
 
-            for (const name of names) output.source_status[name] = await sourceExists(name);
-
-            const allPrincipals = new Set([DEPLOYER, ...Object.values(contracts)]);
-            const callIndex = {};
-            for (const [name, cid] of Object.entries(contracts)) {
-              if (!output.source_status[name].exists) continue;
-              const txs = await getTransactions(cid, 1000);
-              const calls = directCalls(txs, cid).map(tx => ({
-                tx_id: tx.tx_id,
-                status: tx.tx_status,
-                block_height: tx.block_height,
-                burn_block_time_iso: tx.burn_block_time_iso,
-                sender_address: tx.sender_address,
-                function_name: tx.contract_call.function_name,
-                args: argsByName(tx),
-                tx_result: tx.tx_result?.repr,
-              }));
-              output.transactions[name] = { total_address_txs: txs.length, direct_calls: calls };
-              callIndex[name] = calls;
-              for (const p of principalsFrom(calls)) allPrincipals.add(p);
-              for (const c of calls) if (c.sender_address) allPrincipals.add(c.sender_address);
+            for (const [key, cid] of Object.entries(CONTRACTS)) {
+              const name = cid.split('.')[1];
+              try { output.source_meta[key] = await sourceMeta(name); }
+              catch (e) { output.errors.push({ step: `source:${key}`, error: String(e) }); }
             }
 
-            const principals = [...allPrincipals].sort();
-            output.candidate_principals = principals;
-
-            const hq = {};
-            for (const fn of ['get-contracts-enabled','get-minting-enabled','get-owner','get-next-owner']) await safeCall(hq, fn, 'hq-v1', fn);
-            hq.by_principal = {};
-            for (const p of principals) {
-              const row = {};
-              for (const fn of ['get-contract-active','get-minting-contract','get-admin','get-guardian']) await safeCall(row, fn, 'hq-v1', fn, [principalCV(p)]);
-              hq.by_principal[p] = row;
+            const reads = [
+              ['controller.maxRewardPerWindow', 'controller-v1-1', 'get-max-reward-per-window'],
+              ['controller.updateWindow', 'controller-v1-1', 'get-update-window'],
+              ['controller.lastLogBlockHeight', 'controller-v1-1', 'get-last-log-block-height'],
+              ['staking.usdhPerSusdh', 'staking-v1-1', 'get-usdh-per-susdh'],
+              ['stakingState.cooldownWindow', 'staking-state-v1', 'get-cooldown-window'],
+              ['stakingState.stakingEnabled', 'staking-state-v1', 'get-staking-enabled'],
+              ['usdh.totalSupply', 'usdh-token-v1', 'get-total-supply'],
+              ['susdh.totalSupply', 'susdh-token-v1', 'get-total-supply'],
+            ];
+            for (const [key, contract, fn] of reads) {
+              try { output.read_only[key] = await callRead(contract, fn); }
+              catch (e) { output.errors.push({ step: `read:${key}`, error: String(e) }); }
             }
-            output.current_state.hq = hq;
 
-            const autoState = {};
-            for (const fn of ['get-mint-fee','get-redeem-fee','get-fee-address']) await safeCall(autoState, fn, 'minting-auto-state-v1', fn);
-            const whitelistPairs = new Map();
-            const supportedAssets = new Set();
-            for (const c of callIndex['minting-auto-state-v1'] || []) {
-              const ps = principalsFrom(c.args);
-              if (c.function_name === 'set-whitelist' && ps.length >= 2) whitelistPairs.set(`${ps[0]}|${ps[1]}`, [ps[0], ps[1]]);
-              if (c.function_name === 'set-supported-asset' && ps.length >= 1) supportedAssets.add(ps[0]);
+            for (const key of ['stakingReserve','stakingSilo','controller','staking']) {
+              try { output.balances[key] = await getBalance(CONTRACTS[key]); }
+              catch (e) { output.errors.push({ step: `balance:${key}`, error: String(e) }); }
             }
-            autoState.supported_assets = {};
-            for (const a of [...supportedAssets].sort()) await safeCall(autoState.supported_assets, a, 'minting-auto-state-v1', 'get-supported-asset', [principalCV(a)]);
-            autoState.whitelist = {};
-            for (const [k, [a, asset]] of [...whitelistPairs.entries()].sort()) await safeCall(autoState.whitelist, k, 'minting-auto-state-v1', 'get-whitelist', [principalCV(a), principalCV(asset)]);
-            output.current_state.minting_auto_state = autoState;
 
-            const auto = {};
-            for (const fn of ['get-mint-limit','get-current-mint-limit','get-last-mint-limit-reset','get-mint-limit-reset-window']) await safeCall(auto, fn, 'minting-auto-v1-2', fn);
-            output.current_state.minting_auto = auto;
-
-            const mintState = {};
-            for (const fn of ['get-mint-confirmation-window','get-redeem-confirmation-window','get-whitelist-enabled','get-mint-enabled','get-redeem-enabled','get-fee-address','get-min-amount-usdh-requested','get-mint-fee-usdh','get-redeem-fee-usdh','get-mint-fee-asset','get-redeem-fee-asset']) await safeCall(mintState, fn, 'minting-state-v1', fn);
-            mintState.by_principal = {};
-            for (const p of principals) {
-              const row = {};
-              await safeCall(row, 'get-gatekeeper-active', 'minting-state-v1', 'get-gatekeeper-active', [principalCV(p)]);
-              await safeCall(row, 'get-whitelist', 'minting-state-v1', 'get-whitelist', [principalCV(p)]);
-              mintState.by_principal[p] = row;
+            for (const key of ['controller','staking','stakingSilo']) {
+              try { output.history[key] = await getDirectCalls(CONTRACTS[key]); }
+              catch (e) { output.errors.push({ step: `history:${key}`, error: String(e) }); }
             }
-            output.current_state.minting_state = mintState;
 
-            const reserve = { by_principal: {} };
-            for (const p of principals) {
-              const row = {};
-              await safeCall(row, 'get-manager', 'redeeming-reserve-v1-2', 'get-manager', [principalCV(p)]);
-              await safeCall(row, 'get-authorized-recipient', 'redeeming-reserve-v1-2', 'get-authorized-recipient', [principalCV(p)]);
-              reserve.by_principal[p] = row;
-            }
-            output.current_state.redeeming_reserve = reserve;
-
-            const otc = {};
-            for (const fn of ['get-mint-limit','get-current-mint-limit','get-mint-limit-reset-window','get-last-mint-limit-reset']) await safeCall(otc, fn, 'minting-otc-v1-1', fn);
-            otc.by_principal = {};
-            for (const p of principals) {
-              const row = {};
-              await safeCall(row, 'get-trader', 'minting-otc-v1-1', 'get-trader', [principalCV(p)]);
-              otc.by_principal[p] = row;
-            }
-            output.current_state.minting_otc = otc;
-
-            const controller = {};
-            for (const fn of ['get-max-reward-per-window','get-update-window','get-last-log-block-height']) await safeCall(controller, fn, 'controller-v1-1', fn);
-            controller.by_principal = {};
-            for (const p of principals) {
-              const row = {};
-              await safeCall(row, 'get-rewarder', 'controller-v1-1', 'get-rewarder', [principalCV(p)]);
-              controller.by_principal[p] = row;
-            }
-            output.current_state.controller = controller;
-
-            const staking = {};
-            for (const fn of ['get-cooldown-window','get-staking-enabled']) await safeCall(staking, fn, 'staking-state-v1', fn);
-            staking.by_principal = {};
-            for (const p of principals) {
-              const row = {};
-              await safeCall(row, 'get-custom-cooldown', 'staking-state-v1', 'get-custom-cooldown', [principalCV(p)]);
-              staking.by_principal[p] = row;
-            }
-            output.current_state.staking_state = staking;
-
-            for (const [name, cid] of Object.entries(contracts)) {
-              if (!output.source_status[name].exists) continue;
-              try { output.balances[name] = await getBalances(cid); }
-              catch (e) { output.balances[name] = { error: String(e) }; }
-            }
+            const usdhAsset = `${CONTRACTS.usdh}::usdh`;
+            const susdhAsset = `${CONTRACTS.susdh}::susdh`;
+            output.summary = {
+              controller_log_reward_calls: (output.history.controller || []).filter(x => x.function_name === 'log-reward' && x.status === 'success').length,
+              staking_stake_calls: (output.history.staking || []).filter(x => x.function_name === 'stake' && x.status === 'success').length,
+              staking_unstake_calls: (output.history.staking || []).filter(x => x.function_name === 'unstake' && x.status === 'success').length,
+              silo_withdraw_calls: (output.history.stakingSilo || []).filter(x => x.function_name === 'withdraw' && x.status === 'success').length,
+              staking_reserve_usdh: ftBalance(output.balances.stakingReserve || {}, usdhAsset),
+              staking_silo_usdh: ftBalance(output.balances.stakingSilo || {}, usdhAsset),
+              staking_contract_susdh: ftBalance(output.balances.staking || {}, susdhAsset),
+            };
 
             fs.writeFileSync('hermetica-usdh-public-state.json', JSON.stringify(output, null, 2));
-            console.log(JSON.stringify({ principals: principals.length, contracts_found: Object.values(output.source_status).filter(x => x.exists).length }, null, 2));
-          })().catch(e => { console.error(e); process.exit(1); });
+            if (output.errors.length) fs.writeFileSync('errors.json', JSON.stringify(output.errors, null, 2));
+            console.log(JSON.stringify(output.summary, null, 2));
+          })().catch(e => {
+            fs.writeFileSync('fatal-error.txt', String(e && e.stack ? e.stack : e));
+            console.error(e);
+            process.exit(1);
+          });
           NODE
           node snapshot.cjs
           sha256sum hermetica-usdh-public-state.json > hermetica-usdh-public-state.json.sha256
 
       - name: Upload public state snapshot
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: hermetica-usdh-public-state
           path: |
             /tmp/hermetica-state/hermetica-usdh-public-state.json
             /tmp/hermetica-state/hermetica-usdh-public-state.json.sha256
+            /tmp/hermetica-state/errors.json
+            /tmp/hermetica-state/fatal-error.txt
           retention-days: 1
-          if-no-files-found: error
+          if-no-files-found: warn
           compression-level: 0
