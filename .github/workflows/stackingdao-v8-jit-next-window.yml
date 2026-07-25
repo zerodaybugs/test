@@ -1,0 +1,108 @@
+name: StackingDAO rewards-v8 next JIT window
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/stackingdao-v8-jit-next-window.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout workflow
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Query public timing state read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cd evidence
+          npm init -y >/dev/null 2>&1
+          npm install --no-save --package-lock=false @stacks/transactions@6.17.0 >/dev/null 2>&1
+          cat > query.mjs <<'NODE'
+          import { cvToHex, cvToString, hexToCV, uintCV } from '@stacks/transactions';
+          import { writeFile } from 'node:fs/promises';
+
+          const owner='SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG';
+          const name='rewards-v8';
+          const api='https://api.mainnet.hiro.so';
+          async function fetchJson(url, options={}, attempts=8) {
+            let last;
+            for (let i=1;i<=attempts;i+=1) {
+              try {
+                const r=await fetch(url, options); const text=await r.text();
+                if(!r.ok) throw new Error(`${r.status}: ${text.slice(0,300)}`);
+                return JSON.parse(text);
+              } catch(e) { last=e; if(i<attempts) await new Promise(res=>setTimeout(res,1200*i)); }
+            }
+            throw last;
+          }
+          async function call(fn,args=[]) {
+            const body=JSON.stringify({sender:owner,arguments:args.map(cvToHex)});
+            const j=await fetchJson(`${api}/v2/contracts/call-read/${owner}/${name}/${fn}`,{method:'POST',headers:{'content-type':'application/json'},body});
+            return {decoded:j.result?cvToString(hexToCV(j.result)):null,raw:j};
+          }
+          function topUint(s){const m=String(s??'').match(/^(?:\(ok )?u(\d+)\)?$/);return m?BigInt(m[1]):null;}
+          function field(s,k){const m=String(s??'').match(new RegExp(`\\(${k} u(\\d+)\\)`));return m?BigInt(m[1]):null;}
+          const info=await fetchJson(`${api}/v2/info`);
+          const cycle=topUint((await call('get-pox-cycle')).decoded);
+          if(cycle===null) throw new Error('cycle decode');
+          const targetCycle=cycle-1n;
+          const start=topUint((await call('reward-cycle-to-burn-height',[uintCV(Number(cycle))])).decoded);
+          const end=topUint((await call('reward-cycle-to-burn-height',[uintCV(Number(cycle+1n))])).decoded);
+          const interval=topUint((await call('get-rewards-interval-length')).decoded);
+          const should=await call('should-process-rewards',[uintCV(Number(targetCycle))]);
+          const stx=await call('get-cycle-rewards-ststx',[uintCV(Number(targetCycle))]);
+          const past=field(should.decoded,'past-intervals');
+          const total=field(should.decoded,'total-intervals');
+          const protocol=field(stx.decoded,'protocol-stx');
+          const processed=field(stx.decoded,'processed-protocol-stx');
+          if([start,end,interval,past,total,protocol,processed].some(v=>v===null)) throw new Error('decode failure');
+          const nextPast=past<total?past+1n:past;
+          const nextThreshold=start+nextPast*interval;
+          const current=BigInt(info.burn_block_height);
+          const blocksRemaining=nextThreshold>current?nextThreshold-current:0n;
+          const tranche=(protocol*nextPast/total)-processed;
+          const fullSingleInterval=protocol/total;
+          const remaining=protocol-processed;
+          const out={
+            captured_at:new Date().toISOString(),current_cycle:cycle.toString(),target_cycle:targetCycle.toString(),
+            current_burn_height:current.toString(),cycle_start:start.toString(),cycle_end:end.toString(),
+            interval_length:interval.toString(),past_intervals:past.toString(),total_intervals:total.toString(),
+            next_past_intervals:nextPast.toString(),next_threshold_burn_height:nextThreshold.toString(),
+            blocks_remaining:blocksRemaining.toString(),approx_minutes_remaining:(blocksRemaining*10n).toString(),
+            protocol_stx:protocol.toString(),processed_protocol_stx:processed.toString(),remaining_protocol_stx:remaining.toString(),
+            next_processable_protocol_stx:tranche.toString(),single_interval_floor:fullSingleInterval.toString(),
+            should:should.decoded,stx:stx.decoded,
+          };
+          await writeFile('window.json',`${JSON.stringify(out,null,2)}\n`);
+          await writeFile('window.txt',`${Object.entries(out).map(([k,v])=>`${k}=${v}`).join('\n')}\n`);
+          console.log(await (await import('node:fs/promises')).readFile('window.txt','utf8'));
+          NODE
+          node query.mjs
+          sha256sum window.json window.txt query.mjs > SHA256SUMS
+
+      - name: Upload timing evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackingdao-v8-jit-window-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Enforce integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd evidence && sha256sum -c SHA256SUMS)
+          grep -F 'next_threshold_burn_height=' evidence/window.txt
+          grep -F 'next_processable_protocol_stx=' evidence/window.txt
