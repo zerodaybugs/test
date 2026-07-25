@@ -1,0 +1,150 @@
+name: veda-native-oracle-state
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Inspect native pseudo-asset configuration and live oracle invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, subprocess, time, urllib.request, traceback
+
+          ATTACKER="0x1111111111111111111111111111111111111111"
+          NATIVE="0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+          CHAINS={
+            "ethereum":{"id":1,"rpcs":["https://ethereum-rpc.publicnode.com","https://eth.drpc.org","https://rpc.mevblocker.io"],"weth":"0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2","tellers":{
+              "liquidBTC":"0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353","liquidETH":"0x9AA79C84b79816ab920bBcE20f8f74557B514734","liquidUSD":"0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387"}},
+            "optimism":{"id":10,"rpcs":["https://optimism-rpc.publicnode.com","https://mainnet.optimism.io","https://optimism.drpc.org"],"weth":"0x4200000000000000000000000000000000000006","tellers":{
+              "liquidBTC":"0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353","liquidETH":"0x9AA79C84b79816ab920bBcE20f8f74557B514734","liquidUSD":"0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387"}},
+            "scroll":{"id":534352,"rpcs":["https://scroll-rpc.publicnode.com","https://rpc.scroll.io","https://scroll.drpc.org"],"weth":"0x5300000000000000000000000000000000000004","tellers":{
+              "liquidBTC":"0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353","liquidETH":"0x9AA79C84b79816ab920bBcE20f8f74557B514734","liquidUSD":"0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387"}},
+            "ink":{"id":57073,"rpcs":["https://rpc-gel.inkonchain.com","https://rpc-qnd.inkonchain.com","https://ink.drpc.org"],"weth":"0x4200000000000000000000000000000000000006","tellers":{
+              "balanced":"0xC151E263d5c890FD0Bceb33a6525F1A76a8329fC","boosted":"0xc46f2443b3521632E2E2a903D6da8f965B46f6a0"}},
+          }
+          def rpc(ep,m,p,t=35):
+              b=json.dumps({"jsonrpc":"2.0","id":1,"method":m,"params":p}).encode();q=urllib.request.Request(ep,data=b,method="POST",headers={"content-type":"application/json","user-agent":"veda-native-oracle/1.0"})
+              with urllib.request.urlopen(q,timeout=t) as r:o=json.loads(r.read().decode())
+              if "error" in o:raise RuntimeError(o["error"])
+              return o["result"]
+          def choose(c):
+              bad={}
+              for ep in c["rpcs"]:
+                  try:
+                      if int(rpc(ep,"eth_chainId",[]),16)==c["id"]:return ep,bad
+                  except Exception as e:bad[ep]=repr(e)
+              raise RuntimeError(bad)
+          def run(*a):
+              p=subprocess.run(list(a),text=True,capture_output=True);return {"ok":p.returncode==0,"stdout":p.stdout.strip(),"stderr":p.stderr.strip(),"returncode":p.returncode}
+          def sig(s):return run("cast","sig",s)["stdout"]
+          def st(x):return x[2:] if str(x).startswith("0x") else str(x)
+          def aw(a):return st(a).lower().rjust(64,"0")
+          def sw(s):return st(s).lower().ljust(64,"0")
+          def words(x):
+              h=st(x);return [int(h[i:i+64],16) for i in range(0,len(h),64)] if h else []
+          def addr(x):return "0x"+st(x)[-40:].lower()
+          S={"assetData":sig("assetData(address)"),"authority":sig("authority()"),"nativeWrapper":sig("nativeWrapper()"),"shareLock":sig("shareLockPeriod()"),"depositCap":sig("depositCap()")}
+          PUB=sig("isCapabilityPublic(address,bytes4)");CAN=sig("canCall(address,address,bytes4)")
+          DEPOSITS={
+            "deposit3":sig("deposit(address,uint256,uint256)"),
+            "deposit4_referral":sig("deposit(address,uint256,uint256,address)"),
+            "deposit5_to_referral":sig("deposit(address,uint256,uint256,address,address)"),
+            "depositAndBridge":sig("depositAndBridge(address,uint256,uint256,address,bytes,address,uint256)"),
+          }
+          out={"generated_at_unix":int(time.time()),"chains":{},"flags":[],"errors":[]}
+          for cname,c in CHAINS.items():
+              ep,bad=choose(c);block=rpc(ep,"eth_blockNumber",[]);cd={"endpoint":ep,"rpc_failures":bad,"block":int(block,16),"tellers":{}};out["chains"][cname]=cd
+              def call(to,data):return rpc(ep,"eth_call",[{"to":to,"data":data},block])
+              for name,teller in c["tellers"].items():
+                  row={"address":teller.lower()}
+                  try:
+                      code=rpc(ep,"eth_getCode",[teller,block]);row["code_bytes"]=(len(code)-2)//2
+                      auth=addr(call(teller,S["authority"]));row["authority"]=auth
+                      nw=call(teller,S["nativeWrapper"]);row["native_wrapper"]=addr(nw)
+                      row["expected_weth"]=c["weth"].lower();row["native_wrapper_matches_expected"]=row["native_wrapper"]==c["weth"].lower()
+                      n=words(call(teller,S["assetData"]+aw(NATIVE)));w=words(call(teller,S["assetData"]+aw(c["weth"])))
+                      row["native_asset_data"]={"allow_deposit":bool(n[0]) if n else False,"allow_withdraw":bool(n[1]) if len(n)>1 else False,"premium_bps":n[2] if len(n)>2 else None,"words":n}
+                      row["weth_asset_data"]={"allow_deposit":bool(w[0]) if w else False,"allow_withdraw":bool(w[1]) if len(w)>1 else False,"premium_bps":w[2] if len(w)>2 else None,"words":w}
+                      row["share_lock_period"]=int(call(teller,S["shareLock"]),16);row["deposit_cap"]=int(call(teller,S["depositCap"]),16)
+                      row["deposit_gates"]={}
+                      for dn,ds in DEPOSITS.items():
+                          public=bool(int(call(auth,PUB+aw(teller)+sw(ds)),16));attacker=bool(int(call(auth,CAN+aw(ATTACKER)+aw(teller)+sw(ds)),16))
+                          row["deposit_gates"][dn]={"selector":ds,"public":public,"attacker":attacker}
+                      nd=row["native_asset_data"];wd=row["weth_asset_data"]
+                      if nd["allow_deposit"] and any(x["attacker"] for x in row["deposit_gates"].values()):
+                          if not row["native_wrapper_matches_expected"] or nd["premium_bps"]!=wd["premium_bps"] or not wd["allow_deposit"]:
+                              out["flags"].append({"type":"NATIVE_WRAPPER_CONFIG_ASYMMETRY","chain":cname,"product":name,"row":row})
+                  except Exception as e:
+                      row["error"]=repr(e);row["traceback"]=traceback.format_exc();out["errors"].append({"chain":cname,"product":name,"error":repr(e)})
+                  cd["tellers"][name]=row
+          with open("veda-native-config.json","w",encoding="utf-8") as f:json.dump(out,f,indent=2,sort_keys=True);f.write("\n")
+          print(json.dumps({"flags":out["flags"],"errors":out["errors"],"chains":{c:{p:{"native":r.get("native_asset_data"),"weth":r.get("weth_asset_data"),"wrapper":r.get("native_wrapper"),"gates":r.get("deposit_gates")} for p,r in d["tellers"].items()} for c,d in out["chains"].items()}},indent=2,sort_keys=True))
+          PY
+
+          RPC="https://ethereum-rpc.publicnode.com"
+          LOCAL="http://127.0.0.1:8545"
+          anvil --fork-url "$RPC" --port 8545 --silent >anvil-veda-oracle.log 2>&1 &
+          PID=$!
+          trap 'kill "$PID" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 90); do cast chain-id --rpc-url "$LOCAL" >/dev/null 2>&1 && break; sleep 1; done
+          cast chain-id --rpc-url "$LOCAL" >/dev/null
+          python3 - <<'PY'
+          import json,subprocess,time,traceback
+          RPC="http://127.0.0.1:8545";ATTACKER="0x1111111111111111111111111111111111111111"
+          WEETH="0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee";VEDA_ACCOUNTANT="0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198";VEDA_QUEUE="0x0D2dF071207E18Ca8638b4f04E98c53155eC2cE0"
+          def r(*a,check=True):
+              p=subprocess.run(list(a),text=True,capture_output=True)
+              if check and p.returncode:raise RuntimeError({"cmd":a,"stderr":p.stderr})
+              return p.stdout.strip()
+          def call(to,sig,*args):return int(r("cast","call",to,sig,*map(str,args),"--rpc-url",RPC).split()[0],0)
+          def call_addr(to,sig):return r("cast","call",to,sig,"--rpc-url",RPC).split()[0]
+          def send(frm,to,sig=None,*args,value=None):
+              cmd=["cast","send","--unlocked","--from",frm]
+              if value is not None:cmd += ["--value",str(value)]
+              cmd += [to]
+              if sig:cmd += [sig,*map(str,args)]
+              cmd += ["--rpc-url",RPC,"--json"]
+              return json.loads(r(*cmd))
+          out={"generated_at_unix":int(time.time()),"block":call("0x0000000000000000000000000000000000000000","balance(address)(uint256)",ATTACKER) if False else int(r("cast","block-number","--rpc-url",RPC)),"steps":[],"flags":[],"errors":[]}
+          try:
+              lp=call_addr(WEETH,"liquidityPool()(address)");eeth=call_addr(WEETH,"eETH()(address)");out["liquidity_pool"]=lp;out["eeth"]=eeth
+              r("cast","rpc","anvil_impersonateAccount",ATTACKER,"--rpc-url",RPC);r("cast","rpc","anvil_setBalance",ATTACKER,"0x3635c9adc5dea00000","--rpc-url",RPC)
+              def snap(label):
+                  s={"label":label,"weeth_rate":call(WEETH,"getRate()(uint256)"),"pooled":call(lp,"getTotalPooledEther()(uint256)"),"total_shares":call(eeth,"totalShares()(uint256)"),"value_in":call(lp,"totalValueInLp()(uint128)"),"value_out":call(lp,"totalValueOutOfLp()(uint128)"),"veda_quote":call(VEDA_ACCOUNTANT,"getRateInQuoteSafe(address)(uint256)",WEETH),"veda_queue_preview":call(VEDA_QUEUE,"previewAssetsOut(address,uint128,uint16)(uint128)",WEETH,10**18,0)}
+                  out["steps"].append(s);return s
+              a=snap("initial")
+              send(ATTACKER,lp,value=1);b=snap("after_direct_1wei_receive")
+              send(ATTACKER,lp,"deposit()(uint256)",value=10**18);c=snap("after_public_1eth_deposit")
+              ebal=call(eeth,"balanceOf(address)(uint256)",ATTACKER);send(ATTACKER,eeth,"approve(address,uint256)(bool)",WEETH,ebal);send(ATTACKER,WEETH,"wrap(uint256)(uint256)",ebal);d=snap("after_wrap_all_eeth")
+              wbal=call(WEETH,"balanceOf(address)(uint256)",ATTACKER);send(ATTACKER,WEETH,"unwrap(uint256)(uint256)",wbal);e=snap("after_unwrap_all_weeth")
+              out["deltas"]={"direct_receive_rate":b["weeth_rate"]-a["weeth_rate"],"direct_receive_pooled":b["pooled"]-a["pooled"],"deposit_rate":c["weeth_rate"]-b["weeth_rate"],"wrap_rate":d["weeth_rate"]-c["weeth_rate"],"unwrap_rate":e["weeth_rate"]-d["weeth_rate"],"direct_receive_veda_preview":b["veda_queue_preview"]-a["veda_queue_preview"],"wrap_veda_preview":d["veda_queue_preview"]-c["veda_queue_preview"]}
+              if out["deltas"]["direct_receive_rate"]!=0 or out["deltas"]["direct_receive_pooled"]!=0:out["flags"].append({"type":"DIRECT_RECEIVE_MOVES_WEETH_RATE","delta":out["deltas"]})
+              if out["deltas"]["wrap_rate"]!=0 or out["deltas"]["unwrap_rate"]!=0:out["flags"].append({"type":"WRAP_UNWRAP_MOVES_WEETH_RATE","delta":out["deltas"]})
+          except Exception as ex:
+              out["errors"].append({"error":repr(ex),"traceback":traceback.format_exc()})
+          with open("veda-weeth-rate-mutation.json","w",encoding="utf-8") as f:json.dump(out,f,indent=2,sort_keys=True);f.write("\n")
+          print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+      - name: Upload native and oracle evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-native-oracle-state
+          path: |
+            veda-native-config.json
+            veda-weeth-rate-mutation.json
+            anvil-veda-oracle.log
+          if-no-files-found: error
+          retention-days: 1
