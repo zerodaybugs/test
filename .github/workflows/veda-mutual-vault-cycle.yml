@@ -1,0 +1,104 @@
+name: veda-mutual-vault-cycle
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Inspect mutual BoringVault collateral and fee amplification surface
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import time
+          import urllib.request
+
+          ATTACKER="0x1111111111111111111111111111111111111111"
+          CHAINS={
+            "ethereum":{"id":1,"rpcs":["https://ethereum-rpc.publicnode.com","https://eth.drpc.org","https://rpc.mevblocker.io"]},
+            "optimism":{"id":10,"rpcs":["https://optimism-rpc.publicnode.com","https://mainnet.optimism.io","https://optimism.drpc.org"]},
+            "scroll":{"id":534352,"rpcs":["https://scroll-rpc.publicnode.com","https://rpc.scroll.io","https://scroll.drpc.org"]},
+          }
+          PRODUCTS={
+            "liquidBTC":{"vault":"0x5f46d540b6eD704C3c8789105F30E075AA900726","accountant":"0xEa23aC6D7D11f6b181d6B98174D334478ADAe6b0","teller":"0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353","queue":"0x77A2fd42F8769d8063F2E75061FC200014E41Edf","solver_by_chain":{"ethereum":"0x7102C6889B0BB93Acf4A895f3EbeB17080D91d29","optimism":"0xED41172438897BcB22c9dd72B9F9bbF9A8bF8929","scroll":"0x7102C6889B0BB93Acf4A895f3EbeB17080D91d29"}},
+            "eBTC":{"vault":"0x657e8C867D8B37dCC18fA4Caead9C45EB088C642","accountant":"0x1b293DC39F94157fA0D1D36d7e0090C8B8B8c13F","teller_by_chain":{"ethereum":"0x6Ee3aaCcf9f2321E49063C4F8da775DdBd407268","optimism":"0x6Ee3aaCcf9f2321E49063C4F8da775DdBd407268","scroll":"0xe19a43B1b8af6CeE71749Af2332627338B3242D1"},"queue":"0x686696A3e59eE16e8A8533d84B62cfA504827135","solver":"0x7aa7CB90eF6677B4389B0eB707c4c7208897Bee8"},
+          }
+
+          def rpc(ep,method,params,timeout=35):
+              body=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
+              req=urllib.request.Request(ep,data=body,method="POST",headers={"content-type":"application/json","user-agent":"veda-mutual-vault-cycle/1.0"})
+              with urllib.request.urlopen(req,timeout=timeout) as r:o=json.loads(r.read().decode())
+              if "error" in o:raise RuntimeError(o["error"])
+              return o["result"]
+          def choose(c):
+              bad={}
+              for ep in c["rpcs"]:
+                  try:
+                      if int(rpc(ep,"eth_chainId",[]),16)==c["id"]:return ep,bad
+                  except Exception as e:bad[ep]=repr(e)
+              raise RuntimeError(bad)
+          def sig(s):return subprocess.check_output(["cast","sig",s],text=True).strip().lower()
+          def strip0(x):return x[2:] if str(x).startswith("0x") else str(x)
+          def aw(a):return strip0(a).lower().rjust(64,"0")
+          def sw(s):return strip0(s).lower().ljust(64,"0")
+          def words(raw):
+              x=strip0(raw);return [int(x[i:i+64],16) for i in range(0,len(x),64)] if x else []
+          def addr(raw):return "0x"+strip0(raw)[-40:]
+
+          S={"hook":sig("hook()"),"authority":sig("authority()"),"assetData":sig("assetData(address)"),"rateProviderData":sig("rateProviderData(address)"),"quote":sig("getRateInQuoteSafe(address)"),"rate":sig("getRate()"),"withdrawAssets":sig("withdrawAssets(address)"),"balanceOf":sig("balanceOf(address)"),"totalSupply":sig("totalSupply()"),"accountantState":sig("accountantState()"),"shareLock":sig("shareLockPeriod()"),"deposit3":sig("deposit(address,uint256,uint256)"),"deposit4":sig("deposit(address,uint256,uint256,address)"),"deposit5":sig("deposit(address,uint256,uint256,address,address)"),"queueRequest":sig("requestOnChainWithdraw(address,uint128,uint16,uint24)"),"selfMint":sig("boringRedeemMintSelfSolve((uint96,address,address,uint128,uint128,uint40,uint24,uint24),address,address,address)"),"bulkDeposit":sig("bulkDeposit(address,uint256,uint256,address)"),"bulkWithdraw":sig("bulkWithdraw(address,uint256,uint256,address)")}
+          PUBLIC=sig("isCapabilityPublic(address,bytes4)");CAN=sig("canCall(address,address,bytes4)")
+          out={"generated_at_unix":int(time.time()),"selectors":S,"chains":{},"flags":[],"errors":[]}
+          for cname,c in CHAINS.items():
+              ep,bad=choose(c);block=rpc(ep,"eth_blockNumber",[]);cd={"endpoint":ep,"rpc_failures":bad,"block":int(block,16),"products":{},"directions":{}};out["chains"][cname]=cd
+              def call(to,data):return rpc(ep,"eth_call",[{"to":to,"data":data},block])
+              def safe(label,to,data):
+                  try:return {"raw":call(to,data),"words":words(call(to,data))}
+                  except Exception as e:out["errors"].append({"chain":cname,"label":label,"error":repr(e)});return {"error":repr(e)}
+              def gate(auth,target,selector,caller=ATTACKER):
+                  try:return {"public":bool(int(call(auth,PUBLIC+aw(target)+sw(selector)),16)),"caller":bool(int(call(auth,CAN+aw(caller)+aw(target)+sw(selector)),16))}
+                  except Exception as e:return {"error":repr(e)}
+              # resolve live components
+              resolved={}
+              for pname,p in PRODUCTS.items():
+                  teller=p.get("teller") or p["teller_by_chain"][cname]
+                  code=rpc(ep,"eth_getCode",[p["vault"],block]);tcode=rpc(ep,"eth_getCode",[teller,block]);acode=rpc(ep,"eth_getCode",[p["accountant"],block]);qcode=rpc(ep,"eth_getCode",[p["queue"],block])
+                  if len(code)<=2 or len(tcode)<=2 or len(acode)<=2:
+                      cd["products"][pname]={"present":False,"vault_code_bytes":len(strip0(code))//2,"teller_code_bytes":len(strip0(tcode))//2,"accountant_code_bytes":len(strip0(acode))//2};continue
+                  auth=addr(call(teller,S["authority"]));qauth=addr(call(p["queue"],S["authority"])) if len(qcode)>2 else None;hook=addr(call(p["vault"],S["hook"]));state=words(call(p["accountant"],S["accountantState"]));rate=int(call(p["accountant"],S["rate"]),16)
+                  solver=(p.get("solver") or p.get("solver_by_chain",{}).get(cname))
+                  row={"present":True,"vault":p["vault"].lower(),"teller":teller.lower(),"accountant":p["accountant"].lower(),"queue":p["queue"].lower(),"solver":solver.lower() if solver else None,"authority":auth,"queue_authority":qauth,"hook":hook,"active_hook":hook.lower()==teller.lower(),"rate":rate,"total_supply":int(call(p["vault"],S["totalSupply"]),16),"share_lock":int(call(teller,S["shareLock"]),16) if len(tcode)>2 else None,"accountant_state_words":state,"platform_fee_bps":state[9] if len(state)>9 else None,"fees_owed_base":state[2] if len(state)>2 else None,"deposit_gates":{k:gate(auth,teller,S[k]) for k in ("deposit3","deposit4","deposit5")},"queue_request_gate":gate(qauth,p["queue"],S["queueRequest"]) if qauth else None,"self_mint_gate":None,"solver_bulk":None}
+                  if solver and len(rpc(ep,"eth_getCode",[solver,block]))>2:
+                      sa=addr(call(solver,S["authority"]));row["solver_authority"]=sa;row["self_mint_gate"]=gate(sa,solver,S["selfMint"]);row["solver_bulk"]={"teller_bulk_deposit":gate(auth,teller,S["bulkDeposit"],solver),"teller_bulk_withdraw":gate(auth,teller,S["bulkWithdraw"],solver),"queue_solve":None}
+                  cd["products"][pname]=row;resolved[pname]=(p,teller,auth,qauth,solver)
+              if len(resolved)<2:continue
+              for src,dst in (("liquidBTC","eBTC"),("eBTC","liquidBTC")):
+                  sp,st,sa,sqa,ss=resolved[src];dp,dt,da,dqa,ds=resolved[dst]
+                  asset=dp["vault"]
+                  ad=safe(src+"_assetData_"+dst,st,S["assetData"]+aw(asset));rp=safe(src+"_rateProvider_"+dst,sp["accountant"],S["rateProviderData"]+aw(asset));qt=safe(src+"_quote_"+dst,sp["accountant"],S["quote"]+aw(asset));wa=safe(src+"_queueAsset_"+dst,sp["queue"],S["withdrawAssets"]+aw(asset));bal=int(call(asset,S["balanceOf"]+aw(sp["vault"])),16)
+                  adw=ad.get("words",[]);rpw=rp.get("words",[]);waw=wa.get("words",[]);quote=qt.get("words",[None])[0] if qt.get("words") else None
+                  direction={"source":src,"destination":dst,"asset":asset.lower(),"source_teller":st.lower(),"destination_teller":dt.lower(),"allow_deposit":bool(adw[0]) if len(adw)>0 else False,"allow_direct_withdraw":bool(adw[1]) if len(adw)>1 else False,"share_premium_bps":adw[2] if len(adw)>2 else None,"rate_provider_words":rpw,"quote":quote,"allow_queue":bool(waw[0]) if len(waw)>0 else False,"queue_words":waw,"source_vault_balance_of_destination_share":bal,"public_deposit":any(g.get("caller") for g in cd["products"][src]["deposit_gates"].values()),"public_queue_request":bool((cd["products"][src].get("queue_request_gate") or {}).get("caller")),"public_self_mint":bool((cd["products"][src].get("self_mint_gate") or {}).get("caller"))}
+                  cd["directions"][src+"_to_"+dst]=direction
+              a=cd["directions"]["liquidBTC_to_eBTC"];b=cd["directions"]["eBTC_to_liquidBTC"]
+              if a["allow_deposit"] and b["allow_deposit"] and a["public_deposit"] and b["public_deposit"]:
+                  out["flags"].append({"chain":cname,"type":"PUBLIC_MUTUAL_VAULT_COLLATERAL_CYCLE","a":a,"b":b,"products":cd["products"]})
+          with open("veda-mutual-vault-cycle.json","w",encoding="utf-8") as f:json.dump(out,f,indent=2,sort_keys=True);f.write("\n")
+          print(json.dumps({"flags":out["flags"],"errors":out["errors"],"directions":{c:d.get("directions") for c,d in out["chains"].items()}},indent=2,sort_keys=True))
+          PY
+      - name: Upload mutual-cycle proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-mutual-vault-cycle
+          path: veda-mutual-vault-cycle.json
+          if-no-files-found: error
+          retention-days: 1
