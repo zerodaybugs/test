@@ -90,3 +90,245 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
+
+  executor-source-binding:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      PYTH_COMMIT: 4a596e7adff552afaf5687ce791764019f2d3719
+      EXECUTOR_PROXY: 0x26dd80569a8b23768a1d80869ed7339e07595e85
+      IMPLEMENTATION_SLOT: 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc
+      OUT_DIR: ${{ github.workspace }}/binding_out
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.0.0'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '10.28.0'
+          run_install: false
+      - name: Install pinned Foundry and solc
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$OUT_DIR" toolchain pyth-crosschain
+          mkdir -p "$OUT_DIR" toolchain/bin
+          curl -fL --retry 5 \
+            https://github.com/foundry-rs/foundry/releases/download/v1.7.1/foundry_v1.7.1_linux_amd64.tar.gz \
+            -o toolchain/foundry.tar.gz
+          tar -xzf toolchain/foundry.tar.gz -C toolchain/bin
+          curl -fL --retry 5 \
+            https://github.com/ethereum/solidity/releases/download/v0.8.29/solc-static-linux \
+            -o toolchain/bin/solc-0.8.29
+          chmod 0755 toolchain/bin/*
+          toolchain/bin/forge --version | tee "$OUT_DIR/forge-version.txt"
+          toolchain/bin/solc-0.8.29 --version | tee "$OUT_DIR/solc-version.txt"
+          sha256sum toolchain/bin/* > "$OUT_DIR/toolchain-sha256.txt"
+      - name: Fetch exact Pyth source and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/pyth-network/pyth-crosschain.git pyth-crosschain
+          git -C pyth-crosschain fetch --depth 1 origin "$PYTH_COMMIT"
+          git -C pyth-crosschain checkout --detach "$PYTH_COMMIT"
+          test "$(git -C pyth-crosschain rev-parse HEAD)" = "$PYTH_COMMIT"
+          git -C pyth-crosschain status --porcelain=v1 > "$OUT_DIR/source-status.txt"
+          test ! -s "$OUT_DIR/source-status.txt"
+          git -C pyth-crosschain show -s --format='%H%n%aI%n%an%n%s' HEAD > "$OUT_DIR/source-commit.txt"
+          cd pyth-crosschain
+          pnpm install --frozen-lockfile --filter @pythnetwork/pyth-evm-contract...
+      - name: Compile exact Executor runtime
+        shell: bash
+        working-directory: pyth-crosschain/target_chains/ethereum/contracts
+        run: |
+          set -euo pipefail
+          export PATH="$GITHUB_WORKSPACE/toolchain/bin:$PATH"
+          rm -rf out cache
+          forge build --use "$GITHUB_WORKSPACE/toolchain/bin/solc-0.8.29" --skip test -vv \
+            2>&1 | tee "$OUT_DIR/forge-build.log"
+          cp out/ExecutorUpgradable.sol/ExecutorUpgradable.json "$OUT_DIR/ExecutorUpgradable.json"
+          test -s "$OUT_DIR/ExecutorUpgradable.json"
+      - name: Query live BSC Executor and compare immutable-normalized runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, os, time, urllib.request
+          from pathlib import Path
+
+          out = Path(os.environ['OUT_DIR'])
+          proxy = os.environ['EXECUTOR_PROXY'].lower()
+          slot = os.environ['IMPLEMENTATION_SLOT']
+          providers = [
+              'https://bsc-dataseed.binance.org',
+              'https://bsc-rpc.publicnode.com',
+              'https://bsc-dataseed.bnbchain.org',
+          ]
+
+          def rpc(url, method, params, request_id):
+              payload = json.dumps({'jsonrpc':'2.0','id':request_id,'method':method,'params':params}).encode()
+              errors = []
+              for attempt in range(4):
+                  req = urllib.request.Request(url, data=payload, headers={
+                      'content-type':'application/json',
+                      'accept':'application/json',
+                      'user-agent':'pyth-readonly-source-binding/5.0',
+                  })
+                  try:
+                      with urllib.request.urlopen(req, timeout=45) as response:
+                          obj = json.load(response)
+                      if 'error' in obj:
+                          raise RuntimeError(obj['error'])
+                      return obj['result']
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                      if attempt < 3:
+                          time.sleep(1 + attempt)
+              raise RuntimeError({'url':url,'method':method,'errors':errors})
+
+          artifact = json.loads((out/'ExecutorUpgradable.json').read_text())
+          compiled = bytes.fromhex(artifact['deployedBytecode']['object'].removeprefix('0x'))
+          immutable_refs = sorted(
+              [
+                  {'start':int(ref['start']), 'length':int(ref['length'])}
+                  for refs in artifact['deployedBytecode'].get('immutableReferences', {}).values()
+                  for ref in refs
+              ],
+              key=lambda item:(item['start'], item['length']),
+          )
+
+          def strip_cbor(data):
+              if len(data) < 2:
+                  return data
+              size = int.from_bytes(data[-2:], 'big')
+              return data[:-(size+2)] if size + 2 <= len(data) else data
+
+          def zero_immutables(data):
+              result = bytearray(data)
+              for ref in immutable_refs:
+                  start, length = ref['start'], ref['length']
+                  if start + length > len(result):
+                      raise ValueError({'immutable_reference':ref,'runtime_length':len(result)})
+                  result[start:start+length] = bytes(length)
+              return bytes(result)
+
+          def hashes(data):
+              return {'bytes':len(data), 'sha256':hashlib.sha256(data).hexdigest()}
+
+          rows = []
+          failures = []
+          for index, url in enumerate(providers):
+              try:
+                  impl_word = rpc(url, 'eth_getStorageAt', [proxy, slot, 'latest'], 100+index*10)
+                  implementation = '0x' + impl_word[-40:]
+                  implementation_code_hex = rpc(url, 'eth_getCode', [implementation, 'latest'], 101+index*10).lower()
+                  proxy_code_hex = rpc(url, 'eth_getCode', [proxy, 'latest'], 102+index*10).lower()
+                  block = rpc(url, 'eth_getBlockByNumber', ['latest', False], 103+index*10)
+                  version_raw = rpc(url, 'eth_call', [{'to':proxy,'data':'0x54fd4d50'}, 'latest'], 104+index*10)
+                  runtime = bytes.fromhex(implementation_code_hex.removeprefix('0x'))
+                  immutable_values = [
+                      '0x' + runtime[ref['start']:ref['start']+ref['length']].hex()
+                      for ref in immutable_refs
+                  ]
+                  rows.append({
+                      'rpc':url,
+                      'implementation':implementation.lower(),
+                      'implementation_code_hex':implementation_code_hex,
+                      'proxy_code_hex':proxy_code_hex,
+                      'latest_block':block,
+                      'version_raw':version_raw,
+                      'implementation_hashes':hashes(runtime),
+                      'proxy_hashes':hashes(bytes.fromhex(proxy_code_hex.removeprefix('0x'))),
+                      'immutable_values':immutable_values,
+                      'normalized_full_sha256':hashlib.sha256(zero_immutables(runtime)).hexdigest(),
+                      'normalized_stripped_sha256':hashlib.sha256(strip_cbor(zero_immutables(runtime))).hexdigest(),
+                  })
+              except Exception as exc:
+                  failures.append({'rpc':url,'error':repr(exc)})
+
+          if len(rows) < 2:
+              raise RuntimeError({'successful_provider_count':len(rows),'failures':failures})
+
+          compiled_normalized = zero_immutables(compiled)
+          providers_identical = (
+              len({row['implementation'] for row in rows}) == 1 and
+              len({row['implementation_code_hex'] for row in rows}) == 1 and
+              len({row['proxy_code_hex'] for row in rows}) == 1
+          )
+          immutable_values_are_impl = all(
+              all((int(value,16) & ((1<<160)-1)) == int(row['implementation'],16) for value in row['immutable_values'])
+              for row in rows
+          )
+          full_normalized_match = all(
+              zero_immutables(bytes.fromhex(row['implementation_code_hex'][2:])) == compiled_normalized
+              for row in rows
+          )
+          stripped_normalized_match = all(
+              strip_cbor(zero_immutables(bytes.fromhex(row['implementation_code_hex'][2:]))) == strip_cbor(compiled_normalized)
+              for row in rows
+          )
+
+          result = {
+              'mode':'BSC_READ_ONLY_ETH_GETSTORAGEAT_ETH_GETCODE_ETH_CALL',
+              'signed_or_broadcast_transactions':0,
+              'source_commit':os.environ['PYTH_COMMIT'],
+              'executor_proxy':proxy,
+              'immutable_references':immutable_refs,
+              'successful_provider_count':len(rows),
+              'provider_failures':failures,
+              'compiled_runtime_hashes':hashes(compiled),
+              'compiled_normalized_full_sha256':hashlib.sha256(compiled_normalized).hexdigest(),
+              'compiled_normalized_stripped_sha256':hashlib.sha256(strip_cbor(compiled_normalized)).hexdigest(),
+              'providers_identical':providers_identical,
+              'immutable_values_are_live_implementation':immutable_values_are_impl,
+              'full_normalized_runtime_match':full_normalized_match,
+              'cbor_stripped_normalized_runtime_match':stripped_normalized_match,
+              'rows':rows,
+          }
+          (out/'SOURCE_DEPLOYMENT_BINDING.json').write_text(json.dumps(result, indent=2, sort_keys=True)+'\n')
+          markers = [
+              'PYTH_EVM_EXECUTOR_IMMUTABLE_AWARE_BINDING_CAPTURED',
+              'PUBLIC_CHAIN_MODE=READ_ONLY',
+              'SIGNED_OR_BROADCAST_TRANSACTIONS=0',
+              f"SUCCESSFUL_PROVIDER_COUNT={len(rows)}",
+              f"PROVIDERS_IDENTICAL={str(providers_identical).lower()}",
+              f"IMMUTABLE_VALUES_ARE_LIVE_IMPLEMENTATION={str(immutable_values_are_impl).lower()}",
+              f"FULL_NORMALIZED_RUNTIME_MATCH={str(full_normalized_match).lower()}",
+              f"CBOR_STRIPPED_NORMALIZED_RUNTIME_MATCH={str(stripped_normalized_match).lower()}",
+              f"EXECUTOR_IMPLEMENTATION={rows[0]['implementation']}",
+          ]
+          (out/'BINDING_MARKERS.txt').write_text('\n'.join(markers)+'\n')
+          print('\n'.join(markers))
+          PY
+      - name: Finalize binding evidence
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          {
+            uname -a
+            git --version
+            node --version
+            pnpm --version
+            toolchain/bin/forge --version
+            toolchain/bin/solc-0.8.29 --version
+          } > "$OUT_DIR/ENVIRONMENT.txt" 2>&1
+          find "$OUT_DIR" -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$OUT_DIR/SHA256SUMS"
+          exit 0
+      - name: Enforce binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -F 'SIGNED_OR_BROADCAST_TRANSACTIONS=0' "$OUT_DIR/BINDING_MARKERS.txt"
+          grep -F 'PROVIDERS_IDENTICAL=true' "$OUT_DIR/BINDING_MARKERS.txt"
+          grep -F 'IMMUTABLE_VALUES_ARE_LIVE_IMPLEMENTATION=true' "$OUT_DIR/BINDING_MARKERS.txt"
+          grep -F 'CBOR_STRIPPED_NORMALIZED_RUNTIME_MATCH=true' "$OUT_DIR/BINDING_MARKERS.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pyth-evm-executor-source-binding-${{ github.run_id }}
+          path: binding_out/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
