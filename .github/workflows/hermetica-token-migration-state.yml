@@ -1,0 +1,80 @@
+name: Hermetica token migration state capture
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-token-migration-state.yml'
+      - 'public-data/hermetica-token-migration-state-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Capture public token migration state
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/hermetica-migration
+          API='https://api.hiro.so'
+          DEP='SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG'
+          for name in usdh-token-v1 susdh-token-v1; do
+            curl --fail --location --retry 6 \
+              "$API/extended/v1/address/$DEP.$name/transactions?limit=50&offset=0" \
+              -o "/tmp/hermetica-migration/$name-0.json"
+            for offset in 50 100 150 200 250; do
+              curl --fail --location --retry 6 \
+                "$API/extended/v1/address/$DEP.$name/transactions?limit=50&offset=$offset" \
+                -o "/tmp/hermetica-migration/$name-$offset.json"
+            done
+            curl --fail --location --retry 6 -X POST \
+              -H 'content-type: application/json' \
+              -d "{\"sender\":\"$DEP\",\"arguments\":[]}" \
+              "$API/v2/contracts/call-read/$DEP/$name/is-not-migrated" \
+              -o "/tmp/hermetica-migration/$name-is-not-migrated.json"
+          done
+          python3 - <<'PY'
+          import json, pathlib, re
+          root=pathlib.Path('/tmp/hermetica-migration')
+          out={'source':'Hiro public read-only APIs','tokens':{}}
+          for token in ['usdh-token-v1','susdh-token-v1']:
+              rows=[]
+              for p in sorted(root.glob(token+'-[0-9]*.json')):
+                  rows.extend(json.loads(p.read_text()).get('results',[]))
+              direct=[]
+              for t in rows:
+                  cc=t.get('contract_call') or {}
+                  if cc.get('contract_id')!=f'SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG.{token}':
+                      continue
+                  fn=cc.get('function_name')
+                  if fn not in {'start-migration','migrate-balance'}:
+                      continue
+                  direct.append({
+                      'tx_id':t.get('tx_id'),'status':t.get('tx_status'),
+                      'block_height':t.get('block_height'),'time':t.get('burn_block_time_iso'),
+                      'sender':t.get('sender_address'),'function':fn,
+                      'args':[{a.get('name'):a.get('repr')} for a in cc.get('function_args',[])],
+                      'result':(t.get('tx_result') or {}).get('repr')
+                  })
+              out['tokens'][token]={
+                  'is_not_migrated':json.loads(root.joinpath(token+'-is-not-migrated.json').read_text()),
+                  'migration_calls':direct,
+                  'address_tx_count':len(rows),
+              }
+          root.joinpath('migration-state.json').write_text(json.dumps(out,indent=2))
+          print(json.dumps(out,indent=2))
+          PY
+          sha256sum /tmp/hermetica-migration/* > /tmp/hermetica-migration/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-token-migration-state
+          path: /tmp/hermetica-migration
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
