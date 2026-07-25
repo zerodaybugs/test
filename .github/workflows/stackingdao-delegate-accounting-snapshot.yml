@@ -1,0 +1,187 @@
+name: StackingDAO delegate accounting snapshot
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/stackingdao-delegate-accounting-snapshot.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stackingdao-delegate-accounting-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout workflow
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Query public mainnet accounting state read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cd evidence
+          npm init -y >/dev/null 2>&1
+          npm install --no-save --package-lock=false @stacks/transactions@6.17.0 >/dev/null 2>&1
+
+          cat > query.mjs <<'NODE'
+          import { contractPrincipalCV, cvToHex, cvToString, hexToCV } from '@stacks/transactions';
+          import { writeFile } from 'node:fs/promises';
+
+          const address = 'SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG';
+          const api = 'https://api.mainnet.hiro.so';
+          const handler = 'delegates-handler-v1';
+          const providers = [
+            '', 'alum-labs', 'blockdaemon', 'chorus-one', 'despread', 'foundry',
+            'hashkey', 'infstones', 'juicy-stake', 'kiln', 'luganodes', 'restake', 'xverse',
+          ];
+          const delegates = providers.flatMap(provider =>
+            [1, 2, 3, 4, 5].map(index =>
+              provider ? `stacking-delegate-${provider}-1-${index}` : `stacking-delegate-1-${index}`,
+            ),
+          );
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+          async function fetchJson(url, options = {}, attempts = 6) {
+            let last;
+            for (let i = 1; i <= attempts; i += 1) {
+              try {
+                const response = await fetch(url, options);
+                const text = await response.text();
+                if (!response.ok) throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 300)}`);
+                return JSON.parse(text);
+              } catch (error) {
+                last = error;
+                if (i < attempts) await sleep(1000 * i);
+              }
+            }
+            throw last;
+          }
+
+          async function call(contract, fn, args = []) {
+            const body = JSON.stringify({ sender: address, arguments: args.map(cvToHex) });
+            const json = await fetchJson(
+              `${api}/v2/contracts/call-read/${address}/${contract}/${fn}`,
+              { method: 'POST', headers: { 'content-type': 'application/json' }, body },
+            );
+            return {
+              okay: Boolean(json.okay),
+              decoded: json.result ? cvToString(hexToCV(json.result)) : null,
+              raw: json,
+            };
+          }
+
+          function uintFrom(decoded) {
+            const match = String(decoded ?? '').match(/^u(\d+)$/);
+            return match ? BigInt(match[1]) : null;
+          }
+
+          const results = {
+            captured_at: new Date().toISOString(),
+            endpoint: api,
+            address,
+            handler,
+            delegates: [],
+          };
+
+          for (const name of delegates) {
+            const principal = `${address}.${name}`;
+            const principalCv = contractPrincipalCV(address, name);
+            const row = { name, principal };
+            try {
+              row.account = await fetchJson(`${api}/extended/v1/address/${principal}/stx`);
+              row.active = await call('dao', 'get-contract-active', [principalCv]);
+              const unlocked = BigInt(row.account.balance ?? '0');
+              const locked = BigInt(row.account.locked ?? '0');
+              row.unlocked = unlocked.toString();
+              row.locked = locked.toString();
+              row.current_total = (unlocked + locked).toString();
+
+              if (unlocked + locked > 0n) {
+                row.target_locked = await call(handler, 'get-target-locked-amount', [principalCv]);
+                row.last_locked = await call(handler, 'get-last-locked-amount', [principalCv]);
+                row.last_unlocked = await call(handler, 'get-last-unlocked-amount', [principalCv]);
+                row.selected_pool = await call(handler, 'get-last-selected-pool', [principalCv]);
+                row.calculated_rewards = await call(handler, 'calculate-rewards', [principalCv]);
+                row.calculated_excess = await call(handler, 'calculate-excess', [principalCv]);
+
+                const lastLocked = uintFrom(row.last_locked.decoded);
+                const lastUnlocked = uintFrom(row.last_unlocked.decoded);
+                const rewards = uintFrom(row.calculated_rewards.decoded);
+                const excess = uintFrom(row.calculated_excess.decoded);
+                if (lastLocked !== null && lastUnlocked !== null) {
+                  row.last_total = (lastLocked + lastUnlocked).toString();
+                  row.raw_delta = ((unlocked + locked) - (lastLocked + lastUnlocked)).toString();
+                }
+                row.rewards_uint = rewards?.toString() ?? null;
+                row.excess_uint = excess?.toString() ?? null;
+                row.rewards_transferable_from_unlocked = rewards !== null && rewards > 0n && rewards <= unlocked;
+              }
+            } catch (error) {
+              row.error = String(error);
+            }
+            results.delegates.push(row);
+            await sleep(150);
+          }
+
+          results.summary = {
+            total_delegates: results.delegates.length,
+            nonzero_delegates: results.delegates.filter(r => BigInt(r.current_total ?? '0') > 0n).length,
+            errored: results.delegates.filter(r => r.error).length,
+            positive_rewards: results.delegates.filter(r => BigInt(r.rewards_uint ?? '0') > 0n).length,
+            transferable_positive_rewards: results.delegates.filter(r => r.rewards_transferable_from_unlocked).length,
+            positive_excess: results.delegates.filter(r => BigInt(r.excess_uint ?? '0') > 0n).length,
+            total_current: results.delegates.reduce((s, r) => s + BigInt(r.current_total ?? '0'), 0n).toString(),
+            total_calculated_rewards: results.delegates.reduce((s, r) => s + BigInt(r.rewards_uint ?? '0'), 0n).toString(),
+            total_calculated_excess: results.delegates.reduce((s, r) => s + BigInt(r.excess_uint ?? '0'), 0n).toString(),
+          };
+
+          const text = [
+            `captured_at=${results.captured_at}`,
+            ...Object.entries(results.summary).map(([k, v]) => `${k}=${v}`),
+            '',
+            'name\tunlocked\tlocked\tcurrent_total\tlast_total\traw_delta\trewards\ttransferable\texcess\tselected_pool\terror',
+            ...results.delegates.map(r => [
+              r.name, r.unlocked ?? '', r.locked ?? '', r.current_total ?? '', r.last_total ?? '',
+              r.raw_delta ?? '', r.rewards_uint ?? '', String(Boolean(r.rewards_transferable_from_unlocked)),
+              r.excess_uint ?? '', r.selected_pool?.decoded ?? '', r.error ?? '',
+            ].join('\t')),
+          ].join('\n');
+
+          await writeFile('delegate-accounting.json', `${JSON.stringify(results, null, 2)}\n`);
+          await writeFile('delegate-accounting.tsv', `${text}\n`);
+          console.log(text);
+          NODE
+
+          node query.mjs
+          sha256sum delegate-accounting.json delegate-accounting.tsv query.mjs > SHA256SUMS
+
+      - name: Upload read-only accounting evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackingdao-delegate-accounting-${{ github.run_id }}
+          path: |
+            evidence/delegate-accounting.json
+            evidence/delegate-accounting.tsv
+            evidence/query.mjs
+            evidence/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Enforce snapshot integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s evidence/delegate-accounting.json
+          test -s evidence/delegate-accounting.tsv
+          (cd evidence && sha256sum -c SHA256SUMS)
+          grep -F 'total_delegates=65' evidence/delegate-accounting.tsv
