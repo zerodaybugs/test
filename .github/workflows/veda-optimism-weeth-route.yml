@@ -1,0 +1,190 @@
+name: veda-optimism-weeth-route
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Verify Ethereum to Optimism LiquidETH weETH route
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import time
+          import urllib.request
+
+          ATTACKER="0x1111111111111111111111111111111111111111"
+          NATIVE="0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+          VAULT="0xf0bb20865277aBd641a307eCe5Ee04E79073416C"
+          ACCOUNTANT="0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198"
+          TELLER="0x9AA79C84b79816ab920bBcE20f8f74557B514734"
+          QUEUE="0x0D2dF071207E18Ca8638b4f04E98c53155eC2cE0"
+          SOLVERS=[
+              "0x23aff90ed3b3effcf78fb41ab001c525a6c32a01",
+              "0xe3F8fa039fF7A8Fe42fA2C6e9DC8565EcE6f7042",
+          ]
+          CHAINS={
+              "ethereum":{"id":1,"eid":30101,"rpcs":["https://ethereum-rpc.publicnode.com","https://eth.drpc.org","https://rpc.mevblocker.io"],"assets":{
+                  "weETH":"0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee",
+                  "WETH":"0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+              }},
+              "optimism":{"id":10,"eid":30111,"rpcs":["https://optimism-rpc.publicnode.com","https://mainnet.optimism.io","https://optimism.drpc.org"],"assets":{
+                  "weETH":"0x346e03F8Cce9fE01dCB3d0Da3e9D00dC2c0E08f0",
+                  "weETH_OFT":"0x5A7fACB970D094B6C7FF1df0eA68D99E6e73CBFF",
+                  "WETH":"0x4200000000000000000000000000000000000006",
+              }},
+          }
+
+          def rpc(ep,method,params,timeout=35):
+              payload=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
+              req=urllib.request.Request(ep,data=payload,method="POST",headers={"content-type":"application/json","user-agent":"veda-optimism-weeth-route/1.0"})
+              with urllib.request.urlopen(req,timeout=timeout) as r: out=json.loads(r.read().decode())
+              if "error" in out: raise RuntimeError(out["error"])
+              return out["result"]
+          def choose(c):
+              bad={}
+              for ep in c["rpcs"]:
+                  try:
+                      if int(rpc(ep,"eth_chainId",[]),16)==c["id"]: return ep
+                  except Exception as e: bad[ep]=repr(e)
+              raise RuntimeError(bad)
+          def sig(s): return subprocess.check_output(["cast","sig",s],text=True).strip()
+          def calldata(s,*args): return subprocess.check_output(["cast","calldata",s,*map(str,args)],text=True).strip()
+          def abi_u32(n): return subprocess.check_output(["cast","abi-encode","f(uint32)",str(n)],text=True).strip()
+          def strip0(x): return x[2:] if x.startswith("0x") else x
+          def aw(a): return strip0(a).lower().rjust(64,"0")
+          def sw(s): return strip0(s).lower().ljust(64,"0")
+          def uw(n): return hex(n)[2:].rjust(64,"0")
+          def words(raw):
+              x=strip0(raw); return [int(x[i:i+64],16) for i in range(0,len(x),64)] if x else []
+          def address(raw): return "0x"+strip0(raw)[-40:]
+          def boolean(raw): return bool(int(raw,16))
+
+          PUBLIC=sig("isCapabilityPublic(address,bytes4)")
+          CAN=sig("canCall(address,address,bytes4)")
+          S={
+              "authority":sig("authority()"),"getRate":sig("getRate()"),"quote":sig("getRateInQuoteSafe(address)"),
+              "assetData":sig("assetData(address)"),"withdrawAssets":sig("withdrawAssets(address)"),
+              "balanceOf":sig("balanceOf(address)"),"totalSupply":sig("totalSupply()"),"shareLock":sig("shareLockPeriod()"),
+              "paused":sig("isPaused()"),"bridge":sig("bridge(uint96,address,bytes,address,uint256)"),
+              "deposit":sig("deposit(address,uint256,uint256)"),"depositBridge":sig("depositAndBridge(address,uint256,uint256,address,bytes,address,uint256)"),
+              "queueRequest":sig("requestOnChainWithdraw(address,uint128,uint16,uint24)"),"queueSolve":sig("solveOnChainWithdraws((uint96,address,address,uint128,uint128,uint40,uint24,uint24)[],bytes,address)"),
+              "bulkWithdraw":sig("bulkWithdraw(address,uint256,uint256,address)"),
+              "solverAdmin":sig("boringRedeemSolve((uint96,address,address,uint128,uint128,uint40,uint24,uint24)[],address,bool)"),
+              "solverAdminLegacy":sig("boringRedeemSolve((uint96,address,address,uint128,uint128,uint40,uint24,uint24)[],address)"),
+              "previewFee":sig("previewFee(uint96,address,bytes,address)"),
+              "canSend":sig("getAmountCanBeSent(uint32)"),"canReceive":sig("getAmountCanBeReceived(uint32)"),
+          }
+
+          endpoints={n:choose(c) for n,c in CHAINS.items()}
+          snapshots={}; errors=[]
+          for name,c in CHAINS.items():
+              ep=endpoints[name]; block_hex=rpc(ep,"eth_blockNumber",[]); block=int(block_hex,16)
+              def call(to,data,frm=None):
+                  tx={"to":to,"data":data}
+                  if frm: tx["from"]=frm
+                  return rpc(ep,"eth_call",[tx,block_hex])
+              def safe(label,to,data,frm=None):
+                  try: return {"raw":call(to,data,frm)}
+                  except Exception as e:
+                      errors.append({"chain":name,"label":label,"error":repr(e)}); return {"error":repr(e)}
+              ta=address(call(TELLER,S["authority"])); qa=address(call(QUEUE,S["authority"]))
+              def gate(auth,target,selector,caller=ATTACKER):
+                  return {"selector":selector,"public":boolean(call(auth,PUBLIC+aw(target)+sw(selector))),"caller":boolean(call(auth,CAN+aw(caller)+aw(target)+sw(selector)))}
+              assets={}
+              for label,asset in c["assets"].items():
+                  code=rpc(ep,"eth_getCode",[asset,block_hex])
+                  if len(code)<=2:
+                      assets[label]={"address":asset.lower(),"code_bytes":0}; continue
+                  ad=safe(label+":assetData",TELLER,S["assetData"]+aw(asset)); qd=safe(label+":withdrawAssets",QUEUE,S["withdrawAssets"]+aw(asset)); qr=safe(label+":quote",ACCOUNTANT,S["quote"]+aw(asset)); bal=safe(label+":balance",asset,S["balanceOf"]+aw(VAULT))
+                  adw=words(ad["raw"]) if "raw" in ad else []
+                  qdw=words(qd["raw"]) if "raw" in qd else []
+                  assets[label]={
+                      "address":asset.lower(),"code_bytes":(len(code)-2)//2,
+                      "asset_data_words":adw,"allow_deposit":bool(adw[0]) if len(adw)>0 else False,"allow_direct_withdraw":bool(adw[1]) if len(adw)>1 else False,"premium_bps":adw[2] if len(adw)>2 else None,
+                      "queue_words":qdw,"allow_queue_withdraw":bool(qdw[0]) if len(qdw)>0 else False,"queue_min_discount_bps":qdw[3] if len(qdw)>3 else None,"queue_max_discount_bps":qdw[4] if len(qdw)>4 else None,
+                      "rate_in_quote":int(qr["raw"],16) if "raw" in qr else None,"vault_balance":int(bal["raw"],16) if "raw" in bal else None,
+                  }
+              solvers={}
+              for solver in SOLVERS:
+                  code=rpc(ep,"eth_getCode",[solver,block_hex])
+                  if len(code)<=2:
+                      solvers[solver.lower()]={"code_bytes":0}; continue
+                  sa=address(call(solver,S["authority"]))
+                  solvers[solver.lower()]={
+                      "code_bytes":(len(code)-2)//2,"authority":sa,
+                      "can_queue_solve":boolean(call(qa,CAN+aw(solver)+aw(QUEUE)+sw(S["queueSolve"]))),
+                      "can_teller_bulk_withdraw":boolean(call(ta,CAN+aw(solver)+aw(TELLER)+sw(S["bulkWithdraw"]))),
+                      "admin_roles_mask":words(call(sa,sig("getRolesWithCapability(address,bytes4)")+aw(solver)+sw(S["solverAdmin"]))) if len(call(sa,sig("getRolesWithCapability(address,bytes4)")+aw(solver)+sw(S["solverAdmin"])))>=2 else [],
+                      "legacy_admin_roles_mask":words(call(sa,sig("getRolesWithCapability(address,bytes4)")+aw(solver)+sw(S["solverAdminLegacy"]))) if len(call(sa,sig("getRolesWithCapability(address,bytes4)")+aw(solver)+sw(S["solverAdminLegacy"])))>=2 else [],
+                  }
+              remote="optimism" if name=="ethereum" else "ethereum"; remote_eid=CHAINS[remote]["eid"]
+              snapshots[name]={
+                  "endpoint":ep,"block":block,"base_rate":int(call(ACCOUNTANT,S["getRate"]),16),"teller_authority":ta,"queue_authority":qa,
+                  "share_lock_period":int(call(TELLER,S["shareLock"]),16),"paused":boolean(call(TELLER,S["paused"])),"vault_total_supply":int(call(VAULT,S["totalSupply"]),16),
+                  "attacker_gates":{
+                      "deposit":gate(ta,TELLER,S["deposit"]),"depositAndBridge":gate(ta,TELLER,S["depositBridge"]),"bridge":gate(ta,TELLER,S["bridge"]),"queueRequest":gate(qa,QUEUE,S["queueRequest"]),
+                  },
+                  "amount_can_send":words(call(TELLER,S["canSend"]+uw(remote_eid))),"amount_can_receive":words(call(TELLER,S["canReceive"]+uw(remote_eid))),
+                  "assets":assets,"solvers":solvers,
+              }
+
+          source=snapshots["ethereum"]; dest=snapshots["optimism"]
+          routes=[]
+          for dest_label in ("weETH","weETH_OFT","WETH"):
+              src_asset=source["assets"]["weETH"] if dest_label!="WETH" else source["assets"]["WETH"]
+              dst_asset=dest["assets"][dest_label]
+              if not src_asset.get("rate_in_quote") or not dst_asset.get("rate_in_quote"): continue
+              src_q=src_asset["rate_in_quote"]; dst_q=dst_asset["rate_in_quote"]
+              premium=src_asset.get("premium_bps") or 0
+              deposit_amount=10**18
+              shares=(deposit_amount*10**18//src_q)*(10_000-premium)//10_000
+              discount=dst_asset.get("queue_min_discount_bps") or 0
+              payout=(shares*dst_q//10**18)*(10_000-discount)//10_000
+              gross=payout-deposit_amount
+              operational_solvers=[a for a,s in dest["solvers"].items() if s.get("can_queue_solve") and s.get("can_teller_bulk_withdraw")]
+              bridge_capacity=source["amount_can_send"][1] if len(source["amount_can_send"])>1 else 0
+              liquidity_shares=(dst_asset.get("vault_balance") or 0)*10**18//dst_q
+              max_shares=min(bridge_capacity,liquidity_shares)
+              max_input=(max_shares*src_q//10**18)*10_000//max(1,10_000-premium)
+              max_payout=(max_shares*dst_q//10**18)*(10_000-discount)//10_000
+              fee=None
+              if dest_label=="weETH":
+                  try:
+                      data=calldata("previewFee(uint96,address,bytes,address)",10**18,ATTACKER,abi_u32(CHAINS["optimism"]["eid"]),NATIVE)
+                      fee=int(rpc(endpoints["ethereum"],"eth_call",[{"to":TELLER,"data":data},hex(source["block"])]),16)
+                  except Exception as e: errors.append({"chain":"ethereum","label":"previewFee","error":repr(e)})
+              routes.append({
+                  "source_asset":"weETH" if dest_label!="WETH" else "WETH","destination_asset":dest_label,"source_quote":src_q,"destination_quote":dst_q,"source_premium_bps":premium,"destination_queue_discount_bps":discount,
+                  "one_asset":{"input":deposit_amount,"shares":shares,"payout":payout,"gross_profit":gross},
+                  "source_deposit_open":source["attacker_gates"]["deposit"]["caller"],"source_deposit_bridge_open":source["attacker_gates"]["depositAndBridge"]["caller"],"source_bridge_open":source["attacker_gates"]["bridge"]["caller"],
+                  "destination_queue_request_open":dest["attacker_gates"]["queueRequest"]["caller"],"destination_queue_asset_open":dst_asset.get("allow_queue_withdraw",False),"operational_solvers":operational_solvers,
+                  "destination_vault_balance":dst_asset.get("vault_balance"),"bridge_capacity_shares":bridge_capacity,"max_current_liquid_shares":max_shares,"max_current_input":max_input,"max_current_payout":max_payout,"max_current_gross_profit":max_payout-max_input,
+                  "native_bridge_fee_for_1_share":fee,
+                  "attacker_can_initiate_full_user_side":source["attacker_gates"]["depositAndBridge"]["caller"] and dest["attacker_gates"]["queueRequest"]["caller"] and dst_asset.get("allow_queue_withdraw",False),
+                  "normal_solver_path_exists":bool(operational_solvers),"positive_gross_profit":gross>0,
+              })
+
+          flags=[r for r in routes if r["attacker_can_initiate_full_user_side"] and r["normal_solver_path_exists"] and r["positive_gross_profit"] and r["max_current_gross_profit"]>0]
+          out={"generated_at_unix":int(time.time()),"chains":snapshots,"routes":routes,"flags":flags,"errors":errors,"selectors":S}
+          with open("veda-optimism-weeth-route.json","w",encoding="utf-8") as f: json.dump(out,f,indent=2,sort_keys=True); f.write("\n")
+          print(json.dumps({"routes":routes,"flags":flags,"errors":errors},indent=2,sort_keys=True))
+          PY
+      - name: Upload Optimism route proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-optimism-weeth-route
+          path: veda-optimism-weeth-route.json
+          if-no-files-found: error
+          retention-days: 1
