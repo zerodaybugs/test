@@ -4,21 +4,7 @@ pragma solidity ^0.8.30;
 import {Test, console2} from "forge-std/Test.sol";
 
 interface IERC20Like {
-    function approve(address spender, uint256 amount) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
-}
-
-interface ISignatureTransferLike {
-    struct TokenPermissions {
-        address token;
-        uint256 amount;
-    }
-
-    struct PermitTransferFrom {
-        TokenPermissions permitted;
-        uint256 nonce;
-        uint256 deadline;
-    }
 }
 
 interface ISynthetixDepositLike {
@@ -30,19 +16,6 @@ interface ISynthetixDepositLike {
         Disputed,
         Cancelled,
         Expired
-    }
-
-    struct PermitDetails {
-        ISignatureTransferLike.PermitTransferFrom permit;
-        bytes signature;
-    }
-
-    struct DepositEntry {
-        address token;
-        uint256 amount;
-        address beneficiary;
-        uint256 subAccountId;
-        PermitDetails permitDetails;
     }
 
     struct WithdrawalEntry {
@@ -64,7 +37,6 @@ interface ISynthetixDepositLike {
 
     error ActiveWithdrawalExists();
 
-    function deposit(DepositEntry[] calldata deposits) external;
     function requestWithdrawal(WithdrawalEntry[] calldata withdrawals) external;
     function castWatcherVotes(uint256[] calldata requestIds) external;
     function disburseWithdrawals(uint256[] calldata requestIds) external;
@@ -86,13 +58,11 @@ interface ISynthetixDepositLike {
 contract SynthetixWithdrawalOvercommitForkTest is Test {
     address internal constant DEPOSIT_PROXY = 0xD62595c3c23B690BAEE0935e107A209Cb1Dbd37B;
     address internal constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
-
-    uint256 internal constant PRINCIPAL = 100_000_000; // 100 USDT
+    uint256 internal constant AMOUNT = 100_000_000; // 100 USDT per request
 
     ISynthetixDepositLike internal constant depositContract = ISynthetixDepositLike(DEPOSIT_PROXY);
     IERC20Like internal constant usdt = IERC20Like(USDT);
 
-    address internal owner;
     address internal destinationA;
     address internal destinationB;
     address internal relayer;
@@ -102,7 +72,6 @@ contract SynthetixWithdrawalOvercommitForkTest is Test {
     function setUp() public {
         vm.createSelectFork(vm.envString("ETH_RPC_URL"));
 
-        owner = makeAddr("synthetic-account-owner");
         destinationA = makeAddr("withdrawal-destination-a");
         destinationB = makeAddr("withdrawal-destination-b");
 
@@ -117,29 +86,28 @@ contract SynthetixWithdrawalOvercommitForkTest is Test {
         relayer = depositContract.getRoleMember(relayerRole, 0);
         teller = depositContract.getRoleMember(tellerRole, 0);
 
-        _depositSyntheticPrincipal();
-
         console2.log("fork block", block.number);
         console2.log("relayer", relayer);
         console2.log("teller", teller);
         console2.log("watcher quorum", depositContract.watcherQuorum());
     }
 
-    function testDistinctDestinationsPermitTwoFullPrincipalWithdrawals() public {
+    function testDistinctDestinationsPermitTwoConcurrentFullWithdrawals() public {
         uint256 requestCounterBefore = depositContract.getWithdrawalRequestCounter();
         uint256 contractBalanceBefore = usdt.balanceOf(DEPOSIT_PROXY);
         uint256 trackedTotalBefore = depositContract.getTotalDeposited(USDT);
         uint256 destinationABefore = usdt.balanceOf(destinationA);
         uint256 destinationBBefore = usdt.balanceOf(destinationB);
 
-        assertEq(depositContract.getUserBalance(owner, USDT), int256(PRINCIPAL), "synthetic deposit not credited");
+        assertGt(contractBalanceBefore, AMOUNT * 2, "fork custody balance too small");
+        assertGt(trackedTotalBefore, AMOUNT * 2, "fork tracked balance too small");
         assertEq(depositContract.getUserBalance(destinationA, USDT), 0, "destination A unexpectedly credited");
         assertEq(depositContract.getUserBalance(destinationB, USDT), 0, "destination B unexpectedly credited");
 
         ISynthetixDepositLike.WithdrawalEntry[] memory withdrawals =
             new ISynthetixDepositLike.WithdrawalEntry[](2);
-        withdrawals[0] = _withdrawal(destinationA, PRINCIPAL);
-        withdrawals[1] = _withdrawal(destinationB, PRINCIPAL);
+        withdrawals[0] = _withdrawal(destinationA, AMOUNT);
+        withdrawals[1] = _withdrawal(destinationB, AMOUNT);
 
         vm.prank(relayer);
         depositContract.requestWithdrawal(withdrawals);
@@ -170,26 +138,24 @@ contract SynthetixWithdrawalOvercommitForkTest is Test {
         vm.prank(teller);
         depositContract.disburseWithdrawals(requestIds);
 
-        assertEq(usdt.balanceOf(destinationA) - destinationABefore, PRINCIPAL, "destination A payout mismatch");
-        assertEq(usdt.balanceOf(destinationB) - destinationBBefore, PRINCIPAL, "destination B payout mismatch");
-        assertEq(contractBalanceBefore - usdt.balanceOf(DEPOSIT_PROXY), PRINCIPAL * 2, "custody outflow mismatch");
-        assertEq(trackedTotalBefore - depositContract.getTotalDeposited(USDT), PRINCIPAL * 2, "tracked outflow mismatch");
+        assertEq(usdt.balanceOf(destinationA) - destinationABefore, AMOUNT, "destination A payout mismatch");
+        assertEq(usdt.balanceOf(destinationB) - destinationBBefore, AMOUNT, "destination B payout mismatch");
+        assertEq(contractBalanceBefore - usdt.balanceOf(DEPOSIT_PROXY), AMOUNT * 2, "custody outflow mismatch");
+        assertEq(trackedTotalBefore - depositContract.getTotalDeposited(USDT), AMOUNT * 2, "tracked outflow mismatch");
 
-        // The only synthetic economic deposit remains credited to its owner because the
-        // withdrawal request contains no source owner/subaccount. Instead, both arbitrary
-        // payout destinations acquire negative onchain ledgers.
-        assertEq(depositContract.getUserBalance(owner, USDT), int256(PRINCIPAL), "owner ledger was consumed");
-        assertEq(depositContract.getUserBalance(destinationA, USDT), -int256(PRINCIPAL));
-        assertEq(depositContract.getUserBalance(destinationB, USDT), -int256(PRINCIPAL));
+        // WithdrawalEntry carries no source owner or subaccount. Both destinations begin
+        // with zero onchain credit, yet each receives a full payout and ends negative.
+        assertEq(depositContract.getUserBalance(destinationA, USDT), -int256(AMOUNT));
+        assertEq(depositContract.getUserBalance(destinationB, USDT), -int256(AMOUNT));
+        assertEq(depositContract.getActiveWithdrawalId(destinationA), 0);
+        assertEq(depositContract.getActiveWithdrawalId(destinationB), 0);
 
         storedA = depositContract.getWithdrawalRequest(requestA);
         storedB = depositContract.getWithdrawalRequest(requestB);
         assertEq(uint256(storedA.status), uint256(ISynthetixDepositLike.Status.Disbursed));
         assertEq(uint256(storedB.status), uint256(ISynthetixDepositLike.Status.Disbursed));
 
-        console2.log("synthetic principal deposited", PRINCIPAL);
-        console2.log("aggregate payout", PRINCIPAL * 2);
-        console2.logInt(depositContract.getUserBalance(owner, USDT));
+        console2.log("aggregate payout", AMOUNT * 2);
         console2.logInt(depositContract.getUserBalance(destinationA, USDT));
         console2.logInt(depositContract.getUserBalance(destinationB, USDT));
     }
@@ -199,45 +165,17 @@ contract SynthetixWithdrawalOvercommitForkTest is Test {
 
         ISynthetixDepositLike.WithdrawalEntry[] memory withdrawals =
             new ISynthetixDepositLike.WithdrawalEntry[](2);
-        withdrawals[0] = _withdrawal(destinationA, PRINCIPAL);
-        withdrawals[1] = _withdrawal(destinationA, PRINCIPAL);
+        withdrawals[0] = _withdrawal(destinationA, AMOUNT);
+        withdrawals[1] = _withdrawal(destinationA, AMOUNT);
 
         vm.expectRevert(ISynthetixDepositLike.ActiveWithdrawalExists.selector);
         vm.prank(relayer);
         depositContract.requestWithdrawal(withdrawals);
 
-        // Entire batch reverts. This negative control isolates the bypass to the use of
-        // payout destination as the active-withdrawal key.
+        // Entire batch reverts. The contrasting result isolates the concurrency guard to
+        // the payout destination rather than a source account or globally reserved balance.
         assertEq(depositContract.getWithdrawalRequestCounter(), requestCounterBefore);
         assertEq(depositContract.getActiveWithdrawalId(destinationA), 0);
-    }
-
-    function _depositSyntheticPrincipal() internal {
-        deal(USDT, owner, PRINCIPAL, true);
-
-        vm.startPrank(owner);
-        usdt.approve(DEPOSIT_PROXY, PRINCIPAL);
-
-        ISignatureTransferLike.TokenPermissions memory permissions =
-            ISignatureTransferLike.TokenPermissions({token: address(0), amount: 0});
-        ISignatureTransferLike.PermitTransferFrom memory emptyPermit = ISignatureTransferLike.PermitTransferFrom({
-            permitted: permissions,
-            nonce: 0,
-            deadline: 0
-        });
-        ISynthetixDepositLike.PermitDetails memory permitDetails =
-            ISynthetixDepositLike.PermitDetails({permit: emptyPermit, signature: bytes("")});
-
-        ISynthetixDepositLike.DepositEntry[] memory entries = new ISynthetixDepositLike.DepositEntry[](1);
-        entries[0] = ISynthetixDepositLike.DepositEntry({
-            token: USDT,
-            amount: PRINCIPAL,
-            beneficiary: owner,
-            subAccountId: 424242,
-            permitDetails: permitDetails
-        });
-        depositContract.deposit(entries);
-        vm.stopPrank();
     }
 
     function _withdrawal(address beneficiary, uint256 amount)
