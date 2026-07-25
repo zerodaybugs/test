@@ -1,0 +1,258 @@
+name: StackingDAO delegate rewards history
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/stackingdao-delegate-rewards-history.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stackingdao-delegate-history-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  history:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout workflow
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Query public mainnet history read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cd evidence
+          npm init -y >/dev/null 2>&1
+          npm install --no-save --package-lock=false @stacks/transactions@6.17.0 >/dev/null 2>&1
+
+          cat > query.mjs <<'NODE'
+          import { cvToHex, cvToString, hexToCV } from '@stacks/transactions';
+          import { writeFile } from 'node:fs/promises';
+
+          const owner = 'SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG';
+          const api = 'https://api.mainnet.hiro.so';
+          const ids = {
+            handler: `${owner}.delegates-handler-v1`,
+            rewards2: `${owner}.rewards-v2`,
+            strategy4: `${owner}.strategy-v4`,
+          };
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+          async function fetchJson(url, options = {}, attempts = 8) {
+            let last;
+            for (let attempt = 1; attempt <= attempts; attempt += 1) {
+              try {
+                const response = await fetch(url, options);
+                const text = await response.text();
+                if (!response.ok) {
+                  const retryAfter = Number(response.headers.get('retry-after') ?? 0);
+                  if ((response.status === 429 || response.status >= 500) && attempt < attempts) {
+                    await sleep(Math.max(retryAfter * 1000, attempt * 1500));
+                    continue;
+                  }
+                  throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 600)}`);
+                }
+                return JSON.parse(text);
+              } catch (error) {
+                last = error;
+                if (attempt < attempts) await sleep(attempt * 1500);
+              }
+            }
+            throw last;
+          }
+
+          function splitContract(id) {
+            const dot = id.indexOf('.');
+            return [id.slice(0, dot), id.slice(dot + 1)];
+          }
+
+          async function callRead(contractId, fn, args = []) {
+            const [address, name] = splitContract(contractId);
+            const body = JSON.stringify({ sender: owner, arguments: args.map(cvToHex) });
+            const json = await fetchJson(
+              `${api}/v2/contracts/call-read/${address}/${name}/${fn}`,
+              { method: 'POST', headers: { 'content-type': 'application/json' }, body },
+            );
+            return {
+              okay: Boolean(json.okay),
+              decoded: json.result ? cvToString(hexToCV(json.result)) : null,
+              raw: json,
+            };
+          }
+
+          async function fetchTransactions(principal, maxRows = 10000) {
+            const rows = [];
+            const limit = 50;
+            let offset = 0;
+            let total = Infinity;
+            while (offset < total && rows.length < maxRows) {
+              const page = await fetchJson(
+                `${api}/extended/v2/addresses/${principal}/transactions?limit=${limit}&offset=${offset}`,
+              );
+              const pageRows = page.results ?? [];
+              rows.push(...pageRows);
+              total = Number(page.total ?? rows.length);
+              if (pageRows.length === 0) break;
+              offset += pageRows.length;
+              await sleep(220);
+            }
+            return { rows, total };
+          }
+
+          function core(row) { return row.tx ?? row; }
+          function call(row) { return core(row).contract_call ?? row.contract_call ?? null; }
+          function status(row) { return core(row).tx_status ?? row.tx_status ?? null; }
+          function txid(row) { return core(row).tx_id ?? row.tx_id ?? null; }
+          function time(row) {
+            const tx = core(row);
+            return tx.burn_block_time_iso ?? tx.block_time_iso ?? row.burn_block_time_iso ?? row.block_time_iso ?? null;
+          }
+          function blockHeight(row) {
+            const tx = core(row);
+            return tx.block_height ?? row.block_height ?? null;
+          }
+          function resultRepr(row) {
+            const tx = core(row);
+            return tx.tx_result?.repr ?? row.tx_result?.repr ?? null;
+          }
+          function amountFromResult(repr) {
+            const match = String(repr ?? '').match(/^\(ok u(\d+)\)$/);
+            return match ? BigInt(match[1]) : null;
+          }
+          function reprArgs(contractCall) {
+            return (contractCall?.function_args ?? []).map(arg => arg.repr ?? arg.hex ?? '').join(' | ');
+          }
+
+          const pages = {};
+          for (const [name, id] of Object.entries(ids)) {
+            pages[name] = await fetchTransactions(id);
+          }
+
+          const direct = [];
+          for (const [source, page] of Object.entries(pages)) {
+            for (const row of page.rows) {
+              const c = call(row);
+              if (!c || !Object.values(ids).includes(c.contract_id)) continue;
+              const repr = resultRepr(row);
+              direct.push({
+                source,
+                contract_id: c.contract_id,
+                function_name: c.function_name,
+                function_args: c.function_args ?? [],
+                args_repr: reprArgs(c),
+                tx_id: txid(row),
+                status: status(row),
+                result_repr: repr,
+                result_amount: amountFromResult(repr)?.toString() ?? null,
+                block_height: blockHeight(row),
+                block_time_iso: time(row),
+                sender_address: core(row).sender_address ?? row.sender_address ?? null,
+              });
+            }
+          }
+
+          const unique = [...new Map(direct.map(item => [item.tx_id, item])).values()];
+          unique.sort((a, b) => Number(b.block_height ?? 0) - Number(a.block_height ?? 0));
+          const successful = unique.filter(item => item.status === 'success');
+          const handlerRewards = successful.filter(item =>
+            item.contract_id === ids.handler && item.function_name === 'handle-rewards');
+          const positiveHandlerRewards = handlerRewards.filter(item => BigInt(item.result_amount ?? '0') > 0n);
+          const reward2Calls = successful.filter(item => item.contract_id === ids.rewards2);
+          const process2 = reward2Calls.filter(item => item.function_name === 'process-rewards');
+          const add2 = reward2Calls.filter(item => item.function_name === 'add-rewards');
+          const strategyCalls = successful.filter(item => item.contract_id === ids.strategy4);
+
+          const current = {
+            rewards2_total_commission: await callRead(ids.rewards2, 'get-total-commission'),
+            rewards2_total_rewards_left: await callRead(ids.rewards2, 'get-total-rewards-left'),
+            rewards2_unlock: await callRead(ids.rewards2, 'get-rewards-unlock'),
+            rewards2_next_unlock: await callRead(ids.rewards2, 'next-rewards-unlock'),
+            rewards2_pox_cycle: await callRead(ids.rewards2, 'get-pox-cycle'),
+          };
+          const info = await fetchJson(`${api}/v2/info`);
+
+          const output = {
+            captured_at: new Date().toISOString(),
+            ids,
+            page_totals: Object.fromEntries(Object.entries(pages).map(([k, v]) => [k, { fetched: v.rows.length, total: v.total }])),
+            chain_tip: {
+              stacks_tip_height: info.stacks_tip_height,
+              burn_block_height: info.burn_block_height,
+              server_version: info.server_version,
+            },
+            current,
+            summary: {
+              unique_direct_calls: unique.length,
+              successful_direct_calls: successful.length,
+              handler_rewards_calls: handlerRewards.length,
+              positive_handler_rewards_calls: positiveHandlerRewards.length,
+              positive_handler_rewards_total: positiveHandlerRewards.reduce((sum, item) => sum + BigInt(item.result_amount ?? '0'), 0n).toString(),
+              rewards2_add_calls: add2.length,
+              rewards2_process_calls: process2.length,
+              strategy4_calls: strategyCalls.length,
+              handler_rewards_v2_args: handlerRewards.filter(item => item.args_repr.includes('.rewards-v2')).length,
+              handler_rewards_non_v2_args: handlerRewards.filter(item => !item.args_repr.includes('.rewards-v2')).length,
+            },
+            latest_positive_handler_rewards: positiveHandlerRewards.slice(0, 50),
+            latest_handler_rewards: handlerRewards.slice(0, 100),
+            latest_rewards2_add: add2.slice(0, 100),
+            latest_rewards2_process: process2.slice(0, 100),
+            latest_strategy4: strategyCalls.slice(0, 100),
+            direct_calls: unique,
+          };
+
+          await writeFile('history.json', `${JSON.stringify(output, null, 2)}\n`);
+          const lines = [
+            `captured_at=${output.captured_at}`,
+            `stacks_tip_height=${output.chain_tip.stacks_tip_height}`,
+            `burn_block_height=${output.chain_tip.burn_block_height}`,
+            ...Object.entries(output.summary).map(([k, v]) => `${k}=${v}`),
+            `rewards2_total_commission=${current.rewards2_total_commission.decoded}`,
+            `rewards2_total_rewards_left=${current.rewards2_total_rewards_left.decoded}`,
+            `rewards2_unlock=${current.rewards2_unlock.decoded}`,
+            `rewards2_next_unlock=${current.rewards2_next_unlock.decoded}`,
+            `rewards2_pox_cycle=${current.rewards2_pox_cycle.decoded}`,
+            '',
+            'LATEST POSITIVE HANDLER REWARDS',
+            ...positiveHandlerRewards.slice(0, 50).map(item =>
+              `${item.block_time_iso}\t${item.block_height}\t${item.result_repr}\t${item.args_repr}\t${item.tx_id}`),
+            '',
+            'LATEST REWARDS-V2 PROCESS',
+            ...process2.slice(0, 50).map(item =>
+              `${item.block_time_iso}\t${item.block_height}\t${item.result_repr}\t${item.args_repr}\t${item.tx_id}`),
+          ];
+          await writeFile('history.txt', `${lines.join('\n')}\n`);
+          console.log(lines.join('\n'));
+          NODE
+
+          node query.mjs
+          sha256sum history.json history.txt query.mjs > SHA256SUMS
+
+      - name: Upload history evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackingdao-delegate-history-${{ github.run_id }}
+          path: |
+            evidence/history.json
+            evidence/history.txt
+            evidence/query.mjs
+            evidence/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Enforce history integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s evidence/history.json
+          test -s evidence/history.txt
+          (cd evidence && sha256sum -c SHA256SUMS)
+          grep -F 'handler_rewards_calls=' evidence/history.txt
