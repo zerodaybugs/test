@@ -1,0 +1,148 @@
+name: Temporary Pyth Core encrypted historical-fork runner
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-pyth-core-secure-fork-run.yml'
+      - 'tmp-secure/pyth-core-payload.enc.b64'
+      - 'tmp-secure/pyth-core-keyinfo.enc.b64'
+      - 'tmp-secure/pyth-core-payload.sha256'
+      - 'tmp-secure/pyth-core-output-public.pem'
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout ciphertext only
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Restore cached one-time decryption key
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/katana-secure-private.pem
+          key: katana-secure-poc-key-56fe0ca7762997ce47d5ae1706bf8af29cbc71202b28c498
+          fail-on-cache-miss: true
+
+      - name: Install pinned Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Decrypt and verify private Pyth Core payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s /tmp/katana-secure-private.pem
+          umask 077
+          base64 -d tmp-secure/pyth-core-payload.enc.b64 > /tmp/pyth-core-payload.enc
+          base64 -d tmp-secure/pyth-core-keyinfo.enc.b64 > /tmp/pyth-core-keyinfo.enc
+          openssl pkeyutl -decrypt \
+            -inkey /tmp/katana-secure-private.pem \
+            -in /tmp/pyth-core-keyinfo.enc \
+            -out /tmp/pyth-core-keyinfo.bin \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          python3 - <<'PY'
+          from pathlib import Path
+          keyinfo = Path('/tmp/pyth-core-keyinfo.bin').read_bytes()
+          if len(keyinfo) != 48:
+              raise SystemExit(f'invalid key material length: {len(keyinfo)}')
+          Path('/tmp/pyth-core-key.hex').write_text(keyinfo[:32].hex())
+          Path('/tmp/pyth-core-iv.hex').write_text(keyinfo[32:].hex())
+          PY
+          KEY=$(cat /tmp/pyth-core-key.hex)
+          IV=$(cat /tmp/pyth-core-iv.hex)
+          openssl enc -d -aes-256-cbc \
+            -K "$KEY" -iv "$IV" \
+            -in /tmp/pyth-core-payload.enc \
+            -out /tmp/pyth-core-payload.tar.gz
+          EXPECTED=$(tr -d '[:space:]' < tmp-secure/pyth-core-payload.sha256)
+          printf '%s  %s\n' "$EXPECTED" /tmp/pyth-core-payload.tar.gz | sha256sum -c -
+          tar -xzf /tmp/pyth-core-payload.tar.gz
+          test -f pyth_core_secure_payload/run.sh
+          mv pyth_core_secure_payload payload
+          chmod +x payload/run.sh
+
+      - name: Execute isolated historical-fork proof
+        id: execute
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          set +e
+          timeout 2100 bash payload/run.sh > evidence/runner-console.log 2>&1
+          STATUS=$?
+          set -e
+          printf '%s\n' "$STATUS" > evidence/runner-exit-code.txt
+          printf '%s\n' "${GITHUB_RUN_ID}" > evidence/github-run-id.txt
+          printf '%s\n' "${GITHUB_SHA}" > evidence/github-sha.txt
+          if [ -d payload/evidence ]; then
+            cp -a payload/evidence evidence/payload-evidence
+          fi
+          exit 0
+
+      - name: Encrypt all evidence before upload
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted-output evidence
+          if [ ! -f evidence/runner-exit-code.txt ]; then
+            printf '%s\n' '125' > evidence/runner-exit-code.txt
+            printf '%s\n' 'Execution step did not create an exit-code record.' > evidence/runner-bootstrap-error.txt
+          fi
+          tar --sort=name --mtime='UTC 2026-07-25' --owner=0 --group=0 --numeric-owner \
+            -czf /tmp/pyth-core-evidence.tar.gz evidence
+          sha256sum /tmp/pyth-core-evidence.tar.gz | awk '{print $1}' \
+            > encrypted-output/evidence-plaintext.sha256
+          openssl rand 32 > /tmp/output-key.bin
+          openssl rand 16 > /tmp/output-iv.bin
+          cat /tmp/output-key.bin /tmp/output-iv.bin > /tmp/output-keyinfo.bin
+          KEY=$(python3 -c "from pathlib import Path; print(Path('/tmp/output-key.bin').read_bytes().hex())")
+          IV=$(python3 -c "from pathlib import Path; print(Path('/tmp/output-iv.bin').read_bytes().hex())")
+          openssl enc -aes-256-cbc \
+            -K "$KEY" -iv "$IV" \
+            -in /tmp/pyth-core-evidence.tar.gz \
+            -out encrypted-output/evidence.tar.gz.enc
+          openssl pkeyutl -encrypt \
+            -pubin -inkey tmp-secure/pyth-core-output-public.pem \
+            -in /tmp/output-keyinfo.bin \
+            -out encrypted-output/evidence-keyinfo.enc \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          sha256sum encrypted-output/evidence.tar.gz.enc encrypted-output/evidence-keyinfo.enc \
+            > encrypted-output/SHA256SUMS
+          rm -rf evidence payload pyth_core_secure_payload out cache broadcast
+          rm -f /tmp/pyth-core-payload* /tmp/pyth-core-keyinfo* /tmp/pyth-core-key.hex /tmp/pyth-core-iv.hex
+          rm -f /tmp/pyth-core-evidence.tar.gz /tmp/output-key.bin /tmp/output-iv.bin /tmp/output-keyinfo.bin
+          rm -f /tmp/katana-secure-private.pem
+
+      - name: Upload encrypted evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyth-core-encrypted-historical-fork-evidence-${{ github.run_id }}
+          path: encrypted-output/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Enforce encrypted-output boundary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s encrypted-output/evidence.tar.gz.enc
+          test -s encrypted-output/evidence-keyinfo.enc
+          test -s encrypted-output/evidence-plaintext.sha256
+          test -s encrypted-output/SHA256SUMS
+          test ! -e payload
+          test ! -e evidence
