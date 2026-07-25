@@ -1,0 +1,111 @@
+name: veda-self-root-proof-v2
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Reconstruct committed LiquidUSD leaf roots and proof schemas
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet --no-tags https://github.com/Veda-Labs/boring-vault.git veda-main
+          git -C veda-main checkout --quiet 48ab2e6e0d5bc7e1971d25aded399936393eb478
+          git clone --quiet --no-tags https://github.com/Veda-Labs/boring-vault-plasma.git veda-plasma
+          git -C veda-plasma checkout --quiet 1b3501be1f7a63968fdd1dbf0a1b7d89ad95b278
+          python3 - <<'PY'
+          import hashlib, json, os, re, time, traceback
+          LIVE="0x64fe8acfe1936a9cba6d2cbe0d204b5dee6a3b6b55d52f0d44825c03c6f7f719"
+          VAULT="0x08c6f91e2b681faf5e17227f2a44c307b3c1364c";MANAGER="0x7b57ad1a0aa89583130acfad024241170d24c13c";ACCOUNTANT="0xc315d6e14ddcdc7407784e2caf815d131bc1d3e7";TELLER="0x4de413a26fc24c3fc27cc983be70aa9c5c299387";QUEUE="0x38fc1ba73b7ed289955a07d9f11a85b6e388064a"
+          try:
+            from Crypto.Hash import keccak
+            def k256(b):h=keccak.new(digest_bits=256);h.update(b);return h.digest()
+            crypto="Crypto.Hash.keccak"
+          except Exception:
+            # Pure Keccak fallback is intentionally unavailable; report schema without proof verification.
+            k256=None;crypto=None
+          def norm(x):return str(x or '').lower()
+          def walk(obj,path=()):
+            if isinstance(obj,dict):
+              yield path,obj
+              for k,v in obj.items():yield from walk(v,path+(str(k),))
+            elif isinstance(obj,list):
+              for i,v in enumerate(obj):yield from walk(v,path+(str(i),))
+          def pick(d,*names):
+            low={str(k).lower():v for k,v in d.items()}
+            for n in names:
+              if n.lower() in low:return low[n.lower()]
+          def hex32(x):return isinstance(x,str) and re.fullmatch(r'0x[0-9a-fA-F]{64}',x or '') is not None
+          def addrlist(x):
+            if isinstance(x,list):return [norm(v) for v in x if re.fullmatch(r'0x[0-9a-fA-F]{40}',str(v))]
+            return [a.lower() for a in re.findall(r'0x[0-9a-fA-F]{40}',str(x or ''))]
+          def process(leaf,proof):
+            cur=bytes.fromhex(leaf[2:])
+            for p in proof:
+              b=bytes.fromhex(p[2:]);cur=k256(cur+b if cur<=b else b+cur)
+            return '0x'+cur.hex()
+          out={"generated_at_unix":int(time.time()),"live_root":LIVE,"crypto":crypto,"files":[],"matching_files":[],"matching_leaves":[],"high_risk_matching_leaves":[],"errors":[]}
+          for repo in ('veda-main','veda-plasma'):
+            for base,_,files in os.walk(repo):
+              for fn in files:
+                if not fn.endswith('.json'):continue
+                path=os.path.join(base,fn);lp=path.lower()
+                if 'liquidusd' not in lp and 'liquid_usd' not in lp and 'liquidusd' not in fn.lower():continue
+                try:
+                  raw=open(path,encoding='utf-8',errors='ignore').read()
+                  if not raw.strip():continue
+                  data=json.loads(raw)
+                except Exception as e:out["errors"].append({"file":path,"parse":repr(e)});continue
+                rec={"file":path,"bytes":len(raw),"top_type":type(data).__name__,"top_keys":list(data)[:30] if isinstance(data,dict) else None,"candidate_records":0,"leaf_records":0,"proof_records":0,"computed_roots":{},"field_schemas":{},"sample_records":[],"live_matches":0}
+                schemas={};computed={}
+                for jpath,d in walk(data):
+                  if not isinstance(d,dict):continue
+                  keys=tuple(sorted(str(k) for k in d));schemas[keys]=schemas.get(keys,0)+1
+                  leaf=pick(d,'LeafDigest','leafDigest','leaf','Leaf','digest','Digest')
+                  proof=pick(d,'Proofs','proofs','Proof','proof','MerkleProof','merkleProof')
+                  target=pick(d,'TargetAddress','targetAddress','Target','target')
+                  decoder=pick(d,'DecoderAndSanitizerAddress','decoderAndSanitizerAddress','DecoderAndSanitizer','decoderAndSanitizer','decoder')
+                  sig=pick(d,'FunctionSignature','functionSignature','Signature','signature','Function','function')
+                  args=pick(d,'ArgumentAddresses','argumentAddresses','AddressArguments','addressArguments','arguments')
+                  desc=pick(d,'Description','description')
+                  if leaf or sig or target:rec["candidate_records"]+=1
+                  if hex32(leaf):
+                    rec["leaf_records"]+=1
+                    proof_list=[p for p in (proof if isinstance(proof,list) else []) if hex32(p)]
+                    if proof_list:
+                      rec["proof_records"]+=1
+                      if k256:
+                        root=process(leaf,proof_list);computed[root]=computed.get(root,0)+1
+                        if root.lower()==LIVE:
+                          rec["live_matches"]+=1
+                          item={"file":path,"json_path":jpath,"leaf":leaf,"proof_length":len(proof_list),"target":norm(target),"decoder":norm(decoder),"signature":str(sig or ''),"arguments":addrlist(args),"description":desc,"record_keys":list(d)}
+                          out["matching_leaves"].append(item)
+                          sl=item["signature"].lower();reasons=[]
+                          if item["target"] in {VAULT,MANAGER,ACCOUNTANT,TELLER,QUEUE}:reasons.append('sensitive_target')
+                          if any(x in sl for x in ('manage(','execute(','multicall(','delegatecall','enter(','exit(','bulkwithdraw','bulkdeposit','setauthority','transferownership','rescuetokens')):reasons.append('dangerous_selector')
+                          if ('address' in sl or 'bytes' in sl or 'tuple' in sl or '(' in sl) and len(item["arguments"])==0:reasons.append('no_address_binding')
+                          if item["decoder"] in ('','0x0000000000000000000000000000000000000000'):reasons.append('missing_decoder')
+                          if reasons:out["high_risk_matching_leaves"].append({"reasons":reasons,"leaf":item})
+                  if len(rec["sample_records"])<3 and (leaf or sig or target):rec["sample_records"].append({"path":jpath,"keys":list(d),"leaf":leaf,"proof_type":type(proof).__name__,"target":target,"decoder":decoder,"signature":sig,"arguments":args,"description":desc})
+                rec["computed_roots"]={k:v for k,v in sorted(computed.items(),key=lambda z:-z[1])[:20]};rec["field_schemas"]=[{"keys":list(k),"count":v} for k,v in sorted(schemas.items(),key=lambda z:-z[1])[:20]]
+                if rec["live_matches"]:out["matching_files"].append(path)
+                out["files"].append(rec)
+          out["summary"]={"file_count":len(out["files"]),"matching_file_count":len(out["matching_files"]),"matching_leaf_count":len(out["matching_leaves"]),"high_risk_count":len(out["high_risk_matching_leaves"]),"crypto_available":bool(k256)}
+          with open('veda-self-root-proof-v2.json','w',encoding='utf-8') as f:json.dump(out,f,indent=2,sort_keys=True);f.write('\n')
+          print(json.dumps({"summary":out["summary"],"matching_files":out["matching_files"],"high_risk":out["high_risk_matching_leaves"][:100],"files":[{"file":r["file"],"bytes":r["bytes"],"top_keys":r["top_keys"],"leaf_records":r["leaf_records"],"proof_records":r["proof_records"],"live_matches":r["live_matches"],"roots":r["computed_roots"],"schemas":r["field_schemas"][:5],"samples":r["sample_records"]} for r in out["files"]],"errors":out["errors"]},indent=2,sort_keys=True))
+          PY
+      - name: Upload proof-level self-root audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-self-root-proof-v2
+          path: veda-self-root-proof-v2.json
+          if-no-files-found: error
+          retention-days: 1
