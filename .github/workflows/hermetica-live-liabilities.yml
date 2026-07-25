@@ -1,0 +1,337 @@
+name: Hermetica live liability reconstruction
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-live-liabilities.yml'
+      - 'public-data/hermetica-live-liabilities-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reconstruct:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install read-only decoder
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/hermetica-live-liabilities
+          cd /tmp/hermetica-live-liabilities
+          npm init -y >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund @stacks/transactions@7.2.0
+
+      - name: Reconstruct current silo and old OTC liabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/hermetica-live-liabilities
+          cat > reconstruct.cjs <<'NODE'
+          const fs = require('fs');
+          const {
+            uintCV,
+            stringAsciiCV,
+            cvToHex,
+            hexToCV,
+            cvToJSON,
+          } = require('@stacks/transactions');
+
+          const API = 'https://api.hiro.so';
+          const DEP = 'SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG';
+          const SILO_NAME = 'staking-silo-v1-1';
+          const SILO = `${DEP}.${SILO_NAME}`;
+          const OTC_NAME = 'minting-otc-v1';
+          const OTC = `${DEP}.${OTC_NAME}`;
+          const USDH_KEY = `${DEP}.usdh-token-v1::usdh`;
+
+          async function fetchRetry(url, options = {}, attempts = 8) {
+            let last;
+            for (let i = 0; i < attempts; i++) {
+              try {
+                const res = await fetch(url, options);
+                if (res.ok) return res;
+                const text = await res.text();
+                last = new Error(`${res.status} ${res.statusText}: ${text}`);
+                if (res.status < 500 && res.status !== 429) throw last;
+              } catch (e) { last = e; }
+              await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+            }
+            throw last;
+          }
+
+          async function history(principal, max = 5000) {
+            const all = [];
+            for (let offset = 0; offset < max; offset += 50) {
+              const res = await fetchRetry(`${API}/extended/v1/address/${encodeURIComponent(principal)}/transactions?limit=50&offset=${offset}`);
+              const body = await res.json();
+              const rows = body.results || [];
+              all.push(...rows);
+              if (rows.length < 50 || all.length >= (body.total || max)) break;
+            }
+            return all.slice(0, max);
+          }
+
+          async function balances(principal) {
+            const res = await fetchRetry(`${API}/extended/v1/address/${encodeURIComponent(principal)}/balances`);
+            return await res.json();
+          }
+
+          async function callRead(contractName, fn, args = []) {
+            const res = await fetchRetry(`${API}/v2/contracts/call-read/${DEP}/${contractName}/${fn}`, {
+              method: 'POST',
+              headers: {'content-type':'application/json'},
+              body: JSON.stringify({sender: DEP, arguments: args.map(cvToHex)}),
+            });
+            const body = await res.json();
+            let decoded = null;
+            if (body.result) {
+              try { decoded = cvToJSON(hexToCV(body.result)); }
+              catch (e) { decoded = {decode_error:String(e), raw:body.result}; }
+            }
+            return {okay:body.okay, cause:body.cause, result_raw:body.result, decoded};
+          }
+
+          function directCalls(txs, cid) {
+            return txs.filter(tx => tx.tx_type === 'contract_call' && tx.contract_call?.contract_id === cid);
+          }
+
+          function uintIds(repr) {
+            return [...String(repr || '').matchAll(/u(\d+)/g)].map(m => Number(m[1]));
+          }
+
+          function responseOutcomes(repr) {
+            return [...String(repr || '').matchAll(/\((ok true|err u\d+)\)/g)].map(m => m[1]);
+          }
+
+          function argObject(tx) {
+            return Object.fromEntries((tx.contract_call?.function_args || []).map((a, i) => [a.name || `arg${i}`, a.repr]));
+          }
+
+          function unwrap(node) {
+            if (node == null) return null;
+            if (typeof node !== 'object') return node;
+            if ('value' in node) {
+              const value = node.value;
+              if (value && typeof value === 'object' && !Array.isArray(value)) {
+                const out = {};
+                for (const [k, v] of Object.entries(value)) out[k] = unwrap(v);
+                return out;
+              }
+              return unwrap(value);
+            }
+            const out = {};
+            for (const [k, v] of Object.entries(node)) out[k] = unwrap(v);
+            return out;
+          }
+
+          function parseAsciiArg(repr) {
+            const s = String(repr || '').trim();
+            const m = s.match(/^"([\s\S]*)"$/);
+            return m ? m[1] : s;
+          }
+
+          async function reconstructCurrentSilo() {
+            const txs = await history(SILO);
+            const calls = directCalls(txs, SILO);
+            const withdrawn = new Set();
+            const withdrawalAttempts = [];
+
+            for (const tx of calls) {
+              const fn = tx.contract_call.function_name;
+              if (!['withdraw', 'withdraw-many'].includes(fn)) continue;
+              const ids = uintIds((tx.contract_call.function_args || [])[0]?.repr);
+              const repr = tx.tx_result?.repr || '';
+              const successful = [];
+              if (tx.tx_status === 'success') {
+                if (fn === 'withdraw') {
+                  if (/^\(ok true\)$/.test(repr.trim())) successful.push(...ids.slice(0, 1));
+                } else {
+                  const outcomes = responseOutcomes(repr);
+                  for (let i = 0; i < Math.min(ids.length, outcomes.length); i++) {
+                    if (outcomes[i] === 'ok true') successful.push(ids[i]);
+                  }
+                }
+              }
+              for (const id of successful) withdrawn.add(id);
+              withdrawalAttempts.push({
+                tx_id:tx.tx_id,
+                status:tx.tx_status,
+                time:tx.burn_block_time_iso,
+                height:tx.block_height,
+                sender:tx.sender_address,
+                function:fn,
+                ids,
+                successful_ids:successful,
+                result:repr,
+                vm_error:tx.vm_error,
+              });
+            }
+
+            const currentIdState = await callRead(SILO_NAME, 'get-current-claim-id');
+            const currentId = Number(unwrap(currentIdState.decoded));
+            const candidates = [];
+            for (let id = 1; id <= currentId; id++) if (!withdrawn.has(id)) candidates.push(id);
+
+            const open = [];
+            const missing = [];
+            for (let i = 0; i < candidates.length; i++) {
+              const id = candidates[i];
+              const row = await callRead(SILO_NAME, 'get-claim', [uintCV(id)]);
+              if (row.okay && row.decoded?.success === true) {
+                const decoded = unwrap(row.decoded);
+                open.push({claim_id:id, claim:decoded.value ?? decoded, raw:row});
+              } else {
+                missing.push({claim_id:id, raw:row});
+              }
+              if (i % 20 === 19) await new Promise(r => setTimeout(r, 220));
+            }
+
+            let liability = 0n;
+            for (const row of open) {
+              const amount = row.claim?.amount;
+              if (amount != null) liability += BigInt(amount);
+            }
+            const bal = await balances(SILO);
+            const balance = BigInt(bal.fungible_tokens?.[USDH_KEY]?.balance || '0');
+            return {
+              current_claim_id:currentId,
+              address_transaction_count:txs.length,
+              direct_call_count:calls.length,
+              successful_withdrawn_count:withdrawn.size,
+              candidate_count:candidates.length,
+              open_claim_count:open.length,
+              total_open_liability:liability.toString(),
+              silo_usdh_balance:balance.toString(),
+              surplus_or_deficit:(balance - liability).toString(),
+              open_claims:open,
+              missing_candidates:missing,
+              withdrawal_attempts:withdrawalAttempts,
+              balances:bal,
+            };
+          }
+
+          async function reconstructOldOtc() {
+            const txs = await history(OTC, 1000);
+            const calls = directCalls(txs, OTC);
+            const requests = new Map();
+            const terminal = new Map();
+            const callRows = [];
+
+            for (const tx of calls) {
+              const fn = tx.contract_call.function_name;
+              const args = argObject(tx);
+              const firstArg = (tx.contract_call.function_args || [])[0];
+              const requestId = firstArg ? parseAsciiArg(firstArg.repr) : null;
+              const row = {
+                tx_id:tx.tx_id,
+                status:tx.tx_status,
+                time:tx.burn_block_time_iso,
+                height:tx.block_height,
+                sender:tx.sender_address,
+                function:fn,
+                args,
+                result:tx.tx_result?.repr,
+                vm_error:tx.vm_error,
+              };
+              callRows.push(row);
+              if (tx.tx_status !== 'success' || !requestId) continue;
+              if (fn === 'request-redeem') requests.set(requestId, row);
+              if (['confirm-redeem', 'cancel-redeem-request', 'claim-unconfirmed-redeem'].includes(fn)) terminal.set(requestId, row);
+              if (fn === 'cancel-redeem-request-many') {
+                const ids = [...String(firstArg.repr || '').matchAll(/"([^"]{1,36})"/g)].map(m => m[1]);
+                const outcomes = responseOutcomes(tx.tx_result?.repr || '');
+                for (let i = 0; i < Math.min(ids.length, outcomes.length); i++) {
+                  if (outcomes[i] === 'ok true') terminal.set(ids[i], row);
+                }
+              }
+            }
+
+            const candidates = [...requests.keys()].filter(id => !terminal.has(id));
+            const open = [];
+            const closed = [];
+            for (const id of candidates) {
+              const row = await callRead(OTC_NAME, 'get-redeem-request', [stringAsciiCV(id)]);
+              if (row.okay && row.decoded?.success === true) {
+                const decoded = unwrap(row.decoded);
+                open.push({request_id:id, request:decoded.value ?? decoded, raw:row, creation:requests.get(id)});
+              } else {
+                closed.push({request_id:id, raw:row});
+              }
+            }
+
+            let liability = 0n;
+            for (const row of open) {
+              const amount = row.request?.['amount-usdh'];
+              if (amount != null) liability += BigInt(amount);
+            }
+            const bal = await balances(OTC);
+            const balance = BigInt(bal.fungible_tokens?.[USDH_KEY]?.balance || '0');
+            return {
+              address_transaction_count:txs.length,
+              direct_call_count:calls.length,
+              created_request_count:requests.size,
+              terminal_request_count:terminal.size,
+              candidate_count:candidates.length,
+              open_request_count:open.length,
+              total_open_liability:liability.toString(),
+              contract_usdh_balance:balance.toString(),
+              surplus_or_deficit:(balance - liability).toString(),
+              open_requests:open,
+              missing_candidates:closed,
+              calls:callRows,
+              balances:bal,
+            };
+          }
+
+          (async () => {
+            const silo = await reconstructCurrentSilo();
+            const otc = await reconstructOldOtc();
+            const out = {
+              generated_at:new Date().toISOString(),
+              source:'Hiro public read-only APIs',
+              current_silo:silo,
+              deprecated_otc:otc,
+            };
+            fs.writeFileSync('live-liabilities.json', JSON.stringify(out, null, 2));
+            fs.writeFileSync('summary.json', JSON.stringify({
+              current_silo:{
+                current_claim_id:silo.current_claim_id,
+                successful_withdrawn_count:silo.successful_withdrawn_count,
+                open_claim_count:silo.open_claim_count,
+                total_open_liability:silo.total_open_liability,
+                silo_usdh_balance:silo.silo_usdh_balance,
+                surplus_or_deficit:silo.surplus_or_deficit,
+                open_claims:silo.open_claims.map(x => ({claim_id:x.claim_id, claim:x.claim})),
+              },
+              deprecated_otc:{
+                created_request_count:otc.created_request_count,
+                terminal_request_count:otc.terminal_request_count,
+                open_request_count:otc.open_request_count,
+                total_open_liability:otc.total_open_liability,
+                contract_usdh_balance:otc.contract_usdh_balance,
+                surplus_or_deficit:otc.surplus_or_deficit,
+                open_requests:otc.open_requests.map(x => ({request_id:x.request_id, request:x.request, creation:x.creation})),
+              },
+            }, null, 2));
+            console.log(fs.readFileSync('summary.json', 'utf8'));
+          })().catch(e => { console.error(e); process.exit(1); });
+          NODE
+          node reconstruct.cjs
+          sha256sum live-liabilities.json summary.json > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-live-liabilities
+          path: |
+            /tmp/hermetica-live-liabilities/live-liabilities.json
+            /tmp/hermetica-live-liabilities/summary.json
+            /tmp/hermetica-live-liabilities/SHA256SUMS
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
