@@ -1,0 +1,248 @@
+name: Temporary Katana migration lifecycle gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-katana-migration-history.yml'
+      - 'tmp-katana-migration-history-trigger.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  reconstruct:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Reconstruct Katana and Ethereum migration lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > /tmp/scan.py <<'PY'
+          from __future__ import annotations
+          import concurrent.futures
+          import json
+          import subprocess
+          import time
+          import urllib.request
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          KAT_RPC='https://rpc.katana.network/'
+          ETH_RPC='https://ethereum-rpc.publicnode.com'
+          KAT_START=15_000_000
+          ETH_START=20_000_000
+          STEP=30_000
+          WORKERS=10
+          BRIDGE='0x2a3DD3EB832aF982ec71669E178424b10Dca2EDe'
+          ZERO='0x0000000000000000000000000000000000000000'
+
+          PAIRS=[
+            ('eth','0xEE7D8BCFb72bC1880D0Cf19822eB0A2e6577aB62','0xa6b0db1293144ebe9478b6a84f75dd651e45914a','0x2DC70fb75b88d2eB4715bc06E1595E6D97c34DFF'),
+            ('usdc','0x203A662b0BD271A6ed5a60EdFbd04bFce608FD36','0x97a3500083348A147F419b8a65717909762c389f','0x53E82ABbb12638F09d9e624578ccB666217a765e'),
+            ('usdt','0x2DCa96907fde857dd3D816880A0df407eeB2D2F2','0x053FA9b934b83E1E0ffc7e98a41aAdc3640bB462','0x6d4f9f9f8f0155509ecd6Ac6c544fF27999845CC'),
+            ('wbtc','0x0913DA6Da4b42f538B445599b46Bb4622342Cf52','0xb00aa68b87256E2F22058fB2Ba3246EEc54A44fc','0x2C24B57e2CCd1f273045Af6A5f632504C432374F'),
+            ('usds','0x62D6A123E8D19d06d68cf0d2294F9A3A0362c6b3','0x639f13D5f30B47c792b6851238c05D0b623C77DE','0x3DD459dE96F9C28e3a343b831cbDC2B93c8C4855'),
+          ]
+          TOKENS={token.lower():name for name,token,_,_ in PAIRS}
+          CONVERTERS={converter.lower():name for name,_,converter,_ in PAIRS}
+          VBS={vb.lower():name for name,_,_,vb in PAIRS}
+
+          def keccak(signature:str)->str:
+            return subprocess.check_output(['cast','keccak',signature], text=True).strip().lower()
+
+          TOPICS={
+            'MigrationStarted':keccak('MigrationStarted(uint256,uint256)'),
+            'MigrationInProgressAdded':keccak('MigrationInProgressAdded(uint256)'),
+            'MigrationInProgressRemoved':keccak('MigrationInProgressRemoved(uint256)'),
+            'AlreadyMinted':keccak('AlreadyMinted(uint256)'),
+            'MigrationCompleted':keccak('MigrationCompleted(uint32,uint256,uint256,uint256)'),
+            'Upgraded':keccak('Upgraded(address)'),
+            'BridgeEvent':keccak('BridgeEvent(uint8,uint32,address,uint32,address,uint256,bytes,uint32)'),
+            'ClaimEvent':keccak('ClaimEvent(uint256,uint32,address,address,uint256)'),
+          }
+
+          def post(rpc:str,payload:dict,retries:int=10)->dict:
+            raw=json.dumps(payload).encode()
+            last=None
+            for i in range(retries):
+              try:
+                req=urllib.request.Request(rpc,data=raw,headers={'content-type':'application/json','accept':'application/json'})
+                with urllib.request.urlopen(req,timeout=90) as response:
+                  return json.loads(response.read())
+              except Exception as exc:
+                last=repr(exc)
+                time.sleep(min(1.7**i,15))
+            return {'error':{'message':last}}
+
+          def block_number(rpc:str)->int:
+            response=post(rpc,{'jsonrpc':'2.0','id':1,'method':'eth_blockNumber','params':[]})
+            return int(response['result'],16)
+
+          def fetch_logs(rpc:str,start:int,end:int,addresses:list[str],topic0s:list[str]):
+            payload={'jsonrpc':'2.0','id':start,'method':'eth_getLogs','params':[{
+              'fromBlock':hex(start),'toBlock':hex(end),'address':addresses,'topics':[topic0s]
+            }]}
+            return start,end,post(rpc,payload)
+
+          def scan(rpc:str,start:int,latest:int,addresses:list[str],topic0s:list[str]):
+            ranges=[(s,min(s+STEP-1,latest)) for s in range(start,latest+1,STEP)]
+            output=[]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
+              futures=[executor.submit(fetch_logs,rpc,a,b,addresses,topic0s) for a,b in ranges]
+              for future in concurrent.futures.as_completed(futures):
+                output.append(future.result())
+            output.sort(key=lambda x:x[0])
+            logs=[]; errors=[]
+            for a,b,response in output:
+              if response.get('error'):
+                errors.append({'from':a,'to':b,'error':response['error']})
+              else:
+                logs.extend(response.get('result') or [])
+            logs.sort(key=lambda x:(int(x['blockNumber'],16),int(x['transactionIndex'],16),int(x['logIndex'],16)))
+            return logs,errors
+
+          def word(data:str,index:int)->int:
+            body=data[2:] if data.startswith('0x') else data
+            return int(body[index*64:(index+1)*64],16)
+
+          def addr_word(data:str,index:int)->str:
+            return '0x'+format(word(data,index),'064x')[-40:]
+
+          def topic_int(log:dict,index:int)->int:
+            return int(log['topics'][index],16)
+
+          def base(log:dict)->dict:
+            return {
+              'address':log['address'].lower(),
+              'block':int(log['blockNumber'],16),
+              'transactionIndex':int(log['transactionIndex'],16),
+              'logIndex':int(log['logIndex'],16),
+              'tx':log['transactionHash'].lower(),
+            }
+
+          kat_latest=block_number(KAT_RPC)
+          eth_latest=block_number(ETH_RPC)
+          kat_addresses=[x for pair in PAIRS for x in pair[1:3]]+[BRIDGE]
+          eth_addresses=[pair[3] for pair in PAIRS]+[BRIDGE]
+
+          kat_logs,kat_errors=scan(
+            KAT_RPC,KAT_START,kat_latest,kat_addresses,
+            [TOPICS[x] for x in ('MigrationStarted','MigrationInProgressAdded','MigrationInProgressRemoved','AlreadyMinted','Upgraded','ClaimEvent')]
+          )
+          eth_logs,eth_errors=scan(
+            ETH_RPC,ETH_START,eth_latest,eth_addresses,
+            [TOPICS[x] for x in ('MigrationCompleted','Upgraded','BridgeEvent')]
+          )
+
+          kat_events=[]
+          for log in kat_logs:
+            t=log['topics'][0].lower(); row=base(log)
+            if t==TOPICS['MigrationStarted']:
+              row.update(kind='MigrationStarted',name=CONVERTERS.get(row['address']),shares=topic_int(log,1),assets=topic_int(log,2))
+            elif t==TOPICS['MigrationInProgressAdded']:
+              row.update(kind='MigrationInProgressAdded',name=CONVERTERS.get(row['address']),amount=topic_int(log,1))
+            elif t==TOPICS['MigrationInProgressRemoved']:
+              row.update(kind='MigrationInProgressRemoved',name=CONVERTERS.get(row['address']),amount=topic_int(log,1))
+            elif t==TOPICS['AlreadyMinted']:
+              row.update(kind='AlreadyMinted',name=TOKENS.get(row['address']),amount=topic_int(log,1))
+            elif t==TOPICS['Upgraded']:
+              row.update(kind='Upgraded',name=TOKENS.get(row['address']) or CONVERTERS.get(row['address']) or 'bridge',implementation='0x'+log['topics'][1][-40:])
+            elif t==TOPICS['ClaimEvent']:
+              # all fields are unindexed in the bridge implementation
+              row.update(kind='ClaimEvent',globalIndex=word(log['data'],0),originNetwork=word(log['data'],1),originAddress=addr_word(log['data'],2),destinationAddress=addr_word(log['data'],3),amount=word(log['data'],4))
+            kat_events.append(row)
+
+          eth_events=[]
+          migration_completed_txs=set()
+          for log in eth_logs:
+            t=log['topics'][0].lower(); row=base(log)
+            if t==TOPICS['MigrationCompleted']:
+              row.update(kind='MigrationCompleted',name=VBS.get(row['address']),originNetwork=topic_int(log,1),shares=topic_int(log,2),assets=topic_int(log,3),migrationFeesFundUtilization=word(log['data'],0))
+              migration_completed_txs.add(row['tx'])
+            elif t==TOPICS['Upgraded']:
+              row.update(kind='Upgraded',name=VBS.get(row['address']) or 'bridge',implementation='0x'+log['topics'][1][-40:])
+            elif t==TOPICS['BridgeEvent']:
+              leaf_type=word(log['data'],0)
+              origin_network=word(log['data'],1)
+              origin_address=addr_word(log['data'],2)
+              destination_network=word(log['data'],3)
+              destination_address=addr_word(log['data'],4)
+              amount=word(log['data'],5)
+              deposit_count=word(log['data'],7)
+              row.update(kind='BridgeEvent',leafType=leaf_type,originNetwork=origin_network,originAddress=origin_address,destinationNetwork=destination_network,destinationAddress=destination_address,amount=amount,depositCount=deposit_count,name=VBS.get(origin_address.lower()))
+            eth_events.append(row)
+
+          starts=[e for e in kat_events if e['kind']=='MigrationStarted']
+          adds=[e for e in kat_events if e['kind']=='MigrationInProgressAdded']
+          removes=[e for e in kat_events if e['kind']=='MigrationInProgressRemoved']
+          already=[e for e in kat_events if e['kind']=='AlreadyMinted']
+          completed=[e for e in eth_events if e['kind']=='MigrationCompleted']
+          zero_bridges=[e for e in eth_events if e['kind']=='BridgeEvent' and e.get('name') and e['destinationAddress'].lower()==ZERO]
+          zero_protocol=[e for e in zero_bridges if e['tx'] in migration_completed_txs]
+          zero_non_protocol=[e for e in zero_bridges if e['tx'] not in migration_completed_txs]
+          kat_zero_claims=[e for e in kat_events if e['kind']=='ClaimEvent' and e.get('originAddress','').lower() in VBS and e.get('destinationAddress','').lower()==ZERO]
+
+          def count_by_name_amount(events:list[dict],amount_key:str)->Counter:
+            return Counter((e.get('name'),e.get(amount_key)) for e in events)
+
+          c_start=count_by_name_amount(starts,'shares')
+          c_add=count_by_name_amount(adds,'amount')
+          c_remove=count_by_name_amount(removes,'amount')
+          c_already=count_by_name_amount(already,'amount')
+          c_complete=count_by_name_amount(completed,'shares')
+          all_keys=sorted(set(c_start)|set(c_add)|set(c_remove)|set(c_already)|set(c_complete),key=lambda x:(str(x[0]),x[1] or 0))
+          reconciliation=[]
+          for key in all_keys:
+            reconciliation.append({
+              'name':key[0],'amount':key[1],
+              'started':c_start[key],'trackingAdded':c_add[key],'trackingRemoved':c_remove[key],
+              'alreadyMinted':c_already[key],'primaryCompleted':c_complete[key],
+              'pendingFromTracking':c_add[key]-c_remove[key],
+              'startedMinusAlreadyMinted':c_start[key]-c_already[key],
+              'primaryCompletedMinusAlreadyMinted':c_complete[key]-c_already[key],
+            })
+
+          upgrades=[e for e in kat_events+eth_events if e['kind']=='Upgraded']
+          report={
+            'katanaLatest':kat_latest,'ethereumLatest':eth_latest,
+            'katanaRangeErrors':kat_errors,'ethereumRangeErrors':eth_errors,
+            'topics':TOPICS,'upgrades':upgrades,
+            'katanaEvents':kat_events,'ethereumEvents':eth_events,
+            'counts':{
+              'migrationStarted':len(starts),'trackingAdded':len(adds),'trackingRemoved':len(removes),
+              'alreadyMinted':len(already),'primaryCompleted':len(completed),
+              'zeroAddressVbBridges':len(zero_bridges),'zeroAddressProtocolBridges':len(zero_protocol),
+              'zeroAddressNonProtocolBridges':len(zero_non_protocol),'katanaZeroAddressClaims':len(kat_zero_claims),
+            },
+            'zeroAddressProtocolBridges':zero_protocol,
+            'zeroAddressNonProtocolBridges':zero_non_protocol,
+            'katanaZeroAddressClaims':kat_zero_claims,
+            'reconciliation':reconciliation,
+          }
+          Path('evidence/migration-lifecycle.json').write_text(json.dumps(report,indent=2,sort_keys=True))
+          Path('evidence/summary.json').write_text(json.dumps({
+            'katanaLatest':kat_latest,'ethereumLatest':eth_latest,
+            'counts':report['counts'],'reconciliation':reconciliation,
+            'katanaRangeErrorCount':len(kat_errors),'ethereumRangeErrorCount':len(eth_errors),
+            'upgradeCount':len(upgrades),
+          },indent=2,sort_keys=True))
+          print(json.dumps(json.loads(Path('evidence/summary.json').read_text()),indent=2,sort_keys=True))
+          PY
+          python3 /tmp/scan.py | tee evidence/run.log
+          find evidence -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-migration-lifecycle-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 3
