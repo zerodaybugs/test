@@ -1,0 +1,190 @@
+name: Temporary KAT token state-machine gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-kat-token-state.yml'
+      - 'tmp-kat-token-state-trigger.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Reconstruct live KAT state and mint-capacity conservation
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > /tmp/kat_state.py <<'PY'
+          from __future__ import annotations
+          import concurrent.futures, json, subprocess, time, urllib.request
+          from pathlib import Path
+
+          RPC='https://rpc.katana.network/'
+          TOKEN='0x7F1f4b4b29f5058fA32CC7a97141b8D7e5ABDC2d'
+          DEPLOY_TX='0x73e2b7e9e6801a0153c3fb20b7448ead2ebb6999376d3d0b9b19b47da75695de'
+          INITIAL_DISTRIBUTOR='0x92D8Ce89fF02C640daf0B7c23d497cCF1880C390'
+          ZERO='0x0000000000000000000000000000000000000000'
+          STEP=50_000
+          WORKERS=10
+
+          def execute(args):
+            p=subprocess.run(args,text=True,capture_output=True)
+            return {'success':p.returncode==0,'stdout':p.stdout.strip(),'stderr':p.stderr.strip(),'returnCode':p.returncode}
+
+          def call(sig,*args):
+            return execute(['cast','call',TOKEN,sig,*map(str,args),'--rpc-url',RPC])
+
+          def first(result):
+            if not result['success'] or not result['stdout']: return None
+            return result['stdout'].split()[0]
+
+          def number(result):
+            x=first(result)
+            if x is None:return None
+            try:return int(x,16 if x.startswith('0x') else 10)
+            except:return None
+
+          def address(result):
+            x=first(result)
+            return x if x and x.startswith('0x') and len(x)==42 else None
+
+          def post(payload,retries=10):
+            raw=json.dumps(payload).encode(); last=None
+            for i in range(retries):
+              try:
+                req=urllib.request.Request(RPC,data=raw,headers={'content-type':'application/json'})
+                with urllib.request.urlopen(req,timeout=90) as r:return json.loads(r.read())
+              except Exception as e:
+                last=repr(e);time.sleep(min(1.7**i,15))
+            return {'error':{'message':last}}
+
+          def keccak(sig):
+            return subprocess.check_output(['cast','keccak',sig],text=True).strip().lower()
+
+          topics={
+            'Transfer':keccak('Transfer(address,address,uint256)'),
+            'InflationDistributed':keccak('InflationDistributed(address,uint256)'),
+            'InflationChanged':keccak('InflationChanged(uint256,uint256)'),
+            'MintCapacityDistributed':keccak('MintCapacityDistributed(address,address,uint256)'),
+            'RoleChangeStarted':keccak('RoleChangeStarted(address,bytes32)'),
+            'RoleChangeCompleted':keccak('RoleChangeCompleted(address,bytes32)'),
+          }
+
+          receipt=post({'jsonrpc':'2.0','id':1,'method':'eth_getTransactionReceipt','params':[DEPLOY_TX]})['result']
+          start=int(receipt['blockNumber'],16)
+          latest=int(post({'jsonrpc':'2.0','id':2,'method':'eth_blockNumber','params':[]})['result'],16)
+
+          def get_range(a,b):
+            return a,b,post({'jsonrpc':'2.0','id':a,'method':'eth_getLogs','params':[{
+              'fromBlock':hex(a),'toBlock':hex(b),'address':TOKEN,'topics':[[*topics.values()]]
+            }]})
+
+          ranges=[(s,min(s+STEP-1,latest)) for s in range(start,latest+1,STEP)]
+          rows=[]
+          with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            for item in ex.map(lambda x:get_range(*x),ranges):rows.append(item)
+          rows.sort(key=lambda x:x[0]); logs=[]; errors=[]
+          for a,b,response in rows:
+            if response.get('error'):errors.append({'from':a,'to':b,'error':response['error']})
+            else:logs.extend(response.get('result') or [])
+          logs.sort(key=lambda x:(int(x['blockNumber'],16),int(x['transactionIndex'],16),int(x['logIndex'],16)))
+
+          def word(data,index):
+            body=data[2:] if data.startswith('0x') else data
+            return int(body[index*64:(index+1)*64],16)
+          def data_addr(data,index):return '0x'+format(word(data,index),'064x')[-40:]
+          def topic_addr(topic):return '0x'+topic[-40:]
+
+          events=[]; candidates={INITIAL_DISTRIBUTOR.lower()}; mint_txs=[]
+          for log in logs:
+            t=log['topics'][0].lower(); data=log['data']; base={
+              'block':int(log['blockNumber'],16),'tx':log['transactionHash'].lower(),
+              'transactionIndex':int(log['transactionIndex'],16),'logIndex':int(log['logIndex'],16),
+            }
+            if t==topics['Transfer']:
+              frm=topic_addr(log['topics'][1]).lower();to=topic_addr(log['topics'][2]).lower();amount=word(data,0)
+              base.update(kind='Transfer',frm=frm,to=to,amount=amount)
+              if frm==ZERO:mint_txs.append(base['tx'])
+            elif t==topics['InflationDistributed']:
+              receiver=data_addr(data,0).lower();amount=word(data,1);candidates.add(receiver)
+              base.update(kind='InflationDistributed',receiver=receiver,amount=amount)
+            elif t==topics['InflationChanged']:
+              base.update(kind='InflationChanged',oldValue=word(data,0),newValue=word(data,1))
+            elif t==topics['MintCapacityDistributed']:
+              sender=data_addr(data,0).lower();receiver=data_addr(data,1).lower();amount=word(data,2)
+              candidates.update((sender,receiver));base.update(kind='MintCapacityDistributed',sender=sender,receiver=receiver,amount=amount)
+            elif t==topics['RoleChangeStarted']:
+              holder=data_addr(data,0).lower();role='0x'+data[66:130];candidates.add(holder)
+              base.update(kind='RoleChangeStarted',holder=holder,role=role)
+            elif t==topics['RoleChangeCompleted']:
+              holder=data_addr(data,0).lower();role='0x'+data[66:130];candidates.add(holder)
+              base.update(kind='RoleChangeCompleted',holder=holder,role=role)
+            events.append(base)
+
+          role_names=['INFLATION_ADMIN','INFLATION_BENEFICIARY','UNLOCKER','LOCK_EXEMPTION_ADMIN']
+          roles={}
+          for role_name in role_names:
+            role=first(call(f'{role_name}()(bytes32)'))
+            holder=address(call('roleHolder(bytes32)(address)',role)) if role else None
+            pending=address(call('pendingRoleHolder(bytes32)(address)',role)) if role else None
+            if holder:candidates.add(holder.lower())
+            if pending:candidates.add(pending.lower())
+            roles[role_name]={'id':role,'holder':holder,'pending':pending}
+
+          # Fetch transaction senders for every mint tx as an extra capacity-holder negative control.
+          for tx in sorted(set(mint_txs)):
+            result=post({'jsonrpc':'2.0','id':tx,'method':'eth_getTransactionByHash','params':[tx]}).get('result')
+            if result and result.get('from'):candidates.add(result['from'].lower())
+
+          capacities=[];capacity_sum=0
+          for account in sorted(a for a in candidates if a!=ZERO):
+            value=number(call('mintCapacity(address)(uint256)',account))
+            capacities.append({'address':account,'mintCapacity':value})
+            if value is not None:capacity_sum+=value
+
+          state={
+            'block':latest,'deploymentBlock':start,'rangeErrors':errors,
+            'name':call('name()(string)'),'symbol':call('symbol()(string)'),
+            'totalSupply':number(call('totalSupply()(uint256)')),
+            'distributedSupplyCap':number(call('distributedSupplyCap()(uint256)')),
+            'unrealizedCap':number(call('cap()(uint256)')),
+            'lastMintCapacityIncrease':number(call('lastMintCapacityIncrease()(uint256)')),
+            'inflationFactor':number(call('inflationFactor()(uint256)')),
+            'unlockTime':number(call('unlockTime()(uint256)')),
+            'locked':first(call('locked()(bool)')),
+            'isUnlocked':first(call('isUnlocked()(bool)')),
+            'roles':roles,'capacities':capacities,'capacitySum':capacity_sum,
+            'capacityConservationDelta':None,'events':events,
+            'eventCounts':{},
+          }
+          if state['totalSupply'] is not None and state['distributedSupplyCap'] is not None:
+            state['capacityConservationDelta']=state['distributedSupplyCap']-state['totalSupply']-capacity_sum
+          for event in events:state['eventCounts'][event['kind']]=state['eventCounts'].get(event['kind'],0)+1
+
+          Path('evidence/kat-state.json').write_text(json.dumps(state,indent=2,sort_keys=True))
+          summary={k:state[k] for k in ('block','deploymentBlock','totalSupply','distributedSupplyCap','unrealizedCap','lastMintCapacityIncrease','inflationFactor','unlockTime','locked','isUnlocked','capacitySum','capacityConservationDelta','eventCounts')}
+          summary['roles']=roles;summary['nonzeroCapacities']=[x for x in capacities if x['mintCapacity']]
+          Path('evidence/summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True))
+          print(json.dumps(summary,indent=2,sort_keys=True))
+          PY
+          python3 /tmp/kat_state.py | tee evidence/run.log
+          find evidence -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: kat-token-state-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 3
