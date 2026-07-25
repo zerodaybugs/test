@@ -1,0 +1,370 @@
+name: veda-owner-callgraph-fast
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Resolve authority owners and Safe module graph
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import time
+          import urllib.request
+
+          CHAINS = {
+              "ethereum": {
+                  "id": 1,
+                  "rpcs": ["https://ethereum-rpc.publicnode.com", "https://eth.llamarpc.com"],
+                  "authorities": {
+                      "liquidBTC": "0x49f954c67ff235034b69b8a59fbe309a40256c8d",
+                      "liquidETH": "0x485bde66bb668a51f2372e34e45b1c6226798122",
+                      "liquidUSD": "0xaba6ba1e95e0926a6a6b917fe4e2f19ceae4ff2e",
+                  },
+              },
+              "scroll": {
+                  "id": 534352,
+                  "rpcs": ["https://scroll-rpc.publicnode.com", "https://rpc.scroll.io", "https://scroll.drpc.org"],
+                  "authorities": {
+                      "liquidBTC": "0x49f954c67ff235034b69b8a59fbe309a40256c8d",
+                      "liquidETH": "0x485bde66bb668a51f2372e34e45b1c6226798122",
+                      "liquidUSD": "0xaba6ba1e95e0926a6a6b917fe4e2f19ceae4ff2e",
+                  },
+              },
+              "ink": {
+                  "id": 57073,
+                  "rpcs": ["https://rpc-gel.inkonchain.com", "https://rpc-qnd.inkonchain.com", "https://ink.drpc.org"],
+                  "authorities": {
+                      "balanced": "0x3e8b0ee1d05267fe9f8d2b1f8cb48f2e23d69c6b",
+                      "boosted": "0x1f53135155d6ff516bccfdd9424fcdb8ad1efb77",
+                  },
+                  "legacy_owners": ["0x5f2f11ad8656439d5c14d9b351f8b09cdac2a02d"],
+              },
+          }
+          TEST = "0x1111111111111111111111111111111111111111"
+          ZERO = "0x0000000000000000000000000000000000000000"
+          SENTINEL = "0x0000000000000000000000000000000000000001"
+
+          def sig(signature):
+              return subprocess.check_output(["cast", "sig", signature], text=True).strip()
+
+          S = {
+              name: sig(signature)
+              for name, signature in {
+                  "owner": "owner()",
+                  "authority": "authority()",
+                  "pendingOwner": "pendingOwner()",
+                  "getOwners": "getOwners()",
+                  "getThreshold": "getThreshold()",
+                  "threshold": "threshold()",
+                  "getModulesPaginated": "getModulesPaginated(address,uint256)",
+                  "getGuard": "getGuard()",
+                  "getFallbackHandler": "getFallbackHandler()",
+                  "getMinDelay": "getMinDelay()",
+                  "hasRole": "hasRole(bytes32,address)",
+                  "isDeployer": "isDeployer(address)",
+                  "execTransaction": "execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)",
+                  "execute": "execute(address,uint256,bytes,bytes32,bytes32)",
+                  "executeBatch": "executeBatch(address[],uint256[],bytes[],bytes32,bytes32)",
+                  "schedule": "schedule(address,uint256,bytes,bytes32,bytes32,uint256)",
+                  "scheduleBatch": "scheduleBatch(address[],uint256[],bytes[],bytes32,bytes32,uint256)",
+                  "multicall": "multicall(bytes[])",
+                  "bundle": "bundle(address[],bytes[],uint256[])",
+                  "manage": "manage(address,bytes,uint256)",
+                  "setPublicCapability": "setPublicCapability(address,bytes4,bool)",
+                  "setRoleCapability": "setRoleCapability(uint8,address,bytes4,bool)",
+                  "setUserRole": "setUserRole(address,uint8,bool)",
+              }.items()
+          }
+
+          def keccak(text):
+              return subprocess.check_output(["cast", "keccak", text], text=True).strip()
+
+          ROLE_IDS = {
+              "DEFAULT_ADMIN_ROLE": "0x" + "00" * 32,
+              "PROPOSER_ROLE": keccak("PROPOSER_ROLE"),
+              "EXECUTOR_ROLE": keccak("EXECUTOR_ROLE"),
+              "CANCELLER_ROLE": keccak("CANCELLER_ROLE"),
+          }
+
+          def request(endpoint, method, params, timeout=20):
+              body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+              req = urllib.request.Request(
+                  endpoint,
+                  data=body,
+                  method="POST",
+                  headers={"content-type": "application/json", "user-agent": "veda-owner-callgraph-fast/1.0"},
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as response:
+                  result = json.loads(response.read().decode())
+              if "error" in result:
+                  raise RuntimeError(result["error"])
+              return result["result"]
+
+          def choose_rpc(config):
+              failures = {}
+              for endpoint in config["rpcs"]:
+                  try:
+                      if int(request(endpoint, "eth_chainId", []), 16) == config["id"]:
+                          return endpoint, failures
+                  except Exception as exc:
+                      failures[endpoint] = repr(exc)
+              raise RuntimeError(failures)
+
+          def strip0(value):
+              return value[2:] if str(value).startswith("0x") else str(value)
+
+          def address_word(value):
+              return strip0(value).lower().rjust(64, "0")
+
+          def uint_word(value):
+              return hex(value)[2:].rjust(64, "0")
+
+          def decode_address(raw):
+              return None if not raw or raw == "0x" else "0x" + strip0(raw)[-40:]
+
+          def decode_uint(raw):
+              return None if not raw or raw == "0x" else int(raw, 16)
+
+          def decode_address_array(raw):
+              if not raw or raw == "0x":
+                  return []
+              value = strip0(raw)
+              try:
+                  offset = int(value[:64], 16) * 2
+                  length = int(value[offset:offset + 64], 16)
+                  return [
+                      "0x" + value[offset + 64 + index * 64:offset + 64 + (index + 1) * 64][-40:]
+                      for index in range(length)
+                  ]
+              except Exception:
+                  return []
+
+          def decode_modules_page(raw):
+              if not raw or raw == "0x":
+                  return {"modules": [], "next": None}
+              value = strip0(raw)
+              try:
+                  array_offset = int(value[:64], 16) * 2
+                  next_address = "0x" + value[64:128][-40:]
+                  length = int(value[array_offset:array_offset + 64], 16)
+                  modules = [
+                      "0x" + value[array_offset + 64 + index * 64:array_offset + 64 + (index + 1) * 64][-40:]
+                      for index in range(length)
+                  ]
+                  return {"modules": modules, "next": next_address}
+              except Exception as exc:
+                  return {"modules": [], "next": None, "decode_error": repr(exc), "raw": raw}
+
+          def push4(code):
+              value = strip0(code)
+              result = set()
+              index = 0
+              while index + 10 <= len(value):
+                  if value[index:index + 2].lower() == "63":
+                      result.add("0x" + value[index + 2:index + 10].lower())
+                      index += 10
+                  else:
+                      index += 2
+              return sorted(result)
+
+          def call(endpoint, target, data):
+              return request(endpoint, "eth_call", [{"to": target, "data": data}, "latest"])
+
+          def probe_node(endpoint, address):
+              code = request(endpoint, "eth_getCode", [address, "latest"])
+              selectors = push4(code)
+              node = {
+                  "address": address.lower(),
+                  "code_bytes": len(strip0(code)) // 2,
+                  "push4": selectors,
+                  "probes": {},
+                  "roles": {},
+                  "arbitrary_call_surface": {
+                      name: selector.lower() in selectors
+                      for name, selector in S.items()
+                      if name in {
+                          "execTransaction", "execute", "executeBatch", "schedule", "scheduleBatch",
+                          "multicall", "bundle", "manage", "setPublicCapability", "setRoleCapability", "setUserRole"
+                      }
+                  },
+              }
+              if node["code_bytes"] == 0:
+                  return node
+              for name in ("owner", "authority", "pendingOwner", "getGuard", "getFallbackHandler"):
+                  try:
+                      node["probes"][name] = decode_address(call(endpoint, address, S[name]))
+                  except Exception as exc:
+                      node["probes"][name] = {"error": repr(exc)}
+              for name in ("getThreshold", "threshold", "getMinDelay"):
+                  try:
+                      node["probes"][name] = decode_uint(call(endpoint, address, S[name]))
+                  except Exception as exc:
+                      node["probes"][name] = {"error": repr(exc)}
+              try:
+                  node["probes"]["getOwners"] = decode_address_array(call(endpoint, address, S["getOwners"]))
+              except Exception as exc:
+                  node["probes"]["getOwners"] = {"error": repr(exc)}
+              try:
+                  raw = call(
+                      endpoint,
+                      address,
+                      S["getModulesPaginated"] + address_word(SENTINEL) + uint_word(100),
+                  )
+                  node["probes"]["modules"] = decode_modules_page(raw)
+              except Exception as exc:
+                  node["probes"]["modules"] = {"error": repr(exc)}
+              try:
+                  node["probes"]["isDeployer_attacker"] = bool(
+                      decode_uint(call(endpoint, address, S["isDeployer"] + address_word(TEST)))
+                  )
+              except Exception as exc:
+                  node["probes"]["isDeployer_attacker"] = {"error": repr(exc)}
+              for role_name, role_id in ROLE_IDS.items():
+                  role = {}
+                  for subject_name, subject in (("attacker", TEST), ("zero", ZERO)):
+                      try:
+                          role[subject_name] = bool(
+                              decode_uint(call(
+                                  endpoint,
+                                  address,
+                                  S["hasRole"] + strip0(role_id).rjust(64, "0") + address_word(subject),
+                              ))
+                          )
+                      except Exception as exc:
+                          role[subject_name] = {"error": repr(exc)}
+                  node["roles"][role_name] = role
+              return node
+
+          output = {
+              "generated_at_unix": int(time.time()),
+              "selectors": S,
+              "role_ids": ROLE_IDS,
+              "chains": {},
+              "candidate_open_paths": [],
+          }
+
+          for chain_name, config in CHAINS.items():
+              endpoint, rpc_failures = choose_rpc(config)
+              chain = {
+                  "endpoint": endpoint,
+                  "rpc_failures": rpc_failures,
+                  "block": int(request(endpoint, "eth_blockNumber", []), 16),
+                  "authorities": {},
+                  "nodes": {},
+              }
+              roots = []
+              for label, authority in config["authorities"].items():
+                  authority_node = probe_node(endpoint, authority)
+                  owner = authority_node["probes"].get("owner")
+                  parent = authority_node["probes"].get("authority")
+                  chain["authorities"][label] = {
+                      "address": authority.lower(),
+                      "owner": owner,
+                      "parent_authority": parent,
+                      "code_bytes": authority_node["code_bytes"],
+                  }
+                  chain["nodes"][authority.lower()] = authority_node
+                  for candidate in (owner, parent):
+                      if isinstance(candidate, str) and candidate.lower() not in {ZERO, authority.lower()}:
+                          roots.append(candidate.lower())
+              roots.extend(address.lower() for address in config.get("legacy_owners", []))
+
+              queue = [(address, 0) for address in dict.fromkeys(roots)]
+              seen = set(chain["nodes"])
+              while queue:
+                  address, depth = queue.pop(0)
+                  if address in seen or address == ZERO or depth > 2:
+                      continue
+                  seen.add(address)
+                  node = probe_node(endpoint, address)
+                  chain["nodes"][address] = node
+                  next_nodes = []
+                  for key in ("owner", "authority", "pendingOwner"):
+                      value = node["probes"].get(key)
+                      if isinstance(value, str):
+                          next_nodes.append(value.lower())
+                  owners = node["probes"].get("getOwners")
+                  if isinstance(owners, list):
+                      next_nodes.extend(value.lower() for value in owners)
+                  modules = node["probes"].get("modules", {}).get("modules") if isinstance(node["probes"].get("modules"), dict) else []
+                  if isinstance(modules, list):
+                      next_nodes.extend(value.lower() for value in modules)
+                  for next_address in dict.fromkeys(next_nodes):
+                      if next_address not in {ZERO, SENTINEL} and next_address not in seen:
+                          queue.append((next_address, depth + 1))
+
+              for address, node in chain["nodes"].items():
+                  open_executor = node["roles"].get("EXECUTOR_ROLE", {}).get("zero") is True
+                  attacker_role = any(
+                      role.get("attacker") is True for role in node.get("roles", {}).values()
+                  )
+                  attacker_deployer = node["probes"].get("isDeployer_attacker") is True
+                  arbitrary = any(node["arbitrary_call_surface"].values())
+                  modules = node["probes"].get("modules", {}).get("modules") if isinstance(node["probes"].get("modules"), dict) else []
+                  threshold = node["probes"].get("getThreshold")
+                  owners = node["probes"].get("getOwners")
+                  if (open_executor or attacker_role or attacker_deployer) and arbitrary:
+                      output["candidate_open_paths"].append({
+                          "chain": chain_name,
+                          "address": address,
+                          "open_executor": open_executor,
+                          "attacker_role": attacker_role,
+                          "attacker_deployer": attacker_deployer,
+                          "arbitrary_call_surface": node["arbitrary_call_surface"],
+                      })
+                  if isinstance(modules, list) and modules:
+                      output["candidate_open_paths"].append({
+                          "chain": chain_name,
+                          "address": address,
+                          "type": "SAFE_MODULE_REQUIRES_REVIEW",
+                          "modules": modules,
+                          "threshold": threshold,
+                          "owners": owners,
+                      })
+              output["chains"][chain_name] = chain
+
+          with open("veda-owner-callgraph-fast.json", "w", encoding="utf-8") as handle:
+              json.dump(output, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+
+          print(json.dumps({
+              "blocks": {name: chain["block"] for name, chain in output["chains"].items()},
+              "authorities": {name: chain["authorities"] for name, chain in output["chains"].items()},
+              "nodes": {name: len(chain["nodes"]) for name, chain in output["chains"].items()},
+              "candidates": output["candidate_open_paths"],
+              "safe_summary": {
+                  chain_name: {
+                      address: {
+                          "threshold": node["probes"].get("getThreshold"),
+                          "owners": node["probes"].get("getOwners"),
+                          "modules": node["probes"].get("modules"),
+                          "guard": node["probes"].get("getGuard"),
+                          "fallback_handler": node["probes"].get("getFallbackHandler"),
+                      }
+                      for address, node in chain["nodes"].items()
+                      if isinstance(node["probes"].get("getOwners"), list) and node["probes"].get("getOwners")
+                  }
+                  for chain_name, chain in output["chains"].items()
+              },
+          }, indent=2, sort_keys=True))
+          PY
+      - name: Upload owner graph
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-owner-callgraph-fast
+          path: veda-owner-callgraph-fast.json
+          if-no-files-found: error
+          retention-days: 1
