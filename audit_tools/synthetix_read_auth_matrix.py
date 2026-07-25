@@ -25,6 +25,7 @@ from typing import Any
 
 from eth_account import Account
 from eth_account.messages import encode_typed_data
+from eth_utils import to_checksum_address
 
 OUT = pathlib.Path("read_auth_matrix")
 OUT.mkdir(parents=True, exist_ok=True)
@@ -75,7 +76,6 @@ TYPES = {
     ],
 }
 
-# Minimal action-specific params. Variants intentionally cover naming drift and newer actions.
 CASES: list[tuple[str, dict[str, Any]]] = [
     ("getSubAccount", {}),
     ("getSubAccounts", {}),
@@ -134,12 +134,7 @@ def post_json(url: str, payload: dict[str, Any], timeout: int = 45) -> tuple[int
                 raise ValueError("response too large")
             return response.status, response_body, dict(response.headers.items()), time.monotonic() - started
     except urllib.error.HTTPError as exc:
-        return (
-            exc.code,
-            exc.read(MAX_BODY + 1),
-            dict(exc.headers.items()) if exc.headers else {},
-            time.monotonic() - started,
-        )
+        return exc.code, exc.read(MAX_BODY + 1), dict(exc.headers.items()) if exc.headers else {}, time.monotonic() - started
 
 
 def parse_json(body: bytes) -> Any:
@@ -176,7 +171,7 @@ def rpc(method: str, params: list[Any]) -> Any:
 
 
 def topic_address(topic: str) -> str:
-    return "0x" + topic[-40:]
+    return to_checksum_address("0x" + topic[-40:])
 
 
 def discover_target() -> tuple[str, str, str]:
@@ -236,26 +231,11 @@ def envelope(action: str, target_id: str, extra: dict[str, Any], nonce: int) -> 
             "types": TYPES,
             "primaryType": "SubAccountAction",
             "domain": DOMAIN,
-            "message": {
-                "subAccountId": int(target_id),
-                "action": action,
-                "nonce": nonce,
-                "expiresAfter": expires_after,
-            },
+            "message": {"subAccountId": int(target_id), "action": action, "nonce": nonce, "expiresAfter": expires_after},
         }
     )
-    params = {
-        "action": action,
-        "subaccountId": target_id,
-        "walletAddress": ATTACKER.address,
-        **extra,
-    }
-    return {
-        "signature": format_signature(ATTACKER.sign_message(encoded)),
-        "nonce": nonce,
-        "expiresAfter": expires_after,
-        "params": params,
-    }
+    params = {"action": action, "subaccountId": target_id, "walletAddress": ATTACKER.address, **extra}
+    return {"signature": format_signature(ATTACKER.sign_message(encoded)), "nonce": nonce, "expiresAfter": expires_after, "params": params}
 
 
 def summarize(name: str, status: int, body: bytes, headers: dict[str, str], elapsed: float) -> dict[str, Any]:
@@ -281,9 +261,7 @@ def summarize(name: str, status: int, body: bytes, headers: dict[str, str], elap
         "bodySha256": digest(body),
         "bodyBytes": len(body),
         "rateLimit": parsed.get("rateLimit") if isinstance(parsed, dict) and isinstance(parsed.get("rateLimit"), dict) else None,
-        "requestId": (
-            parsed.get("request_id") if isinstance(parsed, dict) else None
-        ) or headers.get("X-Request-Id") or headers.get("x-request-id"),
+        "requestId": (parsed.get("request_id") if isinstance(parsed, dict) else None) or headers.get("X-Request-Id") or headers.get("x-request-id"),
     }
 
 
@@ -297,7 +275,6 @@ def main() -> None:
         "sourceTransactionSha256": digest(source_tx),
         "tests": [],
     }
-
     status, body, headers, elapsed = post_json(
         PAPI_INFO,
         {"params": {"action": "getSubAccountIds", "walletAddress": ATTACKER.address, "includeDelegations": True}},
@@ -307,7 +284,6 @@ def main() -> None:
     response = parsed.get("response") if isinstance(parsed, dict) else None
     preflight["attackerAccountCount"] = account_count(response)
     evidence["tests"].append(preflight)
-
     if preflight.get("attackerAccountCount") != 0:
         evidence["probeAborted"] = True
         evidence["abortReason"] = "Synthetic attacker was not confirmed to have zero accounts."
@@ -318,20 +294,10 @@ def main() -> None:
             evidence["tests"].append(summarize(action, status, body, headers, elapsed))
             if index + 1 < len(CASES):
                 time.sleep(0.55)
-
     unexpected = [item for item in evidence["tests"] if item.get("success") and item.get("name") != "attacker_preflight"]
-    ownership_failures = [
-        item["name"] for item in evidence["tests"]
-        if re.search(r"ownership|not authorized|permission", str(item.get("errorMessageRedacted") or ""), re.I)
-    ]
-    unsupported = [
-        item["name"] for item in evidence["tests"]
-        if re.search(r"unknown action|unsupported type|invalid request type", str(item.get("errorMessageRedacted") or ""), re.I)
-    ]
-    validation_failures = [
-        item["name"] for item in evidence["tests"]
-        if item.get("httpStatus") == 400 or item.get("errorCode") in ("VALIDATION_ERROR", "INVALID_FORMAT")
-    ]
+    ownership_failures = [item["name"] for item in evidence["tests"] if re.search(r"ownership|not authorized|permission", str(item.get("errorMessageRedacted") or ""), re.I)]
+    unsupported = [item["name"] for item in evidence["tests"] if re.search(r"unknown action|unsupported type|invalid request type", str(item.get("errorMessageRedacted") or ""), re.I)]
+    validation_failures = [item["name"] for item in evidence["tests"] if item.get("httpStatus") == 400 or item.get("errorCode") in ("VALIDATION_ERROR", "INVALID_FORMAT")]
     evidence["summary"] = {
         "testCount": len(evidence["tests"]),
         "probeAborted": bool(evidence.get("probeAborted")),
@@ -340,10 +306,7 @@ def main() -> None:
         "ownershipFailureActions": ownership_failures,
         "unsupportedActions": unsupported,
         "validationFailureActions": validation_failures,
-        "caseMatrix": [
-            {key: item.get(key) for key in ("name", "httpStatus", "apiStatus", "success", "errorCode", "errorMessageRedacted", "responseSchema", "rateLimit", "bodySha256")}
-            for item in evidence["tests"]
-        ],
+        "caseMatrix": [{key: item.get(key) for key in ("name", "httpStatus", "apiStatus", "success", "errorCode", "errorMessageRedacted", "responseSchema", "rateLimit", "bodySha256")} for item in evidence["tests"]],
     }
     (OUT / "evidence.json").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
     (OUT / "summary.json").write_text(json.dumps(evidence["summary"], indent=2), encoding="utf-8")
