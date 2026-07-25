@@ -1,4 +1,4 @@
-name: Hermetica live liability reconstruction
+name: Hermetica current silo liability reconstruction
 
 on:
   pull_request:
@@ -17,242 +17,41 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-
       - name: Install read-only decoder
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/hermetica-live-liabilities
-          cd /tmp/hermetica-live-liabilities
+          mkdir -p /tmp/current-silo && cd /tmp/current-silo
           npm init -y >/dev/null
           npm install --ignore-scripts --no-audit --no-fund @stacks/transactions@7.2.0
-
-      - name: Reconstruct current silo and old OTC liabilities
+      - name: Reconstruct claims
         shell: bash
         run: |
           set -euo pipefail
-          cd /tmp/hermetica-live-liabilities
-          cat > reconstruct.cjs <<'NODE'
-          const fs = require('fs');
-          const {
-            uintCV,
-            stringAsciiCV,
-            cvToHex,
-            hexToCV,
-            cvToJSON,
-          } = require('@stacks/transactions');
-
-          const API = 'https://api.hiro.so';
-          const DEP = 'SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG';
-          const SILO_NAME = 'staking-silo-v1-1';
-          const SILO = `${DEP}.${SILO_NAME}`;
-          const OTC_NAME = 'minting-otc-v1';
-          const OTC = `${DEP}.${OTC_NAME}`;
-          const USDH_KEY = `${DEP}.usdh-token-v1::usdh`;
-
-          async function fetchRetry(url, options = {}, attempts = 9) {
-            let last;
-            for (let i = 0; i < attempts; i++) {
-              try {
-                const res = await fetch(url, options);
-                if (res.ok) return res;
-                const text = await res.text();
-                last = new Error(`${res.status} ${res.statusText}: ${text}`);
-                if (res.status < 500 && res.status !== 429) throw last;
-              } catch (e) { last = e; }
-              await new Promise(r => setTimeout(r, 900 * (i + 1)));
-            }
-            throw last;
-          }
-
-          async function callRead(contractName, fn, args = []) {
-            const res = await fetchRetry(`${API}/v2/contracts/call-read/${DEP}/${contractName}/${fn}`, {
-              method: 'POST',
-              headers: {'content-type':'application/json'},
-              body: JSON.stringify({sender: DEP, arguments: args.map(cvToHex)}),
-            });
-            const body = await res.json();
-            let decoded = null;
-            if (body.result) {
-              try { decoded = cvToJSON(hexToCV(body.result)); }
-              catch (e) { decoded = {decode_error:String(e), raw:body.result}; }
-            }
-            return {okay:body.okay, cause:body.cause, result_raw:body.result, decoded};
-          }
-
-          async function balances(principal) {
-            const res = await fetchRetry(`${API}/extended/v1/address/${encodeURIComponent(principal)}/balances`);
-            return await res.json();
-          }
-
-          async function history(principal, max = 1000) {
-            const all = [];
-            for (let offset = 0; offset < max; offset += 50) {
-              const res = await fetchRetry(`${API}/extended/v1/address/${encodeURIComponent(principal)}/transactions?limit=50&offset=${offset}`);
-              const body = await res.json();
-              const rows = body.results || [];
-              all.push(...rows);
-              if (rows.length < 50 || all.length >= (body.total || max)) break;
-            }
-            return all.slice(0, max);
-          }
-
-          function unwrapCvJson(node) {
-            if (node == null) return null;
-            if (typeof node !== 'object') return node;
-            if (Object.prototype.hasOwnProperty.call(node, 'value')) {
-              const value = node.value;
-              if (value && typeof value === 'object' && !Array.isArray(value)) {
-                const out = {};
-                for (const [k, v] of Object.entries(value)) out[k] = unwrapCvJson(v);
-                return out;
-              }
-              return unwrapCvJson(value);
-            }
-            const out = {};
-            for (const [k, v] of Object.entries(node)) out[k] = unwrapCvJson(v);
-            return out;
-          }
-
-          function successfulResponseValue(row) {
-            if (!row.okay || row.decoded?.success !== true) return null;
-            return unwrapCvJson(row.decoded.value);
-          }
-
-          async function mapBatches(values, batchSize, worker) {
-            const out = [];
-            for (let i = 0; i < values.length; i += batchSize) {
-              const batch = values.slice(i, i + batchSize);
-              out.push(...await Promise.all(batch.map(worker)));
-              await new Promise(r => setTimeout(r, 80));
-            }
-            return out;
-          }
-
-          async function reconstructCurrentSilo() {
-            const currentRow = await callRead(SILO_NAME, 'get-current-claim-id');
-            if (!currentRow.okay || currentRow.decoded?.type !== 'uint') throw new Error(`unexpected current claim id: ${JSON.stringify(currentRow)}`);
-            const currentId = Number(currentRow.decoded.value);
-            const ids = Array.from({length:currentId}, (_, i) => i + 1);
-            const rows = await mapBatches(ids, 15, async id => {
-              const raw = await callRead(SILO_NAME, 'get-claim', [uintCV(id)]);
-              const claim = successfulResponseValue(raw);
-              return {claim_id:id, claim, raw};
-            });
-            const open = rows.filter(x => x.claim !== null);
-            let liability = 0n;
-            for (const row of open) {
-              if (row.claim?.amount == null) throw new Error(`missing amount in claim ${row.claim_id}: ${JSON.stringify(row.claim)}`);
-              liability += BigInt(row.claim.amount);
-            }
-            const bal = await balances(SILO);
-            const balance = BigInt(bal.fungible_tokens?.[USDH_KEY]?.balance || '0');
-            return {
-              current_claim_id:currentId,
-              queried_claim_count:rows.length,
-              open_claim_count:open.length,
-              closed_claim_count:rows.length - open.length,
-              total_open_liability:liability.toString(),
-              silo_usdh_balance:balance.toString(),
-              surplus_or_deficit:(balance - liability).toString(),
-              open_claims:open,
-              balances:bal,
-            };
-          }
-
-          function parseAsciiArg(repr) {
-            const text = String(repr || '').trim();
-            const match = text.match(/^"([\s\S]*)"$/);
-            return match ? match[1] : null;
-          }
-
-          async function reconstructOldOtc() {
-            const txs = await history(OTC, 1000);
-            const requests = new Map();
-            for (const tx of txs) {
-              const call = tx.contract_call || {};
-              if (tx.tx_type !== 'contract_call' || call.contract_id !== OTC || call.function_name !== 'request-redeem' || tx.tx_status !== 'success') continue;
-              const id = parseAsciiArg((call.function_args || [])[0]?.repr);
-              if (!id) continue;
-              requests.set(id, {
-                tx_id:tx.tx_id,
-                time:tx.burn_block_time_iso,
-                height:tx.block_height,
-                sender:tx.sender_address,
-                result:tx.tx_result?.repr,
-                args:Object.fromEntries((call.function_args || []).map((a, i) => [a.name || `arg${i}`, a.repr])),
-              });
-            }
-            const ids = [...requests.keys()].sort();
-            const rows = await mapBatches(ids, 12, async id => {
-              const raw = await callRead(OTC_NAME, 'get-redeem-request', [stringAsciiCV(id)]);
-              const request = successfulResponseValue(raw);
-              return {request_id:id, request, creation:requests.get(id), raw};
-            });
-            const open = rows.filter(x => x.request !== null);
-            let liability = 0n;
-            for (const row of open) {
-              const amount = row.request?.['amount-usdh'];
-              if (amount == null) throw new Error(`missing amount in request ${row.request_id}: ${JSON.stringify(row.request)}`);
-              liability += BigInt(amount);
-            }
-            const bal = await balances(OTC);
-            const balance = BigInt(bal.fungible_tokens?.[USDH_KEY]?.balance || '0');
-            return {
-              address_transaction_count:txs.length,
-              created_request_count:ids.length,
-              queried_request_count:rows.length,
-              open_request_count:open.length,
-              closed_request_count:rows.length - open.length,
-              total_open_liability:liability.toString(),
-              contract_usdh_balance:balance.toString(),
-              surplus_or_deficit:(balance - liability).toString(),
-              open_requests:open,
-              balances:bal,
-            };
-          }
-
-          (async () => {
-            const silo = await reconstructCurrentSilo();
-            fs.writeFileSync('current-silo.json', JSON.stringify(silo, null, 2));
-            console.log(JSON.stringify({current_silo:{current_claim_id:silo.current_claim_id,open_claim_count:silo.open_claim_count,total_open_liability:silo.total_open_liability,silo_usdh_balance:silo.silo_usdh_balance,surplus_or_deficit:silo.surplus_or_deficit}}, null, 2));
-
-            const otc = await reconstructOldOtc();
-            fs.writeFileSync('deprecated-otc.json', JSON.stringify(otc, null, 2));
-            console.log(JSON.stringify({deprecated_otc:{created_request_count:otc.created_request_count,open_request_count:otc.open_request_count,total_open_liability:otc.total_open_liability,contract_usdh_balance:otc.contract_usdh_balance,surplus_or_deficit:otc.surplus_or_deficit}}, null, 2));
-
-            const summary = {
-              current_silo:{
-                current_claim_id:silo.current_claim_id,
-                open_claim_count:silo.open_claim_count,
-                total_open_liability:silo.total_open_liability,
-                silo_usdh_balance:silo.silo_usdh_balance,
-                surplus_or_deficit:silo.surplus_or_deficit,
-                open_claims:silo.open_claims.map(x => ({claim_id:x.claim_id, claim:x.claim})),
-              },
-              deprecated_otc:{
-                created_request_count:otc.created_request_count,
-                open_request_count:otc.open_request_count,
-                total_open_liability:otc.total_open_liability,
-                contract_usdh_balance:otc.contract_usdh_balance,
-                surplus_or_deficit:otc.surplus_or_deficit,
-                open_requests:otc.open_requests.map(x => ({request_id:x.request_id, request:x.request, creation:x.creation})),
-              },
-            };
-            fs.writeFileSync('summary.json', JSON.stringify(summary, null, 2));
-          })().catch(e => { console.error(e); process.exit(1); });
+          cd /tmp/current-silo
+          cat > run.cjs <<'NODE'
+          const fs=require('fs');
+          const {uintCV,cvToHex,hexToCV,cvToJSON}=require('@stacks/transactions');
+          const API='https://api.hiro.so', DEP='SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG';
+          const NAME='staking-silo-v1-1', CID=`${DEP}.${NAME}`, START=1234;
+          async function get(url,opt={},n=8){let e;for(let i=0;i<n;i++){try{const r=await fetch(url,opt);if(r.ok)return r;e=new Error(`${r.status}: ${await r.text()}`);if(r.status<500&&r.status!==429)throw e;}catch(x){e=x}await new Promise(r=>setTimeout(r,800*(i+1)))}throw e}
+          async function read(fn,args=[]){const r=await get(`${API}/v2/contracts/call-read/${DEP}/${NAME}/${fn}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({sender:DEP,arguments:args.map(cvToHex)})});const b=await r.json();let d=null;try{d=b.result?cvToJSON(hexToCV(b.result)):null}catch(e){d={error:String(e)}}return {...b,decoded:d}}
+          async function hist(){const a=[];for(let o=0;o<4000;o+=50){const r=await get(`${API}/extended/v1/address/${encodeURIComponent(CID)}/transactions?limit=50&offset=${o}`),b=await r.json(),x=b.results||[];a.push(...x);if(x.length<50||a.length>=(b.total||4000))break}return a}
+          function unwrap(x){if(x==null||typeof x!=='object')return x;if('value'in x)return unwrap(x.value);const o={};for(const[k,v]of Object.entries(x))o[k]=unwrap(v);return o}
+          function ids(s){return[...String(s||'').matchAll(/u(\d+)/g)].map(m=>+m[1])}
+          function outs(s){return[...String(s||'').matchAll(/\((ok true|err u\d+)\)/g)].map(m=>m[1])}
+          (async()=>{const tx=await hist(),done=new Set();for(const t of tx){const c=t.contract_call||{};if(c.contract_id!==CID||!['withdraw','withdraw-many'].includes(c.function_name)||t.tx_status!=='success')continue;const a=ids((c.function_args||[])[0]?.repr),r=t.tx_result?.repr||'';if(c.function_name==='withdraw'&&/^\(ok true\)$/.test(r.trim()))done.add(a[0]);else{const z=outs(r);a.forEach((id,i)=>{if(z[i]==='ok true')done.add(id)})}}
+          const cur=Number(unwrap((await read('get-current-claim-id')).decoded)),cand=[];for(let i=START+1;i<=cur;i++)if(!done.has(i))cand.push(i);const open=[];for(let i=0;i<cand.length;i++){const id=cand[i],row=await read('get-claim',[uintCV(id)]),v=unwrap(row.decoded);if(row.okay&&row.decoded?.success===true)open.push({id,claim:v});if(i%15===14)await new Promise(r=>setTimeout(r,120))}
+          let liability=0n;for(const x of open)liability+=BigInt(x.claim.amount);const br=await get(`${API}/extended/v1/address/${encodeURIComponent(CID)}/balances`),bal=await br.json(),key=`${DEP}.usdh-token-v1::usdh`,cash=BigInt(bal.fungible_tokens?.[key]?.balance||0);const out={current_claim_id:cur,withdrawn_count:done.size,candidate_count:cand.length,open_claims:open,open_claim_count:open.length,liability:liability.toString(),balance:cash.toString(),surplus_or_deficit:(cash-liability).toString()};fs.writeFileSync('current-silo.json',JSON.stringify(out,null,2));console.log(JSON.stringify(out,null,2))})().catch(e=>{console.error(e);process.exit(1)})
           NODE
-          node reconstruct.cjs
-          sha256sum current-silo.json deprecated-otc.json summary.json > SHA256SUMS
-
+          node run.cjs
+          sha256sum current-silo.json > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
-          name: hermetica-live-liabilities
+          name: hermetica-current-silo-liability
           path: |
-            /tmp/hermetica-live-liabilities/current-silo.json
-            /tmp/hermetica-live-liabilities/deprecated-otc.json
-            /tmp/hermetica-live-liabilities/summary.json
-            /tmp/hermetica-live-liabilities/SHA256SUMS
+            /tmp/current-silo/current-silo.json
+            /tmp/current-silo/SHA256SUMS
           retention-days: 1
           if-no-files-found: error
           compression-level: 0
