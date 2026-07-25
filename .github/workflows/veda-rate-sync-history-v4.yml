@@ -1,0 +1,117 @@
+name: veda-rate-sync-history-v4
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Reconstruct full rate chronology from Blockscout address logs
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import datetime as dt, json, subprocess, time, urllib.parse, urllib.request, traceback
+          INSTANCES={
+            "ethereum":"https://eth.blockscout.com",
+            "optimism":"https://explorer.optimism.io",
+            "scroll":"https://scrollscan.com",
+          }
+          PRODUCTS={"liquidBTC":"0xEa23aC6D7D11f6b181d6B98174D334478ADAe6b0","liquidETH":"0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198","liquidUSD":"0xc315D6e14DDCDC7407784e2Caf815d131Bc1D3E7"}
+          def run(*a):
+            p=subprocess.run([str(x) for x in a],text=True,capture_output=True);return p.stdout.strip()
+          TOPIC=run("cast","keccak","ExchangeRateUpdated(uint96,uint96,uint64)").lower()
+          def get(url,t=60):
+            q=urllib.request.Request(url,headers={"accept":"application/json","user-agent":"veda-rate-history-v4/1.0"})
+            with urllib.request.urlopen(q,timeout=t) as r:return json.loads(r.read().decode())
+          def normalize_topic(x):
+            if isinstance(x,dict):x=x.get("value") or x.get("hex") or x.get("data")
+            return str(x or "").lower()
+          def blocknum(x):
+            if isinstance(x,int):return x
+            s=str(x or "0");return int(s,16) if s.startswith("0x") else int(s)
+          def timestamp(x):
+            if isinstance(x,(int,float)):return int(x)
+            s=str(x or "")
+            if s.isdigit():return int(s)
+            try:return int(dt.datetime.fromisoformat(s.replace("Z","+00:00")).timestamp())
+            except Exception:return 0
+          def words(raw):
+            h=str(raw or "");h=h[2:] if h.startswith("0x") else h
+            return [int(h[i:i+64],16) for i in range(0,len(h),64)] if h and len(h)%64==0 else []
+          def fetch_address_logs(base,address):
+            url=f"{base}/api/v2/addresses/{address}/logs";params={};items=[];pages=0;errors=[];seen=set()
+            while True:
+              full=url+("?"+urllib.parse.urlencode(params,doseq=True) if params else "")
+              try:d=get(full)
+              except Exception as e:errors.append({"url":full,"error":repr(e)});break
+              pages+=1
+              batch=d.get("items") or []
+              for x in batch:
+                key=(x.get("transaction_hash") or x.get("tx_hash"),x.get("index") or x.get("log_index"),x.get("block_number"))
+                if key in seen:continue
+                seen.add(key);items.append(x)
+              nxt=d.get("next_page_params")
+              if not nxt or not batch:break
+              params={k:v for k,v in nxt.items() if v is not None}
+              if pages>=2000:errors.append({"error":"pagination_guard","pages":pages});break
+              time.sleep(.05)
+            return items,pages,errors
+          out={"generated_at_unix":int(time.time()),"topic":TOPIC,"chains":{},"matched_updates":[],"asynchronous_windows":[],"errors":[]}
+          for cname,base in INSTANCES.items():
+            cd={"base":base,"products":{}};out["chains"][cname]=cd
+            for pname,address in PRODUCTS.items():
+              row={"address":address.lower(),"events":[]};cd["products"][pname]=row
+              try:
+                items,pages,errs=fetch_address_logs(base,address);row.update({"raw_item_count":len(items),"pages":pages,"fetch_errors":errs})
+                for x in items:
+                  ts=[normalize_topic(v) for v in (x.get("topics") or [])]
+                  if not ts or ts[0]!=TOPIC:continue
+                  w=words(x.get("data"))
+                  if len(w)<3:continue
+                  row["events"].append({"old_rate":w[0],"new_rate":w[1],"event_time":w[2] or timestamp(x.get("timestamp")),"block":blocknum(x.get("block_number")),"tx":x.get("transaction_hash"),"log_index":blocknum(x.get("index") or x.get("log_index"))})
+                row["events"].sort(key=lambda e:(e["event_time"],e["block"],e["log_index"]));row["event_count"]=len(row["events"])
+              except Exception as e:
+                row["error"]=repr(e);row["traceback"]=traceback.format_exc();out["errors"].append({"chain":cname,"product":pname,"error":repr(e)})
+          for pname in PRODUCTS:
+            histories={c:out["chains"][c]["products"][pname].get("events",[]) for c in INSTANCES};by_rate={}
+            for cname,h in histories.items():
+              for e in h:by_rate.setdefault(e["new_rate"],[]).append({"chain":cname,**e})
+            for rate,events in by_rate.items():
+              chains={e["chain"] for e in events}
+              if len(chains)<2:continue
+              events.sort(key=lambda x:x["event_time"]);m={"product":pname,"new_rate":rate,"chains":sorted(chains),"events":events,"first_time":events[0]["event_time"],"last_time":events[-1]["event_time"],"sync_gap_seconds":events[-1]["event_time"]-events[0]["event_time"],"order":[e["chain"] for e in events]};out["matched_updates"].append(m)
+              first_per={}
+              for e in events:first_per.setdefault(e["chain"],e)
+              for dest,de in first_per.items():
+                t=de["event_time"]
+                for source,h in histories.items():
+                  if source==dest:continue
+                  prev=[e for e in h if e["event_time"]<=t]
+                  if not prev:continue
+                  sr=prev[-1]["new_rate"]
+                  if sr>=rate:continue
+                  nxt=[e for e in h if e["event_time"]>t and e["new_rate"]==rate]
+                  end=nxt[0]["event_time"] if nxt else None
+                  out["asynchronous_windows"].append({"product":pname,"source":source,"destination":dest,"source_stale_rate":sr,"destination_fresh_rate":rate,"start_time":t,"end_time":end,"window_seconds":None if end is None else end-t,"gross_rate_edge_bps":(rate-sr)*10000/sr,"destination_event":de,"source_previous_event":prev[-1]})
+          out["matched_updates"].sort(key=lambda x:(x["product"],x["first_time"]));out["asynchronous_windows"].sort(key=lambda x:(-x["gross_rate_edge_bps"],-(x["window_seconds"] or -1)))
+          out["summary"]={"events":{c:{p:out["chains"][c]["products"][p].get("event_count",0) for p in PRODUCTS} for c in INSTANCES},"raw_items":{c:{p:out["chains"][c]["products"][p].get("raw_item_count",0) for p in PRODUCTS} for c in INSTANCES},"matched_update_count":len(out["matched_updates"]),"async_window_count":len(out["asynchronous_windows"]),"max_edge_bps":max([x["gross_rate_edge_bps"] for x in out["asynchronous_windows"]],default=0),"longest_window_seconds":max([x["window_seconds"] or 0 for x in out["asynchronous_windows"]],default=0)}
+          with open("veda-rate-sync-history-v4.json","w",encoding="utf-8") as f:json.dump(out,f,indent=2,sort_keys=True);f.write("\n")
+          print(json.dumps({"summary":out["summary"],"top_windows":out["asynchronous_windows"][:100],"fetch_state":{c:{p:{k:r.get(k) for k in ("raw_item_count","pages","event_count","fetch_errors","error")} for p,r in d["products"].items()} for c,d in out["chains"].items()},"errors":out["errors"]},indent=2,sort_keys=True))
+          PY
+      - name: Upload indexed rate chronology
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-rate-sync-history-v4
+          path: veda-rate-sync-history-v4.json
+          if-no-files-found: error
+          retention-days: 1
