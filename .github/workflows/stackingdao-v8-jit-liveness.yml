@@ -1,0 +1,278 @@
+name: StackingDAO rewards-v8 JIT liveness
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/stackingdao-v8-jit-liveness.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stackingdao-v8-jit-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout workflow
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Query public mainnet state read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cd evidence
+          npm init -y >/dev/null 2>&1
+          npm install --no-save --package-lock=false @stacks/transactions@6.17.0 >/dev/null 2>&1
+
+          cat > query.mjs <<'NODE'
+          import {
+            contractPrincipalCV,
+            cvToHex,
+            cvToString,
+            hexToCV,
+            uintCV,
+          } from '@stacks/transactions';
+          import { writeFile } from 'node:fs/promises';
+
+          const owner = 'SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG';
+          const api = 'https://api.mainnet.hiro.so';
+          const ids = {
+            dao: `${owner}.dao`,
+            rewards: `${owner}.rewards-v8`,
+            reserve: `${owner}.reserve-v1`,
+            data: `${owner}.data-core-v3`,
+            swap: `${owner}.swap-ststx-ststxbtc-v2`,
+            ststx: `${owner}.ststx-token`,
+            ststxbtc1: `${owner}.ststxbtc-token`,
+            ststxbtc2: `${owner}.ststxbtc-token-v2`,
+          };
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+          async function fetchJson(url, options = {}, attempts = 8) {
+            let last;
+            for (let attempt = 1; attempt <= attempts; attempt += 1) {
+              try {
+                const response = await fetch(url, options);
+                const text = await response.text();
+                if (!response.ok) {
+                  const retryAfter = Number(response.headers.get('retry-after') ?? 0);
+                  if ((response.status === 429 || response.status >= 500) && attempt < attempts) {
+                    await sleep(Math.max(retryAfter * 1000, attempt * 1500));
+                    continue;
+                  }
+                  throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 600)}`);
+                }
+                return JSON.parse(text);
+              } catch (error) {
+                last = error;
+                if (attempt < attempts) await sleep(attempt * 1500);
+              }
+            }
+            throw last;
+          }
+
+          function splitContract(id) {
+            const dot = id.indexOf('.');
+            return [id.slice(0, dot), id.slice(dot + 1)];
+          }
+
+          async function callRead(contractId, fn, args = []) {
+            const [address, name] = splitContract(contractId);
+            const body = JSON.stringify({ sender: owner, arguments: args.map(cvToHex) });
+            const json = await fetchJson(
+              `${api}/v2/contracts/call-read/${address}/${name}/${fn}`,
+              { method: 'POST', headers: { 'content-type': 'application/json' }, body },
+            );
+            return {
+              okay: Boolean(json.okay),
+              decoded: json.result ? cvToString(hexToCV(json.result)) : null,
+              raw: json,
+            };
+          }
+
+          function uintField(decoded, field) {
+            const match = String(decoded ?? '').match(new RegExp(`\\(${field} u(\\d+)\\)`));
+            return match ? BigInt(match[1]) : null;
+          }
+
+          function topUint(decoded) {
+            const match = String(decoded ?? '').match(/^(?:\(ok )?u(\d+)\)?$/);
+            return match ? BigInt(match[1]) : null;
+          }
+
+          async function fetchTransactions(principal) {
+            const rows = [];
+            const limit = 50;
+            let offset = 0;
+            let total = Infinity;
+            while (offset < total) {
+              const page = await fetchJson(
+                `${api}/extended/v2/addresses/${principal}/transactions?limit=${limit}&offset=${offset}`,
+              );
+              const pageRows = page.results ?? [];
+              rows.push(...pageRows);
+              total = Number(page.total ?? rows.length);
+              if (pageRows.length === 0) break;
+              offset += pageRows.length;
+              await sleep(180);
+            }
+            return { rows, total };
+          }
+
+          function core(row) { return row.tx ?? row; }
+          function call(row) { return core(row).contract_call ?? row.contract_call ?? null; }
+          function status(row) { return core(row).tx_status ?? row.tx_status ?? null; }
+          function txid(row) { return core(row).tx_id ?? row.tx_id ?? null; }
+          function time(row) {
+            const tx = core(row);
+            return tx.burn_block_time_iso ?? tx.block_time_iso ?? row.burn_block_time_iso ?? row.block_time_iso ?? null;
+          }
+          function height(row) { return core(row).block_height ?? row.block_height ?? null; }
+          function result(row) { return core(row).tx_result?.repr ?? row.tx_result?.repr ?? null; }
+
+          const info = await fetchJson(`${api}/v2/info`);
+          const cycleCall = await callRead(ids.rewards, 'get-pox-cycle');
+          const currentCycle = Number(String(cycleCall.decoded).match(/u(\d+)/)?.[1]);
+          if (!Number.isSafeInteger(currentCycle)) throw new Error(`bad cycle ${cycleCall.decoded}`);
+
+          const active = {};
+          for (const [key, id] of Object.entries(ids)) {
+            if (key === 'dao') continue;
+            const [address, name] = splitContract(id);
+            active[key] = await callRead(ids.dao, 'get-contract-active', [contractPrincipalCV(address, name)]);
+          }
+
+          const state = {
+            chain: {
+              stacks_tip_height: info.stacks_tip_height,
+              burn_block_height: info.burn_block_height,
+              server_version: info.server_version,
+            },
+            current_cycle: currentCycle,
+            interval_length: await callRead(ids.rewards, 'get-rewards-interval-length'),
+            active,
+            reserve_total: await callRead(ids.reserve, 'get-total-stx'),
+            reserve_balance: await callRead(ids.reserve, 'get-stx-balance'),
+            reserve_stacking: await callRead(ids.reserve, 'get-stx-stacking'),
+            reserve_withdrawals: await callRead(ids.reserve, 'get-stx-for-withdrawals'),
+            ststx_supply: await callRead(ids.ststx, 'get-total-supply'),
+            ststxbtc_v1_supply: await callRead(ids.ststxbtc1, 'get-total-supply'),
+            ststxbtc_v2_supply: await callRead(ids.ststxbtc2, 'get-total-supply'),
+            rate: await callRead(ids.data, 'get-stx-per-ststx', [contractPrincipalCV(owner, 'reserve-v1')]),
+            rewards_account: await fetchJson(`${api}/extended/v1/address/${ids.rewards}/stx`),
+            cycles: [],
+          };
+
+          for (let cycle = Math.max(0, currentCycle - 3); cycle <= currentCycle; cycle += 1) {
+            const stx = await callRead(ids.rewards, 'get-cycle-rewards-ststx', [uintCV(cycle)]);
+            const sbtc = await callRead(ids.rewards, 'get-cycle-rewards-ststxbtc', [uintCV(cycle)]);
+            const should = await callRead(ids.rewards, 'should-process-rewards', [uintCV(cycle)]);
+            state.cycles.push({
+              cycle,
+              stx,
+              sbtc,
+              should,
+              parsed: {
+                total_stx: uintField(stx.decoded, 'total-stx')?.toString() ?? null,
+                commission_stx: uintField(stx.decoded, 'commission-stx')?.toString() ?? null,
+                protocol_stx: uintField(stx.decoded, 'protocol-stx')?.toString() ?? null,
+                processed_commission_stx: uintField(stx.decoded, 'processed-commission-stx')?.toString() ?? null,
+                processed_protocol_stx: uintField(stx.decoded, 'processed-protocol-stx')?.toString() ?? null,
+                total_intervals: uintField(should.decoded, 'total-intervals')?.toString() ?? null,
+                past_intervals: uintField(should.decoded, 'past-intervals')?.toString() ?? null,
+                processable_commission_stx: uintField(should.decoded, 'commission-stx')?.toString() ?? null,
+                processable_protocol_stx: uintField(should.decoded, 'protocol-stx')?.toString() ?? null,
+              },
+            });
+            await sleep(100);
+          }
+
+          const txPage = await fetchTransactions(ids.rewards);
+          const direct = [];
+          for (const row of txPage.rows) {
+            const c = call(row);
+            if (!c || c.contract_id !== ids.rewards) continue;
+            direct.push({
+              tx_id: txid(row),
+              status: status(row),
+              block_height: height(row),
+              block_time_iso: time(row),
+              sender: core(row).sender_address ?? null,
+              function_name: c.function_name,
+              args: (c.function_args ?? []).map(arg => arg.repr ?? arg.hex ?? ''),
+              result_repr: result(row),
+            });
+          }
+          const successful = direct.filter(row => row.status === 'success');
+          const latest = {};
+          for (const row of successful) {
+            if (!latest[row.function_name]) latest[row.function_name] = row;
+          }
+
+          const processableCycles = state.cycles.filter(item =>
+            BigInt(item.parsed.processable_protocol_stx ?? '0') > 0n ||
+            BigInt(item.parsed.processable_commission_stx ?? '0') > 0n
+          );
+          const summary = {
+            captured_at: new Date().toISOString(),
+            current_cycle: currentCycle,
+            burn_block_height: info.burn_block_height,
+            ststx_supply: topUint(state.ststx_supply.decoded)?.toString() ?? null,
+            ststxbtc_v1_supply: topUint(state.ststxbtc_v1_supply.decoded)?.toString() ?? null,
+            ststxbtc_v2_supply: topUint(state.ststxbtc_v2_supply.decoded)?.toString() ?? null,
+            stx_per_ststx: topUint(state.rate.decoded)?.toString() ?? null,
+            reserve_total: topUint(state.reserve_total.decoded)?.toString() ?? null,
+            rewards_stx_balance: state.rewards_account.balance ?? null,
+            processable_cycles: processableCycles.length,
+            total_processable_protocol_stx: processableCycles.reduce((sum, item) => sum + BigInt(item.parsed.processable_protocol_stx ?? '0'), 0n).toString(),
+            total_processable_commission_stx: processableCycles.reduce((sum, item) => sum + BigInt(item.parsed.processable_commission_stx ?? '0'), 0n).toString(),
+            latest_successful: latest,
+          };
+
+          const output = { ids, summary, state, direct_calls: direct };
+          await writeFile('snapshot.json', `${JSON.stringify(output, null, 2)}\n`);
+          const lines = [
+            ...Object.entries(summary).filter(([key]) => key !== 'latest_successful').map(([key, value]) => `${key}=${value}`),
+            ...Object.entries(active).map(([key, value]) => `active_${key}=${value.decoded}`),
+            ...state.cycles.map(item =>
+              `cycle_${item.cycle}=total_stx:${item.parsed.total_stx},protocol_stx:${item.parsed.protocol_stx},processed_protocol_stx:${item.parsed.processed_protocol_stx},past:${item.parsed.past_intervals}/${item.parsed.total_intervals},processable_protocol_stx:${item.parsed.processable_protocol_stx},processable_commission_stx:${item.parsed.processable_commission_stx}`
+            ),
+            ...Object.entries(latest).map(([fn, row]) => `latest_${fn}=${row.block_time_iso} ${row.block_height} ${row.tx_id} result=${row.result_repr} args=${row.args.join(' | ')}`),
+          ];
+          await writeFile('snapshot.txt', `${lines.join('\n')}\n`);
+          console.log(lines.join('\n'));
+          NODE
+
+          node query.mjs
+          sha256sum snapshot.json snapshot.txt query.mjs > SHA256SUMS
+
+      - name: Upload read-only liveness evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackingdao-v8-jit-liveness-${{ github.run_id }}
+          path: |
+            evidence/snapshot.json
+            evidence/snapshot.txt
+            evidence/query.mjs
+            evidence/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Enforce evidence integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s evidence/snapshot.json
+          test -s evidence/snapshot.txt
+          (cd evidence && sha256sum -c SHA256SUMS)
+          grep -F 'current_cycle=' evidence/snapshot.txt
+          grep -F 'total_processable_protocol_stx=' evidence/snapshot.txt
