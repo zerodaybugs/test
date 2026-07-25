@@ -1,0 +1,210 @@
+name: Hermetica USDh public role map
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-usdh-role-map.yml'
+      - 'public-data/hermetica-usdh-role-map-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout research branch
+        uses: actions/checkout@v4
+        with:
+          ref: hermetica-usdh-public-state-20260725
+          fetch-depth: 0
+
+      - name: Fetch and reconstruct public maps
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/hermetica-role-map
+          cd /tmp/hermetica-role-map
+          cat > map.py <<'PY'
+          import json, re, time, urllib.parse, urllib.request
+          from pathlib import Path
+
+          API='https://api.hiro.so'
+          DEP='SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG'
+          contracts={
+            'hq':f'{DEP}.hq-v1',
+            'minting_auto_state':f'{DEP}.minting-auto-state-v1',
+            'minting_auto_v12':f'{DEP}.minting-auto-v1-2',
+            'minting_auto_v11':f'{DEP}.minting-auto-v1-1',
+            'minting':f'{DEP}.minting-v1',
+            'minting_state':f'{DEP}.minting-state-v1',
+            'redeeming_reserve':f'{DEP}.redeeming-reserve-v1-2',
+          }
+
+          def get_json(url, tries=8):
+            last=None
+            for i in range(tries):
+              try:
+                req=urllib.request.Request(url, headers={'accept':'application/json','user-agent':'public-security-research/1.0'})
+                with urllib.request.urlopen(req, timeout=60) as r:
+                  return json.load(r)
+              except Exception as e:
+                last=e; time.sleep(0.8*(i+1))
+            raise last
+
+          def transactions(cid, maxn=5000):
+            out=[]
+            for offset in range(0,maxn,50):
+              url=f'{API}/extended/v1/address/{urllib.parse.quote(cid,safe="")}/transactions?limit=50&offset={offset}'
+              body=get_json(url)
+              rows=body.get('results',[])
+              for tx in rows:
+                cc=tx.get('contract_call') or {}
+                if tx.get('tx_type')!='contract_call' or cc.get('contract_id')!=cid: continue
+                out.append({
+                  'tx_id':tx.get('tx_id'), 'status':tx.get('tx_status'),
+                  'sender':tx.get('sender_address'), 'block_height':tx.get('block_height'),
+                  'burn_block_time_iso':tx.get('burn_block_time_iso'),
+                  'function':cc.get('function_name'),
+                  'args':[{'name':a.get('name'),'repr':a.get('repr'),'type':a.get('type')} for a in cc.get('function_args',[])],
+                  'result':(tx.get('tx_result') or {}).get('repr')
+                })
+              if len(rows)<50 or offset+len(rows)>=body.get('total',maxn): break
+            return sorted(out,key=lambda x:(x.get('block_height') or 0,x.get('tx_id') or ''))
+
+          def principal(rep):
+            if not isinstance(rep,str): return None
+            m=re.fullmatch(r"'?((?:SP|SM)[0-9A-HJKMNP-TV-Z]{20,50}(?:\.[a-zA-Z0-9-]{1,40})?)",rep.strip())
+            return m.group(1) if m else None
+
+          def boolval(rep):
+            return True if rep=='true' else False if rep=='false' else None
+
+          def uintval(rep):
+            m=re.fullmatch(r'u([0-9]+)',rep or '')
+            return int(m.group(1)) if m else None
+
+          history={k:transactions(v) for k,v in contracts.items()}
+          state={
+            'hq':{'contracts_enabled':None,'minting_enabled':None,'active_contracts':{},'minting_contracts':{}},
+            'minting_auto_state':{'whitelist':{},'supported_assets':{},'mint_fee':None,'redeem_fee':None,'fee_address':None},
+            'minting_auto_v12':{'mint_limit':None,'reset_window':None},
+            'minting_auto_v11':{'mint_limit':None,'reset_window':None},
+            'minting_state':{'mint_enabled':None,'redeem_enabled':None,'whitelist_enabled':None,'gatekeepers':{},'whitelist':{},'supported_assets':{}},
+            'redeeming_reserve':{'managers':{},'authorized_recipients':{}},
+          }
+
+          for tx in history['hq']:
+            if tx['status']!='success': continue
+            fn=tx['function']; args=tx['args']
+            vals=[a['repr'] for a in args]
+            if fn=='set-contracts-enabled' and vals: state['hq']['contracts_enabled']=boolval(vals[0])
+            elif fn=='set-minting-enabled' and vals: state['hq']['minting_enabled']=boolval(vals[0])
+            elif fn=='set-contract-active' and len(vals)>=2:
+              p=principal(vals[0]); b=boolval(vals[1]);
+              if p: state['hq']['active_contracts'][p]=b
+            elif fn in ('set-minting-contract','set-minting-contract-active') and len(vals)>=2:
+              p=principal(vals[0]); b=boolval(vals[1]);
+              if p: state['hq']['minting_contracts'][p]=b
+
+          for tx in history['minting_auto_state']:
+            if tx['status']!='success': continue
+            fn=tx['function']; vals=[a['repr'] for a in tx['args']]
+            if fn=='set-whitelist' and len(vals)>=7:
+              addr,asset=principal(vals[0]),principal(vals[1])
+              if addr and asset:
+                state['minting_auto_state']['whitelist'][f'{addr}|{asset}']={
+                  'address':addr,'asset':asset,'minter':boolval(vals[2]),'redeemer':boolval(vals[3]),
+                  'block_delay':uintval(vals[4]),'price_slippage':uintval(vals[5]),'custody_address':principal(vals[6]),
+                  'tx_id':tx['tx_id'],'block_height':tx['block_height']}
+            elif fn=='set-supported-asset' and len(vals)>=4:
+              asset=principal(vals[0])
+              if asset:
+                state['minting_auto_state']['supported_assets'][asset]={
+                  'active':boolval(vals[1]),'price_feed_id':vals[2], 'conf_tolerance_bps':uintval(vals[3]),
+                  'tx_id':tx['tx_id'],'block_height':tx['block_height']}
+            elif fn=='set-mint-fee' and vals: state['minting_auto_state']['mint_fee']=uintval(vals[0])
+            elif fn=='set-redeem-fee' and vals: state['minting_auto_state']['redeem_fee']=uintval(vals[0])
+            elif fn=='set-fee-address' and vals: state['minting_auto_state']['fee_address']=principal(vals[0])
+
+          for key in ('minting_auto_v12','minting_auto_v11'):
+            for tx in history[key]:
+              if tx['status']!='success': continue
+              vals=[a['repr'] for a in tx['args']]
+              if tx['function']=='set-mint-limit' and vals: state[key]['mint_limit']=uintval(vals[0])
+              if tx['function']=='set-mint-limit-reset-window' and vals: state[key]['reset_window']=uintval(vals[0])
+
+          for tx in history['minting_state']:
+            if tx['status']!='success': continue
+            fn=tx['function']; vals=[a['repr'] for a in tx['args']]
+            if fn=='set-mint-enabled' and vals: state['minting_state']['mint_enabled']=boolval(vals[0])
+            elif fn=='set-redeem-enabled' and vals: state['minting_state']['redeem_enabled']=boolval(vals[0])
+            elif fn=='set-whitelist-enabled' and vals: state['minting_state']['whitelist_enabled']=boolval(vals[0])
+            elif fn=='set-gatekeeper' and len(vals)>=2:
+              p=principal(vals[0]);
+              if p: state['minting_state']['gatekeepers'][p]=boolval(vals[1])
+            elif fn=='set-whitelist' and len(vals)>=2:
+              p=principal(vals[0]);
+              if p: state['minting_state']['whitelist'][p]=boolval(vals[1])
+            elif fn=='set-supported-asset' and len(vals)>=2:
+              p=principal(vals[0]);
+              if p: state['minting_state']['supported_assets'][p]={'active':boolval(vals[1]),'args':vals,'tx_id':tx['tx_id']}
+
+          for tx in history['redeeming_reserve']:
+            if tx['status']!='success': continue
+            fn=tx['function']; vals=[a['repr'] for a in tx['args']]
+            if fn=='set-manager' and len(vals)>=2:
+              p=principal(vals[0]);
+              if p: state['redeeming_reserve']['managers'][p]=boolval(vals[1])
+            elif fn=='set-authorized-recipient' and len(vals)>=2:
+              p=principal(vals[0]);
+              if p: state['redeeming_reserve']['authorized_recipients'][p]=boolval(vals[1])
+
+          candidates=set()
+          for section in state.values():
+            def walk(x):
+              if isinstance(x,dict):
+                for k,v in x.items():
+                  p=principal(k.split('|')[0]) if isinstance(k,str) else None
+                  if p: candidates.add(p)
+                  walk(v)
+              elif isinstance(x,list):
+                for v in x: walk(v)
+              elif isinstance(x,str):
+                p=principal(x)
+                if p: candidates.add(p)
+            walk(section)
+
+          output={'generated_at':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'source':'Hiro public read-only APIs','contracts':contracts,'state':state,'history':history,'candidate_principals':sorted(candidates)}
+          Path('hermetica-usdh-role-map.json').write_text(json.dumps(output,indent=2),encoding='utf-8')
+          print(json.dumps({'history_counts':{k:len(v) for k,v in history.items()},'whitelist_entries':len(state['minting_auto_state']['whitelist']),'supported_assets':len(state['minting_auto_state']['supported_assets']),'minting_contracts':state['hq']['minting_contracts'],'active_contracts_count':sum(v is True for v in state['hq']['active_contracts'].values())},indent=2))
+          PY
+          python3 map.py | tee summary.txt
+          sha256sum hermetica-usdh-role-map.json > hermetica-usdh-role-map.json.sha256
+
+      - name: Persist public map evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p public-data/hermetica-usdh-role-map
+          cp /tmp/hermetica-role-map/hermetica-usdh-role-map.json public-data/hermetica-usdh-role-map/
+          cp /tmp/hermetica-role-map/hermetica-usdh-role-map.json.sha256 public-data/hermetica-usdh-role-map/
+          cp /tmp/hermetica-role-map/summary.txt public-data/hermetica-usdh-role-map/
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add public-data/hermetica-usdh-role-map
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'chore: persist public Hermetica USDh role map [skip ci]'
+          git push origin HEAD:hermetica-usdh-public-state-20260725
+
+      - name: Upload public map evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-usdh-role-map
+          path: /tmp/hermetica-role-map
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
