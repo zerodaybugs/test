@@ -1,0 +1,131 @@
+name: veda-self-root-leaf-audit
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Reconstruct and lint the live LiquidUSD manager self-root leaves
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet --no-tags https://github.com/Veda-Labs/boring-vault.git veda-main
+          git -C veda-main checkout --quiet 48ab2e6e0d5bc7e1971d25aded399936393eb478
+          git clone --quiet --no-tags https://github.com/Veda-Labs/boring-vault-plasma.git veda-plasma
+          git -C veda-plasma checkout --quiet 1b3501be1f7a63968fdd1dbf0a1b7d89ad95b278
+          python3 - <<'PY'
+          import json, os, re, subprocess, time, urllib.request, traceback
+          ROOT="0x64fe8acfe1936a9cba6d2cbe0d204b5dee6a3b6b55d52f0d44825c03c6f7f719"
+          MANAGER="0x7b57ad1a0aa89583130acfad024241170d24c13c"
+          VAULT="0x08c6f91e2b681faf5e17227f2a44c307b3c1364c"
+          ACCOUNTANT="0xc315d6e14ddcdc7407784e2caf815d131bc1d3e7"
+          TELLER="0x4de413a26fc24c3fc27cc983be70aa9c5c299387"
+          QUEUE="0x38fc1ba73b7ed289955a07d9f11a85b6e388064a"
+          ATTACKER="0x1111111111111111111111111111111111111111"
+          RPCS=["https://ethereum-rpc.publicnode.com","https://eth.drpc.org","https://rpc.mevblocker.io"]
+          DANGEROUS_WORDS=("manage(","execute(","executebatch(","multicall(","delegatecall","call(","enter(","exit(","setauthority","transferownership","setmanageroot","bulkwithdraw","bulkdeposit","rescuetokens","approve(","setapprovalforall")
+          def rpc(ep,m,p,t=35):
+            b=json.dumps({"jsonrpc":"2.0","id":1,"method":m,"params":p}).encode();q=urllib.request.Request(ep,data=b,method="POST",headers={"content-type":"application/json","user-agent":"veda-self-root-leaf-audit/1.0"})
+            with urllib.request.urlopen(q,timeout=t) as r:o=json.loads(r.read().decode())
+            if "error" in o:raise RuntimeError(o["error"])
+            return o["result"]
+          def choose():
+            bad={}
+            for ep in RPCS:
+              try:
+                if int(rpc(ep,"eth_chainId",[]),16)==1:return ep,bad
+              except Exception as e:bad[ep]=repr(e)
+            raise RuntimeError(bad)
+          def run(*a):
+            p=subprocess.run([str(x) for x in a],text=True,capture_output=True);return {"ok":p.returncode==0,"stdout":p.stdout.strip(),"stderr":p.stderr.strip(),"returncode":p.returncode}
+          def norm(x):return str(x or "").lower()
+          def walk(obj,path=()):
+            if isinstance(obj,dict):
+              yield path,obj
+              for k,v in obj.items():yield from walk(v,path+(str(k),))
+            elif isinstance(obj,list):
+              for i,v in enumerate(obj):yield from walk(v,path+(str(i),))
+          def pick(d,*names):
+            low={str(k).lower():v for k,v in d.items()}
+            for n in names:
+              if n.lower() in low:return low[n.lower()]
+            return None
+          def addresses_from(x):
+            if isinstance(x,list):return [norm(v) for v in x if re.fullmatch(r"0x[0-9a-fA-F]{40}",str(v))]
+            if isinstance(x,str):return [a.lower() for a in re.findall(r"0x[0-9a-fA-F]{40}",x)]
+            return []
+          ep,bad=choose();live_root=rpc(ep,"eth_call",[{"to":MANAGER,"data":run("cast","calldata","manageRoot(address)",MANAGER)["stdout"]},"latest"])
+          out={"generated_at_unix":int(time.time()),"endpoint":ep,"rpc_failures":bad,"expected_root":ROOT,"live_root":live_root,"repositories":{},"root_matches":[],"candidate_files":[],"leaves":[],"flags":[],"errors":[]}
+          for repo in ("veda-main","veda-plasma"):
+            rd={"commit":run("git","-C",repo,"rev-parse","HEAD")["stdout"],"json_files":0,"text_root_hits":[],"address_hits":[]};out["repositories"][repo]=rd
+            for base,_,files in os.walk(repo):
+              for fn in files:
+                path=os.path.join(base,fn)
+                if fn.endswith('.json'):rd["json_files"]+=1
+                try:
+                  if os.path.getsize(path)>30_000_000:continue
+                  raw=open(path,'r',encoding='utf-8',errors='ignore').read()
+                except Exception:continue
+                lraw=raw.lower()
+                if ROOT[2:] in lraw or ROOT in lraw:rd["text_root_hits"].append(path)
+                if any(a[2:] in lraw for a in (MANAGER,VAULT,ACCOUNTANT,TELLER,QUEUE)):rd["address_hits"].append(path)
+                if not fn.endswith('.json'):continue
+                try:data=json.loads(raw)
+                except Exception:continue
+                for jpath,d in walk(data):
+                  if not isinstance(d,dict):continue
+                  root=pick(d,"ManageRoot","manageRoot","Root","root","MerkleRoot","merkleRoot")
+                  if norm(root)==ROOT:out["root_matches"].append({"repo":repo,"file":path,"json_path":jpath})
+                  target=pick(d,"TargetAddress","targetAddress","target","Target")
+                  decoder=pick(d,"DecoderAndSanitizer","decoderAndSanitizer","decoder")
+                  sigv=pick(d,"FunctionSignature","functionSignature","signature","Function","function")
+                  args=pick(d,"ArgumentAddresses","argumentAddresses","arguments","addressArguments")
+                  leaf=pick(d,"LeafDigest","leafDigest","leaf","Leaf")
+                  desc=pick(d,"Description","description")
+                  if target and sigv and (leaf or decoder or args is not None):
+                    item={"repo":repo,"file":path,"json_path":jpath,"root":root,"target":norm(target),"decoder":norm(decoder),"signature":str(sigv),"arguments":addresses_from(args),"raw_arguments":args,"leaf":leaf,"description":desc,"can_send_value":bool(pick(d,"CanSendValue","canSendValue","ValueNonZero","valueNonZero"))}
+                    # Keep all leaves from files that contain the live root or the live manager/vault addresses; prune later.
+                    if ROOT[2:] in lraw or MANAGER[2:] in lraw or VAULT[2:] in lraw:
+                      out["leaves"].append(item)
+            rd["text_root_hits"]=sorted(set(rd["text_root_hits"]));rd["address_hits"]=sorted(set(rd["address_hits"]))
+          candidate_files={x["file"] for x in out["root_matches"]}
+          if not candidate_files:
+            for repo,rd in out["repositories"].items():candidate_files.update(rd["text_root_hits"])
+          out["candidate_files"]=sorted(candidate_files)
+          # If the exact live root was not committed, retain leaves only from LiquidUSD files and state this explicitly.
+          if not candidate_files:
+            out["leaves"]=[x for x in out["leaves"] if "liquidusd" in x["file"].lower() or "liquid_usd" in x["file"].lower() or "liquidusd" in norm(x.get("description"))]
+          else:out["leaves"]=[x for x in out["leaves"] if x["file"] in candidate_files]
+          special_targets={VAULT: "vault",MANAGER:"manager",ACCOUNTANT:"accountant",TELLER:"teller",QUEUE:"queue"}
+          for i,x in enumerate(out["leaves"]):
+            sigl=x["signature"].lower();args=x["arguments"];target=x["target"];decoder=x["decoder"]
+            reasons=[]
+            if target in special_targets:reasons.append("targets_"+special_targets[target])
+            if any(w in sigl for w in DANGEROUS_WORDS):reasons.append("dangerous_selector_class")
+            if ("address" in sigl or "bytes" in sigl or "tuple" in sigl) and len(args)==0:reasons.append("dynamic_or_address_args_unbound")
+            if decoder in ("","0x0000000000000000000000000000000000000000"):reasons.append("zero_decoder")
+            if x["can_send_value"]:reasons.append("native_value_enabled")
+            if "approve(" in sigl and len(args)==0:reasons.append("approval_spender_unbound")
+            if reasons:out["flags"].append({"index":i,"reasons":reasons,"leaf":x})
+          out["summary"]={"exact_live_root_found":bool(out["root_matches"]),"candidate_file_count":len(out["candidate_files"]),"leaf_count":len(out["leaves"]),"flag_count":len(out["flags"]),"live_root_matches_expected":norm(live_root)==ROOT}
+          with open("veda-self-root-leaf-audit.json","w",encoding="utf-8") as f:json.dump(out,f,indent=2,sort_keys=True);f.write("\n")
+          print(json.dumps({"summary":out["summary"],"root_matches":out["root_matches"],"candidate_files":out["candidate_files"],"repository_hits":{r:{"root_hits":d["text_root_hits"],"address_hits":[p for p in d["address_hits"] if "liquid" in p.lower() or "leaf" in p.lower()][:50]} for r,d in out["repositories"].items()},"flags":out["flags"][:100],"errors":out["errors"]},indent=2,sort_keys=True))
+          PY
+      - name: Upload self-root leaf audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-self-root-leaf-audit
+          path: veda-self-root-leaf-audit.json
+          if-no-files-found: error
+          retention-days: 1
