@@ -1,0 +1,100 @@
+name: veda-safe-owner-7702
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Inspect Safe owners for EIP-7702 and public execution surfaces
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, time, urllib.request, traceback
+          RPCS=["https://ethereum-rpc.publicnode.com","https://eth.drpc.org","https://rpc.mevblocker.io"]
+          ATTACKER="0x1111111111111111111111111111111111111111"
+          SAFES={
+            "operations":{"address":"0x71e2d6c34f569cc4df5802d675b208fb8ae3bcd6","threshold":2,"owners":["0x2b23a8fc2bd965b9870b29941f2b48d267419f1a","0x43e9fa7a60f80711c9d3afe4ce1bb3e8c3f7a9b8","0xd6841f23e1503ef25e29f25ae47a98cfc4fb3228","0x9b2b83964a8a8115296babebd4f07c5fa089501a"]},
+            "oracle_ops":{"address":"0x41dfc53b13932a2690c9790527c1967d8579a6ae","threshold":2,"owners":["0x2b23a8fc2bd965b9870b29941f2b48d267419f1a","0x43e9fa7a60f80711c9d3afe4ce1bb3e8c3f7a9b8","0x13f26c1dc0c983cc6aceaaf753f98ad58155a99b","0x9b2b83964a8a8115296babebd4f07c5fa089501a"]},
+            "strategist":{"address":"0x607d0c7e3578802eb46d388cb86cfba8ff657306","threshold":2,"owners":["0x0c4626ac3fd3d84258e3d5931f707050db4270f4","0x450c1bee9ad09a3b8ad839035b001b37f20e578a","0x0f2e96633c6bc83494aa694c571e1602cb142da1","0x7d5e5ae39eec3ea2060e9ae22bf0b3b90cdf41ad","0xf5ddd58e6f172a51c048840d1908464b76f871ab"]},
+          }
+          def rpc(ep,m,p,t=35):
+            b=json.dumps({"jsonrpc":"2.0","id":1,"method":m,"params":p}).encode();q=urllib.request.Request(ep,data=b,method="POST",headers={"content-type":"application/json","user-agent":"veda-safe-owner-7702/1.0"})
+            with urllib.request.urlopen(q,timeout=t) as r:o=json.loads(r.read().decode())
+            if "error" in o:raise RuntimeError(o["error"])
+            return o["result"]
+          def choose():
+            bad={}
+            for ep in RPCS:
+              try:
+                if int(rpc(ep,"eth_chainId",[]),16)==1:return ep,bad
+              except Exception as e:bad[ep]=repr(e)
+            raise RuntimeError(bad)
+          def run(*a):
+            p=subprocess.run([str(x) for x in a],text=True,capture_output=True);return {"ok":p.returncode==0,"stdout":p.stdout.strip(),"stderr":p.stderr.strip(),"returncode":p.returncode}
+          def calldata(s,*a):return run("cast","calldata",s,*a)["stdout"]
+          def st(x):return x[2:] if str(x).startswith("0x") else str(x)
+          def safe_call(ep,to,data,frm=None):
+            tx={"to":to,"data":data}
+            if frm:tx["from"]=frm
+            try:return {"ok":True,"raw":rpc(ep,"eth_call",[tx,"latest"])}
+            except Exception as e:return {"ok":False,"error":repr(e)}
+          ep,bad=choose();block=int(rpc(ep,"eth_blockNumber",[]),16);out={"generated_at_unix":int(time.time()),"block":block,"endpoint":ep,"rpc_failures":bad,"owners":{},"safes":{},"flags":[],"errors":[]}
+          owners=sorted({o.lower() for s in SAFES.values() for o in s["owners"]})
+          probes={
+            "execute3":lambda:calldata("execute(address,uint256,bytes)",ATTACKER,0,"0x"),
+            "execute4":lambda:calldata("execute(address,uint256,bytes,uint8)",ATTACKER,0,"0x",0),
+            "executeBatch":lambda:calldata("executeBatch(address[],uint256[],bytes[])",f"[{ATTACKER}]","[0]","[0x]"),
+            "executeUserOp":lambda:calldata("executeUserOp(address,uint256,bytes)",ATTACKER,0,"0x"),
+            "multicall":lambda:calldata("multicall(bytes[])","[]"),
+            "upgradeToAndCall":lambda:calldata("upgradeToAndCall(address,bytes)",ATTACKER,"0x"),
+            "initialize":lambda:calldata("initialize(address)",ATTACKER),
+          }
+          for owner in owners:
+            row={"address":owner,"probes":{}}
+            try:
+              code=rpc(ep,"eth_getCode",[owner,"latest"]);row["code"]=code;row["code_bytes"]=len(st(code))//2
+              row["eip7702"]=st(code).lower().startswith("ef0100") and len(st(code))==46
+              row["delegation_target"]="0x"+st(code)[6:46].lower() if row["eip7702"] else None
+              if row["delegation_target"]:
+                dcode=rpc(ep,"eth_getCode",[row["delegation_target"],"latest"]);row["delegation_code_bytes"]=len(st(dcode))//2;row["delegation_code_hash"]=run("cast","keccak",dcode)["stdout"]
+              for name,fn in probes.items():
+                try:data=fn()
+                except Exception as e:row["probes"][name]={"build_error":repr(e)};continue
+                row["probes"][name]=safe_call(ep,owner,data,ATTACKER)
+              row["owner_views"]={
+                "owner":safe_call(ep,owner,run("cast","sig","owner()")["stdout"]),
+                "entryPoint":safe_call(ep,owner,run("cast","sig","entryPoint()")["stdout"]),
+                "nonce":safe_call(ep,owner,run("cast","sig","nonce()")["stdout"]),
+                "implementation":safe_call(ep,owner,run("cast","sig","implementation()")["stdout"]),
+              }
+              successful=[n for n,r in row["probes"].items() if r.get("ok")]
+              row["successful_probes"]=successful
+              if successful:out["flags"].append({"type":"OWNER_PUBLIC_EXECUTION_SURFACE","owner":owner,"successful_probes":successful,"eip7702":row["eip7702"],"delegation_target":row["delegation_target"]})
+            except Exception as e:
+              row["error"]=repr(e);row["traceback"]=traceback.format_exc();out["errors"].append({"owner":owner,"error":repr(e)})
+            out["owners"][owner]=row
+          for name,s in SAFES.items():
+            compromised=[o.lower() for o in s["owners"] if out["owners"].get(o.lower(),{}).get("successful_probes")]
+            out["safes"][name]={**s,"potentially_open_owners":compromised,"threshold_reached":len(compromised)>=s["threshold"]}
+            if len(compromised)>=s["threshold"]:out["flags"].append({"type":"SAFE_THRESHOLD_PUBLICLY_REACHABLE","safe":name,"owners":compromised,"threshold":s["threshold"]})
+          with open("veda-safe-owner-7702.json","w",encoding="utf-8") as f:json.dump(out,f,indent=2,sort_keys=True);f.write("\n")
+          print(json.dumps({"flags":out["flags"],"errors":out["errors"],"safes":out["safes"],"owners":{o:{"bytes":r.get("code_bytes"),"eip7702":r.get("eip7702"),"delegate":r.get("delegation_target"),"successful":r.get("successful_probes")} for o,r in out["owners"].items()}},indent=2,sort_keys=True))
+          PY
+      - name: Upload Safe owner transitive proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-safe-owner-7702
+          path: veda-safe-owner-7702.json
+          if-no-files-found: error
+          retention-days: 1
