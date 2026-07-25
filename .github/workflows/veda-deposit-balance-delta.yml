@@ -1,0 +1,124 @@
+name: veda-deposit-balance-delta
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Measure supported asset balance deltas on a local Ethereum fork
+        shell: bash
+        run: |
+          set -euo pipefail
+          RPC="https://ethereum-rpc.publicnode.com"
+          LOCAL="http://127.0.0.1:8545"
+          anvil --fork-url "$RPC" --port 8545 --silent >anvil-balance-delta.log 2>&1 &
+          PID=$!
+          trap 'kill "$PID" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 90); do
+            if cast chain-id --rpc-url "$LOCAL" >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          cast chain-id --rpc-url "$LOCAL" >/dev/null
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import time
+          import traceback
+          import urllib.request
+
+          RPC="http://127.0.0.1:8545"
+          ATTACKER="0x1111111111111111111111111111111111111111"
+          PRODUCTS={
+            "liquidBTC":{"vault":"0x5f46d540b6eD704C3c8789105F30E075AA900726","teller":"0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353","assets":{
+              "WBTC":"0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599","cbBTC":"0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf","LBTC":"0x8236a87084f8B84306f72007F36F2618A5634494","eBTC":"0x657e8C867D8B37dCC18fA4Caead9C45EB088C642"}},
+            "liquidETH":{"vault":"0xf0bb20865277aBd641a307eCe5Ee04E79073416C","teller":"0x9AA79C84b79816ab920bBcE20f8f74557B514734","assets":{
+              "WETH":"0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2","weETH":"0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee","eETH":"0x35fA164735182de50811E8e2E824cFb9B6118ac2","aEthWETH":"0x4d5F47FA6A74757f35C14fD3a6Ef8E3C9BC514E8","LiquidKatanaETH":"0x69d210d3b60e939bfa6e87cccc4fab7e8f44c16b"}},
+            "liquidUSD":{"vault":"0x08c6F91e2B681FaF5e17227F2a44C307b3C1364C","teller":"0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387","assets":{
+              "USDC":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","USDT":"0xdAC17F958D2ee523a2206206994597C13D831ec7"}}
+          }
+
+          def rpc(method,params,timeout=60):
+              body=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
+              req=urllib.request.Request(RPC,data=body,method="POST",headers={"content-type":"application/json","user-agent":"veda-deposit-balance-delta/1.0"})
+              with urllib.request.urlopen(req,timeout=timeout) as r:o=json.loads(r.read().decode())
+              if "error" in o:raise RuntimeError({"method":method,"error":o["error"]})
+              return o["result"]
+          def cmd(*args):return subprocess.check_output(list(args),text=True).strip()
+          def sig(s):return cmd("cast","sig",s)
+          def calldata(s,*args):return cmd("cast","calldata",s,*map(str,args))
+          def strip0(x):return x[2:] if x.startswith("0x") else x
+          def aw(a):return strip0(a).lower().rjust(64,"0")
+          def call_u(to,data):return int(rpc("eth_call",[{"to":to,"data":data},"latest"]),16)
+          def balance(token,user):return call_u(token,sig("balanceOf(address)")+aw(user))
+          def send(sender,to,data,value=0):
+              tx={"from":sender,"to":to,"data":data,"gas":hex(12_000_000)}
+              if value:tx["value"]=hex(value)
+              h=rpc("eth_sendTransaction",[tx])
+              for _ in range(200):
+                  r=rpc("eth_getTransactionReceipt",[h])
+                  if r:
+                      if int(r["status"],16)!=1:raise RuntimeError({"failed_tx":h,"receipt":r})
+                      return r
+                  time.sleep(.05)
+              raise RuntimeError("receipt timeout")
+
+          rpc("anvil_impersonateAccount",[ATTACKER]);rpc("anvil_setBalance",[ATTACKER,hex(1000*10**18)])
+          output={"generated_at_unix":int(time.time()),"block":int(rpc("eth_blockNumber",[]),16),"products":{},"flags":[],"errors":[]}
+          for pname,p in PRODUCTS.items():
+              product={"vault":p["vault"].lower(),"teller":p["teller"].lower(),"assets":{}}
+              output["products"][pname]=product
+              for label,token in p["assets"].items():
+                  snap=rpc("evm_snapshot",[])
+                  row={"token":token.lower()}
+                  try:
+                      rpc("anvil_impersonateAccount",[p["vault"]]);rpc("anvil_setBalance",[p["vault"],hex(1000*10**18)])
+                      decimals=call_u(token,sig("decimals()"));vault_balance=balance(token,p["vault"])
+                      row.update({"decimals":decimals,"initial_vault_balance":vault_balance})
+                      if vault_balance<100:
+                          row["skipped"]="insufficient vault balance";product["assets"][label]=row;rpc("evm_revert",[snap]);continue
+                      nominal=min(10**decimals,max(1,vault_balance//10000))
+                      if nominal>=vault_balance:nominal=max(1,vault_balance//2)
+                      before_seed={"vault":balance(token,p["vault"]),"attacker":balance(token,ATTACKER)}
+                      send(p["vault"],token,calldata("transfer(address,uint256)",ATTACKER,nominal))
+                      after_seed={"vault":balance(token,p["vault"]),"attacker":balance(token,ATTACKER)}
+                      attacker_seed_delta=after_seed["attacker"]-before_seed["attacker"]
+                      vault_seed_delta=before_seed["vault"]-after_seed["vault"]
+                      actual_deposit=min(nominal,after_seed["attacker"])
+                      if actual_deposit<=0:raise RuntimeError("zero attacker seed")
+                      send(ATTACKER,token,calldata("approve(address,uint256)",p["vault"],0))
+                      send(ATTACKER,token,calldata("approve(address,uint256)",p["vault"],actual_deposit))
+                      before={"vault_token":balance(token,p["vault"]),"attacker_token":balance(token,ATTACKER),"attacker_shares":balance(p["vault"],ATTACKER),"total_shares":call_u(p["vault"],sig("totalSupply()"))}
+                      preview=rpc("eth_call",[{"from":ATTACKER,"to":p["teller"],"data":calldata("deposit(address,uint256,uint256)",token,actual_deposit,0)},"latest"])
+                      receipt=send(ATTACKER,p["teller"],calldata("deposit(address,uint256,uint256)",token,actual_deposit,0))
+                      after={"vault_token":balance(token,p["vault"]),"attacker_token":balance(token,ATTACKER),"attacker_shares":balance(p["vault"],ATTACKER),"total_shares":call_u(p["vault"],sig("totalSupply()"))}
+                      deltas={"vault_token":after["vault_token"]-before["vault_token"],"attacker_token":before["attacker_token"]-after["attacker_token"],"attacker_shares":after["attacker_shares"]-before["attacker_shares"],"total_shares":after["total_shares"]-before["total_shares"]}
+                      row.update({"nominal_seed":nominal,"seed_attacker_delta":attacker_seed_delta,"seed_vault_delta":vault_seed_delta,"deposit_amount":actual_deposit,"preview_shares":int(preview,16),"gas_used":int(receipt["gasUsed"],16),"before":before,"after":after,"deltas":deltas,"vault_shortfall":actual_deposit-deltas["vault_token"],"attacker_transfer_excess":deltas["attacker_token"]-actual_deposit})
+                      if row["vault_shortfall"]>0 or row["attacker_transfer_excess"]<0:
+                          output["flags"].append({"product":pname,"asset":label,"vault_shortfall":row["vault_shortfall"],"attacker_transfer_excess":row["attacker_transfer_excess"],"row":row})
+                  except Exception as e:
+                      row["error"]=repr(e);row["traceback"]=traceback.format_exc();output["errors"].append({"product":pname,"asset":label,"error":repr(e)})
+                  product["assets"][label]=row
+                  rpc("evm_revert",[snap])
+          with open("veda-deposit-balance-delta.json","w",encoding="utf-8") as f:json.dump(output,f,indent=2,sort_keys=True);f.write("\n")
+          print(json.dumps({"block":output["block"],"flags":output["flags"],"errors":output["errors"],"results":{p:{a:r.get("deltas") for a,r in v["assets"].items()} for p,v in output["products"].items()}},indent=2,sort_keys=True))
+          PY
+      - name: Upload balance-delta evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-deposit-balance-delta
+          path: |
+            veda-deposit-balance-delta.json
+            anvil-balance-delta.log
+          if-no-files-found: error
+          retention-days: 1
