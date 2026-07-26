@@ -1,0 +1,357 @@
+name: veda-holder-exit-classification
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Download secondary-market holder inventory
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api repos/${GITHUB_REPOSITORY}/actions/artifacts/8633331797/zip > secondary.zip
+          unzip -q secondary.zip
+          test -s veda-secondary-market.json
+      - name: Resolve holder identities, proxies, wrappers, Pendle and lending surfaces
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import concurrent.futures
+          import json
+          import subprocess
+          import threading
+          import time
+          import urllib.error
+          import urllib.request
+          import traceback
+
+          RPCS = ["https://ethereum-rpc.publicnode.com", "https://eth.drpc.org", "https://rpc.mevblocker.io"]
+          BLOCKSCOUT = "https://eth.blockscout.com"
+          ATTACKER = "0x1111111111111111111111111111111111111111"
+          ZERO = "0x0000000000000000000000000000000000000000"
+
+          def sh(*args):
+              process = subprocess.run([str(x) for x in args], text=True, capture_output=True)
+              if process.returncode != 0:
+                  raise RuntimeError({"args": args, "stdout": process.stdout, "stderr": process.stderr})
+              return process.stdout.strip()
+
+          SIGNATURES = {
+              "name": "name()",
+              "symbol": "symbol()",
+              "owner": "owner()",
+              "asset": "asset()",
+              "underlying": "underlying()",
+              "vault": "vault()",
+              "token": "token()",
+              "want": "want()",
+              "stakingToken": "stakingToken()",
+              "implementation": "implementation()",
+              "getImplementation": "getImplementation()",
+              "token0": "token0()",
+              "token1": "token1()",
+              "factory": "factory()",
+              "fee": "fee()",
+              "liquidity": "liquidity()",
+              "getReserves": "getReserves()",
+              "readTokens": "readTokens()",
+              "assetInfo": "assetInfo()",
+              "exchangeRate": "exchangeRate()",
+              "getTokensIn": "getTokensIn()",
+              "getTokensOut": "getTokensOut()",
+              "SY": "SY()",
+              "PT": "PT()",
+              "YT": "YT()",
+              "totalSupply": "totalSupply()",
+              "totalAssets": "totalAssets()",
+              "convertToAssets": "convertToAssets(uint256)",
+              "previewRedeem": "previewRedeem(uint256)",
+              "getThreshold": "getThreshold()",
+              "getOwners": "getOwners()",
+              "balanceOf": "balanceOf(address)",
+          }
+          S = {name: sh("cast", "sig", signature) for name, signature in SIGNATURES.items()}
+
+          http_lock = threading.Lock()
+          next_http = 0.0
+          def http_json(url, timeout=45, retries=5):
+              global next_http
+              last = None
+              for attempt in range(retries):
+                  try:
+                      with http_lock:
+                          now = time.monotonic()
+                          delay = max(0.0, next_http - now)
+                          next_http = max(now, next_http) + 0.10
+                      if delay:
+                          time.sleep(delay)
+                      request = urllib.request.Request(url, headers={"accept": "application/json", "user-agent": "veda-holder-classification/1.0"})
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = repr(exc)
+                      time.sleep(min(4, 0.4 * (2 ** attempt)))
+              raise RuntimeError({"url": url, "error": last})
+
+          def rpc(endpoint, method, params, timeout=35):
+              body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+              request = urllib.request.Request(endpoint, data=body, method="POST", headers={"content-type": "application/json", "user-agent": "veda-holder-classification/1.0"})
+              with urllib.request.urlopen(request, timeout=timeout) as response:
+                  payload = json.loads(response.read().decode())
+              if "error" in payload:
+                  raise RuntimeError(payload["error"])
+              return payload["result"]
+
+          def choose():
+              failures = {}
+              for endpoint in RPCS:
+                  try:
+                      if int(rpc(endpoint, "eth_chainId", []), 16) == 1:
+                          return endpoint, failures
+                  except Exception as exc:
+                      failures[endpoint] = repr(exc)
+              raise RuntimeError(failures)
+
+          def strip0(value):
+              value = str(value or "")
+              return value[2:] if value.startswith("0x") else value
+
+          def address_word(address):
+              return strip0(address).lower().rjust(64, "0")
+
+          def uint_word(value):
+              return hex(int(value))[2:].rjust(64, "0")
+
+          def decode_uint(raw):
+              return None if not raw or raw == "0x" else int(raw, 16)
+
+          def decode_address(raw):
+              return None if not raw or raw == "0x" else "0x" + strip0(raw)[-40:].lower()
+
+          def words(raw):
+              value = strip0(raw)
+              return [int(value[index:index+64], 16) for index in range(0, len(value), 64)] if value and len(value) % 64 == 0 else []
+
+          def decode_string(raw):
+              value = strip0(raw)
+              if not value:
+                  return None
+              try:
+                  if len(value) == 64:
+                      return bytes.fromhex(value).rstrip(b"\x00").decode(errors="replace")
+                  offset = int(value[:64], 16) * 2
+                  length = int(value[offset:offset+64], 16)
+                  return bytes.fromhex(value[offset+64:offset+64+length*2]).decode(errors="replace")
+              except Exception:
+                  return None
+
+          def decode_address_array(raw):
+              value = strip0(raw)
+              if not value:
+                  return None
+              try:
+                  first = int(value[:64], 16)
+                  offset = first * 2 if first >= 32 else 0
+                  length = int(value[offset:offset+64], 16)
+                  result = []
+                  cursor = offset + 64
+                  for _ in range(length):
+                      result.append("0x" + value[cursor+24:cursor+64].lower())
+                      cursor += 64
+                  return result
+              except Exception:
+                  return None
+
+          def call(endpoint, target, data, from_address=None):
+              tx = {"to": target, "data": data}
+              if from_address:
+                  tx["from"] = from_address
+              return rpc(endpoint, "eth_call", [tx, "latest"])
+
+          def safe_call(endpoint, target, data, from_address=None):
+              try:
+                  return {"ok": True, "raw": call(endpoint, target, data, from_address)}
+              except Exception as exc:
+                  return {"ok": False, "error": repr(exc)}
+
+          def scalar_probe(endpoint, address, name, decoder, suffix=""):
+              result = safe_call(endpoint, address, S[name] + suffix)
+              if not result["ok"]:
+                  return None
+              return decoder(result["raw"])
+
+          def normalize_abi(payload):
+              abi = payload.get("abi") if isinstance(payload, dict) else None
+              if isinstance(abi, str):
+                  try:
+                      abi = json.loads(abi)
+                  except Exception:
+                      abi = None
+              return abi if isinstance(abi, list) else []
+
+          inventory = json.load(open("veda-secondary-market.json", encoding="utf-8"))
+          endpoint, rpc_failures = choose()
+          block = int(rpc(endpoint, "eth_blockNumber", []), 16)
+
+          holder_map = {}
+          for product_name, product in inventory.get("products", {}).items():
+              token = product.get("token")
+              for holder in product.get("contract_holders", [])[:25]:
+                  address = str(holder.get("address") or "").lower()
+                  if not address:
+                      continue
+                  item = holder_map.setdefault(address, {"address": address, "products": {}})
+                  item["products"][product_name] = {"token": token, "share_balance": holder.get("share_balance"), "holder_value": holder.get("holder_value")}
+
+          def inspect(entry):
+              address = entry["address"]
+              result = {"address": address, "products": entry["products"], "errors": []}
+              try:
+                  code = rpc(endpoint, "eth_getCode", [address, "latest"])
+                  result["code_bytes"] = len(strip0(code)) // 2
+              except Exception as exc:
+                  result["errors"].append({"stage": "code", "error": repr(exc)})
+                  return result
+
+              for endpoint_name, path in (("address_metadata", f"/api/v2/addresses/{address}"), ("smart_contract", f"/api/v2/smart-contracts/{address}")):
+                  try:
+                      result[endpoint_name] = http_json(BLOCKSCOUT + path)
+                  except Exception as exc:
+                      result[endpoint_name + "_error"] = repr(exc)
+
+              contract_payload = result.get("smart_contract") if isinstance(result.get("smart_contract"), dict) else {}
+              abi = normalize_abi(contract_payload)
+              functions = []
+              for item in abi:
+                  if not isinstance(item, dict) or item.get("type") != "function":
+                      continue
+                  functions.append({
+                      "name": item.get("name"),
+                      "state_mutability": item.get("stateMutability"),
+                      "inputs": [value.get("type") for value in item.get("inputs", []) if isinstance(value, dict)],
+                      "outputs": [value.get("type") for value in item.get("outputs", []) if isinstance(value, dict)],
+                  })
+              result["verified_contract_name"] = contract_payload.get("name") or contract_payload.get("contract_name")
+              result["abi_function_count"] = len(functions)
+              interesting_names = {
+                  "deposit", "depositFor", "mint", "redeem", "withdraw", "wrap", "unwrap", "swap", "borrow",
+                  "repay", "sell", "buy", "exit", "requestRedeem", "requestWithdraw", "instantRedeem",
+                  "exchange", "exchange_underlying", "add_liquidity", "remove_liquidity", "remove_liquidity_one_coin",
+                  "redeemPY", "redeemDueInterestAndRewards", "swapExactTokenForPt", "swapExactPtForToken",
+              }
+              result["interesting_abi_functions"] = [function for function in functions if function.get("name") in interesting_names]
+
+              probes = {}
+              for name, decoder in (
+                  ("name", decode_string), ("symbol", decode_string), ("owner", decode_address),
+                  ("asset", decode_address), ("underlying", decode_address), ("vault", decode_address),
+                  ("token", decode_address), ("want", decode_address), ("stakingToken", decode_address),
+                  ("implementation", decode_address), ("getImplementation", decode_address),
+                  ("token0", decode_address), ("token1", decode_address), ("factory", decode_address),
+                  ("fee", decode_uint), ("liquidity", decode_uint), ("getReserves", words),
+                  ("readTokens", lambda raw: ["0x" + strip0(raw)[offset+24:offset+64].lower() for offset in range(0, 192, 64)] if len(strip0(raw)) >= 192 else None),
+                  ("assetInfo", words), ("exchangeRate", decode_uint),
+                  ("getTokensIn", decode_address_array), ("getTokensOut", decode_address_array),
+                  ("SY", decode_address), ("PT", decode_address), ("YT", decode_address),
+                  ("totalSupply", decode_uint), ("totalAssets", decode_uint),
+                  ("getThreshold", decode_uint), ("getOwners", decode_address_array),
+              ):
+                  value = scalar_probe(endpoint, address, name, decoder)
+                  if value not in (None, [], ""):
+                      probes[name] = value
+              probes["convertToAssets_one"] = scalar_probe(endpoint, address, "convertToAssets", decode_uint, uint_word(10**18))
+              probes["previewRedeem_one"] = scalar_probe(endpoint, address, "previewRedeem", decode_uint, uint_word(10**18))
+              result["probes"] = probes
+
+              classifications = []
+              if probes.get("getThreshold") and probes.get("getOwners"):
+                  classifications.append("safe")
+              if probes.get("token0") and probes.get("token1"):
+                  classifications.append("amm_pair_or_pool")
+              if probes.get("asset") and (probes.get("totalAssets") is not None or probes.get("convertToAssets_one") is not None):
+                  classifications.append("erc4626_like")
+              if probes.get("readTokens"):
+                  classifications.append("pendle_market_like")
+              if probes.get("assetInfo") or probes.get("getTokensIn") or probes.get("getTokensOut"):
+                  classifications.append("pendle_sy_or_adapter_like")
+              if result.get("interesting_abi_functions"):
+                  classifications.append("user_facing_financial_surface")
+              result["classifications"] = classifications
+
+              product_tokens = {str(info.get("token") or "").lower() for info in entry["products"].values()}
+              candidate_reasons = []
+              asset = str(probes.get("asset") or "").lower()
+              tokens_in = {str(value).lower() for value in (probes.get("getTokensIn") or [])}
+              tokens_out = {str(value).lower() for value in (probes.get("getTokensOut") or [])}
+              if product_tokens & tokens_in and any(value not in product_tokens and value != ZERO for value in tokens_out):
+                  candidate_reasons.append("pendle_or_adapter_accepts_share_and_outputs_other_token")
+              if product_tokens & {asset} and any(function.get("name") in {"redeem", "withdraw", "unwrap", "swap", "borrow"} for function in result.get("interesting_abi_functions", [])):
+                  candidate_reasons.append("wrapper_or_lending_surface_accepts_share")
+              if probes.get("token0") in product_tokens or probes.get("token1") in product_tokens:
+                  candidate_reasons.append("amm_holds_share")
+              result["candidate_exit_reasons"] = candidate_reasons
+              return result
+
+          with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+              inspected = list(executor.map(inspect, holder_map.values()))
+
+          candidates = [item for item in inspected if item.get("candidate_exit_reasons")]
+          output = {
+              "generated_at_unix": int(time.time()),
+              "endpoint": endpoint,
+              "rpc_failures": rpc_failures,
+              "block": block,
+              "holder_count": len(holder_map),
+              "holders": sorted(inspected, key=lambda item: -sum(int(value.get("share_balance") or 0) for value in item.get("products", {}).values())),
+              "candidate_exits": candidates,
+              "summary": {
+                  "holder_count": len(holder_map),
+                  "verified_count": sum(bool(item.get("verified_contract_name")) for item in inspected),
+                  "safe_count": sum("safe" in item.get("classifications", []) for item in inspected),
+                  "erc4626_like_count": sum("erc4626_like" in item.get("classifications", []) for item in inspected),
+                  "pendle_like_count": sum(any(value.startswith("pendle") for value in item.get("classifications", [])) for item in inspected),
+                  "amm_count": sum("amm_pair_or_pool" in item.get("classifications", []) for item in inspected),
+                  "candidate_exit_count": len(candidates),
+                  "error_count": sum(len(item.get("errors", [])) for item in inspected),
+              },
+          }
+          with open("veda-holder-exit-classification.json", "w", encoding="utf-8") as handle:
+              json.dump(output, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+          print(json.dumps({
+              "summary": output["summary"],
+              "candidate_exits": candidates,
+              "identified": [
+                  {
+                      "address": item["address"], "products": item["products"],
+                      "verified_contract_name": item.get("verified_contract_name"),
+                      "classifications": item.get("classifications"),
+                      "probes": item.get("probes"),
+                      "interesting_abi_functions": item.get("interesting_abi_functions"),
+                      "metadata_name": (item.get("address_metadata") or {}).get("name") if isinstance(item.get("address_metadata"), dict) else None,
+                  }
+                  for item in output["holders"]
+                  if item.get("verified_contract_name") or item.get("classifications")
+              ],
+          }, indent=2, sort_keys=True))
+          PY
+      - name: Upload holder-exit classification
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-holder-exit-classification
+          path: veda-holder-exit-classification.json
+          if-no-files-found: error
+          retention-days: 1
