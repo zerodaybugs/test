@@ -1,0 +1,92 @@
+name: veda-optimism-recipient-proof
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Prove referral versus recipient overloads on live Optimism tellers
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, urllib.request
+
+          BASE="https://explorer.optimism.io"
+          RPCS=["https://optimism-rpc.publicnode.com","https://mainnet.optimism.io","https://optimism.drpc.org"]
+          ATTACKER="0x1111111111111111111111111111111111111111"
+          PRODUCTS={
+            "liquidBTC":{"authority":"0x49F954c67ff235034b69b8a59fbe309A40256c8d","teller":"0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353"},
+            "liquidETH":{"authority":"0x485Bde66Bb668a51f2372E34e45B1c6226798122","teller":"0x9AA79C84b79816ab920bBcE20f8f74557B514734"},
+            "liquidUSD":{"authority":"0xff90f1B24DFBD25F439B94ed090F373BDE24f60E","teller":"0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387"},
+          }
+          def shell(*args):
+            process=subprocess.run([str(x) for x in args],text=True,capture_output=True)
+            if process.returncode:raise RuntimeError({"args":args,"stdout":process.stdout,"stderr":process.stderr})
+            return process.stdout.strip()
+          SIG={
+            "can":shell("cast","sig","canCall(address,address,bytes4)"),
+            "public":shell("cast","sig","isCapabilityPublic(address,bytes4)"),
+            "deposit4":shell("cast","sig","deposit(address,uint256,uint256,address)"),
+            "deposit5":shell("cast","sig","deposit(address,uint256,uint256,address,address)"),
+            "permit8":shell("cast","sig","depositWithPermit(address,uint256,uint256,uint256,uint8,bytes32,bytes32,address)"),
+            "permit9":shell("cast","sig","depositWithPermit(address,uint256,uint256,uint256,uint8,bytes32,bytes32,address,address)"),
+            "shareLock":"0x"+shell("cast","sig","shareLockPeriod()")[2:],
+          }
+          def http_json(url,timeout=60):
+            request=urllib.request.Request(url,headers={"accept":"application/json","user-agent":"veda-optimism-recipient-proof/1"})
+            with urllib.request.urlopen(request,timeout=timeout) as response:return json.loads(response.read().decode())
+          def rpc(endpoint,method,params,timeout=35):
+            body=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode();request=urllib.request.Request(endpoint,data=body,method="POST",headers={"content-type":"application/json","user-agent":"veda-optimism-recipient-proof/1"})
+            with urllib.request.urlopen(request,timeout=timeout) as response:payload=json.loads(response.read().decode())
+            if "error" in payload:raise RuntimeError(payload["error"])
+            return payload["result"]
+          endpoint=None;failures={}
+          for candidate in RPCS:
+            try:
+              if int(rpc(candidate,"eth_chainId",[]),16)==10:endpoint=candidate;break
+            except Exception as exc:failures[candidate]=repr(exc)
+          if not endpoint:raise RuntimeError(failures)
+          def strip0(value):
+            text=str(value or "");return text[2:] if text.startswith("0x") else text
+          def aw(address):return strip0(address).lower().rjust(64,"0")
+          def bw(selector):return strip0(selector).lower().ljust(64,"0")
+          def call(target,data):return rpc(endpoint,"eth_call",[{"to":target,"data":data},"latest"])
+          def public(authority,target,selector):return bool(int(call(authority,SIG["public"]+aw(target)+bw(selector)),16))
+          def can(authority,target,selector):return bool(int(call(authority,SIG["can"]+aw(ATTACKER)+aw(target)+bw(selector)),16))
+          output={"block":int(rpc(endpoint,"eth_blockNumber",[]),16),"rpc":endpoint,"rpc_failures":failures,"selectors":SIG,"products":{},"errors":[]}
+          for product,config in PRODUCTS.items():
+            row={"teller":config["teller"].lower(),"authority":config["authority"].lower()};output["products"][product]=row
+            try:
+              payload=http_json(f"{BASE}/api/v2/smart-contracts/{config['teller']}");abi=payload.get("abi") if isinstance(payload,dict) else []
+              if isinstance(abi,str):abi=json.loads(abi)
+              overloads=[]
+              for item in abi if isinstance(abi,list) else []:
+                if isinstance(item,dict) and item.get("type")=="function" and item.get("name") in ("deposit","depositWithPermit","depositAndBridge","depositAndBridgeWithPermit"):
+                  overloads.append({"name":item.get("name"),"inputs":[{"name":value.get("name"),"type":value.get("type"),"components":[{"name":component.get("name"),"type":component.get("type")} for component in value.get("components",[]) if isinstance(component,dict)]} for value in item.get("inputs",[]) if isinstance(value,dict)],"state_mutability":item.get("stateMutability")})
+              row["verified_name"]=payload.get("name") or payload.get("contract_name");row["abi_overloads"]=overloads
+              row["share_lock_period"]=int(call(config["teller"],SIG["shareLock"]),16)
+              row["capabilities"]={key:{"selector":SIG[key],"public":public(config["authority"],config["teller"],SIG[key]),"attacker":can(config["authority"],config["teller"],SIG[key])} for key in ("deposit4","deposit5","permit8","permit9")}
+            except Exception as exc:
+              row["error"]=repr(exc);output["errors"].append({"product":product,"error":repr(exc)})
+          output["summary"]={"errors":len(output["errors"]),"public_five_arg_count":sum(1 for row in output["products"].values() if row.get("capabilities",{}).get("deposit5",{}).get("attacker")),"nonzero_share_lock_count":sum(1 for row in output["products"].values() if (row.get("share_lock_period") or 0)>0)}
+          with open("veda-optimism-recipient-proof.json","w",encoding="utf-8") as handle:json.dump(output,handle,indent=2,sort_keys=True);handle.write("\n")
+          print(json.dumps(output,indent=2,sort_keys=True))
+          PY
+      - name: Upload recipient/referral proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-optimism-recipient-proof
+          path: veda-optimism-recipient-proof.json
+          if-no-files-found: error
+          retention-days: 1
