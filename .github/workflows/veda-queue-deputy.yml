@@ -1,0 +1,213 @@
+name: veda-queue-deputy
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Enumerate all queue-solve role holders and transitive public executors
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, time, urllib.request, urllib.parse, traceback
+
+          ATTACKER="0x1111111111111111111111111111111111111111"
+          ZERO="0x0000000000000000000000000000000000000000"
+          CHAINS={
+            "ethereum":{"id":1,"rpcs":["https://ethereum-rpc.publicnode.com","https://eth.drpc.org"],"explorer":"https://eth.blockscout.com"},
+            "optimism":{"id":10,"rpcs":["https://optimism-rpc.publicnode.com","https://mainnet.optimism.io"],"explorer":"https://optimism.blockscout.com"},
+            "scroll":{"id":534352,"rpcs":["https://scroll-rpc.publicnode.com","https://rpc.scroll.io"],"explorer":"https://scroll.blockscout.com"},
+            "ink":{"id":57073,"rpcs":["https://rpc-gel.inkonchain.com"],"explorer":"https://explorer.inkonchain.com"},
+          }
+          PRODUCTS={
+            "ethereum":{
+              "liquidBTC":{"queue":"0x77A2fd42F8769d8063F2E75061FC200014E41Edf","solver":"0xed41172438897bcb22c9dd72b9f9bbf9a8bf8929"},
+              "liquidETH":{"queue":"0x0D2dF071207E18Ca8638b4f04E98c53155eC2cE0","solver":"0x23aff90ed3b3effcf78fb41ab001c525a6c32a01"},
+              "liquidUSD":{"queue":"0x38FC1BA73b7ED289955a07d9F11A85b6E388064A","solver":"0x92b10e02825986bac2375bdacafa3e89e3f612aa"}},
+            "optimism":{
+              "liquidBTC":{"queue":"0x77A2fd42F8769d8063F2E75061FC200014E41Edf","solver":"0xed41172438897bcb22c9dd72b9f9bbf9a8bf8929"},
+              "liquidETH":{"queue":"0x0D2dF071207E18Ca8638b4f04E98c53155eC2cE0","solver":"0x23aff90ed3b3effcf78fb41ab001c525a6c32a01"},
+              "liquidUSD":{"queue":"0x38FC1BA73b7ED289955a07d9F11A85b6E388064A","solver":"0x92b10e02825986bac2375bdacafa3e89e3f612aa"}},
+            "scroll":{
+              "liquidBTC":{"queue":"0x77A2fd42F8769d8063F2E75061FC200014E41Edf","solver":"0xed41172438897bcb22c9dd72b9f9bbf9a8bf8929"},
+              "liquidETH":{"queue":"0x0D2dF071207E18Ca8638b4f04E98c53155eC2cE0","solver":"0x23aff90ed3b3effcf78fb41ab001c525a6c32a01"},
+              "liquidUSD":{"queue":"0x38FC1BA73b7ED289955a07d9F11A85b6E388064A","solver":"0x92b10e02825986bac2375bdacafa3e89e3f612aa"}},
+            "ink":{
+              "balanced":{"queue":"0x4c433Ed6d57316170565D7Fedc11a841832cDc3d","solver":"0xFfDffb178Cb469002B77b47f7e4a6bCAd041a9b6"},
+              "boosted":{"queue":"0x406E63323EF5d39D41C6fD895Ef9665AF926184c","solver":"0xdf4123c18DC985ed94061f2C08cE17b7b17f21fF"}},
+          }
+
+          def sh(*a):
+            p=subprocess.run([str(x) for x in a],text=True,capture_output=True)
+            if p.returncode:raise RuntimeError({"args":a,"stdout":p.stdout,"stderr":p.stderr})
+            return p.stdout.strip()
+          def sig(x):return sh("cast","sig",x)
+          def topic(x):return sh("cast","keccak",x).lower()
+          S={
+            "authority":sig("authority()"),"owner":sig("owner()"),"getUserRoles":sig("getUserRoles(address)"),"rolesCap":sig("getRolesWithCapability(address,bytes4)"),
+            "can":sig("canCall(address,address,bytes4)"),"pub":sig("isCapabilityPublic(address,bytes4)"),
+            "solve":sig("solveOnChainWithdraws((uint96,address,address,uint128,uint128,uint40,uint24,uint24)[],bytes,address)"),
+            "redeem":sig("boringRedeemSolve((uint96,address,address,uint128,uint128,uint40,uint24,uint24)[],address,bool)"),
+            "mint":sig("boringRedeemMintSolve((uint96,address,address,uint128,uint128,uint40,uint24,uint24)[],address,address,address,bool)"),
+            "self":sig("boringRedeemSelfSolve((uint96,address,address,uint128,uint128,uint40,uint24,uint24),address)"),
+            "selfmint":sig("boringRedeemMintSelfSolve((uint96,address,address,uint128,uint128,uint40,uint24,uint24),address,address,address)"),
+            "safeOwners":sig("getOwners()"),"safeThreshold":sig("getThreshold()"),"safeModules":sig("getModulesPaginated(address,uint256)"),
+          }
+          USER_ROLE_TOPIC=topic("UserRoleUpdated(address,uint8,bool)")
+          GENERIC_SIGNATURES=[
+            "execute(address,uint256,bytes)","execute(address,bytes)","execute(address,uint256,bytes,uint8)","executeBatch(address[],uint256[],bytes[])",
+            "manage(address,bytes,uint256)","forward(address,bytes)","call(address,uint256,bytes)","multicall(bytes[])","run(address,bytes)",
+          ]
+          GENERIC={x:sig(x) for x in GENERIC_SIGNATURES}
+
+          def rpc(ep,m,p,timeout=45):
+            body=json.dumps({"jsonrpc":"2.0","id":1,"method":m,"params":p}).encode();req=urllib.request.Request(ep,data=body,method="POST",headers={"content-type":"application/json","user-agent":"veda-queue-deputy/1"})
+            with urllib.request.urlopen(req,timeout=timeout) as r:o=json.loads(r.read().decode())
+            if "error" in o:raise RuntimeError(o["error"])
+            return o["result"]
+          def choose(cfg):
+            bad={}
+            for ep in cfg["rpcs"]:
+              try:
+                if int(rpc(ep,"eth_chainId",[]),16)==cfg["id"]:return ep,bad
+              except Exception as e:bad[ep]=repr(e)
+            raise RuntimeError(bad)
+          def strip0(x):
+            x=str(x or "");return x[2:] if x.startswith("0x") else x
+          def aw(a):return strip0(a).lower().rjust(64,"0")
+          def bw(s):return strip0(s).lower().ljust(64,"0")
+          def uw(x):return hex(int(x))[2:].rjust(64,"0")
+          def addr(raw):return ZERO if not raw or raw=="0x" else "0x"+strip0(raw)[-40:].lower()
+          def call(ep,to,data,from_addr=None):
+            tx={"to":to,"data":data}
+            if from_addr:tx["from"]=from_addr
+            return rpc(ep,"eth_call",[tx,"latest"])
+          def safe_call(ep,to,data,from_addr=None):
+            try:return {"ok":True,"raw":call(ep,to,data,from_addr)}
+            except Exception as e:return {"ok":False,"error":repr(e)}
+          def can(ep,auth,user,target,sel):
+            r=safe_call(ep,auth,S["can"]+aw(user)+aw(target)+bw(sel));return bool(int(r["raw"],16)) if r["ok"] else None
+          def public(ep,auth,target,sel):
+            r=safe_call(ep,auth,S["pub"]+aw(target)+bw(sel));return bool(int(r["raw"],16)) if r["ok"] else None
+          def http_json(url,timeout=45,retries=4):
+            last=None
+            for i in range(retries):
+              try:
+                req=urllib.request.Request(url,headers={"accept":"application/json","user-agent":"veda-queue-deputy/1"})
+                with urllib.request.urlopen(req,timeout=timeout) as r:return json.loads(r.read().decode())
+              except Exception as e:last=repr(e);time.sleep(.4*(i+1))
+            raise RuntimeError({"url":url,"error":last})
+          def address_logs(explorer,address,max_pages=150):
+            url=f"{explorer}/api/v2/addresses/{address}/logs";out=[];errs=[]
+            for _ in range(max_pages):
+              try:p=http_json(url)
+              except Exception as e:errs.append(repr(e));break
+              out.extend(p.get("items") or [])
+              nxt=p.get("next_page_params")
+              if not nxt:break
+              url=f"{explorer}/api/v2/addresses/{address}/logs?"+urllib.parse.urlencode(nxt);time.sleep(.05)
+            return out,errs
+          def smart_contract(explorer,address):
+            try:return http_json(f"{explorer}/api/v2/smart-contracts/{address}")
+            except Exception as e:return {"_error":repr(e)}
+          def abi_functions(payload):
+            abi=payload.get("abi") if isinstance(payload,dict) else None
+            if isinstance(abi,str):
+              try:abi=json.loads(abi)
+              except:abi=[]
+            out=[]
+            for x in abi or []:
+              if isinstance(x,dict) and x.get("type")=="function":
+                out.append({"name":x.get("name"),"inputs":[i.get("type") for i in x.get("inputs",[])],"state":x.get("stateMutability")})
+            return out
+          def decode_addr_array(raw):
+            h=strip0(raw)
+            try:
+              off=int(h[:64],16)*2;n=int(h[off:off+64],16);cur=off+64
+              return ["0x"+h[cur+i*64+24:cur+(i+1)*64].lower() for i in range(n)]
+            except:return []
+          def probe_holder(ep,explorer,address,products):
+            code=rpc(ep,"eth_getCode",[address,"latest"]);item={"address":address,"code_bytes":len(strip0(code))//2,"products":products}
+            if code=="0x":return item
+            item["eip7702_designator"]=("0x"+strip0(code)[6:46]) if strip0(code).startswith("ef0100") and len(strip0(code))>=46 else None
+            sc=smart_contract(explorer,address);funcs=abi_functions(sc);item["verified_name"]=sc.get("name") or sc.get("contract_name");item["abi_function_count"]=len(funcs)
+            interesting={"execute","executeBatch","manage","forward","call","multicall","run","solve","boringRedeemSolve","boringRedeemMintSolve","boringRedeemSelfSolve","boringRedeemMintSelfSolve"}
+            item["interesting_functions"]=[f for f in funcs if f["name"] in interesting]
+            own=safe_call(ep,address,S["owner"]);item["owner"]=addr(own["raw"]) if own["ok"] and own["raw"]!="0x" else None
+            so=safe_call(ep,address,S["safeOwners"]);st=safe_call(ep,address,S["safeThreshold"])
+            if so["ok"] and st["ok"] and so["raw"]!="0x":
+              item["safe"]={"owners":decode_addr_array(so["raw"]),"threshold":int(st["raw"],16)}
+              mods=safe_call(ep,address,S["safeModules"]+aw("0x0000000000000000000000000000000000000001")+uw(50))
+              item["safe"]["modules_raw"]=mods.get("raw") if mods["ok"] else None
+            probes={}
+            # Only test harmless empty/no-op forms. Success is a lead, never treated as exploit by itself.
+            empty_array=uw(32)+uw(0)
+            calldata_map={
+              "execute(address,uint256,bytes)":GENERIC["execute(address,uint256,bytes)"]+aw(ZERO)+uw(0)+uw(96)+uw(0),
+              "execute(address,bytes)":GENERIC["execute(address,bytes)"]+aw(ZERO)+uw(64)+uw(0),
+              "execute(address,uint256,bytes,uint8)":GENERIC["execute(address,uint256,bytes,uint8)"]+aw(ZERO)+uw(0)+uw(128)+uw(0)+uw(0),
+              "manage(address,bytes,uint256)":GENERIC["manage(address,bytes,uint256)"]+aw(ZERO)+uw(96)+uw(0)+uw(0),
+              "forward(address,bytes)":GENERIC["forward(address,bytes)"]+aw(ZERO)+uw(64)+uw(0),
+              "call(address,uint256,bytes)":GENERIC["call(address,uint256,bytes)"]+aw(ZERO)+uw(0)+uw(96)+uw(0),
+              "multicall(bytes[])":GENERIC["multicall(bytes[])"]+empty_array,
+              "run(address,bytes)":GENERIC["run(address,bytes)"]+aw(ZERO)+uw(64)+uw(0),
+            }
+            for name,data in calldata_map.items():
+              r=safe_call(ep,address,data,ATTACKER);probes[name]={"ok":r["ok"],"raw":r.get("raw"),"error":r.get("error")}
+            item["attacker_noop_probes"]=probes
+            return item
+
+          out={"generated_at_unix":int(time.time()),"user_role_topic":USER_ROLE_TOPIC,"chains":{},"open_deputy_candidates":[],"errors":[]}
+          for cname,cfg in CHAINS.items():
+            crow={"products":{},"holders":{}};out["chains"][cname]=crow
+            try:
+              ep,bad=choose(cfg);crow.update({"endpoint":ep,"rpc_failures":bad,"block":int(rpc(ep,"eth_blockNumber",[]),16)})
+              holder_products={}
+              for pname,p in PRODUCTS[cname].items():
+                row={"queue":p["queue"].lower(),"solver":p["solver"].lower()};crow["products"][pname]=row
+                try:
+                  if rpc(ep,"eth_getCode",[p["queue"],"latest"])=="0x":row["not_deployed"]=True;continue
+                  auth=addr(call(ep,p["queue"],S["authority"]));roles_bitmap=int(call(ep,auth,S["rolesCap"]+aw(p["queue"])+bw(S["solve"])),16)
+                  row.update({"authority":auth,"solve_roles_bitmap":roles_bitmap,"solve_public":public(ep,auth,p["queue"],S["solve"]),"attacker_queue_solve":can(ep,auth,ATTACKER,p["queue"],S["solve"]),"solver_queue_solve":can(ep,auth,p["solver"],p["queue"],S["solve"]),"solver_entrypoints":{}})
+                  for key,sel in (("redeem",S["redeem"]),("mint",S["mint"]),("self",S["self"]),("selfmint",S["selfmint"])):
+                    row["solver_entrypoints"][key]={"public":public(ep,auth,p["solver"],sel),"attacker":can(ep,auth,ATTACKER,p["solver"],sel),"selector":sel}
+                  logs,errs=address_logs(cfg["explorer"],auth);row["authority_log_errors"]=errs
+                  candidates={p["solver"].lower()}
+                  for log in logs:
+                    topics=[str(x).lower() for x in (log.get("topics") or [])]
+                    if len(topics)>=3 and topics[0]==USER_ROLE_TOPIC:candidates.add("0x"+strip0(topics[1])[-40:].lower())
+                  authorized=[]
+                  for h in sorted(candidates):
+                    if can(ep,auth,h,p["queue"],S["solve"]):
+                      roles=int(call(ep,auth,S["getUserRoles"]+aw(h)),16);authorized.append({"address":h,"roles":roles});holder_products.setdefault(h,[]).append(pname)
+                  row["authorized_solve_holders"]=authorized
+                except Exception as e:
+                  row["error"]=repr(e);row["traceback"]=traceback.format_exc();out["errors"].append({"chain":cname,"product":pname,"error":repr(e)})
+              for h,ps in holder_products.items():
+                item=probe_holder(ep,cfg["explorer"],h,ps);crow["holders"][h]=item
+                successful=[k for k,v in item.get("attacker_noop_probes",{}).items() if v.get("ok")]
+                if successful and item.get("code_bytes",0)>0:
+                  out["open_deputy_candidates"].append({"chain":cname,"holder":h,"products":ps,"successful_noop_probes":successful,"verified_name":item.get("verified_name")})
+            except Exception as e:
+              crow["error"]=repr(e);crow["traceback"]=traceback.format_exc();out["errors"].append({"chain":cname,"error":repr(e)})
+          out["summary"]={"open_deputy_candidate_count":len(out["open_deputy_candidates"]),"error_count":len(out["errors"]),"authorized_holder_count":sum(len(c.get("holders",{})) for c in out["chains"].values())}
+          with open("veda-queue-deputy.json","w",encoding="utf-8") as f:json.dump(out,f,indent=2,sort_keys=True);f.write("\n")
+          print(json.dumps({"summary":out["summary"],"open_deputy_candidates":out["open_deputy_candidates"],"chains":{c:{"error":x.get("error"),"products":x.get("products"),"holders":x.get("holders")} for c,x in out["chains"].items()},"errors":out["errors"]},indent=2,sort_keys=True))
+          PY
+      - name: Upload queue deputy proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-queue-deputy
+          path: veda-queue-deputy.json
+          if-no-files-found: error
+          retention-days: 1
