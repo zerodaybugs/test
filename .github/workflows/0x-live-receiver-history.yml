@@ -1,0 +1,121 @@
+name: Collect public 0x receiver transaction history
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/0x-live-receiver-history.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Collect public Blockscout history and traces
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/history"
+          mkdir -p "$OUT/pages" "$OUT/transactions"
+          FACTORY=0x00000000000000304861c3aDfb80dd5ebeC96325
+
+          python3 - "$OUT" "$FACTORY" <<'PY'
+          import json, pathlib, sys, time, urllib.parse, urllib.request
+
+          root = pathlib.Path(sys.argv[1])
+          address = sys.argv[2]
+          base = 'https://eth.blockscout.com/api/v2'
+          headers = {'User-Agent': 'Mozilla/5.0 0x-public-audit-history/1.0', 'Accept': 'application/json'}
+
+          def get(url, attempts=4):
+              last = None
+              for i in range(attempts):
+                  try:
+                      req = urllib.request.Request(url, headers=headers)
+                      with urllib.request.urlopen(req, timeout=60) as r:
+                          return r.read()
+                  except Exception as e:
+                      last = e
+                      time.sleep(2 ** i)
+              raise last
+
+          def paginate(path, name, max_pages=40):
+              url = base + path
+              all_items = []
+              for page in range(max_pages):
+                  raw = get(url)
+                  (root/'pages'/f'{name}-{page:03d}.json').write_bytes(raw)
+                  obj = json.loads(raw)
+                  items = obj.get('items', []) if isinstance(obj, dict) else []
+                  all_items.extend(items)
+                  nxt = obj.get('next_page_params') if isinstance(obj, dict) else None
+                  if not nxt:
+                      break
+                  url = base + path.split('?',1)[0] + '?' + urllib.parse.urlencode(nxt, doseq=True)
+              return all_items
+
+          txs = paginate(f'/addresses/{address}/transactions', 'transactions')
+          internals = paginate(f'/addresses/{address}/internal-transactions', 'internal-transactions')
+          (root/'address-transactions.json').write_text(json.dumps(txs, indent=2, sort_keys=True))
+          (root/'address-internal-transactions.json').write_text(json.dumps(internals, indent=2, sort_keys=True))
+
+          hashes = set()
+          for item in txs + internals:
+              if not isinstance(item, dict):
+                  continue
+              for key in ('hash', 'transaction_hash'):
+                  val = item.get(key)
+                  if isinstance(val, str) and val.startswith('0x') and len(val) == 66:
+                      hashes.add(val)
+              tx = item.get('transaction')
+              if isinstance(tx, dict):
+                  val = tx.get('hash')
+                  if isinstance(val, str) and len(val) == 66:
+                      hashes.add(val)
+
+          for h in sorted(hashes):
+              d = root/'transactions'/h
+              d.mkdir(parents=True, exist_ok=True)
+              for suffix, path in {
+                  'transaction.json': f'/transactions/{h}',
+                  'internal-transactions.json': f'/transactions/{h}/internal-transactions',
+                  'raw-trace.json': f'/transactions/{h}/raw-trace',
+                  'state-changes.json': f'/transactions/{h}/state-changes',
+                  'token-transfers.json': f'/transactions/{h}/token-transfers',
+                  'logs.json': f'/transactions/{h}/logs',
+              }.items():
+                  try:
+                      (d/suffix).write_bytes(get(base + path))
+                  except Exception as e:
+                      (d/(suffix+'.err')).write_text(repr(e))
+
+          summary = {
+              'factory': address,
+              'top_level_count': len(txs),
+              'internal_count': len(internals),
+              'parent_transaction_count': len(hashes),
+              'transaction_hashes': sorted(hashes),
+          }
+          (root/'summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True))
+          PY
+
+          find "$OUT" -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS"
+          test -s "$OUT/summary.json"
+
+      - name: Upload public history evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: 0x-live-receiver-history-${{ github.run_id }}
+          path: history/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
