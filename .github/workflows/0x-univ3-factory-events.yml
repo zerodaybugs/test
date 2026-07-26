@@ -1,0 +1,116 @@
+name: Collect public 0x UniV3 factory events
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/0x-univ3-factory-events.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
+      - name: Collect verified sources and event logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/events"
+          mkdir -p "$OUT/robinhood" "$OUT/polygon"
+          RH=https://rpc.mainnet.chain.robinhood.com
+          POLY=https://polygon-bor-rpc.publicnode.com
+          RHX=https://robinhoodchain.blockscout.com
+          POLYX=https://polygon.blockscout.com
+          UA='Mozilla/5.0 0x-public-audit-metadata/1.0'
+
+          cat > "$OUT/targets.tsv" <<'EOF'
+          robinhood	sheriff_factory	0x21Fd9aB06cc927E66013e89b045c26b3eDE7bB20
+          robinhood	gigadex_factory	0xEce6eCd61177336ea6Fb9b17937AC439D85EE20B
+          robinhood	swaphood_factory	0x0Ec554F0BfF0Be6C99d1e95C8015bb0950f6A2C7
+          robinhood	pancake_factory	0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865
+          robinhood	robinswap_factory	0xEa561E058313B96011e5070Ca7d0f027A44E3748
+          robinhood	sushiswap_factory	0xE51960f1B45f1C9FB6D166E6a884F866fC70433B
+          robinhood	uniswap_factory	0x1f7d7550B1b028f7571E69A784071F0205FD2EfA
+          polygon	quickswap_v4_factory	0x134c1dBE4860A9cAaf89002574fFe814772D9904
+          EOF
+
+          RH_HEAD=$(cast block-number --rpc-url "$RH")
+          POLY_HEAD=$(cast block-number --rpc-url "$POLY")
+          printf 'head=%s\n' "$RH_HEAD" > "$OUT/robinhood/network.txt"
+          printf 'head=%s\n' "$POLY_HEAD" > "$OUT/polygon/network.txt"
+          POLY_FROM=$(( POLY_HEAD > 8000000 ? POLY_HEAD - 8000000 : 0 ))
+
+          while IFS=$'\t' read -r chain label address; do
+            [ -n "$chain" ] || continue
+            if [ "$chain" = robinhood ]; then
+              rpc="$RH"; explorer="$RHX"; from=0
+            else
+              rpc="$POLY"; explorer="$POLYX"; from="$POLY_FROM"
+            fi
+            dir="$OUT/$chain/$label"
+            mkdir -p "$dir"
+            printf '%s\n' "$address" > "$dir/address.txt"
+            cast codehash "$address" --rpc-url "$rpc" > "$dir/codehash.txt" 2> "$dir/codehash.err" || true
+            curl -A "$UA" -fsSL --retry 3 --max-time 45 "$explorer/api/v2/smart-contracts/$address" > "$dir/smart-contract.json" 2> "$dir/smart-contract.err" || true
+            curl -A "$UA" -fsSL --retry 3 --max-time 45 "$explorer/api/v2/addresses/$address" > "$dir/address.json" 2> "$dir/address.err" || true
+            cast logs --json --rpc-url "$rpc" --address "$address" --from-block "$from" --to-block latest > "$dir/logs.json" 2> "$dir/logs.err" || true
+          done < "$OUT/targets.tsv"
+
+          python3 - "$OUT" <<'PY'
+          import json, pathlib, subprocess, sys
+          root = pathlib.Path(sys.argv[1])
+          summary=[]
+          for p in sorted(root.rglob('smart-contract.json')):
+              d=p.parent
+              row={'chain':d.parent.name,'label':d.name,'address':(d/'address.txt').read_text().strip()}
+              try:
+                  obj=json.loads(p.read_text())
+                  row.update({'verified':obj.get('is_verified'),'name':obj.get('name'),'file_path':obj.get('file_path')})
+                  abi=obj.get('abi') or []
+                  events=[]
+                  for e in abi:
+                      if e.get('type')=='event':
+                          sig=e.get('name','')+'('+','.join(x.get('type','') for x in e.get('inputs',[]))+')'
+                          try:
+                              topic=subprocess.check_output(['cast','keccak',sig],text=True).strip()
+                          except Exception:
+                              topic=None
+                          events.append({'signature':sig,'topic0':topic})
+                  row['events']=events
+              except Exception as e:
+                  row['source_error']=repr(e)
+              lp=d/'logs.json'
+              if lp.exists() and lp.stat().st_size:
+                  try:
+                      logs=json.loads(lp.read_text())
+                      row['log_count']=len(logs) if isinstance(logs,list) else None
+                      row['log_topic0']=sorted({x.get('topics',[None])[0] for x in logs if isinstance(x,dict) and x.get('topics')})
+                  except Exception as e:
+                      row['logs_error']=repr(e)
+              summary.append(row)
+          (root/'summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True))
+          PY
+
+          find "$OUT" -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS"
+          test -s "$OUT/summary.json"
+
+      - name: Upload public event evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: 0x-univ3-factory-events-${{ github.run_id }}
+          path: events/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
