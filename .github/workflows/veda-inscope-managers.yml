@@ -1,0 +1,180 @@
+name: veda-inscope-managers
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Audit exact in-scope manager instances and root holders
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, time, urllib.request, urllib.parse, traceback
+
+          ATTACKER='0x1111111111111111111111111111111111111111'
+          ZERO='0x0000000000000000000000000000000000000000'
+          CHAINS={
+            'ethereum':{
+              'id':1,'rpcs':['https://ethereum-rpc.publicnode.com','https://eth.drpc.org'],'explorer':'https://eth.blockscout.com',
+              'managers':{
+                'liquidETH':'0xf9f7969C357ce6dfd7973098Ea0D57173592bCCa',
+                'liquidBTC':'0xaFa8c08bedB2eC1bbEb64A7fFa44c604e7cca68d',
+                'liquidUSD':'0x7b57Ad1A0AA89583130aCfAD024241170D24C13C'}},
+            'scroll':{
+              'id':534352,'rpcs':['https://scroll-rpc.publicnode.com','https://rpc.scroll.io'],'explorer':'https://scroll.blockscout.com',
+              'managers':{
+                'liquidETH':'0x227975088C28DBBb4b421c6d96781a53578f19a8',
+                'liquidBTC':'0xaFa8c08bedB2eC1bbEb64A7fFa44c604e7cca68d',
+                'liquidUSD':'0x7b57Ad1A0AA89583130aCfAD024241170D24C13C'}}}
+
+          def sh(*args):
+            p=subprocess.run([str(x) for x in args],text=True,capture_output=True)
+            if p.returncode: raise RuntimeError({'args':args,'stdout':p.stdout,'stderr':p.stderr})
+            return p.stdout.strip()
+          def sig(x):return sh('cast','sig',x)
+          def topic(x):return sh('cast','keccak',x).lower()
+          S={
+            'vault':sig('vault()'),'authority':sig('authority()'),'owner':sig('owner()'),'paused':sig('isPaused()'),
+            'root':sig('manageRoot(address)'),'manage':sig('manageVaultWithMerkleVerification(bytes32[][],address[],address[],bytes[],uint256[])'),
+            'can':sig('canCall(address,address,bytes4)'),'pub':sig('isCapabilityPublic(address,bytes4)'),
+            'safeOwners':sig('getOwners()'),'safeThreshold':sig('getThreshold()'),'safeModules':sig('getModulesPaginated(address,uint256)'),
+          }
+          ROOT_TOPIC=topic('ManageRootUpdated(address,bytes32,bytes32)')
+          EXECS={x:sig(x) for x in ['execute(address,uint256,bytes)','execute(address,bytes)','forward(address,bytes)','call(address,uint256,bytes)','run(address,bytes)','multicall(bytes[])']}
+          def rpc(ep,m,p,t=45):
+            body=json.dumps({'jsonrpc':'2.0','id':1,'method':m,'params':p}).encode();req=urllib.request.Request(ep,data=body,method='POST',headers={'content-type':'application/json','user-agent':'veda-inscope-manager/1'})
+            with urllib.request.urlopen(req,timeout=t) as r:o=json.loads(r.read().decode())
+            if 'error' in o:raise RuntimeError(o['error'])
+            return o['result']
+          def choose(c):
+            bad={}
+            for ep in c['rpcs']:
+              try:
+                if int(rpc(ep,'eth_chainId',[]),16)==c['id']:return ep,bad
+              except Exception as e:bad[ep]=repr(e)
+            raise RuntimeError(bad)
+          def h(x):
+            x=str(x or '');return x[2:] if x.startswith('0x') else x
+          def w(x):return hex(int(x))[2:].rjust(64,'0')
+          def aw(a):return h(a).lower().rjust(64,'0')
+          def bw(s):return h(s).lower().ljust(64,'0')
+          def addr(raw):return ZERO if not raw or raw=='0x' else '0x'+h(raw)[-40:].lower()
+          def call(ep,to,data,frm=None):
+            tx={'to':to,'data':data}
+            if frm:tx['from']=frm
+            return rpc(ep,'eth_call',[tx,'latest'])
+          def safe(ep,to,data,frm=None):
+            try:return {'ok':True,'raw':call(ep,to,data,frm)}
+            except Exception as e:return {'ok':False,'error':repr(e)}
+          def can(ep,auth,user,target,selector):
+            if auth==ZERO:return user.lower()==addr(safe(ep,target,S['owner']).get('raw')).lower()
+            r=safe(ep,auth,S['can']+aw(user)+aw(target)+bw(selector));return bool(int(r['raw'],16)) if r['ok'] else None
+          def public(ep,auth,target,selector):
+            if auth==ZERO:return False
+            r=safe(ep,auth,S['pub']+aw(target)+bw(selector));return bool(int(r['raw'],16)) if r['ok'] else None
+          def http(url,t=45,retries=4):
+            last=None
+            for i in range(retries):
+              try:
+                req=urllib.request.Request(url,headers={'accept':'application/json','user-agent':'veda-inscope-manager/1'})
+                with urllib.request.urlopen(req,timeout=t) as r:return json.loads(r.read().decode())
+              except Exception as e:last=repr(e);time.sleep(.3*(i+1))
+            raise RuntimeError({'url':url,'error':last})
+          def address_logs(explorer,address,max_pages=200):
+            url=f'{explorer}/api/v2/addresses/{address}/logs';out=[];errs=[]
+            for _ in range(max_pages):
+              try:p=http(url)
+              except Exception as e:errs.append(repr(e));break
+              out.extend(p.get('items') or []);nxt=p.get('next_page_params')
+              if not nxt:break
+              url=f'{explorer}/api/v2/addresses/{address}/logs?'+urllib.parse.urlencode(nxt);time.sleep(.04)
+            return out,errs
+          def smart(explorer,a):
+            try:return http(f'{explorer}/api/v2/smart-contracts/{a}')
+            except Exception as e:return {'_error':repr(e)}
+          def meta(explorer,a):
+            try:return http(f'{explorer}/api/v2/addresses/{a}')
+            except Exception as e:return {'_error':repr(e)}
+          def funcs(sc):
+            abi=sc.get('abi') if isinstance(sc,dict) else []
+            if isinstance(abi,str):
+              try:abi=json.loads(abi)
+              except:abi=[]
+            return [{'name':x.get('name'),'inputs':[i.get('type') for i in x.get('inputs',[])],'state':x.get('stateMutability')} for x in abi or [] if isinstance(x,dict) and x.get('type')=='function']
+          def decode_arr(raw):
+            x=h(raw)
+            try:
+              off=int(x[:64],16)*2;n=int(x[off:off+64],16);cur=off+64
+              return ['0x'+x[cur+i*64+24:cur+(i+1)*64].lower() for i in range(n)]
+            except:return []
+          # harmless empty call into manager
+          EMPTY_MANAGE=S['manage']+w(160)+w(192)+w(224)+w(256)+w(288)+w(0)+w(0)+w(0)+w(0)+w(0)
+          def dyn(data):
+            x=h(data);return w(len(x)//2)+x.ljust(((len(x)+63)//64)*64,'0')
+          def exec_data(name,target):
+            b=dyn(EMPTY_MANAGE)
+            if name=='execute(address,uint256,bytes)':return EXECS[name]+aw(target)+w(0)+w(96)+b
+            if name in ('execute(address,bytes)','forward(address,bytes)','run(address,bytes)'):return EXECS[name]+aw(target)+w(64)+b
+            if name=='call(address,uint256,bytes)':return EXECS[name]+aw(target)+w(0)+w(96)+b
+            if name=='multicall(bytes[])':return EXECS[name]+w(32)+w(1)+w(32)+b
+
+          out={'generated_at_unix':int(time.time()),'root_topic':ROOT_TOPIC,'chains':{},'open_deputies':[],'errors':[]}
+          for cn,c in CHAINS.items():
+            cr={'managers':{}};out['chains'][cn]=cr
+            try:
+              ep,bad=choose(c);cr.update({'endpoint':ep,'block':int(rpc(ep,'eth_blockNumber',[]),16),'rpc_failures':bad})
+              for product,mgr in c['managers'].items():
+                row={'address':mgr.lower(),'holders':[]};cr['managers'][product]=row
+                try:
+                  code=rpc(ep,'eth_getCode',[mgr,'latest']);row['code_bytes']=len(h(code))//2
+                  if code=='0x':row['not_deployed']=True;continue
+                  vault=addr(call(ep,mgr,S['vault']));auth=addr(call(ep,mgr,S['authority']));owner=addr(call(ep,mgr,S['owner']));paused=safe(ep,mgr,S['paused'])
+                  row.update({'vault':vault,'authority':auth,'owner':owner,'paused':bool(int(paused['raw'],16)) if paused['ok'] and paused['raw']!='0x' else None,'paused_call':paused,'manage_public':public(ep,auth,mgr,S['manage']),'attacker_manage':can(ep,auth,ATTACKER,mgr,S['manage']),'verified':smart(c['explorer'],mgr)})
+                  ls,errs=address_logs(c['explorer'],mgr);row['log_errors']=errs;candidates={mgr.lower(),owner.lower()}
+                  for log in ls:
+                    ts=[str(x).lower() for x in (log.get('topics') or [])]
+                    if len(ts)>=2 and ts[0]==ROOT_TOPIC:candidates.add('0x'+h(ts[1])[-40:].lower())
+                  for holder in sorted(candidates):
+                    rr=safe(ep,mgr,S['root']+aw(holder));root=rr.get('raw') if rr['ok'] else None
+                    if not root or root=='0x' or int(root,16)==0:continue
+                    codeh=rpc(ep,'eth_getCode',[holder,'latest']);nonce=int(rpc(ep,'eth_getTransactionCount',[holder,'latest']),16);authorized=can(ep,auth,holder,mgr,S['manage'])
+                    item={'address':holder,'root':root,'authorized_manage':authorized,'code_bytes':len(h(codeh))//2,'nonce':nonce,'metadata':meta(c['explorer'],holder)}
+                    if codeh!='0x':
+                      sc=smart(c['explorer'],holder);fs=funcs(sc);item['verified_name']=sc.get('name') or sc.get('contract_name');item['interesting_functions']=[f for f in fs if f['name'] in {'execute','executeBatch','forward','call','run','manage','multicall'}]
+                      own=safe(ep,holder,S['owner']);item['owner']=addr(own['raw']) if own['ok'] and own['raw']!='0x' else None
+                      so=safe(ep,holder,S['safeOwners']);st=safe(ep,holder,S['safeThreshold'])
+                      if so['ok'] and st['ok'] and so['raw']!='0x':
+                        mods=safe(ep,holder,S['safeModules']+aw('0x0000000000000000000000000000000000000001')+w(50))
+                        item['safe']={'owners':decode_arr(so['raw']),'threshold':int(st['raw'],16),'modules_raw':mods.get('raw') if mods['ok'] else None}
+                      item['transitive_probes']={}
+                      if authorized:
+                        for name in EXECS:
+                          r=safe(ep,holder,exec_data(name,mgr),ATTACKER);item['transitive_probes'][name]={'ok':r['ok'],'raw':r.get('raw'),'error':r.get('error')}
+                        successes=[k for k,v in item['transitive_probes'].items() if v['ok']]
+                        if successes:out['open_deputies'].append({'chain':cn,'product':product,'manager':mgr.lower(),'holder':holder,'root':root,'successes':successes,'verified_name':item.get('verified_name')})
+                    row['holders'].append(item)
+                except Exception as e:
+                  row['error']=repr(e);row['traceback']=traceback.format_exc();out['errors'].append({'chain':cn,'product':product,'error':repr(e)})
+            except Exception as e:
+              cr['error']=repr(e);out['errors'].append({'chain':cn,'error':repr(e)})
+          out['summary']={'manager_count':sum(len(c['managers']) for c in out['chains'].values()),'root_holder_count':sum(len(m.get('holders',[])) for c in out['chains'].values() for m in c['managers'].values()),'open_deputy_count':len(out['open_deputies']),'error_count':len(out['errors'])}
+          open('veda-inscope-managers.json','w').write(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+      - name: Upload exact manager proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-inscope-managers
+          path: veda-inscope-managers.json
+          if-no-files-found: error
+          retention-days: 1
