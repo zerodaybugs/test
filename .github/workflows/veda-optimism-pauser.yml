@@ -1,0 +1,144 @@
+name: veda-optimism-pauser
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Inspect Optimism Pauser sender mappings and transitive callers
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, time, urllib.parse, urllib.request
+
+          BASE="https://explorer.optimism.io"
+          RPCS=["https://optimism-rpc.publicnode.com","https://mainnet.optimism.io","https://optimism.drpc.org"]
+          ATTACKER="0x1111111111111111111111111111111111111111"
+          PAUSERS={
+            "liquidBTC":{"address":"0x8c61f2368aaf64aaf7f3c41b6870f584adfabc33","authority":"0x49f954c67ff235034b69b8a59fbe309a40256c8d"},
+            "liquidETH":{"address":"0xdc10b195360aacc31969f5c5fcad24a335afb6b4","authority":"0x485bde66bb668a51f2372e34e45b1c6226798122"},
+            "liquidUSD":{"address":"0xe5f994b710f42efbd4e19affdc0909485b7848eb","authority":"0xff90f1b24dfbd25f439b94ed090f373bde24f60e"},
+          }
+          def shell(*args):
+            proc=subprocess.run([str(x) for x in args],text=True,capture_output=True)
+            if proc.returncode:raise RuntimeError({"args":args,"stdout":proc.stdout,"stderr":proc.stderr})
+            return proc.stdout.strip()
+          TOPIC=shell("cast","keccak","SenderToPausableUpdated(address,address)").lower()
+          SIG={name:shell("cast","sig",signature) for name,signature in {
+            "mapping":"senderToPausable(address)","senderPause":"senderPause()","senderUnpause":"senderUnpause()",
+            "can":"canCall(address,address,bytes4)","public":"isCapabilityPublic(address,bytes4)",
+            "getOwners":"getOwners()","getThreshold":"getThreshold()","getModules":"getModulesPaginated(address,uint256)",
+            "owner":"owner()","authority":"authority()",
+          }.items()}
+          SENTINEL="0x0000000000000000000000000000000000000001"
+          def http_json(url,timeout=60):
+            request=urllib.request.Request(url,headers={"accept":"application/json","user-agent":"veda-optimism-pauser/1"})
+            with urllib.request.urlopen(request,timeout=timeout) as response:return json.loads(response.read().decode())
+          def rpc(endpoint,method,params,timeout=35):
+            body=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
+            request=urllib.request.Request(endpoint,data=body,method="POST",headers={"content-type":"application/json","user-agent":"veda-optimism-pauser/1"})
+            with urllib.request.urlopen(request,timeout=timeout) as response:payload=json.loads(response.read().decode())
+            if "error" in payload:raise RuntimeError(payload["error"])
+            return payload["result"]
+          endpoint=None;failures={}
+          for candidate in RPCS:
+            try:
+              if int(rpc(candidate,"eth_chainId",[]),16)==10:endpoint=candidate;break
+            except Exception as exc:failures[candidate]=repr(exc)
+          if not endpoint:raise RuntimeError(failures)
+          def strip0(value):
+            text=str(value or "");return text[2:] if text.startswith("0x") else text
+          def norm_topic(value):
+            if isinstance(value,dict):value=value.get("value") or value.get("hex") or value.get("data")
+            return str(value or "").lower()
+          def aw(address):return strip0(address).lower().rjust(64,"0")
+          def uw(value):return hex(int(value))[2:].rjust(64,"0")
+          def bw(value):return strip0(value).lower().ljust(64,"0")
+          def decode_address(raw):return None if not raw or raw=="0x" else "0x"+strip0(raw)[-40:].lower()
+          def decode_uint(raw):return None if not raw or raw=="0x" else int(raw,16)
+          def decode_array(raw):
+            value=strip0(raw)
+            try:
+              offset=int(value[:64],16)*2;length=int(value[offset:offset+64],16);cursor=offset+64
+              return ["0x"+value[cursor+i*64+24:cursor+(i+1)*64].lower() for i in range(length)]
+            except Exception:return None
+          def decode_modules(raw):
+            value=strip0(raw)
+            try:
+              offset=int(value[:64],16)*2;length=int(value[offset:offset+64],16);cursor=offset+64
+              return ["0x"+value[cursor+i*64+24:cursor+(i+1)*64].lower() for i in range(length)]
+            except Exception:return None
+          def call(to,data,from_address=None):
+            tx={"to":to,"data":data}
+            if from_address:tx["from"]=from_address
+            return rpc(endpoint,"eth_call",[tx,"latest"])
+          def safe_call(to,data,from_address=None):
+            try:return {"ok":True,"raw":call(to,data,from_address)}
+            except Exception as exc:return {"ok":False,"error":repr(exc)}
+          def fetch_logs(address):
+            url=f"{BASE}/api/v2/addresses/{address}/logs";params={};items=[];seen=set();errors=[]
+            while True:
+              full=url+("?"+urllib.parse.urlencode(params,doseq=True) if params else "")
+              try:payload=http_json(full)
+              except Exception as exc:errors.append({"url":full,"error":repr(exc)});break
+              batch=payload.get("items") or []
+              for item in batch:
+                key=(item.get("transaction_hash"),item.get("index") or item.get("log_index"),item.get("block_number"))
+                if key not in seen:seen.add(key);items.append(item)
+              nxt=payload.get("next_page_params")
+              if not nxt or not batch:break
+              params={k:v for k,v in nxt.items() if v is not None};time.sleep(.03)
+            return items,errors
+          output={"block":int(rpc(endpoint,"eth_blockNumber",[]),16),"rpc":endpoint,"rpc_failures":failures,"pausers":{},"mapped_senders":{},"flags":[],"errors":[]}
+          senders=set([ATTACKER.lower()])
+          for product,config in PAUSERS.items():
+            pauser=config["address"];authority=config["authority"];row={"address":pauser,"authority":authority};output["pausers"][product]=row
+            try:
+              logs,errors=fetch_logs(pauser);row["fetch_errors"]=errors;events=[]
+              for item in logs:
+                topics=[norm_topic(value) for value in item.get("topics") or []]
+                if len(topics)>=3 and topics[0]==TOPIC:
+                  sender="0x"+strip0(topics[1])[-40:].lower();target="0x"+strip0(topics[2])[-40:].lower();senders.add(sender);events.append({"sender":sender,"pausable":target,"block":item.get("block_number"),"tx":item.get("transaction_hash")})
+              row["events"]=events
+              row["sender_pause_public"]=bool(int(call(authority,SIG["public"]+aw(pauser)+bw(SIG["senderPause"])),16))
+              row["sender_unpause_public"]=bool(int(call(authority,SIG["public"]+aw(pauser)+bw(SIG["senderUnpause"])),16))
+              row["attacker_can_pause"]=bool(int(call(authority,SIG["can"]+aw(ATTACKER)+aw(pauser)+bw(SIG["senderPause"])),16))
+              row["attacker_can_unpause"]=bool(int(call(authority,SIG["can"]+aw(ATTACKER)+aw(pauser)+bw(SIG["senderUnpause"])),16))
+              row["attacker_mapping"]=decode_address(call(pauser,SIG["mapping"]+aw(ATTACKER)))
+            except Exception as exc:
+              row["error"]=repr(exc);output["errors"].append({"product":product,"error":repr(exc)})
+          for sender in sorted(senders):
+            state={"address":sender,"mappings":{}}
+            for product,config in PAUSERS.items():
+              try:state["mappings"][product]=decode_address(call(config["address"],SIG["mapping"]+aw(sender)))
+              except Exception as exc:state["mappings"][product]={"error":repr(exc)}
+            code=rpc(endpoint,"eth_getCode",[sender,"latest"]);state["code_bytes"]=len(strip0(code))//2;state["eip7702"]=strip0(code).lower().startswith("ef0100")
+            if state["code_bytes"]:
+              owners=safe_call(sender,SIG["getOwners"]);threshold=safe_call(sender,SIG["getThreshold"]);modules=safe_call(sender,SIG["getModules"]+aw(SENTINEL)+uw(100));owner=safe_call(sender,SIG["owner"]);authority=safe_call(sender,SIG["authority"])
+              state.update({"safe_owners":decode_array(owners.get("raw")) if owners.get("ok") else None,"safe_threshold":decode_uint(threshold.get("raw")) if threshold.get("ok") else None,"safe_modules":decode_modules(modules.get("raw")) if modules.get("ok") else None,"owner":decode_address(owner.get("raw")) if owner.get("ok") else None,"authority":decode_address(authority.get("raw")) if authority.get("ok") else None})
+            output["mapped_senders"][sender]=state
+            live_targets=[value for value in state["mappings"].values() if isinstance(value,str) and value!="0x0000000000000000000000000000000000000000"]
+            if live_targets and (state.get("eip7702") or state.get("safe_modules")):
+              output["flags"].append({"sender":sender,"targets":live_targets,"reason":"mapped_contract_execution_surface","state":state})
+          output["summary"]={"sender_count":len(senders),"mapped_live_count":sum(1 for state in output["mapped_senders"].values() if any(isinstance(value,str) and value!="0x0000000000000000000000000000000000000000" for value in state["mappings"].values())),"flag_count":len(output["flags"]),"errors":len(output["errors"])}
+          with open("veda-optimism-pauser.json","w",encoding="utf-8") as handle:json.dump(output,handle,indent=2,sort_keys=True);handle.write("\n")
+          print(json.dumps(output,indent=2,sort_keys=True))
+          PY
+      - name: Upload Optimism Pauser proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-optimism-pauser
+          path: veda-optimism-pauser.json
+          if-no-files-found: error
+          retention-days: 1
