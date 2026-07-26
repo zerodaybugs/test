@@ -1,0 +1,263 @@
+name: Hermetica hBTC public role map
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-hbtc-role-map.yml'
+      - 'public-data/hermetica-hbtc-role-map-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install read-only decoder
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/hermetica-hbtc-role-map
+          cd /tmp/hermetica-hbtc-role-map
+          npm init -y >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund @stacks/transactions@7.2.0
+
+      - name: Capture public role state and immutable sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/hermetica-hbtc-role-map
+          cat > capture.cjs <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const {
+            principalCV,
+            bufferCV,
+            cvToHex,
+            hexToCV,
+            cvToJSON,
+          } = require('@stacks/transactions');
+
+          const API = 'https://api.hiro.so';
+          const DEPLOYER = 'SP1S1HSFH0SQQGWKB69EYFNY0B1MHRMGXR3J1FH4D';
+          const HQ = `${DEPLOYER}.hq-v1`;
+          const ROLE_TYPES = {
+            guardian: Buffer.from([1]),
+            trader: Buffer.from([2]),
+            rewarder: Buffer.from([3]),
+            manager: Buffer.from([4]),
+            fee_setter: Buffer.from([5]),
+            protocol: Buffer.from([6]),
+          };
+
+          const knownContracts = [
+            'hq-v1', 'state-hbtc-v1', 'vault-hbtc-v1', 'controller-hbtc-v1',
+            'reserve-hbtc-v1', 'reserve-fund-hbtc-v1', 'fee-collector-hbtc-v1',
+            'token-hbtc-v1', 'blacklist-hbtc-v1', 'trading-hbtc-v1',
+            'hermetica-interface-hbtc-v1', 'zest-interface-hbtc-v1',
+            'granite-interface-hbtc-v1', 'airdrop-v1',
+          ].map(n => `${DEPLOYER}.${n}`);
+
+          async function fetchRetry(url, options = {}, attempts = 8) {
+            let last;
+            for (let i = 0; i < attempts; i++) {
+              try {
+                const res = await fetch(url, options);
+                if (res.ok) return res;
+                const text = await res.text();
+                last = new Error(`${res.status} ${res.statusText}: ${text}`);
+                if (res.status < 500 && res.status !== 429) throw last;
+              } catch (e) {
+                last = e;
+              }
+              await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+            }
+            throw last;
+          }
+
+          async function getTransactions(principal, max = 3000) {
+            const all = [];
+            for (let offset = 0; offset < max; offset += 50) {
+              const res = await fetchRetry(`${API}/extended/v1/address/${encodeURIComponent(principal)}/transactions?limit=50&offset=${offset}`);
+              const body = await res.json();
+              const rows = body.results || [];
+              all.push(...rows);
+              if (rows.length < 50 || all.length >= (body.total || max)) break;
+            }
+            return all.slice(0, max);
+          }
+
+          async function callRead(contractName, functionName, cvs = []) {
+            const res = await fetchRetry(`${API}/v2/contracts/call-read/${DEPLOYER}/${contractName}/${functionName}`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ sender: DEPLOYER, arguments: cvs.map(cvToHex) }),
+            });
+            const body = await res.json();
+            let decoded = null;
+            if (body.result) {
+              try { decoded = cvToJSON(hexToCV(body.result)); }
+              catch (e) { decoded = { decode_error: String(e), raw: body.result }; }
+            }
+            return { okay: body.okay, cause: body.cause, result_raw: body.result, decoded };
+          }
+
+          function unwrap(node) {
+            if (node === null || node === undefined) return node;
+            if (typeof node !== 'object') return node;
+            if (Array.isArray(node)) return node.map(unwrap);
+            if (Object.prototype.hasOwnProperty.call(node, 'value')) return unwrap(node.value);
+            const out = {};
+            for (const [k, v] of Object.entries(node)) out[k] = unwrap(v);
+            return out;
+          }
+
+          function principalsFrom(value) {
+            const text = typeof value === 'string' ? value : JSON.stringify(value);
+            const out = new Set();
+            const re = /((?:SP|SM)[0-9A-HJKMNP-TV-Z]{25,50}(?:\.[a-zA-Z0-9-]{1,128})?)/g;
+            let m;
+            while ((m = re.exec(text))) out.add(m[1]);
+            return [...out];
+          }
+
+          function safeName(p) {
+            return p.replace(/[^a-zA-Z0-9_.-]/g, '_');
+          }
+
+          async function sourceFor(principal) {
+            if (!principal.includes('.')) return { exists: false, reason: 'standard-principal' };
+            const [address, ...nameParts] = principal.split('.');
+            const contractName = nameParts.join('.');
+            const res = await fetch(`${API}/v2/contracts/source/${address}/${contractName}?proof=0`);
+            if (!res.ok) return { exists: false, status: res.status };
+            const body = await res.json();
+            const source = body.source || '';
+            const filename = path.join('sources', `${safeName(principal)}.clar`);
+            fs.mkdirSync('sources', { recursive: true });
+            fs.writeFileSync(filename, source);
+            return {
+              exists: true,
+              filename,
+              source_length: source.length,
+              public_functions: [...source.matchAll(/\(define-public\s+\(([^\s()]+)/g)].map(m => m[1]),
+              read_only_functions: [...source.matchAll(/\(define-read-only\s+\(([^\s()]+)/g)].map(m => m[1]),
+              direct_role_checks: [...new Set([...source.matchAll(/check-is-(guardian|trader|rewarder|manager|fee-setter|protocol)/g)].map(m => m[1]))],
+              tx_sender_refs: (source.match(/tx-sender/g) || []).length,
+              contract_caller_refs: (source.match(/contract-caller/g) || []).length,
+              dynamic_contract_calls: (source.match(/contract-call\?\s+[a-zA-Z0-9-]+/g) || []).length,
+            };
+          }
+
+          (async () => {
+            const txs = await getTransactions(HQ);
+            const directCalls = txs.filter(t => t.tx_type === 'contract_call' && t.contract_call?.contract_id === HQ);
+            const successfulCalls = directCalls.filter(t => t.tx_status === 'success');
+
+            const principals = new Set([DEPLOYER, HQ, ...knownContracts]);
+            for (const tx of txs) {
+              if (tx.sender_address) principals.add(tx.sender_address);
+              for (const p of principalsFrom(tx)) principals.add(p);
+            }
+
+            const globals = {};
+            for (const fn of ['get-timelock', 'get-next-timelock', 'get-protocol-enabled', 'get-owner', 'get-next-owner']) {
+              try { globals[fn] = await callRead('hq-v1', fn); }
+              catch (e) { globals[fn] = { error: String(e) }; }
+            }
+
+            const roleState = {};
+            for (const p of [...principals].sort()) {
+              const row = {};
+              for (const [role, type] of Object.entries(ROLE_TYPES)) {
+                try {
+                  const getter = role === 'fee_setter' ? 'get-fee-setter' : `get-${role}`;
+                  row[role] = await callRead('hq-v1', getter, [principalCV(p)]);
+                  row[`${role}_pending`] = await callRead('hq-v1', 'get-update-request', [bufferCV(type), principalCV(p)]);
+                } catch (e) {
+                  row[role] = { error: String(e) };
+                }
+              }
+              roleState[p] = row;
+            }
+
+            const active = {};
+            for (const [p, row] of Object.entries(roleState)) {
+              const roles = [];
+              for (const role of Object.keys(ROLE_TYPES)) {
+                const value = unwrap(row[role]?.decoded);
+                if (value === true || value?.value === true) roles.push(role);
+              }
+              if (roles.length) active[p] = roles;
+            }
+
+            const sourceState = {};
+            const sourceTargets = new Set([...knownContracts, ...Object.keys(active).filter(p => p.includes('.'))]);
+            for (const p of [...sourceTargets].sort()) {
+              try { sourceState[p] = await sourceFor(p); }
+              catch (e) { sourceState[p] = { exists: false, error: String(e) }; }
+            }
+
+            const callHistory = successfulCalls.map(tx => ({
+              tx_id: tx.tx_id,
+              block_height: tx.block_height,
+              burn_block_time_iso: tx.burn_block_time_iso,
+              sender_address: tx.sender_address,
+              function_name: tx.contract_call?.function_name,
+              args: tx.contract_call?.function_args?.map(a => ({ name: a.name, repr: a.repr })) || [],
+              result: tx.tx_result?.repr,
+            }));
+
+            const output = {
+              generated_at: new Date().toISOString(),
+              source: 'Hiro public read-only APIs',
+              deployer: DEPLOYER,
+              hq: HQ,
+              transaction_counts: {
+                address_history: txs.length,
+                direct_calls: directCalls.length,
+                successful_direct_calls: successfulCalls.length,
+              },
+              globals,
+              candidate_principals: [...principals].sort(),
+              active_roles: active,
+              role_state: roleState,
+              source_state: sourceState,
+              successful_hq_calls: callHistory,
+            };
+
+            fs.writeFileSync('hermetica-hbtc-role-map.json', JSON.stringify(output, null, 2));
+            fs.writeFileSync('summary.json', JSON.stringify({
+              generated_at: output.generated_at,
+              transaction_counts: output.transaction_counts,
+              active_roles: active,
+              contract_sources: Object.fromEntries(Object.entries(sourceState).map(([k, v]) => [k, {
+                exists: v.exists,
+                public_functions: v.public_functions,
+                direct_role_checks: v.direct_role_checks,
+                tx_sender_refs: v.tx_sender_refs,
+                contract_caller_refs: v.contract_caller_refs,
+              }])),
+            }, null, 2));
+            console.log(fs.readFileSync('summary.json', 'utf8'));
+          })().catch(e => { console.error(e); process.exit(1); });
+          NODE
+          node capture.cjs
+          sha256sum hermetica-hbtc-role-map.json summary.json sources/* > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-hbtc-role-map
+          path: |
+            /tmp/hermetica-hbtc-role-map/hermetica-hbtc-role-map.json
+            /tmp/hermetica-hbtc-role-map/summary.json
+            /tmp/hermetica-hbtc-role-map/sources
+            /tmp/hermetica-hbtc-role-map/SHA256SUMS
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
