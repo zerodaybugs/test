@@ -1,0 +1,288 @@
+name: Export pinned upstream fork state
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'infra/settler-refund-state-export/**'
+      - '.github/workflows/settler-refund-state-export.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: settler-refund-state-export-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+
+    steps:
+      - name: Checkout exporter
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install pinned Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
+      - name: Export exact public fork state and offline toolchain
+        shell: bash
+        run: |
+          set +e
+          ROOT="$GITHUB_WORKSPACE/evidence"
+          TARGET=/tmp/0x-settler
+          TARGET_COMMIT=92bc8f11836fa96eaa7c5f0b1c371205dcafe245
+          TEST_CONTRACT=NucleusRefundStateExport
+          TEST_NAME=testExportOfficialRefundState
+          mkdir -p "$ROOT" "$ROOT/bundle/bin"
+
+          {
+            echo "runner_repository=$GITHUB_REPOSITORY"
+            echo "runner_commit=$GITHUB_SHA"
+            echo "target_repository=0xProject/0x-settler"
+            echo "target_commit=$TARGET_COMMIT"
+            echo "fork_block=25180132"
+            echo "generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            forge --version
+            cast --version
+            anvil --version
+          } > "$ROOT/PROVENANCE.txt" 2>&1
+
+          clone_rc=99
+          checkout_rc=99
+          submodule_rc=99
+          copy_rc=99
+          solc34_rc=99
+          solc25_rc=99
+          test_rc=99
+          state_rc=99
+          offline_rc=99
+          selected_rpc=''
+
+          rm -rf "$TARGET"
+          git clone https://github.com/0xProject/0x-settler.git "$TARGET" > "$ROOT/clone.log" 2>&1
+          clone_rc=$?
+          if [ "$clone_rc" = 0 ]; then
+            git -C "$TARGET" checkout --detach "$TARGET_COMMIT" >> "$ROOT/clone.log" 2>&1
+            checkout_rc=$?
+            git -C "$TARGET" submodule update --init --recursive >> "$ROOT/clone.log" 2>&1
+            submodule_rc=$?
+            git -C "$TARGET" rev-parse HEAD > "$ROOT/target-head.txt" 2>&1
+          fi
+
+          if [ "$checkout_rc" = 0 ] && [ "$submodule_rc" = 0 ]; then
+            cp "$GITHUB_WORKSPACE/infra/settler-refund-state-export/NucleusRefundStateExport.t.sol" \
+              "$TARGET/test/integration/NucleusRefundStateExport.t.sol"
+            copy_rc=$?
+          fi
+
+          if [ "$copy_rc" = 0 ]; then
+            (
+              cd "$TARGET"
+              FOUNDRY_SOLC_VERSION=0.8.34 forge build -- src/chains/Mainnet/BridgeSettler.sol
+            ) > "$ROOT/solc-0.8.34-build.log" 2>&1
+            solc34_rc=$?
+
+            (
+              cd "$TARGET"
+              FOUNDRY_SOLC_VERSION=0.8.25 forge build -- \
+                src/allowanceholder/AllowanceHolder.sol src/deployer/Deployer.sol
+            ) > "$ROOT/solc-0.8.25-build.log" 2>&1
+            solc25_rc=$?
+          fi
+
+          if [ "$solc34_rc" = 0 ] && [ "$solc25_rc" = 0 ]; then
+            index=0
+            for rpc in \
+              https://ethereum-rpc.publicnode.com \
+              https://eth.llamarpc.com \
+              https://1rpc.io/eth
+            do
+              index=$((index + 1))
+              log="$ROOT/forge-test-rpc-${index}.log"
+              {
+                echo "rpc_index=$index"
+                echo "rpc_host=$(printf '%s' "$rpc" | sed -E 's#https?://([^/]+).*#\1#')"
+                echo "chain_id=$(cast chain-id --rpc-url "$rpc" 2>&1)"
+                echo "head_block=$(cast block-number --rpc-url "$rpc" 2>&1)"
+                echo
+              } > "$log"
+
+              (
+                cd "$TARGET"
+                rm -rf artifacts
+                FOUNDRY_PROFILE=integration \
+                MAINNET_RPC_URL="$rpc" \
+                forge test \
+                  --match-contract "$TEST_CONTRACT" \
+                  --match-test "$TEST_NAME" \
+                  -vvvv
+              ) >> "$log" 2>&1
+              attempt_rc=$?
+              echo "exit_code=$attempt_rc" >> "$log"
+              if [ "$attempt_rc" = 0 ] && [ -s "$TARGET/artifacts/refund-state-alloc.json" ]; then
+                test_rc=0
+                selected_rpc="$(printf '%s' "$rpc" | sed -E 's#https?://([^/]+).*#\1#')"
+                break
+              fi
+              test_rc=$attempt_rc
+            done
+          fi
+
+          if [ "$test_rc" = 0 ]; then
+            cp -a "$TARGET/artifacts/." "$ROOT/"
+            python3 - "$ROOT" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          raw = json.loads((root / "refund-state-alloc.json").read_text())
+          address = (root / "bridge-settler-address.txt").read_text().strip().lower()
+          expected = int((root / "refund-amount.txt").read_text().strip())
+
+          alloc = raw.get("alloc", raw)
+          normalized = {str(k).lower(): v for k, v in alloc.items()}
+          entry = normalized.get(address)
+          if entry is None:
+              entry = normalized.get(address.removeprefix("0x"))
+          if entry is None:
+              raise SystemExit(f"bridge settler {address} missing from state dump")
+
+          balance_raw = entry.get("balance", "0x0")
+          balance = int(balance_raw, 0) if isinstance(balance_raw, str) else int(balance_raw)
+          if balance != expected:
+              raise SystemExit(f"dumped balance {balance} != expected {expected}")
+          code = entry.get("code", "0x")
+          if not isinstance(code, str) or len(code) <= 2:
+              raise SystemExit("bridge settler runtime code missing from dump")
+
+          genesis = {
+              "config": {
+                  "chainId": 31337,
+                  "homesteadBlock": 0,
+                  "eip150Block": 0,
+                  "eip155Block": 0,
+                  "eip158Block": 0,
+                  "byzantiumBlock": 0,
+                  "constantinopleBlock": 0,
+                  "petersburgBlock": 0,
+                  "istanbulBlock": 0,
+                  "berlinBlock": 0,
+                  "londonBlock": 0,
+                  "shanghaiTime": 0,
+                  "cancunTime": 0
+              },
+              "nonce": "0x0",
+              "timestamp": "0x1",
+              "extraData": "0x",
+              "gasLimit": "0x1fffffffffffff",
+              "difficulty": "0x0",
+              "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+              "coinbase": "0x0000000000000000000000000000000000000000",
+              "alloc": alloc
+          }
+          (root / "offline-genesis.json").write_text(json.dumps(genesis, indent=2, sort_keys=True))
+          (root / "state-validation.json").write_text(json.dumps({
+              "bridge_settler": address,
+              "expected_refund": expected,
+              "dumped_refund": balance,
+              "runtime_bytes": (len(code) - 2) // 2,
+              "alloc_accounts": len(alloc)
+          }, indent=2, sort_keys=True))
+          PY
+            state_rc=$?
+          fi
+
+          if [ "$state_rc" = 0 ]; then
+            BRIDGE="$(tr -d '\r\n' < "$ROOT/bridge-settler-address.txt")"
+            EXPECTED="$(tr -d '\r\n' < "$ROOT/refund-amount.txt")"
+            anvil \
+              --init "$ROOT/offline-genesis.json" \
+              --host 127.0.0.1 \
+              --port 8545 \
+              --silent \
+              --auto-impersonate \
+              --hardfork cancun \
+              > "$ROOT/offline-anvil.log" 2>&1 &
+            ANVIL_PID=$!
+            for _ in $(seq 1 30); do
+              cast chain-id --rpc-url http://127.0.0.1:8545 >/dev/null 2>&1 && break
+              sleep 1
+            done
+            CODE="$(cast code "$BRIDGE" --rpc-url http://127.0.0.1:8545 2>> "$ROOT/offline-validation.log")"
+            BALANCE="$(cast balance "$BRIDGE" --rpc-url http://127.0.0.1:8545 2>> "$ROOT/offline-validation.log")"
+            {
+              echo "bridge_settler=$BRIDGE"
+              echo "expected_balance=$EXPECTED"
+              echo "observed_balance=$BALANCE"
+              echo "runtime_prefix=$(printf '%s' "$CODE" | head -c 66)"
+            } >> "$ROOT/offline-validation.log"
+            if [ "$BALANCE" = "$EXPECTED" ] && [ "$CODE" != "0x" ]; then
+              offline_rc=0
+            else
+              offline_rc=1
+            fi
+            kill "$ANVIL_PID" >/dev/null 2>&1
+            wait "$ANVIL_PID" >/dev/null 2>&1
+          fi
+
+          for binary in forge cast anvil chisel; do
+            path="$(command -v "$binary" 2>/dev/null)"
+            [ -n "$path" ] && cp "$path" "$ROOT/bundle/bin/$binary"
+          done
+          [ -d "$HOME/.svm" ] && cp -a "$HOME/.svm" "$ROOT/bundle/svm"
+          if [ -d "$TARGET" ]; then
+            tar --exclude='.git' --exclude='out' --exclude='cache' \
+              -czf "$ROOT/bundle/0x-settler-source-with-submodules.tgz" -C /tmp 0x-settler
+          fi
+          cp "$GITHUB_WORKSPACE/infra/settler-refund-state-export/NucleusRefundStateExport.t.sol" \
+            "$ROOT/bundle/NucleusRefundStateExport.t.sol"
+
+          printf '%s\n' \
+            "clone_rc=$clone_rc" \
+            "checkout_rc=$checkout_rc" \
+            "submodule_rc=$submodule_rc" \
+            "copy_rc=$copy_rc" \
+            "solc34_rc=$solc34_rc" \
+            "solc25_rc=$solc25_rc" \
+            "test_rc=$test_rc" \
+            "state_rc=$state_rc" \
+            "offline_rc=$offline_rc" \
+            "selected_rpc_host=$selected_rpc" \
+            > "$ROOT/exit-codes.txt"
+          find "$ROOT" -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$ROOT/SHA256SUMS"
+          exit 0
+
+      - name: Upload state and offline toolchain
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: settler-refund-state-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 6
+
+      - name: Enforce export gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fx 'clone_rc=0' evidence/exit-codes.txt
+          grep -Fx 'checkout_rc=0' evidence/exit-codes.txt
+          grep -Fx 'submodule_rc=0' evidence/exit-codes.txt
+          grep -Fx 'copy_rc=0' evidence/exit-codes.txt
+          grep -Fx 'solc34_rc=0' evidence/exit-codes.txt
+          grep -Fx 'solc25_rc=0' evidence/exit-codes.txt
+          grep -Fx 'test_rc=0' evidence/exit-codes.txt
+          grep -Fx 'state_rc=0' evidence/exit-codes.txt
+          grep -Fx 'offline_rc=0' evidence/exit-codes.txt
+          grep -R -F '[PASS] testExportOfficialRefundState()' evidence/forge-test-rpc-*.log
