@@ -1,0 +1,182 @@
+name: veda-selfroot-fast
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Search every historical Merkle JSON blob for the live LiquidUSD self-root
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet --no-tags --filter=blob:none --no-checkout https://github.com/Veda-Labs/boring-vault.git veda-main
+          git clone --quiet --no-tags --filter=blob:none --no-checkout https://github.com/Veda-Labs/boring-vault-plasma.git veda-plasma
+          python3 - <<'PY'
+          import json, os, re, subprocess, time, traceback
+
+          LIVE = "0x64fe8acfe1936a9cba6d2cbe0d204b5dee6a3b6b55d52f0d44825c03c6f7f719".lower()
+          SENSITIVE = {
+              "0x08c6f91e2b681faf5e17227f2a44c307b3c1364c",
+              "0x7b57ad1a0aa89583130acfad024241170d24c13c",
+              "0xc315d6e14ddcdc7407784e2caf815d131bc1d3e7",
+              "0x4de413a26fc24c3fc27cc983be70aa9c5c299387",
+              "0x38fc1ba73b7ed289955a07d9f11a85b6e388064a",
+          }
+
+          try:
+              from Crypto.Hash import keccak
+              def k256(data):
+                  h = keccak.new(digest_bits=256); h.update(data); return h.digest()
+              crypto = "Crypto.Hash.keccak"
+          except Exception:
+              k256 = None; crypto = None
+
+          def run(*args, cwd=None, check=True, input_text=None):
+              p = subprocess.run(list(args), cwd=cwd, text=True, input=input_text, capture_output=True)
+              if check and p.returncode != 0:
+                  raise RuntimeError({"args": args, "cwd": cwd, "stdout": p.stdout, "stderr": p.stderr, "code": p.returncode})
+              return p
+
+          def candidate_objects(repo):
+              # Search JSON blobs whose historical path suggests a Merkle/leaf/root artifact.
+              p = run("git", "rev-list", "--objects", "--all", cwd=repo)
+              objects = []
+              seen = set()
+              for line in p.stdout.splitlines():
+                  parts = line.split(" ", 1)
+                  if len(parts) != 2:
+                      continue
+                  sha, path = parts
+                  low = path.lower()
+                  if not low.endswith(".json"):
+                      continue
+                  if not any(term in low for term in ("leaf", "merkle", "root")):
+                      continue
+                  key = (sha, path)
+                  if key not in seen:
+                      seen.add(key); objects.append(key)
+              return objects
+
+          def cat_blob(repo, sha):
+              return run("git", "cat-file", "blob", sha, cwd=repo).stdout
+
+          def root_from_digests(digests):
+              if not k256 or not digests:
+                  return None
+              layer = [bytes.fromhex(x[2:]) for x in digests]
+              # Veda generated trees use sorted-pair hashing. JSONs usually use power-of-two capacity;
+              # duplicate the terminal node only for non-power-of-two historical artifacts.
+              while len(layer) > 1:
+                  nxt = []
+                  for i in range(0, len(layer), 2):
+                      a = layer[i]
+                      b = layer[i+1] if i+1 < len(layer) else layer[i]
+                      nxt.append(k256(a+b if a <= b else b+a))
+                  layer = nxt
+              return "0x" + layer[0].hex()
+
+          def classify(leaf):
+              sig = str(leaf.get("FunctionSignature") or "").lower()
+              target = str(leaf.get("TargetAddress") or "").lower()
+              decoder = str(leaf.get("DecoderAndSanitizerAddress") or "").lower()
+              args = leaf.get("AddressArguments") or []
+              packed = str(leaf.get("PackedArgumentAddresses") or "").lower()
+              reasons = []
+              if target in SENSITIVE: reasons.append("sensitive_target")
+              if any(x in sig for x in ("manage(","execute(","multicall(","delegatecall","transfer(","transferfrom(","approve(","enter(","exit(","bulkwithdraw","bulkdeposit","setauthority","transferownership","rescuetokens","swap(","unoswap","fillorder","withdrawall")):
+                  reasons.append("dangerous_selector")
+              if decoder in ("", "0x0000000000000000000000000000000000000000"): reasons.append("missing_decoder")
+              if ("address" in sig or "bytes" in sig or "tuple" in sig) and not args and packed in ("", "0x"): reasons.append("no_address_binding")
+              if leaf.get("CanSendValue"): reasons.append("can_send_value")
+              return reasons
+
+          output = {"generated_at_unix": int(time.time()), "live_root": LIVE, "crypto": crypto, "repositories": {}, "matches": [], "errors": []}
+          for repo in ("veda-main", "veda-plasma"):
+              rd = {"candidate_object_count": 0, "scanned_blob_count": 0, "text_match_count": 0, "matches": []}
+              output["repositories"][repo] = rd
+              try:
+                  objects = candidate_objects(repo); rd["candidate_object_count"] = len(objects)
+              except Exception as exc:
+                  output["errors"].append({"repository": repo, "stage": "list_objects", "error": repr(exc), "traceback": traceback.format_exc()}); continue
+              # A blob SHA can appear at multiple paths. Read each distinct SHA once but retain all paths.
+              by_sha = {}
+              for sha, path in objects: by_sha.setdefault(sha, []).append(path)
+              for sha, paths in by_sha.items():
+                  try:
+                      raw = cat_blob(repo, sha); rd["scanned_blob_count"] += 1
+                  except Exception as exc:
+                      output["errors"].append({"repository": repo, "sha": sha, "paths": paths, "error": repr(exc)}); continue
+                  if LIVE not in raw.lower():
+                      continue
+                  rd["text_match_count"] += 1
+                  try:
+                      data = json.loads(raw)
+                  except Exception as exc:
+                      match = {"repository": repo, "blob_sha": sha, "paths": paths, "parse_error": repr(exc), "raw_excerpt": raw[:5000]}
+                      rd["matches"].append(match); output["matches"].append(match); continue
+                  metadata = data.get("metadata") if isinstance(data, dict) else None
+                  leaves = data.get("leafs") if isinstance(data, dict) else None
+                  metadata = metadata if isinstance(metadata, dict) else {}
+                  leaves = leaves if isinstance(leaves, list) else []
+                  digests = [str(x.get("LeafDigest") or "").lower() for x in leaves if isinstance(x, dict) and re.fullmatch(r"0x[0-9a-fA-F]{64}", str(x.get("LeafDigest") or ""))]
+                  merkle_root = None
+                  mt = data.get("MerkleTree") if isinstance(data, dict) else None
+                  if isinstance(mt, dict) and isinstance(mt.get("0"), list) and mt["0"]:
+                      merkle_root = str(mt["0"][0]).lower()
+                  computed = root_from_digests(digests)
+                  leaf_records = []
+                  for index, leaf in enumerate(leaves):
+                      if not isinstance(leaf, dict): continue
+                      reasons = classify(leaf)
+                      leaf_records.append({
+                          "index": index,
+                          "leaf": str(leaf.get("LeafDigest") or "").lower(),
+                          "target": str(leaf.get("TargetAddress") or "").lower(),
+                          "decoder": str(leaf.get("DecoderAndSanitizerAddress") or "").lower(),
+                          "selector": str(leaf.get("FunctionSelector") or "").lower(),
+                          "signature": leaf.get("FunctionSignature"),
+                          "arguments": leaf.get("AddressArguments") or [],
+                          "packed_arguments": leaf.get("PackedArgumentAddresses"),
+                          "can_send_value": bool(leaf.get("CanSendValue")),
+                          "description": leaf.get("Description"),
+                          "risk_reasons": reasons,
+                      })
+                  match = {
+                      "repository": repo, "blob_sha": sha, "paths": paths,
+                      "metadata": metadata,
+                      "metadata_root": str(metadata.get("ManageRoot") or "").lower(),
+                      "merkle_root": merkle_root,
+                      "computed_root": computed,
+                      "leaf_count": len(leaves),
+                      "digest_count": len(digests),
+                      "root_fields_contain_live": LIVE in {str(metadata.get("ManageRoot") or "").lower(), merkle_root, computed},
+                      "high_risk_leaves": [x for x in leaf_records if x["risk_reasons"]],
+                      "all_leaves": leaf_records,
+                  }
+                  rd["matches"].append({k:v for k,v in match.items() if k != "all_leaves"})
+                  output["matches"].append(match)
+          output["summary"] = {
+              "match_count": len(output["matches"]),
+              "root_field_match_count": sum(1 for x in output["matches"] if x.get("root_fields_contain_live")),
+              "high_risk_leaf_count": sum(len(x.get("high_risk_leaves", [])) for x in output["matches"]),
+              "errors": len(output["errors"]),
+          }
+          with open("veda-selfroot-fast.json", "w", encoding="utf-8") as f:
+              json.dump(output, f, indent=2, sort_keys=True); f.write("\n")
+          print(json.dumps({"summary": output["summary"], "repositories": output["repositories"], "matches": [{k:v for k,v in x.items() if k != "all_leaves"} for x in output["matches"]], "errors": output["errors"][:50]}, indent=2, sort_keys=True))
+          PY
+      - name: Upload exact historical self-root evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-selfroot-fast
+          path: veda-selfroot-fast.json
+          if-no-files-found: error
+          retention-days: 1
