@@ -1,0 +1,70 @@
+name: Hermetica test relay public map
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-test-relay-map.yml'
+      - 'public-data/hermetica-test-relay-map-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install read-only decoder
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/hermetica-test-relay
+          cd /tmp/hermetica-test-relay
+          npm init -y >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund @stacks/transactions@7.2.0
+      - name: Capture test relay roles, connections and balances
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/hermetica-test-relay
+          cat > snapshot.cjs <<'NODE'
+          const fs=require('fs');
+          const {principalCV,cvToHex,hexToCV,cvToJSON}=require('@stacks/transactions');
+          const API='https://api.hiro.so';
+          const DEP='SP6XGBDAD800GGY6XF48AC27467W9PEHA6EPBGKJ';
+          const REAL='SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG';
+          const names={hq:'test-hq-vaults-v1-1',state:'test-state-hbtc-v1-1',reserve:'test-reserve-hbtc-v1-1',trading:'test-trading-hbtc-v1-1',hermetica:'test-hermetica-interface-hbtc-v1-1',zest:'test-zest-interface-hbtc-v1-1',vault:'test-vault-hbtc-v1-1'};
+          const ids=Object.fromEntries(Object.entries(names).map(([k,v])=>[k,`${DEP}.${v}`]));
+          const real={staking:`${REAL}.staking-v1-1`,silo:`${REAL}.staking-silo-v1-1`,usdh:`${REAL}.usdh-token-v1`,susdh:`${REAL}.susdh-token-v1`};
+          const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+          async function retry(url,opt={},n=8){let e;for(let i=0;i<n;i++){try{const r=await fetch(url,opt);if(r.ok)return r;const t=await r.text();e=new Error(`${r.status}: ${t}`);if(r.status<500&&r.status!==429)throw e;}catch(x){e=x;}await sleep(500*(i+1));}throw e;}
+          function unwrap(x){if(x==null)return x;if(typeof x!=='object')return x;if(Array.isArray(x))return x.map(unwrap);if('value' in x)return unwrap(x.value);const o={};for(const [k,v] of Object.entries(x)){if(k==='type')continue;o[k]=unwrap(v);}return o;}
+          async function read(contract,fn,args=[]){const [addr,name]=contract.split('.');const r=await retry(`${API}/v2/contracts/call-read/${addr}/${name}/${fn}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({sender:DEP,arguments:args.map(x=>cvToHex(principalCV(x)))})});const b=await r.json();let decoded=null;if(b.result){try{decoded=unwrap(cvToJSON(hexToCV(b.result)));}catch(e){decoded={decode_error:String(e),raw:b.result};}}return {okay:b.okay,cause:b.cause,result_raw:b.result,decoded};}
+          async function balances(id){const r=await retry(`${API}/extended/v1/address/${encodeURIComponent(id)}/balances`);return r.json();}
+          async function txs(id,max=500){const out=[];for(let o=0;o<max;o+=50){const r=await retry(`${API}/extended/v1/address/${encodeURIComponent(id)}/transactions?limit=50&offset=${o}`);const b=await r.json();const rows=b.results||[];out.push(...rows);if(rows.length<50||out.length>=(b.total||max))break;}return out.slice(0,max);}
+          async function source(id){const [addr,name]=id.split('.');const r=await retry(`${API}/v2/contracts/source/${addr}/${name}?proof=0`);return r.json();}
+          (async()=>{
+            const principals=[ids.trading,ids.hermetica,ids.zest,ids.reserve,ids.vault,real.staking,real.silo,real.usdh,real.susdh];
+            const hq={};for(const p of principals){hq[p]={keeper:await read(ids.hq,'get-keeper',[p]),protocol:await read(ids.hq,'get-protocol',[p]),vault:await read(ids.hq,'get-vault',[p])};}
+            const state={};for(const p of principals){state[p]={connection:await read(ids.state,'get-connection',[p]),asset:await read(ids.state,'get-trading-asset',[p]),silo:await read(ids.state,'get-silo',[p])};}
+            const contractBalances={};for(const [k,id] of Object.entries({...ids,...real})){try{contractBalances[k]=await balances(id);}catch(e){contractBalances[k]={error:String(e)};}}
+            const histories={};for(const k of ['hq','state','reserve','trading','hermetica','zest','vault'])histories[k]=await txs(ids[k],600);
+            const sources={};for(const k of ['hq','state','reserve','trading','hermetica','zest','vault']){const s=await source(ids[k]);sources[k]={contract_id:ids[k],source:s.source||'',publish_height:s.publish_height};fs.writeFileSync(`${k}.clar`,s.source||'');}
+            const summary={generated_at:new Date().toISOString(),source:'Hiro public read-only APIs',ids,real,hq,state,contract_balances:contractBalances,history_counts:Object.fromEntries(Object.entries(histories).map(([k,v])=>[k,v.length]))};
+            fs.writeFileSync('summary.json',JSON.stringify(summary,null,2));
+            fs.writeFileSync('histories.json',JSON.stringify(histories,null,2));
+            console.log(JSON.stringify({history_counts:summary.history_counts,hq,state,nonzero_balances:Object.fromEntries(Object.entries(contractBalances).filter(([k,v])=>{const ft=v.fungible_tokens||{};const stx=v.stx?.balance||'0';return BigInt(stx)>0n||Object.values(ft).some(x=>BigInt(x.balance||'0')>0n);} ).map(([k,v])=>[k,{stx:v.stx?.balance||'0',fungible_tokens:Object.fromEntries(Object.entries(v.fungible_tokens||{}).filter(([,x])=>BigInt(x.balance||'0')>0n))}]))},null,2));
+          })().catch(e=>{console.error(e);process.exit(1);});
+          NODE
+          node snapshot.cjs
+          sha256sum *.json *.clar > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-test-relay-map
+          path: /tmp/hermetica-test-relay
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
