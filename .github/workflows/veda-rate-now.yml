@@ -1,0 +1,76 @@
+name: veda-rate-now
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Snapshot all current cross-chain accountant rates atomically per chain
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, time, urllib.request
+
+          CHAINS={
+            "ethereum":{"id":1,"rpcs":["https://ethereum-rpc.publicnode.com","https://eth.drpc.org","https://rpc.mevblocker.io"]},
+            "optimism":{"id":10,"rpcs":["https://optimism-rpc.publicnode.com","https://mainnet.optimism.io","https://optimism.drpc.org"]},
+            "scroll":{"id":534352,"rpcs":["https://scroll-rpc.publicnode.com","https://rpc.scroll.io","https://scroll.drpc.org"]},
+          }
+          PRODUCTS={
+            "liquidBTC":{"accountant":"0xEa23aC6D7D11f6b181d6B98174D334478ADAe6b0","one":10**8},
+            "liquidETH":{"accountant":"0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198","one":10**18},
+            "liquidUSD":{"accountant":"0xc315D6e14DDCDC7407784e2Caf815d131Bc1D3E7","one":10**6},
+          }
+          ROUTES=[("ethereum","optimism"),("optimism","ethereum"),("ethereum","scroll"),("scroll","ethereum")]
+          def shell(*args):
+            proc=subprocess.run([str(x) for x in args],text=True,capture_output=True)
+            if proc.returncode:raise RuntimeError(proc.stderr)
+            return proc.stdout.strip()
+          RATE=shell("cast","sig","getRate()")
+          def rpc(endpoint,method,params,timeout=35):
+            body=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode();request=urllib.request.Request(endpoint,data=body,method="POST",headers={"content-type":"application/json","user-agent":"veda-rate-now/1"})
+            with urllib.request.urlopen(request,timeout=timeout) as response:payload=json.loads(response.read().decode())
+            if "error" in payload:raise RuntimeError(payload["error"])
+            return payload["result"]
+          endpoints={};state={};errors=[]
+          for chain,config in CHAINS.items():
+            endpoint=None;failures={}
+            for candidate in config["rpcs"]:
+              try:
+                if int(rpc(candidate,"eth_chainId",[]),16)==config["id"]:endpoint=candidate;break
+              except Exception as exc:failures[candidate]=repr(exc)
+            if not endpoint:errors.append({"chain":chain,"failures":failures});continue
+            endpoints[chain]=endpoint;block_hex=rpc(endpoint,"eth_blockNumber",[]);block=rpc(endpoint,"eth_getBlockByNumber",[block_hex,False])
+            state[chain]={"endpoint":endpoint,"block":int(block_hex,16),"timestamp":int(block["timestamp"],16),"rates":{}}
+            for product,config_product in PRODUCTS.items():
+              state[chain]["rates"][product]=int(rpc(endpoint,"eth_call",[{"to":config_product["accountant"],"data":RATE},"latest"]),16)
+          edges=[]
+          for source,destination in ROUTES:
+            if source not in state or destination not in state:continue
+            for product,config_product in PRODUCTS.items():
+              source_rate=state[source]["rates"][product];destination_rate=state[destination]["rates"][product];delta=destination_rate-source_rate
+              edge={"product":product,"source":source,"destination":destination,"source_rate":source_rate,"destination_rate":destination_rate,"delta":delta,"edge_bps":delta*10000/source_rate if source_rate else None,"source_timestamp":state[source]["timestamp"],"destination_timestamp":state[destination]["timestamp"]}
+              edges.append(edge)
+          positive=[edge for edge in edges if edge["delta"]>0]
+          output={"generated_at_unix":int(time.time()),"chains":state,"edges":edges,"positive_edges":positive,"errors":errors,"summary":{"positive_edge_count":len(positive),"errors":len(errors)}}
+          with open("veda-rate-now.json","w",encoding="utf-8") as handle:json.dump(output,handle,indent=2,sort_keys=True);handle.write("\n")
+          print(json.dumps(output,indent=2,sort_keys=True))
+          PY
+      - name: Upload current rate proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-rate-now
+          path: veda-rate-now.json
+          if-no-files-found: error
+          retention-days: 1
