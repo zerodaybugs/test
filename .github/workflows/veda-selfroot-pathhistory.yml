@@ -1,0 +1,186 @@
+name: veda-selfroot-pathhistory
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Scan only historical LiquidUSD leaf-file versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet --no-tags --filter=blob:none --no-checkout https://github.com/Veda-Labs/boring-vault.git veda-main
+          git clone --quiet --no-tags --filter=blob:none --no-checkout https://github.com/Veda-Labs/boring-vault-plasma.git veda-plasma
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+          import traceback
+
+          LIVE = "0x64fe8acfe1936a9cba6d2cbe0d204b5dee6a3b6b55d52f0d44825c03c6f7f719".lower()
+          SENSITIVE = {
+              "0x08c6f91e2b681faf5e17227f2a44c307b3c1364c",
+              "0x7b57ad1a0aa89583130acfad024241170d24c13c",
+              "0xc315d6e14ddcdc7407784e2caf815d131bc1d3e7",
+              "0x4de413a26fc24c3fc27cc983be70aa9c5c299387",
+              "0x38fc1ba73b7ed289955a07d9f11a85b6e388064a",
+          }
+
+          def run(*args, cwd=None, check=True):
+              p = subprocess.run(list(args), cwd=cwd, text=True, capture_output=True)
+              if check and p.returncode != 0:
+                  raise RuntimeError({"args": args, "cwd": cwd, "stdout": p.stdout, "stderr": p.stderr, "code": p.returncode})
+              return p
+
+          def relevant_path(path):
+              low = path.lower()
+              return low.endswith(".json") and "leaf" in low and (
+                  "liquidusd" in low or "liquid_usd" in low or "liquid-usd" in low or
+                  ("liquid" in low and "usd" in low)
+              )
+
+          def classify(leaf):
+              sig = str(leaf.get("FunctionSignature") or "").lower()
+              target = str(leaf.get("TargetAddress") or "").lower()
+              decoder = str(leaf.get("DecoderAndSanitizerAddress") or "").lower()
+              args = leaf.get("AddressArguments") or []
+              packed = str(leaf.get("PackedArgumentAddresses") or "").lower()
+              reasons = []
+              if target in SENSITIVE:
+                  reasons.append("sensitive_target")
+              if any(term in sig for term in (
+                  "manage(", "execute(", "multicall(", "delegatecall", "transfer(", "transferfrom(",
+                  "approve(", "enter(", "exit(", "bulkwithdraw", "bulkdeposit", "setauthority",
+                  "transferownership", "rescuetokens", "swap(", "unoswap", "fillorder", "withdrawall"
+              )):
+                  reasons.append("dangerous_selector")
+              if decoder in ("", "0x0000000000000000000000000000000000000000"):
+                  reasons.append("missing_decoder")
+              if ("address" in sig or "bytes" in sig or "tuple" in sig) and not args and packed in ("", "0x"):
+                  reasons.append("no_address_binding")
+              if leaf.get("CanSendValue"):
+                  reasons.append("can_send_value")
+              return reasons
+
+          output = {"generated_at_unix": int(time.time()), "live_root": LIVE, "repositories": {}, "matches": [], "errors": []}
+
+          for repo in ("veda-main", "veda-plasma"):
+              state = {"paths": [], "version_count": 0, "unique_blob_count": 0, "matches": []}
+              output["repositories"][repo] = state
+              try:
+                  names = run("git", "log", "--all", "--name-only", "--pretty=format:", "--", "leafs", cwd=repo).stdout.splitlines()
+                  paths = sorted({name.strip() for name in names if relevant_path(name.strip())})
+                  state["paths"] = paths
+              except Exception as exc:
+                  output["errors"].append({"repository": repo, "stage": "paths", "error": repr(exc), "traceback": traceback.format_exc()})
+                  continue
+
+              versions = []
+              for path in state["paths"]:
+                  try:
+                      commits = run("git", "log", "--all", "--format=%H", "--", path, cwd=repo).stdout.splitlines()
+                  except Exception as exc:
+                      output["errors"].append({"repository": repo, "path": path, "stage": "commits", "error": repr(exc)})
+                      continue
+                  for commit in commits:
+                      commit = commit.strip()
+                      if commit:
+                          versions.append((commit, path))
+              state["version_count"] = len(versions)
+
+              blob_versions = {}
+              for commit, path in versions:
+                  try:
+                      blob = run("git", "rev-parse", f"{commit}:{path}", cwd=repo).stdout.strip()
+                  except Exception:
+                      continue
+                  blob_versions.setdefault(blob, []).append({"commit": commit, "path": path})
+              state["unique_blob_count"] = len(blob_versions)
+
+              for blob, locations in blob_versions.items():
+                  try:
+                      raw = run("git", "cat-file", "blob", blob, cwd=repo).stdout
+                  except Exception as exc:
+                      output["errors"].append({"repository": repo, "blob": blob, "stage": "blob", "error": repr(exc)})
+                      continue
+                  try:
+                      data = json.loads(raw)
+                  except Exception:
+                      continue
+                  if not isinstance(data, dict):
+                      continue
+                  metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+                  tree = data.get("MerkleTree") if isinstance(data.get("MerkleTree"), dict) else {}
+                  metadata_root = str(metadata.get("ManageRoot") or "").lower()
+                  tree_root = ""
+                  if isinstance(tree.get("0"), list) and tree["0"]:
+                      tree_root = str(tree["0"][0]).lower()
+                  if LIVE not in {metadata_root, tree_root} and LIVE not in raw.lower():
+                      continue
+                  leaves = data.get("leafs") if isinstance(data.get("leafs"), list) else []
+                  records = []
+                  for index, leaf in enumerate(leaves):
+                      if not isinstance(leaf, dict):
+                          continue
+                      records.append({
+                          "index": index,
+                          "leaf": str(leaf.get("LeafDigest") or "").lower(),
+                          "target": str(leaf.get("TargetAddress") or "").lower(),
+                          "decoder": str(leaf.get("DecoderAndSanitizerAddress") or "").lower(),
+                          "selector": str(leaf.get("FunctionSelector") or "").lower(),
+                          "signature": leaf.get("FunctionSignature"),
+                          "arguments": leaf.get("AddressArguments") or [],
+                          "packed_arguments": leaf.get("PackedArgumentAddresses"),
+                          "can_send_value": bool(leaf.get("CanSendValue")),
+                          "description": leaf.get("Description"),
+                          "risk_reasons": classify(leaf),
+                      })
+                  match = {
+                      "repository": repo,
+                      "blob": blob,
+                      "locations": locations,
+                      "metadata": metadata,
+                      "metadata_root": metadata_root,
+                      "tree_root": tree_root,
+                      "leaf_count": len(records),
+                      "high_risk_leaves": [record for record in records if record["risk_reasons"]],
+                      "all_leaves": records,
+                  }
+                  state["matches"].append({key: value for key, value in match.items() if key != "all_leaves"})
+                  output["matches"].append(match)
+
+          output["summary"] = {
+              "match_count": len(output["matches"]),
+              "high_risk_leaf_count": sum(len(match["high_risk_leaves"]) for match in output["matches"]),
+              "path_count": sum(len(state["paths"]) for state in output["repositories"].values()),
+              "version_count": sum(state["version_count"] for state in output["repositories"].values()),
+              "unique_blob_count": sum(state["unique_blob_count"] for state in output["repositories"].values()),
+              "error_count": len(output["errors"]),
+          }
+          with open("veda-selfroot-pathhistory.json", "w", encoding="utf-8") as handle:
+              json.dump(output, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+          print(json.dumps({
+              "summary": output["summary"],
+              "repositories": output["repositories"],
+              "matches": [{key: value for key, value in match.items() if key != "all_leaves"} for match in output["matches"]],
+              "errors": output["errors"][:50],
+          }, indent=2, sort_keys=True))
+          PY
+      - name: Upload path-scoped self-root evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-selfroot-pathhistory
+          path: veda-selfroot-pathhistory.json
+          if-no-files-found: error
+          retention-days: 1
