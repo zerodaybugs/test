@@ -1,0 +1,78 @@
+name: Hermetica Zest public position state
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-zest-position-state.yml'
+      - 'public-data/hermetica-zest-position-state-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install read-only decoder
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/hermetica-zest-position
+          cd /tmp/hermetica-zest-position
+          npm init -y >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund @stacks/transactions@7.2.0
+      - name: Capture public position and index state
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/hermetica-zest-position
+          cat > capture.cjs <<'NODE'
+          const fs = require('fs');
+          const { principalCV, uintCV, cvToHex, hexToCV, cvToJSON } = require('@stacks/transactions');
+          const API='https://api.hiro.so';
+          const ZEST='SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7';
+          const HBTC='SP1S1HSFH0SQQGWKB69EYFNY0B1MHRMGXR3J1FH4D';
+          const ACCOUNT=`${HBTC}.zest-interface-hbtc-v1`;
+          const names=['v0-1-data','v0-market-vault','v0-assets','v0-vault-usdh','v0-vault-sbtc','v0-4-market'];
+          async function retry(url,opt={},n=8){let e;for(let i=0;i<n;i++){try{const r=await fetch(url,opt);if(r.ok)return r;const t=await r.text();e=new Error(`${r.status}: ${t}`);if(r.status<500&&r.status!==429)throw e;}catch(x){e=x;}await new Promise(r=>setTimeout(r,1000*(i+1)));}throw e;}
+          async function read(name,fn,args=[]){const r=await retry(`${API}/v2/contracts/call-read/${ZEST}/${name}/${fn}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({sender:ACCOUNT,arguments:args.map(cvToHex)})});const b=await r.json();let d=null;if(b.result){try{d=cvToJSON(hexToCV(b.result));}catch(e){d={decode_error:String(e),raw:b.result};}}return {okay:b.okay,cause:b.cause,result_raw:b.result,decoded:d};}
+          async function balances(principal){const r=await retry(`${API}/extended/v1/address/${encodeURIComponent(principal)}/balances`);return await r.json();}
+          async function history(principal,max=2000){const all=[];for(let o=0;o<max;o+=50){const r=await retry(`${API}/extended/v1/address/${encodeURIComponent(principal)}/transactions?limit=50&offset=${o}`);const b=await r.json();const rows=b.results||[];all.push(...rows);if(rows.length<50||all.length>=(b.total||max))break;}return all.slice(0,max);}
+          async function source(name){const r=await fetch(`${API}/v2/contracts/source/${ZEST}/${name}?proof=0`);if(!r.ok)return {exists:false,status:r.status};const b=await r.json();const s=b.source||'';fs.writeFileSync(`${name}.clar`,s);return {exists:true,source_length:s.length,public_functions:[...s.matchAll(/\(define-public\s+\(([^\s()]+)/g)].map(m=>m[1]),read_only_functions:[...s.matchAll(/\(define-read-only\s+\(([^\s()]+)/g)].map(m=>m[1])};}
+          async function safe(out,key,name,fn,args=[]){try{out[key]=await read(name,fn,args);}catch(e){out[key]={error:String(e)};}}
+          (async()=>{const state={account:ACCOUNT,reads:{},sources:{},balances:{},histories:{}};
+            for(const n of names)state.sources[n]=await source(n);
+            await safe(state.reads,'data_user_position','v0-1-data','get-user-position',[principalCV(ACCOUNT)]);
+            await safe(state.reads,'market_resolve','v0-market-vault','resolve-safe',[principalCV(ACCOUNT)]);
+            await safe(state.reads,'market_scaled_usdh_debt','v0-market-vault','get-account-scaled-debt',[principalCV(ACCOUNT),uintCV(8)]);
+            await safe(state.reads,'assets_bitmap','v0-assets','get-bitmap');
+            for(const vault of ['v0-vault-usdh','v0-vault-sbtc']){
+              for(const fn of ['get-assets','get-total-assets','get-principal-scaled','get-index','get-last-update','get-debt','get-utilization','get-interest-rate','get-next-index','get-liquidity-index','get-available-assets']){
+                await safe(state.reads,`${vault}_${fn}`,vault,fn);
+              }
+              state.balances[vault]=await balances(`${ZEST}.${vault}`);
+              const txs=await history(`${ZEST}.${vault}`,2000);
+              state.histories[vault]={total:txs.length,accrue_calls:txs.filter(t=>t.tx_type==='contract_call'&&t.contract_call?.contract_id===`${ZEST}.${vault}`&&t.contract_call?.function_name==='accrue').map(t=>({tx_id:t.tx_id,status:t.tx_status,block_height:t.block_height,burn_block_time_iso:t.burn_block_time_iso,sender_address:t.sender_address,result:t.tx_result?.repr}))};
+            }
+            state.balances.hbtc_zest_interface=await balances(ACCOUNT);
+            const latest=await (await retry(`${API}/extended/v2/blocks?limit=1`)).json();state.latest_block=latest.results?.[0]||latest;
+            state.generated_at=new Date().toISOString();state.source='Hiro public read-only APIs';
+            fs.writeFileSync('zest-position-state.json',JSON.stringify(state,null,2));
+            const simple=(x)=>x?.decoded??x;
+            const summary={generated_at:state.generated_at,account:ACCOUNT,user_position:simple(state.reads.data_user_position),market_resolve:simple(state.reads.market_resolve),scaled_usdh_debt:simple(state.reads.market_scaled_usdh_debt),usdh_vault:Object.fromEntries(Object.entries(state.reads).filter(([k])=>k.startsWith('v0-vault-usdh_')).map(([k,v])=>[k.replace('v0-vault-usdh_',''),simple(v)])),sbtc_vault:Object.fromEntries(Object.entries(state.reads).filter(([k])=>k.startsWith('v0-vault-sbtc_')).map(([k,v])=>[k.replace('v0-vault-sbtc_',''),simple(v)])),accrue_counts:Object.fromEntries(Object.entries(state.histories).map(([k,v])=>[k,v.accrue_calls.length])),latest_block:state.latest_block};
+            fs.writeFileSync('summary.json',JSON.stringify(summary,null,2));console.log(fs.readFileSync('summary.json','utf8'));
+          })().catch(e=>{console.error(e);process.exit(1);});
+          NODE
+          node capture.cjs
+          sha256sum zest-position-state.json summary.json *.clar > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-zest-position-state
+          path: /tmp/hermetica-zest-position
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
