@@ -1,0 +1,90 @@
+name: veda-live-direct-withdraw
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Verify Ethereum direct withdraw capabilities and assets
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, time, urllib.request
+          RPCS=["https://ethereum-rpc.publicnode.com","https://eth.drpc.org","https://rpc.mevblocker.io"]
+          ATTACKER="0x1111111111111111111111111111111111111111"
+          PRODUCTS={
+            "liquidBTC":{"authority":"0x49F954c67ff235034b69b8a59fbe309A40256c8d","teller":"0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353","assets":{"WBTC":"0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599","LBTC":"0x8236a87084f8B84306f72007F36F2618A5634494","cbBTC":"0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf","eBTC":"0x657e8C867D8B37dCC18fA4Caead9C45EB088C642"}},
+            "liquidETH":{"authority":"0x485Bde66Bb668a51f2372E34e45B1c6226798122","teller":"0x9AA79C84b79816ab920bBcE20f8f74557B514734","assets":{"WETH":"0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2","weETH":"0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee","eETH":"0x35fA164735182de50811E8e2E824cFb9B6118ac2","wstETH":"0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0"}},
+            "liquidUSD":{"authority":"0xABa6Ba1e95E0926A6a6B917Fe4e2f19CEaE4fF2e","teller":"0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387","assets":{"USDC":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","USDT":"0xdAC17F958D2ee523a2206206994597C13D831ec7","DAI":"0x6B175474E89094C44Da98b954EedeAC495271d0F","USDe":"0x4c9EDD5852cd905f086C759E8383e09bff1E68B3"}},
+          }
+          def sh(*a):
+            p=subprocess.run([str(x) for x in a],text=True,capture_output=True)
+            if p.returncode:raise RuntimeError({"args":a,"stdout":p.stdout,"stderr":p.stderr})
+            return p.stdout.strip()
+          S={
+            "canCall":sh("cast","sig","canCall(address,address,bytes4)"),
+            "isPublic":sh("cast","sig","isCapabilityPublic(address,bytes4)"),
+            "withdraw":sh("cast","sig","withdraw(address,uint256,uint256,address)"),
+            "assetData":sh("cast","sig","assetData(address)"),
+            "isPaused":sh("cast","sig","isPaused()"),
+            "shareLock":sh("cast","sig","shareLockPeriod()"),
+          }
+          def rpc(ep,m,p,t=30):
+            b=json.dumps({"jsonrpc":"2.0","id":1,"method":m,"params":p}).encode();q=urllib.request.Request(ep,data=b,method="POST",headers={"content-type":"application/json","user-agent":"veda-live-direct-withdraw/1.0"})
+            with urllib.request.urlopen(q,timeout=t) as r:o=json.loads(r.read().decode())
+            if "error" in o:raise RuntimeError(o["error"])
+            return o["result"]
+          def choose():
+            bad={}
+            for ep in RPCS:
+              try:
+                if int(rpc(ep,"eth_chainId",[]),16)==1:return ep,bad
+              except Exception as e:bad[ep]=repr(e)
+            raise RuntimeError(bad)
+          def st(x):return x[2:] if str(x).startswith("0x") else str(x)
+          def aw(a):return st(a).lower().rjust(64,"0")
+          def sw(s):return st(s).lower().ljust(64,"0")
+          def words(x):
+            h=st(x);return [int(h[i:i+64],16) for i in range(0,len(h),64)] if h and len(h)%64==0 else []
+          def call(ep,to,data,frm=None):
+            tx={"to":to,"data":data}
+            if frm:tx["from"]=frm
+            return rpc(ep,"eth_call",[tx,"latest"])
+          def gate(ep,auth,caller,target,sel):return bool(int(call(ep,auth,S["canCall"]+aw(caller)+aw(target)+sw(sel)),16))
+          def public(ep,auth,target,sel):return bool(int(call(ep,auth,S["isPublic"]+aw(target)+sw(sel)),16))
+          ep,bad=choose();block=int(rpc(ep,"eth_blockNumber",[]),16)
+          out={"generated_at_unix":int(time.time()),"endpoint":ep,"rpc_failures":bad,"block":block,"withdraw_selector":S["withdraw"],"products":{},"permissionless_direct_withdraw_products":[],"errors":[]}
+          for name,p in PRODUCTS.items():
+            try:
+              pub=public(ep,p["authority"],p["teller"],S["withdraw"]);att=gate(ep,p["authority"],ATTACKER,p["teller"],S["withdraw"])
+              row={"teller":p["teller"].lower(),"withdraw_public":pub,"withdraw_attacker":att,"paused":bool(int(call(ep,p["teller"],S["isPaused"]),16)),"share_lock_period":int(call(ep,p["teller"],S["shareLock"]),16),"assets":{}}
+              for label,a in p["assets"].items():
+                try:
+                  w=words(call(ep,p["teller"],S["assetData"]+aw(a)))
+                  row["assets"][label]={"address":a.lower(),"allow_deposits":bool(w[0]) if len(w)>0 else None,"allow_withdraws":bool(w[1]) if len(w)>1 else None,"share_premium_bps":w[2] if len(w)>2 else None}
+                except Exception as e:row["assets"][label]={"address":a.lower(),"error":repr(e)}
+              out["products"][name]=row
+              if att and any(x.get("allow_withdraws") for x in row["assets"].values()):out["permissionless_direct_withdraw_products"].append(name)
+            except Exception as e:out["products"][name]={"error":repr(e)};out["errors"].append({"product":name,"error":repr(e)})
+          out["summary"]={"permissionless_direct_withdraw_products":out["permissionless_direct_withdraw_products"],"errors":len(out["errors"])}
+          with open("veda-live-direct-withdraw.json","w",encoding="utf-8") as f:json.dump(out,f,indent=2,sort_keys=True);f.write("\n")
+          print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+      - name: Upload direct-withdraw gates
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-live-direct-withdraw
+          path: veda-live-direct-withdraw.json
+          if-no-files-found: error
+          retention-days: 1
