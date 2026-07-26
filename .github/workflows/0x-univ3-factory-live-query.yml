@@ -1,0 +1,135 @@
+name: Query public 0x UniV3 fork factories
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/0x-univ3-factory-live-query.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
+      - name: Query public contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/live"
+          mkdir -p "$OUT/robinhood" "$OUT/polygon"
+          RH=https://rpc.mainnet.chain.robinhood.com
+          POLY=https://polygon-bor-rpc.publicnode.com
+          RHX=https://robinhoodchain.blockscout.com
+          POLYX=https://polygon.blockscout.com
+
+          call() {
+            local rpc="$1" address="$2" sig="$3" out="$4"
+            cast call "$address" "$sig" --rpc-url "$rpc" > "$out" 2> "$out.err" || true
+          }
+
+          call "$RH" 0x9ac30D72168a4498aE5C80226F4d3C86278e8f80 'getDeployParameters()(address,address,address,address)' "$OUT/robinhood/sheriff-deployer-params.txt"
+          call "$POLY" 0x96B31b1d17dee49e70B950dE33FFF83728f5c181 'getDeployParameters()(address,address,address,address)' "$OUT/polygon/quickswap-v4-deployer-params.txt"
+          call "$RH" 0x5952F5D501a130da00fa8fE2257d8B35ddc0A57B 'factoryAddress()(address)' "$OUT/robinhood/gigadex-factory.txt"
+          call "$RH" 0xcB42A120795Ca98F762fdcCf43Cc4aB6D62bF1B2 'factoryAddress()(address)' "$OUT/robinhood/swaphood-factory.txt"
+          call "$RH" 0x41ff9AA7e16B8B1a8a8dc4f0eFacd93D02d071c9 'factoryAddress()(address)' "$OUT/robinhood/pancake-factory.txt"
+          call "$RH" 0x1ac9dB4a2608ba45D6127B1737949b51Bb54B7F3 'poolImplementation()(address)' "$OUT/robinhood/up-implementation.txt"
+          call "$RH" 0x1ac9dB4a2608ba45D6127B1737949b51Bb54B7F3 'allPoolsLength()(uint256)' "$OUT/robinhood/up-pool-count.txt"
+
+          # Known Sheriff pool from the public 0x integration commit.
+          SHERIFF_POOL=0x536a7B19abB933bf6319e0b8817e733Bba166674
+          for sig in 'token0()(address)' 'token1()(address)' 'factory()(address)' 'plugin()(address)' 'tickSpacing()(int24)' 'globalState()(uint160,int24,uint16,uint8,uint8,bool)'; do
+            safe=$(printf '%s' "$sig" | tr -cd '[:alnum:]_')
+            call "$RH" "$SHERIFF_POOL" "$sig" "$OUT/robinhood/sheriff-pool-$safe.txt"
+          done
+          cast codehash "$SHERIFF_POOL" --rpc-url "$RH" > "$OUT/robinhood/sheriff-pool-codehash.txt"
+
+          python3 - "$OUT" <<'PY'
+          import json, pathlib, re, subprocess, sys, urllib.request
+          root = pathlib.Path(sys.argv[1])
+
+          def first_address(path):
+              text = pathlib.Path(path).read_text().strip() if pathlib.Path(path).exists() else ''
+              m = re.search(r'0x[0-9a-fA-F]{40}', text)
+              return m.group(0) if m else None
+
+          discovered = {
+              'robinhood': {
+                  'sheriff_factory': first_address(root/'robinhood/sheriff-deployer-params.txt'),
+                  'gigadex_factory': first_address(root/'robinhood/gigadex-factory.txt'),
+                  'swaphood_factory': first_address(root/'robinhood/swaphood-factory.txt'),
+                  'pancake_factory': first_address(root/'robinhood/pancake-factory.txt'),
+                  'up_implementation': first_address(root/'robinhood/up-implementation.txt'),
+              },
+              'polygon': {
+                  'quickswap_v4_factory': first_address(root/'polygon/quickswap-v4-deployer-params.txt'),
+              },
+          }
+          # Algebra tuple is plugin,factory,token0,token1. Select second address.
+          for chain, name in [('robinhood','sheriff'),('polygon','quickswap-v4')]:
+              p = root/chain/f'{name}-deployer-params.txt'
+              addrs = re.findall(r'0x[0-9a-fA-F]{40}', p.read_text() if p.exists() else '')
+              if len(addrs) >= 2:
+                  discovered[chain]['sheriff_factory' if chain=='robinhood' else 'quickswap_v4_factory'] = addrs[1]
+
+          (root/'discovered.json').write_text(json.dumps(discovered, indent=2, sort_keys=True))
+          for chain, entries in discovered.items():
+              explorer = 'https://robinhoodchain.blockscout.com' if chain == 'robinhood' else 'https://polygon.blockscout.com'
+              for label, address in entries.items():
+                  if not address:
+                      continue
+                  d = root/chain/f'discovered-{label}'
+                  d.mkdir(parents=True, exist_ok=True)
+                  (d/'address.txt').write_text(address+'\n')
+                  for suffix, url in {
+                      'smart-contract.json': f'{explorer}/api/v2/smart-contracts/{address}',
+                      'address.json': f'{explorer}/api/v2/addresses/{address}',
+                      'logs.json': f'{explorer}/api?module=logs&action=getLogs&fromBlock=0&toBlock=latest&address={address}&page=1&offset=1000',
+                  }.items():
+                      try:
+                          with urllib.request.urlopen(url, timeout=45) as r:
+                              (d/suffix).write_bytes(r.read())
+                      except Exception as e:
+                          (d/(suffix+'.err')).write_text(repr(e))
+          PY
+
+          # Up pools are enumerable; inspect all when the list is reasonably small.
+          COUNT=$(tr -dc '0-9' < "$OUT/robinhood/up-pool-count.txt" || true)
+          if [ -n "$COUNT" ] && [ "$COUNT" -le 500 ]; then
+            mkdir -p "$OUT/robinhood/up-pools"
+            i=0
+            while [ "$i" -lt "$COUNT" ]; do
+              pool=$(cast call 0x1ac9dB4a2608ba45D6127B1737949b51Bb54B7F3 'allPools(uint256)(address)' "$i" --rpc-url "$RH")
+              printf '%s\n' "$pool" > "$OUT/robinhood/up-pools/$i.address"
+              for sig in 'token0()(address)' 'token1()(address)' 'tickSpacing()(int24)' 'factory()(address)'; do
+                safe=$(printf '%s' "$sig" | tr -cd '[:alnum:]_')
+                cast call "$pool" "$sig" --rpc-url "$RH" > "$OUT/robinhood/up-pools/$i.$safe" 2> "$OUT/robinhood/up-pools/$i.$safe.err" || true
+              done
+              cast codehash "$pool" --rpc-url "$RH" > "$OUT/robinhood/up-pools/$i.codehash" 2> /dev/null || true
+              i=$((i+1))
+            done
+          fi
+
+          find "$OUT" -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS"
+          test -s "$OUT/discovered.json"
+
+      - name: Upload public query evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: 0x-univ3-factory-live-${{ github.run_id }}
+          path: live/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
