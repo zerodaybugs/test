@@ -1,0 +1,332 @@
+name: Hermetica mint auto timing snapshot
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-mint-auto-gap.yml'
+      - 'public-data/hermetica-mint-auto-gap-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install read-only decoder
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/hermetica-mint-auto-gap
+          cd /tmp/hermetica-mint-auto-gap
+          npm init -y >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund @stacks/transactions@7.2.0
+
+      - name: Capture public mint state and block timing
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/hermetica-mint-auto-gap
+          cat > snapshot.cjs <<'NODE'
+          const fs = require('fs');
+          const {
+            principalCV,
+            cvToHex,
+            hexToCV,
+            cvToJSON,
+          } = require('@stacks/transactions');
+
+          const API = 'https://api.hiro.so';
+          const DEP = 'SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG';
+          const AUTO = 'minting-auto-v1-2';
+          const AUTO_ID = `${DEP}.${AUTO}`;
+          const STATE = 'minting-auto-state-v1';
+          const SBTC = 'SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token';
+          const MINTERS = [
+            'SP2Z3H3G2A24JZVVQWJT9GZXJP257TWD8Z4RVWEBH',
+            'SPP6CG3E4VKDGC1NW7AQMMHCD6053152X9DNT12C',
+            'SP2YHB356J5MKXF08WKB7214AWM5RJV1HWB28G9TA',
+            'SP1A4X1ZFXGE4J28ZQ9QG3JNRCQ4AK6R10PECHVVP.liquidator',
+            'SP193AZ8C38VPX29YZTP3HQ403083BQETP3CJD9P8',
+            'SP1S1HSFH0SQQGWKB69EYFNY0B1MHRMGXR3J1FH4D.hermetica-interface-hbtc-v1',
+            'SP355DGH5Q7MAREPWJN8DMWDNBXV00TXM8CHB6BWC',
+            'SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.flh',
+          ];
+          const INCIDENTS = [
+            ['2025-05-19-stall', '2025-05-19T18:43:55Z'],
+            ['2025-05-23-stall', '2025-05-23T20:15:48Z'],
+            ['2026-01-03-window', '2026-01-03T03:10:00Z'],
+            ['2026-04-02-window', '2026-04-02T17:24:00Z'],
+            ['2026-05-15-window', '2026-05-15T19:31:00Z'],
+            ['2026-06-19-window', '2026-06-19T12:13:00Z'],
+          ];
+
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          async function fetchRetry(url, options = {}, attempts = 9) {
+            let last;
+            for (let i = 0; i < attempts; i++) {
+              try {
+                const res = await fetch(url, options);
+                const text = await res.text();
+                if (res.ok) {
+                  try { return JSON.parse(text); }
+                  catch { return text; }
+                }
+                last = new Error(`${res.status} ${res.statusText}: ${text.slice(0, 400)}`);
+                if (res.status < 500 && res.status !== 429) throw last;
+              } catch (e) { last = e; }
+              await sleep(Math.min(10000, 650 * (i + 1)));
+            }
+            throw last;
+          }
+
+          function unwrap(node) {
+            if (node == null) return null;
+            if (typeof node !== 'object') return node;
+            if (Array.isArray(node)) return node.map(unwrap);
+            if (Object.prototype.hasOwnProperty.call(node, 'value')) return unwrap(node.value);
+            const out = {};
+            for (const [k, v] of Object.entries(node)) {
+              if (k === 'type' || k === 'success') continue;
+              out[k] = unwrap(v);
+            }
+            return out;
+          }
+
+          async function callRead(contractName, fn, args = []) {
+            const body = {
+              sender: DEP,
+              arguments: args.map(cvToHex),
+            };
+            const data = await fetchRetry(
+              `${API}/v2/contracts/call-read/${DEP}/${contractName}/${fn}`,
+              {
+                method: 'POST',
+                headers: {'content-type': 'application/json'},
+                body: JSON.stringify(body),
+              }
+            );
+            let decoded = null;
+            if (data.result) {
+              try { decoded = unwrap(cvToJSON(hexToCV(data.result))); }
+              catch (e) { decoded = {decode_error: String(e), raw: data.result}; }
+            }
+            return {okay: data.okay, cause: data.cause, result_raw: data.result, decoded};
+          }
+
+          async function getBlock(height) {
+            const candidates = [
+              `${API}/extended/v2/blocks/${height}`,
+              `${API}/extended/v1/block/by_height/${height}`,
+            ];
+            let last;
+            for (const url of candidates) {
+              try {
+                const data = await fetchRetry(url, {}, 4);
+                const block = data.result || data;
+                if (block && Number.isFinite(Number(block.height))) return block;
+                last = new Error(`unexpected block response: ${JSON.stringify(data).slice(0, 300)}`);
+              } catch (e) { last = e; }
+            }
+            throw last;
+          }
+
+          function blockTs(block) {
+            return Number(block.block_time ?? block.burn_block_time ?? 0);
+          }
+
+          async function nearestHeightForTime(targetSec, tipHeight) {
+            let lo = 1;
+            let hi = tipHeight;
+            let best = null;
+            for (let i = 0; i < 30 && lo <= hi; i++) {
+              const mid = Math.floor((lo + hi) / 2);
+              const b = await getBlock(mid);
+              const ts = blockTs(b);
+              if (!ts) throw new Error(`missing timestamp for height ${mid}`);
+              best = b;
+              if (ts < targetSec) lo = mid + 1;
+              else hi = mid - 1;
+            }
+            const heights = [...new Set([lo - 2, lo - 1, lo, lo + 1, lo + 2].filter(h => h > 0 && h <= tipHeight))];
+            const blocks = [];
+            for (const h of heights) {
+              try { blocks.push(await getBlock(h)); } catch {}
+            }
+            blocks.sort((a, b) => Math.abs(blockTs(a) - targetSec) - Math.abs(blockTs(b) - targetSec));
+            return blocks[0] || best;
+          }
+
+          async function gapWindow(centerHeight, radius, tipHeight) {
+            const start = Math.max(2, centerHeight - radius);
+            const end = Math.min(tipHeight, centerHeight + radius);
+            const blocks = [];
+            for (let h = start; h <= end; h++) {
+              try { blocks.push(await getBlock(h)); }
+              catch (e) { blocks.push({height: h, error: String(e)}); }
+              await sleep(40);
+            }
+            const valid = blocks.filter(b => Number.isFinite(Number(b.height)) && blockTs(b) > 0).sort((a, b) => Number(a.height) - Number(b.height));
+            const gaps = [];
+            for (let i = 1; i < valid.length; i++) {
+              gaps.push({
+                from_height: Number(valid[i - 1].height),
+                to_height: Number(valid[i].height),
+                from_time: blockTs(valid[i - 1]),
+                to_time: blockTs(valid[i]),
+                gap_seconds: blockTs(valid[i]) - blockTs(valid[i - 1]),
+              });
+            }
+            gaps.sort((a, b) => b.gap_seconds - a.gap_seconds);
+            return {start, end, max_gap: gaps[0] || null, gaps, blocks};
+          }
+
+          async function addressTransactions(address, max = 1500) {
+            const out = [];
+            for (let offset = 0; offset < max; offset += 50) {
+              const page = await fetchRetry(`${API}/extended/v1/address/${encodeURIComponent(address)}/transactions?limit=50&offset=${offset}`);
+              const rows = page.results || [];
+              out.push(...rows);
+              if (rows.length < 50 || out.length >= (page.total || max)) break;
+              await sleep(120);
+            }
+            return out.slice(0, max);
+          }
+
+          function extractOraclePrint(tx) {
+            const rows = [];
+            for (const ev of tx.events || []) {
+              const log = ev.contract_log;
+              if (!log || log.contract_id !== AUTO_ID) continue;
+              rows.push(log.value?.repr || log.value || log);
+            }
+            return rows;
+          }
+
+          (async () => {
+            const info = await fetchRetry(`${API}/v2/info`);
+            const tipHeight = Number(info.stacks_tip_height || info.stacks_tip_height_unanchored || info.stacks_tip_height);
+            if (!Number.isFinite(tipHeight) || tipHeight <= 0) throw new Error(`invalid tip info: ${JSON.stringify(info)}`);
+
+            const getters = {};
+            for (const fn of ['get-mint-limit', 'get-current-mint-limit', 'get-last-mint-limit-reset', 'get-mint-limit-reset-window']) {
+              getters[fn] = await callRead(AUTO, fn);
+            }
+
+            const whitelist = {};
+            for (const minter of MINTERS) {
+              whitelist[minter] = await callRead(STATE, 'get-whitelist', [principalCV(minter), principalCV(SBTC)]);
+            }
+            const supportedAsset = await callRead(STATE, 'get-supported-asset', [principalCV(SBTC)]);
+
+            const autoTxs = await addressTransactions(AUTO_ID, 1500);
+            const mintTxs = autoTxs.filter(tx => {
+              const cc = tx.contract_call || {};
+              return cc.contract_id === AUTO_ID && cc.function_name === 'mint';
+            });
+            const mintRows = [];
+            for (const tx of mintTxs) {
+              let gap = null;
+              const h = Number(tx.block_height);
+              if (Number.isFinite(h) && h > 1) {
+                try {
+                  const prev = await getBlock(h - 1);
+                  const cur = await getBlock(h);
+                  gap = {
+                    previous_height: h - 1,
+                    current_height: h,
+                    previous_time: blockTs(prev),
+                    current_time: blockTs(cur),
+                    gap_seconds: blockTs(cur) - blockTs(prev),
+                  };
+                } catch (e) { gap = {error: String(e)}; }
+              }
+              mintRows.push({
+                tx_id: tx.tx_id,
+                status: tx.tx_status,
+                sender: tx.sender_address,
+                block_height: tx.block_height,
+                block_time: tx.block_time,
+                block_time_iso: tx.block_time_iso,
+                result: tx.tx_result?.repr,
+                function_args: tx.contract_call?.function_args,
+                oracle_prints: extractOraclePrint(tx),
+                preceding_gap: gap,
+              });
+            }
+
+            const incidents = {};
+            for (const [name, iso] of INCIDENTS) {
+              const target = Math.floor(Date.parse(iso) / 1000);
+              try {
+                const nearest = await nearestHeightForTime(target, tipHeight);
+                incidents[name] = {
+                  target_iso: iso,
+                  nearest_block: nearest,
+                  window: await gapWindow(Number(nearest.height), 8, tipHeight),
+                };
+              } catch (e) {
+                incidents[name] = {target_iso: iso, error: String(e)};
+              }
+            }
+
+            const source = await fetchRetry(`${API}/v2/contracts/source/${DEP}/${AUTO}?proof=0`);
+            fs.writeFileSync(`${AUTO}.clar`, source.source || '');
+            const output = {
+              generated_at: new Date().toISOString(),
+              source: 'Hiro public read-only APIs',
+              contract: AUTO_ID,
+              tip: info,
+              getters,
+              supported_asset: supportedAsset,
+              whitelist,
+              transaction_count_scanned: autoTxs.length,
+              mint_transaction_count: mintRows.length,
+              mint_transactions: mintRows,
+              incident_windows: incidents,
+            };
+            fs.writeFileSync('mint-auto-gap.json', JSON.stringify(output, null, 2));
+
+            const allGaps = [];
+            for (const [name, value] of Object.entries(incidents)) {
+              if (value.window?.max_gap) allGaps.push({name, ...value.window.max_gap});
+            }
+            for (const row of mintRows) {
+              if (row.preceding_gap?.gap_seconds != null) allGaps.push({name: `mint:${row.tx_id}`, ...row.preceding_gap});
+            }
+            allGaps.sort((a, b) => Number(b.gap_seconds || 0) - Number(a.gap_seconds || 0));
+            const summary = {
+              contract: AUTO_ID,
+              tip_height: tipHeight,
+              mint_limit: getters['get-mint-limit']?.decoded,
+              current_mint_limit: getters['get-current-mint-limit']?.decoded,
+              last_mint_limit_reset: getters['get-last-mint-limit-reset']?.decoded,
+              reset_window: getters['get-mint-limit-reset-window']?.decoded,
+              active_sbtc_minters: Object.entries(whitelist).filter(([, v]) => v.decoded?.minter === true || v.decoded?.value?.minter === true).map(([address, v]) => ({address, state: v.decoded})),
+              mint_transaction_count: mintRows.length,
+              successful_mint_count: mintRows.filter(x => x.status === 'success').length,
+              largest_observed_gaps: allGaps.slice(0, 25),
+            };
+            fs.writeFileSync('summary.json', JSON.stringify(summary, null, 2));
+            console.log(JSON.stringify(summary, null, 2));
+          })().catch(e => {
+            fs.writeFileSync('fatal-error.txt', `${e.stack || e}`);
+            console.error(e);
+            process.exit(1);
+          });
+          NODE
+          node snapshot.cjs
+          sha256sum mint-auto-gap.json summary.json minting-auto-v1-2.clar > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-mint-auto-gap
+          path: /tmp/hermetica-mint-auto-gap
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
