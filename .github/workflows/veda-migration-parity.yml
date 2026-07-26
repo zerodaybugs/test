@@ -1,0 +1,321 @@
+name: veda-migration-parity
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Start local Ethereum fork
+        shell: bash
+        run: |
+          set -euo pipefail
+          anvil --fork-url https://ethereum-rpc.publicnode.com --port 8545 --silent > anvil-migration.log 2>&1 &
+          echo $! > anvil.pid
+          for _ in $(seq 1 90); do
+            if cast chain-id --rpc-url http://127.0.0.1:8545 >/dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          cat anvil-migration.log
+          exit 1
+      - name: Prove live backing parity and real-holder redemption
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import time
+          import urllib.parse
+          import urllib.request
+          import traceback
+
+          RPC = "http://127.0.0.1:8545"
+          BLOCKSCOUT = "https://eth.blockscout.com"
+          OLD = "0xeA1A6307D9b18F8d1cbf1c3Dd6aad8416C06a221"
+          NEW = "0xf0bb20865277aBd641a307eCe5Ee04E79073416C"
+          ACCOUNTANT = "0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198"
+          TOKENS = {
+              "WETH": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+              "weETH": "0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee",
+              "eETH": "0x35fA164735182de50811E8e2E824cFb9B6118ac2",
+              "wstETH": "0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0",
+              "stETH": "0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84",
+          }
+
+          def sh(*args):
+              process = subprocess.run([str(value) for value in args], text=True, capture_output=True)
+              if process.returncode != 0:
+                  raise RuntimeError({"args": args, "stdout": process.stdout, "stderr": process.stderr})
+              return process.stdout.strip()
+
+          SIGNATURES = {
+              "name": "name()",
+              "symbol": "symbol()",
+              "decimals": "decimals()",
+              "asset": "asset()",
+              "owner": "owner()",
+              "registry": "registry()",
+              "priceRouter": "priceRouter()",
+              "totalSupply": "totalSupply()",
+              "totalAssets": "totalAssets()",
+              "totalAssetsWithdrawable": "totalAssetsWithdrawable()",
+              "convertToAssets": "convertToAssets(uint256)",
+              "convertToShares": "convertToShares(uint256)",
+              "previewRedeem": "previewRedeem(uint256)",
+              "previewDeposit": "previewDeposit(uint256)",
+              "maxRedeem": "maxRedeem(address)",
+              "maxWithdraw": "maxWithdraw(address)",
+              "maxDeposit": "maxDeposit(address)",
+              "maxMint": "maxMint(address)",
+              "balanceOf": "balanceOf(address)",
+              "isShutdown": "isShutdown()",
+              "ignorePause": "ignorePause()",
+              "locked": "locked()",
+              "holdingPosition": "holdingPosition()",
+              "getCreditPositions": "getCreditPositions()",
+              "getDebtPositions": "getDebtPositions()",
+              "shareSupplyCap": "shareSupplyCap()",
+              "withdrawType": "withdrawType()",
+              "getRate": "getRate()",
+              "redeem": "redeem(uint256,address,address)",
+              "deposit": "deposit(uint256,address)",
+          }
+          S = {name: sh("cast", "sig", signature) for name, signature in SIGNATURES.items()}
+
+          def rpc(method, params, timeout=60):
+              body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+              request = urllib.request.Request(RPC, data=body, method="POST", headers={"content-type": "application/json", "user-agent": "veda-migration-parity/1.0"})
+              with urllib.request.urlopen(request, timeout=timeout) as response:
+                  payload = json.loads(response.read().decode())
+              if "error" in payload:
+                  raise RuntimeError(payload["error"])
+              return payload["result"]
+
+          def http_json(url, timeout=45):
+              request = urllib.request.Request(url, headers={"accept": "application/json", "user-agent": "veda-migration-parity/1.0"})
+              with urllib.request.urlopen(request, timeout=timeout) as response:
+                  return json.loads(response.read().decode())
+
+          def strip0(value):
+              value = str(value or "")
+              return value[2:] if value.startswith("0x") else value
+
+          def address_word(address):
+              return strip0(address).lower().rjust(64, "0")
+
+          def uint_word(value):
+              return hex(int(value))[2:].rjust(64, "0")
+
+          def decode_uint(raw):
+              return None if not raw or raw == "0x" else int(raw, 16)
+
+          def decode_bool(raw):
+              value = decode_uint(raw)
+              return None if value is None else bool(value)
+
+          def decode_address(raw):
+              return None if not raw or raw == "0x" else "0x" + strip0(raw)[-40:].lower()
+
+          def decode_string(raw):
+              value = strip0(raw)
+              if not value:
+                  return None
+              try:
+                  if len(value) == 64:
+                      return bytes.fromhex(value).rstrip(b"\x00").decode(errors="replace")
+                  offset = int(value[:64], 16) * 2
+                  length = int(value[offset:offset+64], 16)
+                  return bytes.fromhex(value[offset+64:offset+64+length*2]).decode(errors="replace")
+              except Exception:
+                  return None
+
+          def decode_uint_array(raw):
+              value = strip0(raw)
+              if not value:
+                  return None
+              try:
+                  first = int(value[:64], 16)
+                  offset = first * 2 if first >= 32 else 0
+                  length = int(value[offset:offset+64], 16)
+                  return [int(value[offset+64+i*64:offset+128+i*64], 16) for i in range(length)]
+              except Exception:
+                  return None
+
+          def call(target, data, from_address=None):
+              tx = {"to": target, "data": data}
+              if from_address:
+                  tx["from"] = from_address
+              return rpc("eth_call", [tx, "latest"])
+
+          def safe_call(target, data, from_address=None):
+              try:
+                  return {"ok": True, "raw": call(target, data, from_address)}
+              except Exception as exc:
+                  return {"ok": False, "error": repr(exc)}
+
+          def getter(target, name, decoder, suffix=""):
+              result = safe_call(target, S[name] + suffix)
+              return decoder(result["raw"]) if result["ok"] else {"error": result["error"]}
+
+          def balance(token, owner):
+              return decode_uint(call(token, S["balanceOf"] + address_word(owner))) or 0
+
+          def find_real_holder():
+              url = f"{BLOCKSCOUT}/api/v2/tokens/{OLD}/holders"
+              params = {}
+              for _ in range(10):
+                  full = url + ("?" + urllib.parse.urlencode(params, doseq=True) if params else "")
+                  payload = http_json(full)
+                  for item in payload.get("items") or []:
+                      address = item.get("address") or item.get("holder")
+                      if isinstance(address, dict):
+                          address = address.get("hash") or address.get("address")
+                      address = str(address or "").lower()
+                      if not address or address in {OLD.lower(), NEW.lower()}:
+                          continue
+                      code = rpc("eth_getCode", [address, "latest"])
+                      holder_balance = balance(OLD, address)
+                      if len(strip0(code)) == 0 and holder_balance > 0:
+                          return address, holder_balance, item
+                  nxt = payload.get("next_page_params")
+                  if not nxt:
+                      break
+                  params = {key: value for key, value in nxt.items() if value is not None}
+              raise RuntimeError("no external EOA holder found")
+
+          block_hex = rpc("eth_blockNumber", [])
+          block = rpc("eth_getBlockByNumber", [block_hex, False])
+          output = {
+              "generated_at_unix": int(time.time()),
+              "block": int(block_hex, 16),
+              "timestamp": int(block["timestamp"], 16),
+              "addresses": {"old": OLD.lower(), "new": NEW.lower(), "accountant": ACCOUNTANT.lower(), "tokens": {key: value.lower() for key, value in TOKENS.items()}},
+              "old_state": {},
+              "new_state": {},
+              "backing": {},
+              "holder_redeem": {},
+              "flags": [],
+              "errors": [],
+          }
+
+          old = output["old_state"]
+          old["name"] = getter(OLD, "name", decode_string)
+          old["symbol"] = getter(OLD, "symbol", decode_string)
+          old["decimals"] = getter(OLD, "decimals", decode_uint)
+          old["asset"] = getter(OLD, "asset", decode_address)
+          old["owner"] = getter(OLD, "owner", decode_address)
+          old["registry"] = getter(OLD, "registry", decode_address)
+          old["price_router"] = getter(OLD, "priceRouter", decode_address)
+          old["total_supply"] = getter(OLD, "totalSupply", decode_uint)
+          old["total_assets"] = getter(OLD, "totalAssets", decode_uint)
+          old["total_assets_withdrawable"] = getter(OLD, "totalAssetsWithdrawable", decode_uint)
+          old["is_shutdown"] = getter(OLD, "isShutdown", decode_bool)
+          old["ignore_pause"] = getter(OLD, "ignorePause", decode_bool)
+          old["locked"] = getter(OLD, "locked", decode_bool)
+          old["holding_position"] = getter(OLD, "holdingPosition", decode_uint)
+          old["credit_positions"] = getter(OLD, "getCreditPositions", decode_uint_array)
+          old["debt_positions"] = getter(OLD, "getDebtPositions", decode_uint_array)
+          old["share_supply_cap"] = getter(OLD, "shareSupplyCap", decode_uint)
+          old["withdraw_type"] = getter(OLD, "withdrawType", decode_uint)
+
+          total_supply = old["total_supply"] if isinstance(old["total_supply"], int) else 0
+          old["convert_to_assets_total_supply"] = getter(OLD, "convertToAssets", decode_uint, uint_word(total_supply))
+          old["preview_redeem_total_supply"] = getter(OLD, "previewRedeem", decode_uint, uint_word(total_supply))
+          old["preview_redeem_one_share"] = getter(OLD, "previewRedeem", decode_uint, uint_word(10**18))
+          old["max_deposit_probe"] = getter(OLD, "maxDeposit", decode_uint, address_word("0x1111111111111111111111111111111111111111"))
+          old["max_mint_probe"] = getter(OLD, "maxMint", decode_uint, address_word("0x1111111111111111111111111111111111111111"))
+
+          new = output["new_state"]
+          new["name"] = getter(NEW, "name", decode_string)
+          new["symbol"] = getter(NEW, "symbol", decode_string)
+          new["decimals"] = getter(NEW, "decimals", decode_uint)
+          new["total_supply"] = getter(NEW, "totalSupply", decode_uint)
+          new["accountant_rate"] = getter(ACCOUNTANT, "getRate", decode_uint)
+          new["old_vault_share_balance"] = balance(NEW, OLD)
+          new["old_vault_direct_token_balances"] = {name: balance(token, OLD) for name, token in TOKENS.items()}
+
+          backing = output["backing"]
+          backing["old_total_supply"] = total_supply
+          backing["new_share_balance"] = new["old_vault_share_balance"]
+          backing["share_difference_new_minus_old"] = new["old_vault_share_balance"] - total_supply
+          rate = new["accountant_rate"] if isinstance(new["accountant_rate"], int) else 0
+          backing["new_share_value_at_accountant_rate"] = new["old_vault_share_balance"] * rate // 10**18 if rate else None
+          total_assets = old["total_assets"] if isinstance(old["total_assets"], int) else 0
+          backing["value_difference_new_share_value_minus_old_total_assets"] = (backing["new_share_value_at_accountant_rate"] - total_assets) if backing["new_share_value_at_accountant_rate"] is not None else None
+          backing["supply_parity_within_2_wei"] = abs(backing["share_difference_new_minus_old"]) <= 2
+          if not backing["supply_parity_within_2_wei"]:
+              output["flags"].append({"type": "share_backing_mismatch", "difference": backing["share_difference_new_minus_old"]})
+
+          try:
+              holder, holder_balance, holder_meta = find_real_holder()
+              redeem_amount = min(holder_balance, 10**18)
+              holder_state = output["holder_redeem"]
+              holder_state.update({"holder": holder, "holder_meta": holder_meta, "starting_old_share_balance": holder_balance, "redeem_amount": redeem_amount})
+              holder_state["max_redeem"] = getter(OLD, "maxRedeem", decode_uint, address_word(holder))
+              holder_state["max_withdraw"] = getter(OLD, "maxWithdraw", decode_uint, address_word(holder))
+              holder_state["preview_redeem"] = getter(OLD, "previewRedeem", decode_uint, uint_word(redeem_amount))
+              before = {"old_share": balance(OLD, holder), "new_share": balance(NEW, holder), **{name: balance(token, holder) for name, token in TOKENS.items()}}
+              holder_state["before"] = before
+
+              rpc("anvil_impersonateAccount", [holder])
+              rpc("anvil_setBalance", [holder, hex(100 * 10**18)])
+              redeem_data = S["redeem"] + uint_word(redeem_amount) + address_word(holder) + address_word(holder)
+              preview_call = safe_call(OLD, redeem_data, holder)
+              holder_state["redeem_eth_call"] = preview_call
+              tx_hash = rpc("eth_sendTransaction", [{"from": holder, "to": OLD, "data": redeem_data, "gas": hex(15_000_000)}])
+              receipt = None
+              for _ in range(200):
+                  receipt = rpc("eth_getTransactionReceipt", [tx_hash])
+                  if receipt:
+                      break
+                  time.sleep(0.05)
+              if not receipt or int(receipt["status"], 16) != 1:
+                  raise RuntimeError({"tx": tx_hash, "receipt": receipt})
+              after = {"old_share": balance(OLD, holder), "new_share": balance(NEW, holder), **{name: balance(token, holder) for name, token in TOKENS.items()}}
+              holder_state["tx_hash_local_fork"] = tx_hash
+              holder_state["gas_used"] = int(receipt["gasUsed"], 16)
+              holder_state["after"] = after
+              holder_state["deltas"] = {key: after[key] - before[key] for key in before}
+              holder_state["new_share_received_minus_old_share_burned"] = holder_state["deltas"]["new_share"] + holder_state["deltas"]["old_share"]
+              holder_state["redeem_parity_within_2_wei"] = abs(holder_state["new_share_received_minus_old_share_burned"]) <= 2
+              if not holder_state["redeem_parity_within_2_wei"]:
+                  output["flags"].append({"type": "holder_redeem_parity_mismatch", "difference": holder_state["new_share_received_minus_old_share_burned"]})
+          except Exception as exc:
+              output["holder_redeem"]["error"] = repr(exc)
+              output["holder_redeem"]["traceback"] = traceback.format_exc()
+              output["errors"].append({"stage": "holder_redeem", "error": repr(exc)})
+
+          output["summary"] = {
+              "share_parity": backing.get("supply_parity_within_2_wei"),
+              "share_difference": backing.get("share_difference_new_minus_old"),
+              "old_total_assets": old.get("total_assets"),
+              "old_total_assets_withdrawable": old.get("total_assets_withdrawable"),
+              "redeem_parity": output["holder_redeem"].get("redeem_parity_within_2_wei"),
+              "redeem_deltas": output["holder_redeem"].get("deltas"),
+              "flags": len(output["flags"]),
+              "errors": len(output["errors"]),
+          }
+          with open("veda-migration-parity.json", "w", encoding="utf-8") as handle:
+              json.dump(output, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+          print(json.dumps(output, indent=2, sort_keys=True))
+          PY
+      - name: Upload migration parity proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-migration-parity
+          path: |
+            veda-migration-parity.json
+            anvil-migration.log
+          if-no-files-found: error
+          retention-days: 1
