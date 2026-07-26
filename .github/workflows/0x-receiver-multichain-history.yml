@@ -1,0 +1,135 @@
+name: Collect public 0x receiver history across chains
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/0x-receiver-multichain-history.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Collect public multichain history
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/multichain-history"
+          mkdir -p "$OUT"
+          FACTORY=0x00000000000000304861c3aDfb80dd5ebeC96325
+
+          python3 - "$OUT" "$FACTORY" <<'PY'
+          import json, pathlib, sys, time, urllib.parse, urllib.request
+
+          root = pathlib.Path(sys.argv[1])
+          address = sys.argv[2]
+          instances = {
+              'ethereum': 'https://eth.blockscout.com',
+              'base': 'https://base.blockscout.com',
+              'optimism': 'https://optimism.blockscout.com',
+              'arbitrum': 'https://arbitrum.blockscout.com',
+              'polygon': 'https://polygon.blockscout.com',
+              'scroll': 'https://scroll.blockscout.com',
+              'unichain': 'https://unichain.blockscout.com',
+              'ink': 'https://explorer.inkonchain.com',
+              'worldchain': 'https://worldchain-mainnet.explorer.alchemy.com',
+              'berachain': 'https://berachain.blockscout.com',
+              'linea': 'https://explorer.linea.build',
+              'gnosis': 'https://gnosis.blockscout.com',
+          }
+          headers = {'User-Agent': 'Mozilla/5.0 0x-public-audit-multichain/1.0', 'Accept': 'application/json'}
+
+          def get(url, attempts=3):
+              last=None
+              for i in range(attempts):
+                  try:
+                      req=urllib.request.Request(url,headers=headers)
+                      with urllib.request.urlopen(req,timeout=45) as r:
+                          return r.read()
+                  except Exception as e:
+                      last=e; time.sleep(1+i)
+              raise last
+
+          def paginate(base, path, outdir, name, max_pages=20):
+              url=base+'/api/v2'+path
+              items=[]
+              for page in range(max_pages):
+                  raw=get(url)
+                  (outdir/f'{name}-{page:03d}.json').write_bytes(raw)
+                  obj=json.loads(raw)
+                  page_items=obj.get('items',[]) if isinstance(obj,dict) else []
+                  items.extend(page_items)
+                  nxt=obj.get('next_page_params') if isinstance(obj,dict) else None
+                  if not nxt: break
+                  url=base+'/api/v2'+path.split('?',1)[0]+'?'+urllib.parse.urlencode(nxt,doseq=True)
+              return items
+
+          all_summary={}
+          for chain,base in instances.items():
+              d=root/chain
+              d.mkdir(parents=True,exist_ok=True)
+              row={'instance':base}
+              try:
+                  addr=get(base+'/api/v2/addresses/'+address)
+                  (d/'address.json').write_bytes(addr)
+                  row['address_ok']=True
+              except Exception as e:
+                  row['address_error']=repr(e)
+              txs=[]; internals=[]
+              try:
+                  txs=paginate(base,f'/addresses/{address}/transactions',d,'transactions')
+              except Exception as e:
+                  row['transactions_error']=repr(e)
+              try:
+                  internals=paginate(base,f'/addresses/{address}/internal-transactions',d,'internal-transactions')
+              except Exception as e:
+                  row['internal_transactions_error']=repr(e)
+              (d/'transactions-all.json').write_text(json.dumps(txs,indent=2,sort_keys=True))
+              (d/'internal-transactions-all.json').write_text(json.dumps(internals,indent=2,sort_keys=True))
+              hashes=set()
+              for item in txs+internals:
+                  if not isinstance(item,dict): continue
+                  for key in ('hash','transaction_hash'):
+                      v=item.get(key)
+                      if isinstance(v,str) and len(v)==66: hashes.add(v)
+                  tr=item.get('transaction')
+                  if isinstance(tr,dict):
+                      v=tr.get('hash')
+                      if isinstance(v,str) and len(v)==66: hashes.add(v)
+              row.update({'top_level_count':len(txs),'internal_count':len(internals),'parent_hash_count':len(hashes),'hashes':sorted(hashes)})
+              txdir=d/'parent-transactions'; txdir.mkdir(exist_ok=True)
+              for h in sorted(hashes)[:100]:
+                  hd=txdir/h; hd.mkdir(exist_ok=True)
+                  for suffix,path in {
+                      'transaction.json':f'/transactions/{h}',
+                      'internal-transactions.json':f'/transactions/{h}/internal-transactions',
+                      'raw-trace.json':f'/transactions/{h}/raw-trace',
+                      'token-transfers.json':f'/transactions/{h}/token-transfers',
+                  }.items():
+                      try: (hd/suffix).write_bytes(get(base+'/api/v2'+path))
+                      except Exception as e: (hd/(suffix+'.err')).write_text(repr(e))
+              all_summary[chain]=row
+          (root/'summary.json').write_text(json.dumps(all_summary,indent=2,sort_keys=True))
+          PY
+
+          find "$OUT" -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS"
+          test -s "$OUT/summary.json"
+
+      - name: Upload public multichain evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: 0x-receiver-multichain-history-${{ github.run_id }}
+          path: multichain-history/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
