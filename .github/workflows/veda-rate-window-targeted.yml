@@ -1,0 +1,323 @@
+name: veda-rate-window-targeted
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Download previously reconstructed rate chronology
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api repos/${GITHUB_REPOSITORY}/actions/artifacts/8624582055/zip > rate-history.zip
+          unzip -q rate-history.zip
+          test -s veda-rate-sync-history-v4.json
+      - name: Query only viable Scroll to Ethereum stale-rate windows
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import concurrent.futures
+          import datetime as dt
+          import json
+          import subprocess
+          import threading
+          import time
+          import urllib.parse
+          import urllib.request
+
+          SCROLL = "https://scrollscan.com"
+          ETH = "https://eth.blockscout.com"
+          BOUNTY_START = int(dt.datetime(2026, 1, 21, tzinfo=dt.timezone.utc).timestamp())
+          PRODUCTS = {
+              "liquidBTC": {"teller": "0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353", "one_share": 10**8, "decimals": 8},
+              "liquidETH": {"teller": "0x9AA79C84b79816ab920bBcE20f8f74557B514734", "one_share": 10**18, "decimals": 18},
+              "liquidUSD": {"teller": "0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387", "one_share": 10**6, "decimals": 6},
+          }
+
+          def sh(*args):
+              p = subprocess.run([str(x) for x in args], text=True, capture_output=True)
+              if p.returncode != 0:
+                  raise RuntimeError({"args": args, "stdout": p.stdout, "stderr": p.stderr})
+              return p.stdout.strip()
+
+          TOPIC_SENT = sh("cast", "keccak", "MessageSent(bytes32,uint256,address)").lower()
+          TOPIC_RECEIVED = sh("cast", "keccak", "MessageReceived(bytes32,uint256,address)").lower()
+          TOPIC_DEPOSIT_8 = sh("cast", "keccak", "Deposit(uint256,address,address,uint256,uint256,uint256,uint256,address)").lower()
+          TOPIC_DEPOSIT_7 = sh("cast", "keccak", "Deposit(uint256,address,address,uint256,uint256,uint256,uint256)").lower()
+          SELECTORS = {
+              "deposit_bridge_8": sh("cast", "sig", "depositAndBridge(address,uint256,uint256,address,bytes,address,uint256,address)").lower(),
+              "deposit_bridge_7": sh("cast", "sig", "depositAndBridge(address,uint256,uint256,address,bytes,address,uint256)").lower(),
+              "permit_tuple": sh("cast", "sig", "depositAndBridgeWithPermit((address,uint256,uint256,uint256,uint8,bytes32,bytes32,address,bytes,address,uint256,address))").lower(),
+              "bridge": sh("cast", "sig", "bridge(uint96,address,bytes,address,uint256)").lower(),
+          }
+          ATOMIC_SELECTORS = {SELECTORS["deposit_bridge_8"], SELECTORS["deposit_bridge_7"], SELECTORS["permit_tuple"], "0x94f51289"}
+
+          lock = threading.Lock()
+          next_allowed = 0.0
+          def get(url, timeout=45, retries=6):
+              global next_allowed
+              last = None
+              for attempt in range(retries):
+                  try:
+                      with lock:
+                          now = time.monotonic()
+                          delay = max(0.0, next_allowed - now)
+                          next_allowed = max(next_allowed, now) + 0.22
+                      if delay:
+                          time.sleep(delay)
+                      req = urllib.request.Request(url, headers={"accept": "application/json", "user-agent": "veda-targeted-window/1.0"})
+                      with urllib.request.urlopen(req, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = repr(exc)
+                      time.sleep(min(8, 0.6 * (2 ** attempt)))
+              raise RuntimeError({"url": url, "error": last})
+
+          def strip0(value):
+              value = str(value or "")
+              return value[2:] if value.startswith("0x") else value
+
+          def words(raw):
+              value = strip0(raw)
+              return [int(value[i:i+64], 16) for i in range(0, len(value), 64)] if value and len(value) % 64 == 0 else []
+
+          def topic_address(topic):
+              return "0x" + strip0(topic)[-40:].lower()
+
+          def block_by_time(timestamp, closest):
+              query = urllib.parse.urlencode({"module": "block", "action": "getblocknobytime", "timestamp": timestamp, "closest": closest})
+              payload = get(f"{SCROLL}/api?{query}")
+              result = payload.get("result")
+              if isinstance(result, dict):
+                  result = result.get("blockNumber")
+              if result is None:
+                  raise RuntimeError(payload)
+              return int(str(result), 16) if str(result).startswith("0x") else int(result)
+
+          def legacy_logs(base, address, topic0, from_block, to_block, topic1=None):
+              params = {"module": "logs", "action": "getLogs", "fromBlock": from_block, "toBlock": to_block, "address": address, "topic0": topic0}
+              if topic1:
+                  params["topic1"] = topic1
+                  params["topic0_1_opr"] = "and"
+              payload = get(f"{base}/api?{urllib.parse.urlencode(params)}")
+              result = payload.get("result")
+              if isinstance(result, list):
+                  return result
+              if isinstance(result, str) and ("no" in result.lower() or payload.get("status") == "0"):
+                  return []
+              raise RuntimeError(payload)
+
+          def tx_detail(base, tx_hash):
+              return get(f"{base}/api/v2/transactions/{tx_hash}")
+
+          def tx_logs(base, tx_hash):
+              payload = get(f"{base}/api/v2/transactions/{tx_hash}/logs")
+              return payload.get("items") or []
+
+          def tx_input(tx):
+              value = tx.get("raw_input") or tx.get("input") or tx.get("input_data") or "0x"
+              if isinstance(value, dict):
+                  value = value.get("raw_input") or value.get("hex") or value.get("data") or "0x"
+              return str(value)
+
+          def dynamic_bytes(calldata, head_base, index):
+              raw = bytes.fromhex(strip0(calldata))
+              pos = head_base + index * 32
+              if len(raw) < pos + 32:
+                  return None
+              offset = int.from_bytes(raw[pos:pos+32], "big")
+              start = head_base + offset
+              if len(raw) < start + 32:
+                  return None
+              length = int.from_bytes(raw[start:start+32], "big")
+              return raw[start+32:start+32+length]
+
+          def decode_destination(input_data):
+              h = strip0(input_data)
+              selector = "0x" + h[:8].lower() if len(h) >= 8 else "0x" + h.lower()
+              eid = None
+              try:
+                  calldata = "0x" + h
+                  if selector == SELECTORS["deposit_bridge_8"]:
+                      blob = dynamic_bytes(calldata, 4, 4)
+                  elif selector == SELECTORS["deposit_bridge_7"]:
+                      blob = dynamic_bytes(calldata, 4, 4)
+                  elif selector == SELECTORS["bridge"]:
+                      blob = dynamic_bytes(calldata, 4, 2)
+                  elif selector == "0x94f51289":
+                      blob = dynamic_bytes(calldata, 4, 8)
+                  else:
+                      blob = None
+                  if blob:
+                      eid = int.from_bytes(blob[-32:], "big")
+              except Exception:
+                  pass
+              return {"selector": selector, "destination_eid": eid, "destination_is_ethereum": eid == 30101}
+
+          history = json.load(open("veda-rate-sync-history-v4.json", encoding="utf-8"))
+          windows = [
+              w for w in history.get("asynchronous_windows", [])
+              if w.get("start_time", 0) >= BOUNTY_START
+              and w.get("source") == "scroll"
+              and w.get("destination") == "ethereum"
+              and w.get("end_time")
+              and w.get("product") in PRODUCTS
+          ]
+          windows.sort(key=lambda w: (w["start_time"], w["product"]))
+
+          timestamps = sorted({int(w["start_time"]) for w in windows} | {int(w["end_time"]) for w in windows})
+          block_cache = {}
+          block_errors = []
+          def resolve_timestamp(timestamp):
+              try:
+                  return timestamp, {
+                      "after": block_by_time(timestamp, "after"),
+                      "before": block_by_time(timestamp, "before"),
+                  }
+              except Exception as exc:
+                  return timestamp, {"error": repr(exc)}
+
+          with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+              for timestamp, value in executor.map(resolve_timestamp, timestamps):
+                  block_cache[timestamp] = value
+                  if "error" in value:
+                      block_errors.append({"timestamp": timestamp, **value})
+
+          hits = []
+          query_errors = []
+          def query_window(index_window):
+              index, window = index_window
+              start_map = block_cache.get(int(window["start_time"]), {})
+              end_map = block_cache.get(int(window["end_time"]), {})
+              if "error" in start_map or "error" in end_map:
+                  return {"index": index, "window": window, "error": "block_resolution_failed"}
+              from_block = max(0, int(start_map["before"]) - 2)
+              to_block = int(end_map["after"]) + 2
+              try:
+                  logs = legacy_logs(SCROLL, PRODUCTS[window["product"]]["teller"], TOPIC_SENT, from_block, to_block)
+                  return {"index": index, "window": window, "from_block": from_block, "to_block": to_block, "logs": logs}
+              except Exception as exc:
+                  return {"index": index, "window": window, "from_block": from_block, "to_block": to_block, "error": repr(exc)}
+
+          with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+              results = list(executor.map(query_window, enumerate(windows)))
+
+          seen = set()
+          for result in results:
+              if result.get("error"):
+                  query_errors.append({k: v for k, v in result.items() if k != "logs"})
+                  continue
+              window = result["window"]
+              for log in result.get("logs", []):
+                  tx_hash = log.get("transactionHash") or log.get("transaction_hash")
+                  log_index = log.get("logIndex") or log.get("index") or log.get("log_index")
+                  key = (window["product"], tx_hash, str(log_index))
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  topics = [str(x).lower() for x in (log.get("topics") or [])]
+                  decoded = words(log.get("data"))
+                  event = {
+                      "product": window["product"],
+                      "window": {k: window.get(k) for k in ("start_time", "end_time", "window_seconds", "source_stale_rate", "destination_fresh_rate", "gross_rate_edge_bps")},
+                      "source_block_range": [result["from_block"], result["to_block"]],
+                      "tx": tx_hash,
+                      "log_index": log_index,
+                      "message_id": topics[1] if len(topics) > 1 else None,
+                      "to": topic_address(topics[2]) if len(topics) > 2 else None,
+                      "share_amount": decoded[0] if decoded else None,
+                  }
+                  try:
+                      detail = tx_detail(SCROLL, tx_hash)
+                      input_data = tx_input(detail)
+                      event["transaction"] = {
+                          "status": detail.get("status"),
+                          "method": detail.get("method"),
+                          "from": (detail.get("from") or {}).get("hash") if isinstance(detail.get("from"), dict) else detail.get("from"),
+                          "selector": "0x" + strip0(input_data)[:8].lower(),
+                      }
+                      event["destination_decode"] = decode_destination(input_data)
+                      same_tx_logs = tx_logs(SCROLL, tx_hash)
+                      deposit_events = []
+                      for item in same_tx_logs:
+                          item_topics = [str(x.get("value") if isinstance(x, dict) else x).lower() for x in (item.get("topics") or [])]
+                          if not item_topics or item_topics[0] not in {TOPIC_DEPOSIT_8, TOPIC_DEPOSIT_7}:
+                              continue
+                          data_words = words(item.get("data"))
+                          deposit_events.append({
+                              "topic": item_topics[0],
+                              "receiver": topic_address(item_topics[1]) if len(item_topics) > 1 else None,
+                              "asset": topic_address(item_topics[2]) if len(item_topics) > 2 else None,
+                              "referral": topic_address(item_topics[3]) if len(item_topics) > 3 else None,
+                              "nonce": data_words[0] if len(data_words) > 0 else None,
+                              "deposit_amount": data_words[1] if len(data_words) > 1 else None,
+                              "share_amount": data_words[2] if len(data_words) > 2 else None,
+                          })
+                      event["deposit_events_same_tx"] = deposit_events
+                      event["is_atomic_deposit_bridge"] = bool(deposit_events) and event["transaction"]["selector"] in ATOMIC_SELECTORS
+                      if event.get("message_id"):
+                          try:
+                              received = legacy_logs(ETH, PRODUCTS[window["product"]]["teller"], TOPIC_RECEIVED, 0, "latest", event["message_id"])
+                          except Exception as exc:
+                              event["destination_receive_error"] = repr(exc)
+                              received = []
+                          event["ethereum_receive_count"] = len(received)
+                          event["ethereum_receive_logs"] = received[:5]
+                      share_amount = event.get("share_amount")
+                      if isinstance(share_amount, int):
+                          delta = int(window["destination_fresh_rate"]) - int(window["source_stale_rate"])
+                          event["gross_extra_base_units"] = share_amount * delta // PRODUCTS[window["product"]]["one_share"]
+                  except Exception as exc:
+                      event["detail_error"] = repr(exc)
+                  hits.append(event)
+
+          atomic = [x for x in hits if x.get("is_atomic_deposit_bridge")]
+          delivered_atomic = [x for x in atomic if x.get("ethereum_receive_count", 0) > 0 and x.get("destination_decode", {}).get("destination_is_ethereum")]
+          output = {
+              "generated_at_unix": int(time.time()),
+              "source_artifact_id": 8624582055,
+              "topics": {"sent": TOPIC_SENT, "received": TOPIC_RECEIVED, "deposit8": TOPIC_DEPOSIT_8, "deposit7": TOPIC_DEPOSIT_7},
+              "selectors": SELECTORS,
+              "window_count": len(windows),
+              "unique_timestamp_count": len(timestamps),
+              "block_resolution_errors": block_errors,
+              "query_errors": query_errors,
+              "message_hits": hits,
+              "atomic_deposit_bridge_hits": atomic,
+              "delivered_atomic_deposit_bridge_hits": delivered_atomic,
+              "summary": {
+                  "windows": len(windows),
+                  "resolved_timestamps": len(block_cache) - len(block_errors),
+                  "query_errors": len(query_errors),
+                  "message_hit_count": len(hits),
+                  "atomic_hit_count": len(atomic),
+                  "delivered_atomic_hit_count": len(delivered_atomic),
+                  "max_atomic_edge_bps": max([x["window"]["gross_rate_edge_bps"] for x in atomic], default=0),
+                  "max_delivered_atomic_gross_extra_base_units": max([x.get("gross_extra_base_units", 0) for x in delivered_atomic], default=0),
+              },
+          }
+          with open("veda-rate-window-targeted.json", "w", encoding="utf-8") as handle:
+              json.dump(output, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+          print(json.dumps({"summary": output["summary"], "atomic_hits": atomic[:50], "block_errors": block_errors[:20], "query_errors": query_errors[:20]}, indent=2, sort_keys=True))
+          PY
+      - name: Upload targeted production evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-rate-window-targeted
+          path: veda-rate-window-targeted.json
+          if-no-files-found: error
+          retention-days: 1
