@@ -1,0 +1,123 @@
+name: Temporary encrypted Pyth Entropy accounting reconciliation
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-pyth-entropy-accounting-scan.yml'
+      - 'tmp-research/pyth-entropy/entropy_accounting_scan.py.gz.b64'
+      - 'tmp-research/pyth-entropy/output-public.pem'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout scan infrastructure
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Decode and verify scan helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pyth-entropy-accounting
+          base64 -d tmp-research/pyth-entropy/entropy_accounting_scan.py.gz.b64 \
+            | gzip -d > /tmp/pyth-entropy-accounting/scan.py
+          chmod 0700 /tmp/pyth-entropy-accounting/scan.py
+          python3 -m py_compile /tmp/pyth-entropy-accounting/scan.py
+          sha256sum /tmp/pyth-entropy-accounting/scan.py \
+            > /tmp/pyth-entropy-accounting/scan.py.sha256
+          grep -F 'signed_or_broadcast_transactions": 0' \
+            /tmp/pyth-entropy-accounting/scan.py
+
+      - name: Execute read-only liability reconciliation
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pyth-entropy-accounting/evidence
+          START=$(date +%s)
+          set +e
+          timeout 4800 python3 /tmp/pyth-entropy-accounting/scan.py \
+            /tmp/pyth-entropy-accounting/evidence \
+            > /tmp/pyth-entropy-accounting/console.log 2>&1
+          STATUS=$?
+          set -e
+          END=$(date +%s)
+          printf '%s\n' "$STATUS" > /tmp/pyth-entropy-accounting/scan-exit-code.txt
+          printf '%s\n' "$((END - START))" > /tmp/pyth-entropy-accounting/duration-seconds.txt
+          printf '%s\n' "$GITHUB_RUN_ID" > /tmp/pyth-entropy-accounting/github-run-id.txt
+          printf '%s\n' "$GITHUB_SHA" > /tmp/pyth-entropy-accounting/github-sha.txt
+          tail -n 30 /tmp/pyth-entropy-accounting/console.log || true
+          test "$STATUS" = '0' -o "$STATUS" = '2'
+          test -s /tmp/pyth-entropy-accounting/evidence/PYTH_ENTROPY_ACCOUNTING_RECONCILIATION.json
+          test -s /tmp/pyth-entropy-accounting/evidence/SUMMARY.json
+          grep -F 'signed_or_broadcast_transactions=0' \
+            /tmp/pyth-entropy-accounting/console.log
+
+      - name: Encrypt detailed evidence before upload
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted-output /tmp/pyth-entropy-accounting/evidence
+          cp /tmp/pyth-entropy-accounting/scan-exit-code.txt \
+            /tmp/pyth-entropy-accounting/duration-seconds.txt \
+            /tmp/pyth-entropy-accounting/github-run-id.txt \
+            /tmp/pyth-entropy-accounting/github-sha.txt \
+            /tmp/pyth-entropy-accounting/scan.py.sha256 \
+            /tmp/pyth-entropy-accounting/console.log \
+            /tmp/pyth-entropy-accounting/evidence/ 2>/dev/null || true
+          tar --sort=name --mtime='UTC 2026-07-26' --owner=0 --group=0 --numeric-owner \
+            -czf /tmp/pyth-entropy-accounting-evidence.tar.gz \
+            -C /tmp/pyth-entropy-accounting evidence
+          sha256sum /tmp/pyth-entropy-accounting-evidence.tar.gz | awk '{print $1}' \
+            > encrypted-output/evidence-plaintext.sha256
+          openssl rand 32 > /tmp/output-key.bin
+          openssl rand 16 > /tmp/output-iv.bin
+          cat /tmp/output-key.bin /tmp/output-iv.bin > /tmp/output-keyinfo.bin
+          KEY=$(xxd -p -c 256 /tmp/output-key.bin)
+          IV=$(xxd -p -c 256 /tmp/output-iv.bin)
+          openssl enc -aes-256-cbc \
+            -K "$KEY" -iv "$IV" \
+            -in /tmp/pyth-entropy-accounting-evidence.tar.gz \
+            -out encrypted-output/evidence.tar.gz.enc
+          openssl pkeyutl -encrypt \
+            -pubin -inkey tmp-research/pyth-entropy/output-public.pem \
+            -in /tmp/output-keyinfo.bin \
+            -out encrypted-output/evidence-keyinfo.enc \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          sha256sum encrypted-output/evidence.tar.gz.enc \
+            encrypted-output/evidence-keyinfo.enc \
+            encrypted-output/evidence-plaintext.sha256 \
+            > encrypted-output/SHA256SUMS
+          rm -rf /tmp/pyth-entropy-accounting
+          rm -f /tmp/pyth-entropy-accounting-evidence.tar.gz \
+            /tmp/output-key.bin /tmp/output-iv.bin /tmp/output-keyinfo.bin
+
+      - name: Upload encrypted evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyth-entropy-encrypted-accounting-${{ github.run_id }}
+          path: encrypted-output/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Enforce encrypted-output boundary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s encrypted-output/evidence.tar.gz.enc
+          test -s encrypted-output/evidence-keyinfo.enc
+          test -s encrypted-output/evidence-plaintext.sha256
+          test -s encrypted-output/SHA256SUMS
+          test ! -e /tmp/pyth-entropy-accounting
