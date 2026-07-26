@@ -1,0 +1,228 @@
+name: veda-self-root-proof-v3
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Resolve the live LiquidUSD manager self-root across repository history
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet --no-tags https://github.com/Veda-Labs/boring-vault.git veda-main
+          git clone --quiet --no-tags https://github.com/Veda-Labs/boring-vault-plasma.git veda-plasma
+          python3 - <<'PY'
+          import json, os, re, subprocess, tempfile, time, traceback
+
+          LIVE = "0x64fe8acfe1936a9cba6d2cbe0d204b5dee6a3b6b55d52f0d44825c03c6f7f719".lower()
+          SENSITIVE = {
+              "0x08c6f91e2b681faf5e17227f2a44c307b3c1364c",  # LiquidUSD vault
+              "0x7b57ad1a0aa89583130acfad024241170d24c13c",  # live manager
+              "0xc315d6e14ddcdc7407784e2caf815d131bc1d3e7",  # accountant
+              "0x4de413a26fc24c3fc27cc983be70aa9c5c299387",  # teller
+              "0x38fc1ba73b7ed289955a07d9f11a85b6e388064a",  # queue
+          }
+
+          def run(*args, cwd=None, check=True):
+              p = subprocess.run(list(args), cwd=cwd, text=True, capture_output=True)
+              if check and p.returncode != 0:
+                  raise RuntimeError({"args": args, "stdout": p.stdout, "stderr": p.stderr, "code": p.returncode})
+              return p
+
+          def k256(data: bytes) -> bytes:
+              p = run("cast", "keccak", "0x" + data.hex())
+              return bytes.fromhex(p.stdout.strip()[2:])
+
+          def tree_root(leaves):
+              layer = [bytes.fromhex(x[2:]) for x in leaves]
+              if not layer:
+                  return None
+              while len(layer) > 1:
+                  nxt = []
+                  for i in range(0, len(layer), 2):
+                      a = layer[i]
+                      b = layer[i + 1] if i + 1 < len(layer) else layer[i]
+                      nxt.append(k256(a + b if a <= b else b + a))
+                  layer = nxt
+              return "0x" + layer[0].hex()
+
+          def proof_for(leaves, index):
+              layer = [bytes.fromhex(x[2:]) for x in leaves]
+              proof = []
+              idx = index
+              while len(layer) > 1:
+                  sibling = idx ^ 1
+                  proof.append("0x" + (layer[sibling] if sibling < len(layer) else layer[idx]).hex())
+                  nxt = []
+                  for i in range(0, len(layer), 2):
+                      a = layer[i]
+                      b = layer[i + 1] if i + 1 < len(layer) else layer[i]
+                      nxt.append(k256(a + b if a <= b else b + a))
+                  idx //= 2
+                  layer = nxt
+              return proof
+
+          def verify(leaf, proof):
+              cur = bytes.fromhex(leaf[2:])
+              for sibling in proof:
+                  b = bytes.fromhex(sibling[2:])
+                  cur = k256(cur + b if cur <= b else b + cur)
+              return "0x" + cur.hex()
+
+          def classify(item):
+              sig = str(item.get("FunctionSignature") or "").lower()
+              target = str(item.get("TargetAddress") or "").lower()
+              decoder = str(item.get("DecoderAndSanitizerAddress") or "").lower()
+              args = item.get("AddressArguments") or []
+              packed = str(item.get("PackedArgumentAddresses") or "").lower()
+              reasons = []
+              if target in SENSITIVE:
+                  reasons.append("sensitive_target")
+              dangerous = (
+                  "manage(", "execute(", "multicall(", "delegatecall", "transfer(", "transferfrom(",
+                  "approve(", "enter(", "exit(", "bulkwithdraw", "bulkdeposit", "setauthority",
+                  "transferownership", "rescuetokens", "swap(", "unoswap", "fillorder", "withdrawall",
+              )
+              if any(x in sig for x in dangerous):
+                  reasons.append("dangerous_selector")
+              if decoder in ("", "0x0000000000000000000000000000000000000000"):
+                  reasons.append("missing_decoder")
+              if ("address" in sig or "bytes" in sig or "tuple" in sig or "(" in sig) and not args and packed in ("", "0x"):
+                  reasons.append("no_address_binding")
+              if item.get("CanSendValue"):
+                  reasons.append("can_send_value")
+              return reasons
+
+          output = {
+              "generated_at_unix": int(time.time()),
+              "live_root": LIVE,
+              "repositories": {},
+              "matches": [],
+              "high_risk_leaves": [],
+              "errors": [],
+          }
+
+          for repo in ("veda-main", "veda-plasma"):
+              rd = {"head": run("git", "rev-parse", "HEAD", cwd=repo).stdout.strip(), "current_matches": [], "history_commits": [], "history_matches": []}
+              output["repositories"][repo] = rd
+
+              # Current-tree exact root matches.
+              grep = run("git", "grep", "-il", LIVE, "HEAD", "--", "*.json", cwd=repo, check=False)
+              current_paths = [x.split(":", 1)[-1].strip() for x in grep.stdout.splitlines() if x.strip()]
+
+              # Search every fetched branch/commit where the exact root string was added or removed.
+              hist = run("git", "log", "--all", "-S", LIVE, "--format=%H", "--", "*.json", cwd=repo, check=False)
+              commits = []
+              for sha in hist.stdout.splitlines():
+                  sha = sha.strip()
+                  if sha and sha not in commits:
+                      commits.append(sha)
+              rd["history_commits"] = commits
+
+              candidates = [("HEAD", p) for p in current_paths]
+              for sha in commits:
+                  gp = run("git", "grep", "-il", LIVE, sha, "--", "*.json", cwd=repo, check=False)
+                  for line in gp.stdout.splitlines():
+                      if not line.strip():
+                          continue
+                      # output is sha:path
+                      path = line.split(":", 1)[-1].strip()
+                      candidates.append((sha, path))
+
+              seen = set()
+              for ref, path in candidates:
+                  key = (ref, path)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  try:
+                      raw = run("git", "show", f"{ref}:{path}", cwd=repo).stdout
+                      data = json.loads(raw)
+                      metadata = data.get("metadata") or {}
+                      leaves = data.get("leafs") or []
+                      digests = [str(x.get("LeafDigest") or "").lower() for x in leaves if re.fullmatch(r"0x[0-9a-fA-F]{64}", str(x.get("LeafDigest") or ""))]
+                      computed = tree_root(digests)
+                      metadata_root = str(metadata.get("ManageRoot") or "").lower()
+                      merkle_root = None
+                      mt = data.get("MerkleTree")
+                      if isinstance(mt, dict) and isinstance(mt.get("0"), list) and mt["0"]:
+                          merkle_root = str(mt["0"][0]).lower()
+                      match = {
+                          "repository": repo,
+                          "ref": ref,
+                          "path": path,
+                          "metadata_root": metadata_root,
+                          "merkle_root": merkle_root,
+                          "computed_root": computed,
+                          "leaf_count": len(leaves),
+                          "metadata": metadata,
+                          "root_consistent": computed == metadata_root == merkle_root,
+                          "matching_live": LIVE in {metadata_root, merkle_root, computed},
+                          "leaves": [],
+                      }
+                      if match["matching_live"]:
+                          for i, item in enumerate(leaves):
+                              leaf = str(item.get("LeafDigest") or "").lower()
+                              if not re.fullmatch(r"0x[0-9a-f]{64}", leaf):
+                                  continue
+                              proof = proof_for(digests, i)
+                              verified_root = verify(leaf, proof)
+                              reasons = classify(item)
+                              record = {
+                                  "index": i,
+                                  "leaf": leaf,
+                                  "proof": proof,
+                                  "verified_root": verified_root,
+                                  "proof_matches_live": verified_root == LIVE,
+                                  "target": str(item.get("TargetAddress") or "").lower(),
+                                  "decoder": str(item.get("DecoderAndSanitizerAddress") or "").lower(),
+                                  "selector": str(item.get("FunctionSelector") or "").lower(),
+                                  "signature": item.get("FunctionSignature"),
+                                  "arguments": item.get("AddressArguments") or [],
+                                  "packed_arguments": item.get("PackedArgumentAddresses"),
+                                  "can_send_value": bool(item.get("CanSendValue")),
+                                  "description": item.get("Description"),
+                                  "risk_reasons": reasons,
+                              }
+                              match["leaves"].append(record)
+                              if reasons:
+                                  output["high_risk_leaves"].append({"repository": repo, "ref": ref, "path": path, **record})
+                          output["matches"].append(match)
+                          (rd["current_matches"] if ref == "HEAD" else rd["history_matches"]).append({k:v for k,v in match.items() if k != "leaves"})
+                  except Exception as exc:
+                      output["errors"].append({"repository": repo, "ref": ref, "path": path, "error": repr(exc), "traceback": traceback.format_exc()})
+
+          output["summary"] = {
+              "match_count": len(output["matches"]),
+              "high_risk_count": len(output["high_risk_leaves"]),
+              "proof_verified_count": sum(1 for m in output["matches"] for x in m["leaves"] if x["proof_matches_live"]),
+              "errors": len(output["errors"]),
+          }
+          with open("veda-self-root-proof-v3.json", "w", encoding="utf-8") as f:
+              json.dump(output, f, indent=2, sort_keys=True)
+              f.write("\n")
+          print(json.dumps({
+              "summary": output["summary"],
+              "repositories": output["repositories"],
+              "matches": [{k:v for k,v in m.items() if k != "leaves"} | {"high_risk_leaves": [x for x in m["leaves"] if x["risk_reasons"]][:100]} for m in output["matches"]],
+              "errors": output["errors"],
+          }, indent=2, sort_keys=True))
+          PY
+      - name: Upload exact self-root proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-self-root-proof-v3
+          path: veda-self-root-proof-v3.json
+          if-no-files-found: error
+          retention-days: 1
