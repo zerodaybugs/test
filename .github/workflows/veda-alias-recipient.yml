@@ -1,0 +1,171 @@
+name: veda-alias-recipient
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Resolve L1 alias preimages and live Ink transfer controls
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, time, traceback, urllib.request
+
+          ZERO='0x0000000000000000000000000000000000000000'
+          ATTACKER='0x1111111111111111111111111111111111111111'
+          OFFSET=int('1111000000000000000000000000000000001111',16)
+          CHAINS={
+            'ethereum':{'id':1,'rpcs':['https://ethereum-rpc.publicnode.com','https://eth.drpc.org'],'explorer':'https://eth.blockscout.com'},
+            'scroll':{'id':534352,'rpcs':['https://scroll-rpc.publicnode.com','https://rpc.scroll.io'],'explorer':'https://scroll.blockscout.com'},
+            'ink':{'id':57073,'rpcs':['https://rpc-gel.inkonchain.com'],'explorer':'https://explorer.inkonchain.com'},
+          }
+          ROLE_ADDRESSES=[
+            {'chain':'ink','address':'0x4a21d84eb5b8bd5254e6a2d0ca11aa64ed1b6b66','role':'pause'},
+            {'chain':'ink','address':'0x13edfc1b04d003c2a142e92fad838b925672b07f','role':'pause'},
+            {'chain':'scroll','address':'0x523455838764e0ecf9add7eab8c1dab86b0c6d7b','role':'pause'},
+          ]
+          INK_TELLERS={
+            'balanced':'0xC151E263d5c890FD0Bceb33a6525F1A76a8329fC',
+            'boosted':'0xc46f2443b3521632E2E2a903D6da8f965B46f6a0',
+          }
+
+          def sh(*args):
+            p=subprocess.run([str(x) for x in args],text=True,capture_output=True)
+            if p.returncode: raise RuntimeError({'args':args,'stdout':p.stdout,'stderr':p.stderr})
+            return p.stdout.strip()
+          def sig(s): return sh('cast','sig',s)
+          S={x:sig(x) for x in [
+            'permissionedTransfers()','shareLockPeriod()','isPaused()','vault()','accountant()','authority()','owner()',
+            'beforeTransferData(address)','getOwners()','getThreshold()','getModulesPaginated(address,uint256)',
+            'execute(address,uint256,bytes)','execute(address,bytes)','call(address,uint256,bytes)','forward(address,bytes)',
+            'multicall(bytes[])','bundleTxs((address,bytes,uint256)[])','depositTransaction(address,uint256,uint64,bool,bytes)',
+          ]}
+          def rpc(ep,method,params,timeout=45):
+            body=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
+            req=urllib.request.Request(ep,data=body,method='POST',headers={'content-type':'application/json','user-agent':'veda-alias-recipient/1'})
+            with urllib.request.urlopen(req,timeout=timeout) as r:o=json.loads(r.read().decode())
+            if 'error' in o: raise RuntimeError(o['error'])
+            return o['result']
+          def choose(cfg):
+            bad={}
+            for ep in cfg['rpcs']:
+              try:
+                if int(rpc(ep,'eth_chainId',[]),16)==cfg['id']: return ep,bad
+              except Exception as e: bad[ep]=repr(e)
+            raise RuntimeError(bad)
+          def h(x):
+            s=str(x or ''); return s[2:] if s.startswith('0x') else s
+          def aw(a): return h(a).lower().rjust(64,'0')
+          def uw(v): return hex(int(v))[2:].rjust(64,'0')
+          def addr(raw): return ZERO if not raw or raw=='0x' else '0x'+h(raw)[-40:].lower()
+          def safe(ep,to,data,frm=None):
+            tx={'to':to,'data':data}
+            if frm:tx['from']=frm
+            try:return {'ok':True,'raw':rpc(ep,'eth_call',[tx,'latest'])}
+            except Exception as e:return {'ok':False,'error':repr(e)}
+          def http_json(url,timeout=30):
+            req=urllib.request.Request(url,headers={'accept':'application/json','user-agent':'veda-alias-recipient/1'})
+            with urllib.request.urlopen(req,timeout=timeout) as r:return json.loads(r.read().decode())
+          def metadata(explorer,a):
+            try:return http_json(f'{explorer}/api/v2/addresses/{a}')
+            except Exception as e:return {'_error':repr(e)}
+          def contract_info(explorer,a):
+            try:return http_json(f'{explorer}/api/v2/smart-contracts/{a}')
+            except Exception as e:return {'_error':repr(e)}
+          def decode_dyn_addresses(raw):
+            x=h(raw)
+            try:
+              off=int(x[:64],16)*2;n=int(x[off:off+64],16);return ['0x'+x[off+64+i*64+24:off+64+(i+1)*64] for i in range(n)]
+            except:return []
+          def alias_preimage(a): return '0x'+format((int(a,16)-OFFSET)%(1<<160),'040x')
+
+          endpoints={};chain_state={};errors=[]
+          for cn,cfg in CHAINS.items():
+            try:
+              ep,bad=choose(cfg);endpoints[cn]=ep;chain_state[cn]={'block':int(rpc(ep,'eth_blockNumber',[]),16),'endpoint':ep,'rpc_failures':bad}
+            except Exception as e: errors.append({'chain':cn,'error':repr(e)})
+
+          alias_rows=[]
+          eth=endpoints.get('ethereum')
+          for item in ROLE_ADDRESSES:
+            row=dict(item);row['l1_preimage']=alias_preimage(item['address'])
+            try:
+              lep=endpoints[item['chain']];row['l2_code_bytes']=len(h(rpc(lep,'eth_getCode',[item['address'],'latest'])))//2;row['l2_nonce']=int(rpc(lep,'eth_getTransactionCount',[item['address'],'latest']),16)
+              if eth:
+                p=row['l1_preimage'];code=rpc(eth,'eth_getCode',[p,'latest']);row['l1_code_bytes']=len(h(code))//2;row['l1_nonce']=int(rpc(eth,'eth_getTransactionCount',[p,'latest']),16);row['l1_balance']=int(rpc(eth,'eth_getBalance',[p,'latest']),16);row['l1_metadata']=metadata(CHAINS['ethereum']['explorer'],p)
+                if row['l1_code_bytes']:
+                  row['l1_contract_info']=contract_info(CHAINS['ethereum']['explorer'],p)
+                  owners=safe(eth,p,S['getOwners()']);threshold=safe(eth,p,S['getThreshold()']);mods=safe(eth,p,S['getModulesPaginated(address,uint256)']+aw('0x0000000000000000000000000000000000000001')+uw(20))
+                  row['safe_probe']={'owners':decode_dyn_addresses(owners.get('raw')) if owners['ok'] else [],'threshold':int(threshold['raw'],16) if threshold['ok'] and threshold.get('raw')!='0x' else None,'modules_raw':mods.get('raw') if mods['ok'] else None}
+                  probes={}
+                  probes['execute(address,uint256,bytes)']=safe(eth,p,S['execute(address,uint256,bytes)']+aw(ATTACKER)+uw(0)+uw(96)+uw(0),ATTACKER)
+                  probes['execute(address,bytes)']=safe(eth,p,S['execute(address,bytes)']+aw(ATTACKER)+uw(64)+uw(0),ATTACKER)
+                  probes['call(address,uint256,bytes)']=safe(eth,p,S['call(address,uint256,bytes)']+aw(ATTACKER)+uw(0)+uw(96)+uw(0),ATTACKER)
+                  probes['forward(address,bytes)']=safe(eth,p,S['forward(address,bytes)']+aw(ATTACKER)+uw(64)+uw(0),ATTACKER)
+                  probes['multicall(bytes[])']=safe(eth,p,S['multicall(bytes[])']+uw(32)+uw(0),ATTACKER)
+                  probes['depositTransaction(address,uint256,uint64,bool,bytes)']=safe(eth,p,S['depositTransaction(address,uint256,uint64,bool,bytes)']+aw(ATTACKER)+uw(0)+uw(100000)+uw(0)+uw(160)+uw(0),ATTACKER)
+                  row['transitive_probes']=probes
+            except Exception as e:row['error']=repr(e);row['traceback']=traceback.format_exc();errors.append({'alias':item,'error':repr(e)})
+            alias_rows.append(row)
+
+          ink_rows={}
+          if 'ink' in endpoints:
+            ep=endpoints['ink']
+            for name,teller in INK_TELLERS.items():
+              row={'address':teller.lower()};ink_rows[name]=row
+              try:
+                code=rpc(ep,'eth_getCode',[teller,'latest']);row['code_bytes']=len(h(code))//2;row['metadata']=metadata(CHAINS['ink']['explorer'],teller);row['contract_info']=contract_info(CHAINS['ink']['explorer'],teller)
+                for key in ['permissionedTransfers()','shareLockPeriod()','isPaused()']:
+                  r=safe(ep,teller,S[key]);row[key]=int(r['raw'],16) if r['ok'] and r.get('raw')!='0x' else None
+                for key in ['vault()','accountant()','authority()','owner()']:
+                  r=safe(ep,teller,S[key]);row[key]=addr(r.get('raw')) if r['ok'] else None
+                # Reconstruct current deny-list subjects from the explorer logs API.
+                subjects=set()
+                topics=[sig(x) for x in ['DenyFrom(address)','DenyTo(address)','DenyOperator(address)','AllowFrom(address)','AllowTo(address)','AllowOperator(address)']]
+                try:
+                  for topic in topics:
+                    url=f"{CHAINS['ink']['explorer']}/api/v2/addresses/{teller}/logs?topic={topic}"
+                    payload=http_json(url)
+                    for log in payload.get('items',[]):
+                      ts=log.get('topics') or []
+                      if len(ts)>1:subjects.add('0x'+h(ts[1])[-40:].lower())
+                except Exception as e:row['deny_log_error']=repr(e)
+                current=[]
+                for user in sorted(subjects):
+                  r=safe(ep,teller,S['beforeTransferData(address)']+aw(user));w=[]
+                  if r['ok'] and r.get('raw')!='0x':
+                    x=h(r['raw']);w=[int(x[i:i+64],16) for i in range(0,len(x),64)]
+                  if len(w)>=5 and any(w[:4]):current.append({'user':user,'denyFrom':bool(w[0]),'denyTo':bool(w[1]),'denyOperator':bool(w[2]),'permissionedOperator':bool(w[3]),'shareUnlockTime':w[4]})
+                row['current_restrictions']=current
+              except Exception as e:row['error']=repr(e);row['traceback']=traceback.format_exc();errors.append({'teller':name,'error':repr(e)})
+
+          flags=[]
+          for row in alias_rows:
+            if row.get('l1_code_bytes',0)>0:
+              flags.append({'type':'L1_ALIAS_PREIMAGE_IS_CONTRACT','row':row})
+          for name,row in ink_rows.items():
+            if row.get('permissionedTransfers()')==1:flags.append({'type':'INK_PERMISSIONED_TRANSFERS_ACTIVE','teller':name,'row':row})
+            if any(x.get('denyTo') for x in row.get('current_restrictions',[])):flags.append({'type':'INK_LIVE_DENY_TO_RECIPIENTS','teller':name,'row':row})
+
+          out={'generated_at_unix':int(time.time()),'chain_state':chain_state,'alias_rows':alias_rows,'ink_tellers':ink_rows,'flags':flags,'errors':errors,'summary':{'alias_count':len(alias_rows),'contract_preimage_count':sum(1 for r in alias_rows if r.get('l1_code_bytes',0)>0),'ink_teller_count':len(ink_rows),'flag_count':len(flags),'error_count':len(errors)}}
+          open('veda-alias-recipient.json','w').write(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({'summary':out['summary'],'flags':flags,'alias_rows':[{k:r.get(k) for k in ['chain','address','l1_preimage','l1_code_bytes','l1_nonce','l2_code_bytes','l2_nonce','error']} for r in alias_rows],'ink':{k:{'permissionedTransfers':v.get('permissionedTransfers()'),'shareLockPeriod':v.get('shareLockPeriod()'),'paused':v.get('isPaused()'),'current_restrictions':v.get('current_restrictions'),'error':v.get('error')} for k,v in ink_rows.items()},'errors':errors},indent=2,sort_keys=True))
+          PY
+      - name: Upload alias and recipient proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-alias-recipient
+          path: veda-alias-recipient.json
+          if-no-files-found: error
+          retention-days: 1
