@@ -1,0 +1,111 @@
+name: veda-msgsig-auth-composition
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Mine direct internal calls across requiresAuth function boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet --no-tags https://github.com/Veda-Labs/boring-vault.git veda
+          git -C veda checkout --quiet 48ab2e6e0d5bc7e1971d25aded399936393eb478
+          python3 - <<'PY'
+          import json, os, re, time, traceback
+
+          ROOT='veda/src'
+          FUNC_RE=re.compile(r'\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)\s*([^;{]*?)\{',re.S)
+          CALL_RE=re.compile(r'(?<![.A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\s*\(')
+          KEYWORDS={'if','for','while','require','assert','revert','return','emit','keccak256','abi','unchecked','new','delete','type','address','uint256','uint128','uint96','uint64','uint32','uint24','uint16','uint8','bytes','bytes32','bool','string'}
+
+          def strip_comments(s):
+              s=re.sub(r'/\*.*?\*/','',s,flags=re.S)
+              s=re.sub(r'//[^\n]*','',s)
+              return s
+
+          def extract_functions(text,path):
+              clean=strip_comments(text)
+              funcs=[]
+              for m in FUNC_RE.finditer(clean):
+                  name,args,tail=m.group(1),m.group(2),m.group(3)
+                  start=m.end()-1;depth=0;end=None
+                  for i in range(start,len(clean)):
+                      c=clean[i]
+                      if c=='{':depth+=1
+                      elif c=='}':
+                          depth-=1
+                          if depth==0:end=i+1;break
+                  if end is None:continue
+                  body=clean[start+1:end-1]
+                  vis='external' if re.search(r'\bexternal\b',tail) else ('public' if re.search(r'\bpublic\b',tail) else ('internal' if re.search(r'\binternal\b',tail) else ('private' if re.search(r'\bprivate\b',tail) else 'unknown')))
+                  funcs.append({'file':path,'name':name,'args':args,'tail':' '.join(tail.split()),'visibility':vis,'requiresAuth':bool(re.search(r'\brequiresAuth\b',tail)),'body':body,'start':m.start(),'end':end})
+              return funcs
+
+          all_funcs=[];errors=[]
+          for base,_,files in os.walk(ROOT):
+              for fn in files:
+                  if not fn.endswith('.sol'):continue
+                  p=os.path.join(base,fn)
+                  try:all_funcs.extend(extract_functions(open(p,encoding='utf-8',errors='ignore').read(),p))
+                  except Exception as e:errors.append({'file':p,'error':repr(e),'traceback':traceback.format_exc()})
+
+          auth_by_name={}
+          for f in all_funcs:
+              if f['requiresAuth']:
+                  auth_by_name.setdefault(f['name'],[]).append({k:v for k,v in f.items() if k!='body'})
+
+          edges=[]
+          for outer in all_funcs:
+              calls=[]
+              for m in CALL_RE.finditer(outer['body']):
+                  name=m.group(1)
+                  if name in KEYWORDS:continue
+                  prefix=outer['body'][max(0,m.start()-12):m.start()]
+                  # direct calls only; member calls have a dot immediately before the name and are excluded by regex.
+                  calls.append(name)
+              for inner_name in sorted(set(calls)):
+                  if inner_name not in auth_by_name:continue
+                  edges.append({
+                      'outer':{k:v for k,v in outer.items() if k!='body'},
+                      'inner_name':inner_name,
+                      'inner_candidates':auth_by_name[inner_name],
+                      'outer_auth':outer['requiresAuth'],
+                      'outer_callable':outer['visibility'] in ('public','external'),
+                      'inner_public_candidates':[x for x in auth_by_name[inner_name] if x['visibility']=='public'],
+                      'msg_sig_confusion_candidate':outer['visibility'] in ('public','external') and bool([x for x in auth_by_name[inner_name] if x['visibility']=='public']),
+                  })
+
+          # High-signal candidates: an externally reachable function directly calls a public requiresAuth function.
+          high=[e for e in edges if e['msg_sig_confusion_candidate']]
+          # Strongest: outer is not itself requiresAuth, or it is a user-facing deposit/bridge/request/cancel/solve surface.
+          user_terms=('deposit','withdraw','bridge','request','cancel','replace','solve','receive','callback','claim','wrap','unwrap','multicall')
+          strongest=[]
+          for e in high:
+              n=e['outer']['name'].lower()
+              reasons=[]
+              if not e['outer_auth']:reasons.append('outer_has_no_requiresAuth')
+              if any(x in n for x in user_terms):reasons.append('outer_is_user_or_callback_surface')
+              if e['outer']['name']!=e['inner_name']:reasons.append('cross_function_boundary')
+              if reasons:strongest.append({'reasons':reasons,**e})
+
+          out={'generated_at_unix':int(time.time()),'function_count':len(all_funcs),'requires_auth_function_count':sum(1 for x in all_funcs if x['requiresAuth']),'edges':edges,'high_signal':high,'strongest':strongest,'errors':errors}
+          out['summary']={'edge_count':len(edges),'high_signal_count':len(high),'strongest_count':len(strongest),'errors':len(errors)}
+          with open('veda-msgsig-auth-composition.json','w',encoding='utf-8') as f:json.dump(out,f,indent=2,sort_keys=True);f.write('\n')
+          print(json.dumps({'summary':out['summary'],'strongest':strongest,'high_signal':high[:100],'errors':errors},indent=2,sort_keys=True))
+          PY
+      - name: Upload msg.sig composition map
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-msgsig-auth-composition
+          path: veda-msgsig-auth-composition.json
+          if-no-files-found: error
+          retention-days: 1
