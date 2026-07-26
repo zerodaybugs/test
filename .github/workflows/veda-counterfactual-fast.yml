@@ -1,0 +1,150 @@
+name: veda-counterfactual-fast
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Isolate no-code nonce-zero holders of live Veda privileges
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import collections, json, re, subprocess, time, traceback, urllib.parse, urllib.request
+          from urllib.parse import urlparse
+
+          SCOPE='https://raw.githubusercontent.com/infosec-us-team/Immunefi-Bug-Bounty-Programs-Unofficial/0008ec8ce2582a3b02f553d9d355671d3ec72502/project/veda.json'
+          ZERO='0x0000000000000000000000000000000000000000'
+          CHAINS={
+            'ethereum':{'id':1,'rpcs':['https://ethereum-rpc.publicnode.com','https://eth.drpc.org'],'api':'https://eth.blockscout.com/api'},
+            'scroll':{'id':534352,'rpcs':['https://scroll-rpc.publicnode.com','https://rpc.scroll.io'],'api':'https://scroll.blockscout.com/api'},
+            'ink':{'id':57073,'rpcs':['https://rpc-gel.inkonchain.com'],'api':'https://explorer.inkonchain.com/api'},
+          }
+          HOST={'etherscan.io':'ethereum','www.etherscan.io':'ethereum','scrollscan.com':'scroll','www.scrollscan.com':'scroll','explorer.inkonchain.com':'ink'}
+
+          def sh(*args):
+            p=subprocess.run([str(x) for x in args],text=True,capture_output=True)
+            if p.returncode:raise RuntimeError({'args':args,'stdout':p.stdout,'stderr':p.stderr})
+            return p.stdout.strip()
+          def sig(s):return sh('cast','sig',s)
+          TOPIC=sh('cast','keccak','UserRoleUpdated(address,uint8,bool)').lower()
+          AUTH=sig('authority()');OWNER=sig('owner()');ROLES=sig('getUserRoles(address)');CAN=sig('canCall(address,address,bytes4)')
+          SIGNATURES=[
+            'manage(address,bytes,uint256)','manage(address[],bytes[],uint256[])','enter(address,address,uint256,address,uint256)','exit(address,address,uint256,address,uint256)','setBeforeTransferHook(address)',
+            'updateExchangeRate(uint96)','vestYield(uint256,uint256)','postLoss(uint256)','setRateProviderData(address,bool,address)','pause()','unpause()',
+            'bulkDeposit(address,uint256,uint256,address)','bulkWithdraw(address,uint256,uint256,address)','withdraw(address,uint256,uint256,address)','updateAssetData(address,bool,bool,uint16)',
+            'solveOnChainWithdraws((uint96,address,address,uint128,uint128,uint40,uint24,uint24)[],bytes,address)','rescueTokens(address,uint256)',
+            'manageVaultWithMerkleVerification(bytes32[][],address[],address[],bytes[],uint256[])','setManageRoot(address,bytes32)',
+            'setUserRole(address,uint8,bool)','setRoleCapability(uint8,address,bytes4,bool)','setPublicCapability(address,bytes4,bool)','setAuthority(address)','transferOwnership(address)'
+          ]
+          SEL={s:sig(s) for s in SIGNATURES}
+
+          def http_json(url,t=60,retries=4):
+            last=None
+            for i in range(retries):
+              try:
+                req=urllib.request.Request(url,headers={'accept':'application/json','user-agent':'veda-counterfactual-fast/1'})
+                with urllib.request.urlopen(req,timeout=t) as r:return json.loads(r.read().decode())
+              except Exception as e:last=repr(e);time.sleep(.4*(i+1))
+            raise RuntimeError({'url':url,'error':last})
+          def rpc(ep,m,p,t=60):
+            body=json.dumps({'jsonrpc':'2.0','id':1,'method':m,'params':p}).encode();req=urllib.request.Request(ep,data=body,method='POST',headers={'content-type':'application/json','user-agent':'veda-counterfactual-fast/1'})
+            with urllib.request.urlopen(req,timeout=t) as r:o=json.loads(r.read().decode())
+            if 'error' in o:raise RuntimeError(o['error'])
+            return o['result']
+          def choose(cfg):
+            bad={}
+            for ep in cfg['rpcs']:
+              try:
+                if int(rpc(ep,'eth_chainId',[]),16)==cfg['id']:return ep,bad
+              except Exception as e:bad[ep]=repr(e)
+            raise RuntimeError(bad)
+          def h(x):
+            x=str(x or '');return x[2:] if x.startswith('0x') else x
+          def aw(a):return h(a).lower().rjust(64,'0')
+          def bw(s):return h(s).lower().ljust(64,'0')
+          def addr(raw):return ZERO if not raw or raw=='0x' else '0x'+h(raw)[-40:].lower()
+          def safe(ep,to,data):
+            try:return {'ok':True,'raw':rpc(ep,'eth_call',[{'to':to,'data':data},'latest'])}
+            except Exception as e:return {'ok':False,'error':repr(e)}
+          def call_address(ep,to,selector):
+            r=safe(ep,to,selector);return addr(r.get('raw')) if r['ok'] and r.get('raw')!='0x' else ZERO
+          def roles(ep,auth,user):
+            r=safe(ep,auth,ROLES+aw(user));return int(r['raw'],16) if r['ok'] and r.get('raw')!='0x' else 0
+          def can(ep,auth,user,target,selector):
+            r=safe(ep,auth,CAN+aw(user)+aw(target)+bw(selector));return bool(int(r['raw'],16)) if r['ok'] and r.get('raw')!='0x' else False
+          def chain_addr(url):
+            u=urlparse(url);m=re.search(r'/address/(0x[a-fA-F0-9]{40})',u.path);return HOST.get(u.netloc.lower()),(m.group(1).lower() if m else None)
+          def role_logs(cfg,auth):
+            q=urllib.parse.urlencode({'module':'logs','action':'getLogs','fromBlock':0,'toBlock':'latest','address':auth,'topic0':TOPIC})
+            payload=http_json(cfg['api']+'?'+q,90,4)
+            result=payload.get('result') if isinstance(payload,dict) else None
+            if not isinstance(result,list):raise RuntimeError({'auth':auth,'response':payload})
+            return result
+          def event_users(logs):
+            users=set()
+            for log in logs:
+              topics=[str(x).lower() for x in (log.get('topics') or [])]
+              if len(topics)>=3 and topics[0]==TOPIC:users.add('0x'+h(topics[1])[-40:].lower())
+            return users
+
+          scope=http_json(SCOPE)
+          raw=[]
+          for item in scope.get('assets') or []:
+            chain,address=chain_addr(item.get('url',''))
+            if chain and address:raw.append({'chain':chain,'address':address,'description':item.get('description')})
+          output={'generated_at_unix':int(time.time()),'scope_count':len(raw),'chains':{},'flags':[],'direct_owner_flags':[],'errors':[]}
+          for chain,cfg in CHAINS.items():
+            try:
+              ep,bad=choose(cfg);targets=[x for x in raw if x['chain']==chain]
+              c={'block':int(rpc(ep,'eth_blockNumber',[]),16),'endpoint':ep,'rpc_failures':bad,'targets':{},'authorities':{}};output['chains'][chain]=c
+              grouped=collections.defaultdict(list)
+              for t in targets:
+                code=rpc(ep,'eth_getCode',[t['address'],'latest']);authority=call_address(ep,t['address'],AUTH);owner=call_address(ep,t['address'],OWNER)
+                row={**t,'code_bytes':len(h(code))//2,'authority':authority,'owner':owner};c['targets'][t['address']]=row
+                if authority!=ZERO:grouped[authority].append(t)
+                if owner!=ZERO:
+                  ocode=rpc(ep,'eth_getCode',[owner,'latest']);ononce=int(rpc(ep,'eth_getTransactionCount',[owner,'latest']),16)
+                  if len(h(ocode))==0 and ononce==0:
+                    flag={'chain':chain,'target':t['address'],'description':t['description'],'owner':owner,'reason':'DIRECT_OWNER_NO_CODE_NONCE_ZERO'}
+                    output['direct_owner_flags'].append(flag)
+              for authority,ats in grouped.items():
+                logs=role_logs(cfg,authority);users=event_users(logs);aowner=call_address(ep,authority,OWNER)
+                if aowner!=ZERO:users.add(aowner)
+                ar={'target_count':len(ats),'event_count':len(logs),'owner':aowner,'holders':{}};c['authorities'][authority]=ar
+                for user in sorted(users):
+                  bitmap=roles(ep,authority,user)
+                  code=rpc(ep,'eth_getCode',[user,'latest']);nonce=int(rpc(ep,'eth_getTransactionCount',[user,'latest']),16);is_owner=user==aowner
+                  sensitive=[]
+                  if len(h(code))==0 and nonce==0 and (bitmap or is_owner):
+                    for t in ats:
+                      for name,selector in SEL.items():
+                        if can(ep,authority,user,t['address'],selector):sensitive.append({'target':t['address'],'description':t['description'],'signature':name})
+                    # Authority owner can always administer RolesAuthority via direct owner path.
+                    if is_owner:sensitive.append({'target':authority,'description':'RolesAuthority owner','signature':'owner-admin'})
+                  row={'roles_bitmap':bitmap,'is_authority_owner':is_owner,'code_bytes':len(h(code))//2,'nonce':nonce,'sensitive':sensitive};ar['holders'][user]=row
+                  if len(h(code))==0 and nonce==0 and sensitive:
+                    output['flags'].append({'chain':chain,'authority':authority,'address':user,**row})
+            except Exception as e:
+              output['errors'].append({'chain':chain,'error':repr(e),'traceback':traceback.format_exc()})
+          output['summary']={'scope_count':len(raw),'chain_count':len(output['chains']),'authority_count':sum(len(c['authorities']) for c in output['chains'].values()),'holder_count':sum(len(a['holders']) for c in output['chains'].values() for a in c['authorities'].values()),'counterfactual_flag_count':len(output['flags']),'direct_owner_flag_count':len(output['direct_owner_flags']),'error_count':len(output['errors'])}
+          with open('veda-counterfactual-fast.json','w') as f:json.dump(output,f,indent=2,sort_keys=True);f.write('\n')
+          print(json.dumps({'summary':output['summary'],'flags':output['flags'],'direct_owner_flags':output['direct_owner_flags'],'errors':output['errors']},indent=2,sort_keys=True))
+          PY
+      - name: Upload targeted counterfactual proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-counterfactual-fast
+          path: veda-counterfactual-fast.json
+          if-no-files-found: error
+          retention-days: 1
