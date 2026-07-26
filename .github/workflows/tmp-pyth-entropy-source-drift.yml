@@ -1,0 +1,141 @@
+name: Temporary encrypted Pyth Entropy exact-source drift scan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-pyth-entropy-source-drift.yml'
+      - 'tmp-research/pyth-entropy/entropy_source_drift.py'
+      - 'tmp-research/pyth-entropy/output-public.pem'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout scan infrastructure
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.0.0'
+
+      - name: Install pnpm 10.28.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@10.28.0 --activate
+          pnpm --version
+
+      - name: Install pinned Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Build exact current Entropy implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/pyth-network/pyth-crosschain.git pyth-crosschain
+          git -C pyth-crosschain fetch --depth 1 origin 4a596e7adff552afaf5687ce791764019f2d3719
+          git -C pyth-crosschain checkout --detach 4a596e7adff552afaf5687ce791764019f2d3719
+          test "$(git -C pyth-crosschain rev-parse HEAD)" = '4a596e7adff552afaf5687ce791764019f2d3719'
+          cd pyth-crosschain
+          pnpm install --frozen-lockfile
+          cd target_chains/ethereum/contracts
+          rm -rf lib/forge-std
+          forge install foundry-rs/forge-std@v1.7.6 --no-git
+          forge build --force --build-info
+          test -s out/EntropyUpgradable.sol/EntropyUpgradable.json
+          forge --version > "$GITHUB_WORKSPACE/forge-version.txt"
+          pnpm --version > "$GITHUB_WORKSPACE/pnpm-version.txt"
+          node --version > "$GITHUB_WORKSPACE/node-version.txt"
+
+      - name: Execute read-only exact-source drift scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          START=$(date +%s)
+          set +e
+          python3 tmp-research/pyth-entropy/entropy_source_drift.py \
+            --artifact pyth-crosschain/target_chains/ethereum/contracts/out/EntropyUpgradable.sol/EntropyUpgradable.json \
+            --out evidence \
+            > evidence/console.log 2>&1
+          STATUS=$?
+          set -e
+          END=$(date +%s)
+          printf '%s\n' "$STATUS" > evidence/scan-exit-code.txt
+          printf '%s\n' "$((END - START))" > evidence/duration-seconds.txt
+          printf '%s\n' "$GITHUB_RUN_ID" > evidence/github-run-id.txt
+          printf '%s\n' "$GITHUB_SHA" > evidence/github-sha.txt
+          cp forge-version.txt pnpm-version.txt node-version.txt evidence/
+          cp pyth-crosschain/target_chains/ethereum/contracts/out/EntropyUpgradable.sol/EntropyUpgradable.json evidence/compiled-artifact.json
+          sha256sum tmp-research/pyth-entropy/entropy_source_drift.py > evidence/scanner-sha256.txt
+          find evidence -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > evidence/SHA256SUMS
+          exit 0
+
+      - name: Encrypt detailed evidence before upload
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted-output evidence
+          if [ ! -f evidence/scan-exit-code.txt ]; then
+            printf '%s\n' '125' > evidence/scan-exit-code.txt
+            printf '%s\n' 'Scan did not create an exit record.' > evidence/bootstrap-error.txt
+          fi
+          cp evidence/scan-exit-code.txt encrypted-output/scan-exit-code.txt
+          tar --sort=name --mtime='UTC 2026-07-26' --owner=0 --group=0 --numeric-owner \
+            -czf /tmp/pyth-entropy-source-drift-evidence.tar.gz evidence
+          sha256sum /tmp/pyth-entropy-source-drift-evidence.tar.gz | awk '{print $1}' \
+            > encrypted-output/evidence-plaintext.sha256
+          openssl rand 32 > /tmp/output-key.bin
+          openssl rand 16 > /tmp/output-iv.bin
+          cat /tmp/output-key.bin /tmp/output-iv.bin > /tmp/output-keyinfo.bin
+          KEY=$(od -An -tx1 -v /tmp/output-key.bin | tr -d ' \n')
+          IV=$(od -An -tx1 -v /tmp/output-iv.bin | tr -d ' \n')
+          openssl enc -aes-256-cbc -K "$KEY" -iv "$IV" \
+            -in /tmp/pyth-entropy-source-drift-evidence.tar.gz \
+            -out encrypted-output/evidence.tar.gz.enc
+          openssl pkeyutl -encrypt \
+            -pubin -inkey tmp-research/pyth-entropy/output-public.pem \
+            -in /tmp/output-keyinfo.bin \
+            -out encrypted-output/evidence-keyinfo.enc \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          sha256sum encrypted-output/evidence.tar.gz.enc encrypted-output/evidence-keyinfo.enc \
+            encrypted-output/scan-exit-code.txt > encrypted-output/SHA256SUMS
+          rm -rf evidence pyth-crosschain
+          rm -f /tmp/output-key.bin /tmp/output-iv.bin /tmp/output-keyinfo.bin /tmp/pyth-entropy-source-drift-evidence.tar.gz
+
+      - name: Upload encrypted evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyth-entropy-encrypted-source-drift-${{ github.run_id }}
+          path: encrypted-output/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Enforce encrypted-output boundary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s encrypted-output/evidence.tar.gz.enc
+          test -s encrypted-output/evidence-keyinfo.enc
+          test -s encrypted-output/evidence-plaintext.sha256
+          test -s encrypted-output/scan-exit-code.txt
+          test -s encrypted-output/SHA256SUMS
+          test ! -e evidence
+          test ! -e pyth-crosschain
