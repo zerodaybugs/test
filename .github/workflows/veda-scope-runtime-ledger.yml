@@ -1,0 +1,190 @@
+name: veda-scope-runtime-ledger
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Bind all 52 published scope targets to current runtime and capabilities
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import collections, hashlib, json, re, subprocess, time, urllib.request, traceback
+          from urllib.parse import urlparse
+
+          SCOPE_URL='https://raw.githubusercontent.com/infosec-us-team/Immunefi-Bug-Bounty-Programs-Unofficial/0008ec8ce2582a3b02f553d9d355671d3ec72502/project/veda.json'
+          ATTACKER='0x1111111111111111111111111111111111111111'
+          ZERO='0x0000000000000000000000000000000000000000'
+          CHAINS={
+            'ethereum':{'id':1,'rpcs':['https://ethereum-rpc.publicnode.com','https://eth.drpc.org'],'explorer':'https://eth.blockscout.com'},
+            'scroll':{'id':534352,'rpcs':['https://scroll-rpc.publicnode.com','https://rpc.scroll.io'],'explorer':'https://scroll.blockscout.com'},
+            'ink':{'id':57073,'rpcs':['https://rpc-gel.inkonchain.com'],'explorer':'https://explorer.inkonchain.com'},
+          }
+          HOST_CHAIN={'etherscan.io':'ethereum','www.etherscan.io':'ethereum','scrollscan.com':'scroll','www.scrollscan.com':'scroll','explorer.inkonchain.com':'ink'}
+
+          def sh(*args):
+            p=subprocess.run([str(x) for x in args],text=True,capture_output=True)
+            if p.returncode:raise RuntimeError({'args':args,'stdout':p.stdout,'stderr':p.stderr})
+            return p.stdout.strip()
+          def sig(x):return sh('cast','sig',x)
+          S={
+            'name':sig('name()'),'symbol':sig('symbol()'),'version':sig('version()'),'vault':sig('vault()'),'accountant':sig('accountant()'),
+            'boringVault':sig('boringVault()'),'queue':sig('queue()'),'authority':sig('authority()'),'owner':sig('owner()'),'base':sig('base()'),
+            'aavePool':sig('aaveV3Pool()'),'hook':sig('hook()'),'paused':sig('isPaused()'),'ids':sig('getRequestIds()'),
+            'can':sig('canCall(address,address,bytes4)'),'pub':sig('isCapabilityPublic(address,bytes4)'),
+            'enter':sig('enter(address,address,uint256,address,uint256)'),'exit':sig('exit(address,address,uint256,address,uint256)'),
+            'manage1':sig('manage(address,bytes,uint256)'),'manageN':sig('manage(address[],bytes[],uint256[])'),
+            'queueSolve':sig('solveOnChainWithdraws((uint96,address,address,uint128,uint128,uint40,uint24,uint24)[],bytes,address)'),
+            'tellerWithdraw':sig('withdraw(address,uint256,uint256,address)'),
+          }
+          def http_json(url,t=60,retries=5):
+            last=None
+            for i in range(retries):
+              try:
+                req=urllib.request.Request(url,headers={'accept':'application/json','user-agent':'veda-scope-ledger/1'})
+                with urllib.request.urlopen(req,timeout=t) as r:return json.loads(r.read().decode())
+              except Exception as e:last=repr(e);time.sleep(.5*(i+1))
+            raise RuntimeError({'url':url,'error':last})
+          scope=http_json(SCOPE_URL)
+          assets=scope.get('assets') or []
+          def chain_and_address(url):
+            u=urlparse(url);chain=HOST_CHAIN.get(u.netloc.lower());m=re.search(r'/address/(0x[a-fA-F0-9]{40})',u.path)
+            return chain,(m.group(1).lower() if m else None)
+          normalized=[]
+          for idx,a in enumerate(assets):
+            chain,address=chain_and_address(a.get('url',''))
+            normalized.append({'index':idx,'id':a.get('id'),'description':a.get('description'),'url':a.get('url'),'addedAt':a.get('addedAt'),'chain':chain,'address':address})
+
+          def rpc(ep,m,p,t=45):
+            body=json.dumps({'jsonrpc':'2.0','id':1,'method':m,'params':p}).encode();req=urllib.request.Request(ep,data=body,method='POST',headers={'content-type':'application/json','user-agent':'veda-scope-ledger/1'})
+            with urllib.request.urlopen(req,timeout=t) as r:o=json.loads(r.read().decode())
+            if 'error' in o:raise RuntimeError(o['error'])
+            return o['result']
+          def choose(cfg):
+            bad={}
+            for ep in cfg['rpcs']:
+              try:
+                if int(rpc(ep,'eth_chainId',[]),16)==cfg['id']:return ep,bad
+              except Exception as e:bad[ep]=repr(e)
+            raise RuntimeError(bad)
+          def h(x):
+            x=str(x or '');return x[2:] if x.startswith('0x') else x
+          def aw(a):return h(a).lower().rjust(64,'0')
+          def bw(s):return h(s).lower().ljust(64,'0')
+          def addr(raw):return ZERO if not raw or raw=='0x' else '0x'+h(raw)[-40:].lower()
+          def call(ep,to,data,frm=None):
+            tx={'to':to,'data':data}
+            if frm:tx['from']=frm
+            return rpc(ep,'eth_call',[tx,'latest'])
+          def safe(ep,to,data,frm=None):
+            try:return {'ok':True,'raw':call(ep,to,data,frm)}
+            except Exception as e:return {'ok':False,'error':repr(e)}
+          def decstr(raw):
+            x=h(raw)
+            if not x:return None
+            try:
+              if len(x)==64:return bytes.fromhex(x).rstrip(b'\0').decode(errors='replace')
+              off=int(x[:64],16)*2;n=int(x[off:off+64],16);return bytes.fromhex(x[off+64:off+64+2*n]).decode(errors='replace')
+            except:return None
+          def decode_ids(raw):
+            x=h(raw)
+            try:
+              off=int(x[:64],16)*2;n=int(x[off:off+64],16);return n
+            except:return None
+          def meta(explorer,a):
+            try:return http_json(f'{explorer}/api/v2/addresses/{a}',45,3)
+            except Exception as e:return {'_error':repr(e)}
+          def can(ep,auth,user,target,sel):
+            if auth==ZERO:return None
+            r=safe(ep,auth,S['can']+aw(user)+aw(target)+bw(sel));return bool(int(r['raw'],16)) if r['ok'] else None
+          def public(ep,auth,target,sel):
+            if auth==ZERO:return False
+            r=safe(ep,auth,S['pub']+aw(target)+bw(sel));return bool(int(r['raw'],16)) if r['ok'] else None
+
+          endpoints={};chain_state={};errors=[]
+          for cn,cfg in CHAINS.items():
+            try:
+              ep,bad=choose(cfg);endpoints[cn]=ep;chain_state[cn]={'endpoint':ep,'rpc_failures':bad,'block':int(rpc(ep,'eth_blockNumber',[]),16)}
+            except Exception as e:errors.append({'chain':cn,'error':repr(e)})
+          rows=[]
+          for item in normalized:
+            row=dict(item);rows.append(row)
+            cn=item['chain'];a=item['address']
+            if cn not in endpoints or not a:
+              row['error']='unresolved chain/address';continue
+            ep=endpoints[cn];cfg=CHAINS[cn]
+            try:
+              code=rpc(ep,'eth_getCode',[a,'latest']);row['code_bytes']=len(h(code))//2;row['runtime_sha256']=hashlib.sha256(bytes.fromhex(h(code))).hexdigest() if code!='0x' else None
+              row['nonce']=int(rpc(ep,'eth_getTransactionCount',[a,'latest']),16);row['balance']=int(rpc(ep,'eth_getBalance',[a,'latest']),16);row['metadata']=meta(cfg['explorer'],a)
+              getters={}
+              for n in ['name','symbol','version','vault','accountant','boringVault','queue','authority','owner','base','aavePool','hook','paused','ids']:
+                r=safe(ep,a,S[n]);getters[n]=r
+              row['getters_raw']=getters
+              row['decoded']={
+                'name':decstr(getters['name'].get('raw')) if getters['name']['ok'] else None,
+                'symbol':decstr(getters['symbol'].get('raw')) if getters['symbol']['ok'] else None,
+                'version':decstr(getters['version'].get('raw')) if getters['version']['ok'] else None,
+                'vault':addr(getters['vault'].get('raw')) if getters['vault']['ok'] and getters['vault'].get('raw')!='0x' else None,
+                'accountant':addr(getters['accountant'].get('raw')) if getters['accountant']['ok'] and getters['accountant'].get('raw')!='0x' else None,
+                'boringVault':addr(getters['boringVault'].get('raw')) if getters['boringVault']['ok'] and getters['boringVault'].get('raw')!='0x' else None,
+                'queue':addr(getters['queue'].get('raw')) if getters['queue']['ok'] and getters['queue'].get('raw')!='0x' else None,
+                'authority':addr(getters['authority'].get('raw')) if getters['authority']['ok'] and getters['authority'].get('raw')!='0x' else None,
+                'owner':addr(getters['owner'].get('raw')) if getters['owner']['ok'] and getters['owner'].get('raw')!='0x' else None,
+                'base':addr(getters['base'].get('raw')) if getters['base']['ok'] and getters['base'].get('raw')!='0x' else None,
+                'aavePool':addr(getters['aavePool'].get('raw')) if getters['aavePool']['ok'] and getters['aavePool'].get('raw')!='0x' else None,
+                'hook':addr(getters['hook'].get('raw')) if getters['hook']['ok'] and getters['hook'].get('raw')!='0x' else None,
+                'paused':bool(int(getters['paused']['raw'],16)) if getters['paused']['ok'] and getters['paused'].get('raw') not in (None,'0x') else None,
+                'active_request_count':decode_ids(getters['ids'].get('raw')) if getters['ids']['ok'] else None,
+              }
+              auth=row['decoded']['authority'] or ZERO
+              desc=(item['description'] or '').lower()
+              caps={}
+              if 'manager' in desc:
+                vault=row['decoded']['vault'];caps={'attacker_manage':can(ep,auth,ATTACKER,a,S['manage1']),'manager_can_vault_manage':can(ep,addr(safe(ep,vault,S['authority']).get('raw')) if vault else ZERO,a,vault,S['manage1']) if vault else None}
+              elif 'solver' in desc:
+                q=row['decoded']['queue'];qauth=addr(safe(ep,q,S['authority']).get('raw')) if q else ZERO;caps={'solver_can_queue_solve':can(ep,qauth,a,q,S['queueSolve']) if q else None,'attacker_solver_withdraw':can(ep,auth,ATTACKER,a,S['tellerWithdraw'])}
+              elif 'teller' in desc:
+                vault=row['decoded']['vault'];vauth=addr(safe(ep,vault,S['authority']).get('raw')) if vault else ZERO;caps={'teller_can_enter':can(ep,vauth,a,vault,S['enter']) if vault else None,'teller_can_exit':can(ep,vauth,a,vault,S['exit']) if vault else None}
+              elif 'queue' in desc:
+                caps={'queue_solve_public':public(ep,auth,a,S['queueSolve']),'attacker_queue_solve':can(ep,auth,ATTACKER,a,S['queueSolve'])}
+              row['capabilities']=caps
+            except Exception as e:
+              row['error']=repr(e);row['traceback']=traceback.format_exc();errors.append({'chain':cn,'address':a,'description':item['description'],'error':repr(e)})
+
+          keygroups=collections.defaultdict(list)
+          for r in rows:
+            keygroups[(r.get('chain'),r.get('address'))].append(r.get('description'))
+          duplicates=[{'chain':k[0],'address':k[1],'descriptions':v,'count':len(v)} for k,v in keygroups.items() if k[1] and len(v)>1]
+          no_code=[{'chain':r['chain'],'address':r['address'],'description':r['description'],'nonce':r.get('nonce')} for r in rows if r.get('code_bytes')==0]
+          stale_flags=[]
+          for r in rows:
+            d=(r.get('description') or '').lower();dec=r.get('decoded') or {};caps=r.get('capabilities') or {}
+            reasons=[]
+            if r.get('code_bytes')==0:reasons.append('NO_RUNTIME_CODE')
+            if 'manager' in d and r.get('code_bytes',0)>0 and not dec.get('vault'):reasons.append('MANAGER_NO_VAULT_GETTER')
+            if 'solver' in d and r.get('code_bytes',0)>0 and caps.get('solver_can_queue_solve') is False:reasons.append('SOLVER_NOT_AUTHORIZED_FOR_QUEUE')
+            if 'teller' in d and r.get('code_bytes',0)>0 and caps.get('teller_can_enter') is False and caps.get('teller_can_exit') is False:reasons.append('TELLER_NOT_AUTHORIZED_ON_VAULT')
+            if 'aavev3bufferhelper' in d and r.get('code_bytes',0)>0 and not dec.get('vault'):reasons.append('HELPER_NO_VAULT_GETTER')
+            if reasons:stale_flags.append({'chain':r['chain'],'address':r['address'],'description':r['description'],'reasons':reasons,'decoded':dec,'capabilities':caps})
+          out={'generated_at_unix':int(time.time()),'scope_source':SCOPE_URL,'scope_project_updated':scope.get('updatedDate'),'asset_count':len(assets),'normalized':normalized,'chain_state':chain_state,'rows':rows,'duplicates':duplicates,'no_code':no_code,'stale_flags':stale_flags,'errors':errors,'summary':{
+            'asset_count':len(assets),'chain_counts':dict(collections.Counter(r.get('chain') for r in normalized)),'unique_chain_addresses':len(keygroups),'duplicate_entry_count':len(duplicates),'no_code_count':len(no_code),'stale_flag_count':len(stale_flags),'error_count':len(errors)}}
+          open('veda-scope-runtime-ledger.json','w').write(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({'summary':out['summary'],'duplicates':duplicates,'no_code':no_code,'stale_flags':stale_flags,'errors':errors},indent=2,sort_keys=True))
+          PY
+      - name: Upload scope ledger
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-scope-runtime-ledger
+          path: veda-scope-runtime-ledger.json
+          if-no-files-found: error
+          retention-days: 1
