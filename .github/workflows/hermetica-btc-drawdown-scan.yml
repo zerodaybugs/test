@@ -1,0 +1,89 @@
+name: Hermetica BTC drawdown scan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-btc-drawdown-scan.yml'
+      - 'public-data/hermetica-btc-drawdown-scan-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan primary Binance BTCUSDT candles
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT=/tmp/hermetica-btc-drawdown-scan
+          mkdir -p "$OUT"
+          python3 - <<'PY'
+          import datetime as dt, json, pathlib, time, urllib.parse, urllib.request
+          OUT=pathlib.Path('/tmp/hermetica-btc-drawdown-scan')
+          BASE='https://data-api.binance.vision/api/v3/klines'
+          START=int(dt.datetime(2025,9,1,tzinfo=dt.timezone.utc).timestamp()*1000)
+          END=int(dt.datetime(2026,7,27,tzinfo=dt.timezone.utc).timestamp()*1000)
+          INTERVAL_MS=5*60*1000
+          def get_json(url,attempts=10):
+              last=None
+              for i in range(attempts):
+                  try:
+                      req=urllib.request.Request(url,headers={'User-Agent':'read-only-security-research/1.0'})
+                      with urllib.request.urlopen(req,timeout=30) as r:return json.loads(r.read().decode())
+                  except Exception as e:
+                      last=e; time.sleep(min(10,1+i))
+              raise RuntimeError(f'{url}: {last}')
+          rows=[]; cursor=START; requests=0
+          while cursor<END:
+              q=urllib.parse.urlencode({'symbol':'BTCUSDT','interval':'5m','startTime':cursor,'endTime':END,'limit':1000})
+              batch=get_json(f'{BASE}?{q}'); requests+=1
+              if not batch: break
+              for k in batch:
+                  rows.append({'open_time':int(k[0]),'open':float(k[1]),'high':float(k[2]),'low':float(k[3]),'close':float(k[4]),'volume':float(k[5]),'close_time':int(k[6])})
+              nxt=int(batch[-1][0])+INTERVAL_MS
+              if nxt<=cursor: raise RuntimeError('non-progressing Binance cursor')
+              cursor=nxt
+              time.sleep(.12)
+          # Deduplicate and preserve chronology.
+          by={r['open_time']:r for r in rows}; rows=[by[k] for k in sorted(by)]
+          # For every peak candle, inspect the next 40 minutes (8 later 5m candles plus current).
+          candidates=[]
+          for i,a in enumerate(rows):
+              peak=a['high']; best=None
+              for j in range(i,min(len(rows),i+9)):
+                  b=rows[j]
+                  drop=(peak-b['low'])/peak if peak else 0
+                  if best is None or drop>best['drop_fraction']:
+                      best={'peak_index':i,'trough_index':j,'peak_time':a['open_time']//1000,'trough_time':b['open_time']//1000,'peak_price':peak,'trough_price':b['low'],'drop_fraction':drop,'drop_percent':drop*100,'minutes':(b['open_time']-a['open_time'])/60000}
+              if best and best['drop_fraction']>=.025:candidates.append(best)
+          candidates.sort(key=lambda x:x['drop_fraction'],reverse=True)
+          # Collapse overlapping windows, keeping the largest one.
+          selected=[]
+          for c in candidates:
+              if any(abs(c['peak_time']-s['peak_time'])<3600 or abs(c['trough_time']-s['trough_time'])<3600 for s in selected): continue
+              selected.append(c)
+              if len(selected)>=50: break
+          for c in selected:
+              c['peak_iso']=dt.datetime.fromtimestamp(c['peak_time'],dt.timezone.utc).isoformat()
+              c['trough_iso']=dt.datetime.fromtimestamp(c['trough_time'],dt.timezone.utc).isoformat()
+              c['stale_over_current_ratio']=c['peak_price']/c['trough_price']
+              c['exceeds_5pct']=c['drop_fraction']>.05
+          result={'generated_at':dt.datetime.now(dt.timezone.utc).isoformat(),'source':'Binance public primary market-data API (data-api.binance.vision)','symbol':'BTCUSDT','interval':'5m','start_ms':START,'end_ms':END,'request_count':requests,'candle_count':len(rows),'max_drawdown_40m':selected[0] if selected else None,'non_overlapping_candidates':selected,'candidate_count_ge_2_5pct':len(candidates),'selected_count':len(selected)}
+          (OUT/'summary.json').write_text(json.dumps(result,indent=2))
+          (OUT/'candles.json').write_text(json.dumps(rows,separators=(',',':')))
+          print(json.dumps({k:v for k,v in result.items() if k!='non_overlapping_candidates'}|{'top_candidates':selected[:15]},indent=2))
+          PY
+          (cd "$OUT" && sha256sum *.json > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-btc-drawdown-scan
+          path: /tmp/hermetica-btc-drawdown-scan
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
