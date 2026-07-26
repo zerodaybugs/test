@@ -1,0 +1,207 @@
+name: Hermetica Pyth gap price snapshot
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-pyth-gap-prices.yml'
+      - 'public-data/hermetica-pyth-gap-prices-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Query signed Pyth BTC/USD history
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT=/tmp/hermetica-pyth-gap-prices
+          mkdir -p "$OUT"
+          cd "$OUT"
+          cat > snapshot.py <<'PY'
+          import datetime as dt
+          import decimal
+          import hashlib
+          import json
+          import pathlib
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          decimal.getcontext().prec = 50
+          OUT = pathlib.Path('/tmp/hermetica-pyth-gap-prices')
+          FEED = 'e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43'
+          BASE = 'https://benchmarks.pyth.network'
+          WINDOWS = {
+              'stacks_gap_2026_05_15': {
+                  'from': 1778872120,
+                  'to': 1778874220,
+                  'step': 30,
+                  'observed_pre_gap_block_time': 1778872216,
+                  'observed_post_gap_block_time': 1778873966,
+                  'gap_seconds': 1750,
+                  'mint_limit_reset_window_seconds': 600,
+                  'granite_slippage_bps': 500,
+              },
+          }
+
+          def request_json(url: str, attempts: int = 8):
+              last = None
+              for i in range(attempts):
+                  try:
+                      req = urllib.request.Request(url, headers={'User-Agent': 'read-only-security-research/1.0'})
+                      with urllib.request.urlopen(req, timeout=30) as response:
+                          return json.loads(response.read().decode('utf-8'))
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(12.0, 1.5 * (i + 1)))
+              raise RuntimeError(f'failed after retries: {url}: {last}')
+
+          def fetch_at(timestamp: int):
+              queries = [
+                  urllib.parse.urlencode({'ids': FEED, 'encoding': 'hex', 'parsed': 'true'}),
+                  urllib.parse.urlencode([('ids[]', FEED), ('encoding', 'hex'), ('parsed', 'true')]),
+              ]
+              errors = []
+              for query in queries:
+                  url = f'{BASE}/v1/updates/price/{timestamp}?{query}'
+                  try:
+                      body = request_json(url)
+                      parsed = body.get('parsed') or []
+                      if not parsed:
+                          errors.append({'url': url, 'error': 'missing parsed price', 'body_keys': list(body)})
+                          continue
+                      item = parsed[0]
+                      price = item.get('price') or {}
+                      price_int = decimal.Decimal(str(price['price']))
+                      expo = int(price['expo'])
+                      value = price_int * (decimal.Decimal(10) ** expo)
+                      binary = body.get('binary') or {}
+                      data = binary.get('data') or []
+                      signed_hex = data[0] if data else ''
+                      return {
+                          'requested_timestamp': timestamp,
+                          'requested_iso': dt.datetime.fromtimestamp(timestamp, dt.timezone.utc).isoformat(),
+                          'publish_time': int(price.get('publish_time', item.get('publish_time', 0))),
+                          'publish_iso': dt.datetime.fromtimestamp(int(price.get('publish_time', item.get('publish_time', 0))), dt.timezone.utc).isoformat() if int(price.get('publish_time', item.get('publish_time', 0))) > 0 else None,
+                          'price_integer': str(price_int),
+                          'expo': expo,
+                          'price': format(value, 'f'),
+                          'conf': str(price.get('conf')),
+                          'ema_price': item.get('ema_price'),
+                          'feed_id': item.get('id'),
+                          'signed_update_bytes': len(signed_hex) // 2,
+                          'signed_update_sha256': hashlib.sha256(bytes.fromhex(signed_hex)).hexdigest() if signed_hex else None,
+                          'endpoint': url,
+                      }
+                  except Exception as exc:
+                      errors.append({'url': url, 'error': str(exc)})
+              raise RuntimeError(json.dumps(errors))
+
+          def dec(row):
+              return decimal.Decimal(row['price'])
+
+          def analyse(rows, config):
+              unique = {}
+              for row in rows:
+                  unique[(row['publish_time'], row['price'])] = row
+              ordered = sorted(unique.values(), key=lambda r: (r['publish_time'], r['requested_timestamp']))
+              max_drawdown = None
+              peak = None
+              for row in ordered:
+                  price = dec(row)
+                  if peak is None or price > dec(peak):
+                      peak = row
+                  if peak is not None and dec(peak) > 0:
+                      drop = (dec(peak) - price) / dec(peak)
+                      if max_drawdown is None or drop > max_drawdown['fraction_decimal']:
+                          max_drawdown = {
+                              'from_publish_time': peak['publish_time'],
+                              'from_publish_iso': peak['publish_iso'],
+                              'from_price': peak['price'],
+                              'to_publish_time': row['publish_time'],
+                              'to_publish_iso': row['publish_iso'],
+                              'to_price': row['price'],
+                              'fraction_decimal': drop,
+                              'percent': drop * 100,
+                          }
+              pre = min(ordered, key=lambda r: abs(r['publish_time'] - config['observed_pre_gap_block_time']))
+              post = min(ordered, key=lambda r: abs(r['publish_time'] - config['observed_post_gap_block_time']))
+              start_end_drop = ((dec(pre) - dec(post)) / dec(pre)) if dec(pre) else decimal.Decimal(0)
+              undercollateralization_threshold = decimal.Decimal(1) - (decimal.Decimal(10000) / decimal.Decimal(10000 - config['granite_slippage_bps']))
+              # Absolute drop needed so stale_price * 0.95 > current_price.
+              threshold_fraction = decimal.Decimal(1) - (decimal.Decimal(10000 - config['granite_slippage_bps']) / decimal.Decimal(10000))
+              exact_required_drop = decimal.Decimal(1) - (decimal.Decimal(10000 - config['granite_slippage_bps']) / decimal.Decimal(10000))
+              # Expressed against stale price, this is exactly 5%; against current price stale/current must exceed 1/0.95.
+              stale_over_current_ratio = decimal.Decimal(10000) / decimal.Decimal(10000 - config['granite_slippage_bps'])
+              max_resets_after_first = config['gap_seconds'] // config['mint_limit_reset_window_seconds']
+              return {
+                  'raw_sample_count': len(rows),
+                  'unique_publish_count': len(ordered),
+                  'first': ordered[0],
+                  'last': ordered[-1],
+                  'nearest_pre_gap': pre,
+                  'nearest_post_gap': post,
+                  'pre_to_post_drop_fraction': str(start_end_drop),
+                  'pre_to_post_drop_percent': str(start_end_drop * 100),
+                  'maximum_peak_to_later_trough': None if max_drawdown is None else {**max_drawdown, 'fraction_decimal': str(max_drawdown['fraction_decimal']), 'percent': str(max_drawdown['percent'])},
+                  'granite_stale_price_over_current_price_required': str(stale_over_current_ratio),
+                  'granite_required_drop_from_stale_price_fraction': str(exact_required_drop),
+                  'granite_required_drop_from_stale_price_percent': str(exact_required_drop * 100),
+                  'observed_max_drawdown_exceeds_required': bool(max_drawdown and max_drawdown['fraction_decimal'] > exact_required_drop),
+                  'possible_600s_intervals_inside_gap': max_resets_after_first,
+                  'all_unique_prices': ordered,
+              }
+
+          result = {
+              'generated_at': dt.datetime.now(dt.timezone.utc).isoformat(),
+              'source': 'Pyth Benchmarks public historical signed-price API',
+              'feed_id': FEED,
+              'windows': {},
+          }
+          for name, config in WINDOWS.items():
+              rows = []
+              errors = []
+              for timestamp in range(config['from'], config['to'] + 1, config['step']):
+                  try:
+                      rows.append(fetch_at(timestamp))
+                  except Exception as exc:
+                      errors.append({'timestamp': timestamp, 'error': str(exc)})
+                  time.sleep(1.08)
+              result['windows'][name] = {
+                  'config': config,
+                  'rows': rows,
+                  'errors': errors,
+                  'analysis': analyse(rows, config) if rows else None,
+              }
+
+          (OUT / 'pyth-gap-prices.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
+          summary = {
+              name: {
+                  'config': data['config'],
+                  'error_count': len(data['errors']),
+                  'analysis': data['analysis'],
+              }
+              for name, data in result['windows'].items()
+          }
+          (OUT / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+          print(json.dumps(summary, indent=2))
+          PY
+          python3 snapshot.py
+          sha256sum snapshot.py pyth-gap-prices.json summary.json > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-pyth-gap-prices
+          path: /tmp/hermetica-pyth-gap-prices
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
