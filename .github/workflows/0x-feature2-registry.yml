@@ -1,0 +1,92 @@
+name: Record current and previous 0x Settler bindings
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/0x-feature2-registry.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
+      - name: Query feature 2 and bind verified source
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/feature2"
+          mkdir -p "$OUT"
+          REG=0x00000000000004533Fe15556B1E086BB1A72cEae
+          RPC=https://eth.drpc.org
+          CURRENT=$(cast call "$REG" 'ownerOf(uint256)(address)' 2 --rpc-url "$RPC")
+          PREV=$(cast call "$REG" 'prev(uint128)(address)' 2 --rpc-url "$RPC")
+          NEXT=$(cast call "$REG" 'next(uint128)(address)' 2 --rpc-url "$RPC")
+          printf 'current=%s\nprev=%s\nnext=%s\nhead=%s\n' "$CURRENT" "$PREV" "$NEXT" "$(cast block-number --rpc-url "$RPC")" > "$OUT/registry.txt"
+
+          for kind in current prev next; do
+            eval address="\$$kind"
+            mkdir -p "$OUT/$kind"
+            printf '%s\n' "$address" > "$OUT/$kind/address.txt"
+            cast code "$address" --rpc-url "$RPC" > "$OUT/$kind/code.hex"
+            cast codehash "$address" --rpc-url "$RPC" > "$OUT/$kind/codehash.txt"
+            cast balance "$address" --rpc-url "$RPC" > "$OUT/$kind/native-balance.txt"
+            curl -fsSL --retry 3 --max-time 45 "https://api.etherscan.io/v2/api?chainid=1&module=contract&action=getsourcecode&address=$address" > "$OUT/$kind/etherscan-source.json" || true
+            curl -fsSL --retry 3 --max-time 45 "https://eth.blockscout.com/api/v2/smart-contracts/$address" > "$OUT/$kind/blockscout-source.json" || true
+            curl -fsSL --retry 3 --max-time 45 "https://eth.blockscout.com/api/v2/addresses/$address" > "$OUT/$kind/blockscout-address.json" || true
+            cast logs --json --rpc-url "$RPC" --address "$address" --from-block 0 --to-block latest > "$OUT/$kind/logs.json" 2> "$OUT/$kind/logs.err" || true
+          done
+
+          python3 - "$OUT" <<'PY'
+          import json, pathlib, re, sys
+          root=pathlib.Path(sys.argv[1])
+          summary={}
+          for kind in ('current','prev','next'):
+              d=root/kind
+              address=(d/'address.txt').read_text().strip()
+              code=(d/'code.hex').read_text().strip()
+              row={'address':address,'runtime_bytes':len(code.removeprefix('0x'))//2,'codehash':(d/'codehash.txt').read_text().strip()}
+              for name in ('etherscan-source.json','blockscout-source.json','blockscout-address.json'):
+                  p=d/name
+                  try:
+                      obj=json.loads(p.read_text())
+                      row[name]=obj
+                  except Exception as e:
+                      row[name]={'error':repr(e)}
+              # Extract the constructor git commit from GitCommit(bytes20) logs if present.
+              try:
+                  logs=json.loads((d/'logs.json').read_text())
+                  row['log_count']=len(logs)
+                  row['topic0s']=sorted({x['topics'][0] for x in logs if x.get('topics')})
+                  row['data_words']=sorted({x.get('data','') for x in logs})[:50]
+              except Exception as e:
+                  row['logs_error']=repr(e)
+              summary[kind]=row
+          (root/'summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True))
+          if summary['current']['runtime_bytes'] == 0 or summary['prev']['runtime_bytes'] == 0:
+              raise SystemExit('current/prev runtime missing')
+          PY
+
+          find "$OUT" -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS"
+          test -s "$OUT/summary.json"
+
+      - name: Upload feature-2 evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: 0x-feature2-registry-${{ github.run_id }}
+          path: feature2/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
