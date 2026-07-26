@@ -1,0 +1,183 @@
+name: veda-ink-crossasset
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Enumerate live assets, helpers, and exact cross-asset round trips
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, time, urllib.request, urllib.parse, traceback
+
+          RPCS=["https://rpc-gel.inkonchain.com"]
+          EXPLORER="https://explorer.inkonchain.com"
+          ATTACKER="0x1111111111111111111111111111111111111111"
+          ZERO="0x0000000000000000000000000000000000000000"
+          STATIC_ASSETS={
+            "USDC":"0x2D270e6886d130D724215A266106e6832161EAEd",
+            "USDT0":"0x0200C29006150606B650577BBE7B6248F58470c1",
+            "USDC.e":"0xF1815bd50389c46847f0Bda824eC8da914045D14",
+          }
+          PRODUCTS={
+            "balanced":{"vault":"0xcaae49fb7f74cCFBE8A05E6104b01c097a78789f","accountant":"0x0C4dF79d9e35E5C4876BC1aE4663E834312DDc67","teller":"0xC151E263d5c890FD0Bceb33a6525F1A76a8329fC","one":10**6},
+            "boosted":{"vault":"0xDbD87325D7b1189Dcc9255c4926076fF4a96A271","accountant":"0x9c2477D4Ea17d3cCC45e6b1087c94d14926F54C9","teller":"0xc46f2443b3521632E2E2a903D6da8f965B46f6a0","one":10**6},
+          }
+
+          def sh(*args):
+            p=subprocess.run([str(x) for x in args],text=True,capture_output=True)
+            if p.returncode: raise RuntimeError({"args":args,"stdout":p.stdout,"stderr":p.stderr})
+            return p.stdout.strip()
+          def sig(s): return sh("cast","sig",s)
+          def topic(s): return sh("cast","keccak",s).lower()
+          S={
+            "authority":sig("authority()"),"can":sig("canCall(address,address,bytes4)"),"pub":sig("isCapabilityPublic(address,bytes4)"),
+            "base":sig("base()"),"rate":sig("getRate()"),"quote":sig("getRateInQuoteSafe(address)"),"rateData":sig("rateProviderData(address)"),
+            "assetData":sig("assetData(address)"),"helpers":sig("currentBufferHelpers(address)"),"allowedHelper":sig("allowedBufferHelpers(address,address)"),
+            "balance":sig("balanceOf(address)"),"decimals":sig("decimals()"),"symbol":sig("symbol()"),"name":sig("name()"),
+            "helperVault":sig("vault()"),"aavePool":sig("aaveV3Pool()"),
+            "deposit3":sig("deposit(address,uint256,uint256)"),"deposit4":sig("deposit(address,uint256,uint256,address)"),
+            "withdraw":sig("withdraw(address,uint256,uint256,address)"),
+          }
+          EVENT_TOPICS={
+            "asset":topic("AssetDataUpdated(address,bool,bool,uint16)"),
+            "deposit_helper":topic("DepositBufferHelperSet(address,address)"),
+            "withdraw_helper":topic("WithdrawBufferHelperSet(address,address)"),
+            "helper_allowed":topic("BufferHelperAllowed(address,address)"),
+          }
+          def rpc(ep,method,params,timeout=45):
+            body=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
+            req=urllib.request.Request(ep,data=body,method="POST",headers={"content-type":"application/json","user-agent":"veda-ink-crossasset/1.0"})
+            with urllib.request.urlopen(req,timeout=timeout) as r: out=json.loads(r.read().decode())
+            if "error" in out: raise RuntimeError(out["error"])
+            return out["result"]
+          endpoint=None;rpc_failures={}
+          for ep in RPCS:
+            try:
+              if int(rpc(ep,"eth_chainId",[]),16)==57073: endpoint=ep;break
+            except Exception as exc: rpc_failures[ep]=repr(exc)
+          if not endpoint: raise RuntimeError(rpc_failures)
+          def strip0(x):
+            x=str(x or ""); return x[2:] if x.startswith("0x") else x
+          def aw(a): return strip0(a).lower().rjust(64,"0")
+          def bw(s): return strip0(s).lower().ljust(64,"0")
+          def words(raw):
+            x=strip0(raw); return [int(x[i:i+64],16) for i in range(0,len(x),64)] if x and len(x)%64==0 else []
+          def addr(raw): return ZERO if not raw or raw=="0x" else "0x"+strip0(raw)[-40:].lower()
+          def decode_string(raw):
+            x=strip0(raw)
+            if not x:return None
+            try:
+              if len(x)==64:return bytes.fromhex(x).rstrip(b"\x00").decode(errors="replace")
+              off=int(x[:64],16)*2;n=int(x[off:off+64],16)
+              return bytes.fromhex(x[off+64:off+64+n*2]).decode(errors="replace")
+            except Exception:return None
+          def call(to,data,block="latest"):
+            return rpc(endpoint,"eth_call",[{"to":to,"data":data},block])
+          def safe_call(to,data,block="latest"):
+            try:return {"ok":True,"raw":call(to,data,block)}
+            except Exception as exc:return {"ok":False,"error":repr(exc)}
+          def http_json(url,timeout=45):
+            req=urllib.request.Request(url,headers={"accept":"application/json","user-agent":"veda-ink-crossasset/1.0"})
+            with urllib.request.urlopen(req,timeout=timeout) as r:return json.loads(r.read().decode())
+          def explorer_logs(address,max_pages=40):
+            url=f"{EXPLORER}/api/v2/addresses/{address}/logs"; items=[]; errors=[]
+            for _ in range(max_pages):
+              try: payload=http_json(url)
+              except Exception as exc:
+                errors.append(repr(exc));break
+              batch=payload.get("items") or [];items.extend(batch)
+              nxt=payload.get("next_page_params")
+              if not nxt:break
+              url=f"{EXPLORER}/api/v2/addresses/{address}/logs?"+urllib.parse.urlencode(nxt)
+              time.sleep(.08)
+            return items,errors
+          def can(auth,caller,target,selector):
+            r=safe_call(auth,S["can"]+aw(caller)+aw(target)+bw(selector))
+            return bool(int(r["raw"],16)) if r["ok"] else None
+          def public(auth,target,selector):
+            r=safe_call(auth,S["pub"]+aw(target)+bw(selector))
+            return bool(int(r["raw"],16)) if r["ok"] else None
+
+          block=int(rpc(endpoint,"eth_blockNumber",[]),16)
+          output={"generated_at_unix":int(time.time()),"block":block,"endpoint":endpoint,"rpc_failures":rpc_failures,"event_topics":EVENT_TOPICS,"products":{},"positive_loops":[],"errors":[]}
+          for pname,p in PRODUCTS.items():
+            row={"addresses":p,"event_log_errors":[],"event_counts":{},"assets":{},"helpers":{},"routes":[]};output["products"][pname]=row
+            try:
+              auth=addr(call(p["teller"],S["authority"]));base=addr(call(p["accountant"],S["base"]));base_rate=int(call(p["accountant"],S["rate"]),16)
+              row.update({"authority":auth,"base":base,"base_rate":base_rate,"capabilities":{
+                "deposit3":{"selector":S["deposit3"],"public":public(auth,p["teller"],S["deposit3"]),"attacker":can(auth,ATTACKER,p["teller"],S["deposit3"])},
+                "deposit4":{"selector":S["deposit4"],"public":public(auth,p["teller"],S["deposit4"]),"attacker":can(auth,ATTACKER,p["teller"],S["deposit4"])},
+                "withdraw":{"selector":S["withdraw"],"public":public(auth,p["teller"],S["withdraw"]),"attacker":can(auth,ATTACKER,p["teller"],S["withdraw"])},
+              }})
+              candidates={k:v.lower() for k,v in STATIC_ASSETS.items()};candidates["BASE"]=base
+              logs,errs=explorer_logs(p["teller"]);row["event_log_errors"].extend(errs)
+              for log in logs:
+                topics=[str(x).lower() for x in (log.get("topics") or [])]
+                if not topics:continue
+                row["event_counts"][topics[0]]=row["event_counts"].get(topics[0],0)+1
+                if topics[0] in EVENT_TOPICS.values() and len(topics)>1:
+                  asset="0x"+strip0(topics[1])[-40:].lower();candidates.setdefault(f"event_{asset[-6:]}",asset)
+              # Deduplicate candidate labels by address.
+              by_address={}
+              for label,a in candidates.items():by_address.setdefault(a.lower(),[]).append(label)
+              for a,labels in by_address.items():
+                code=rpc(endpoint,"eth_getCode",[a,"latest"])
+                if code=="0x":continue
+                ad=safe_call(p["teller"],S["assetData"]+aw(a));qd=safe_call(p["accountant"],S["quote"]+aw(a));rd=safe_call(p["accountant"],S["rateData"]+aw(a));hp=safe_call(p["teller"],S["helpers"]+aw(a))
+                dec=safe_call(a,S["decimals"]);sym=safe_call(a,S["symbol"]);nm=safe_call(a,S["name"]);bal=safe_call(a,S["balance"]+aw(p["vault"]))
+                adw=words(ad.get("raw")) if ad["ok"] else [];rdw=words(rd.get("raw")) if rd["ok"] else [];hpw=words(hp.get("raw")) if hp["ok"] else []
+                item={"labels":labels,"address":a,"symbol":decode_string(sym.get("raw")) if sym["ok"] else None,"name":decode_string(nm.get("raw")) if nm["ok"] else None,"decimals":int(dec["raw"],16) if dec["ok"] else None,"allow_deposit":bool(adw[0]) if len(adw)>0 else False,"allow_withdraw":bool(adw[1]) if len(adw)>1 else False,"premium_bps":adw[2] if len(adw)>2 else 0,"quote":int(qd["raw"],16) if qd["ok"] else None,"quote_error":qd.get("error"),"is_pegged":bool(rdw[0]) if len(rdw)>0 else None,"rate_provider":"0x"+hex(rdw[1])[2:].rjust(40,"0")[-40:] if len(rdw)>1 else None,"vault_balance":int(bal["raw"],16) if bal["ok"] else None,"deposit_helper":"0x"+hex(hpw[0])[2:].rjust(40,"0")[-40:] if len(hpw)>0 else ZERO,"withdraw_helper":"0x"+hex(hpw[1])[2:].rjust(40,"0")[-40:] if len(hpw)>1 else ZERO}
+                row["assets"][a]=item
+                for hkey in ("deposit_helper","withdraw_helper"):
+                  h=item[hkey]
+                  if h and h!=ZERO and h not in row["helpers"]:
+                    hv=safe_call(h,S["helperVault"]);pool=safe_call(h,S["aavePool"])
+                    row["helpers"][h]={"vault":addr(hv.get("raw")) if hv["ok"] else None,"vault_error":hv.get("error"),"aave_pool":addr(pool.get("raw")) if pool["ok"] else None,"pool_error":pool.get("error")}
+              deposits=[v for v in row["assets"].values() if v["allow_deposit"] and v["quote"] and v["decimals"] is not None]
+              withdrawals=[v for v in row["assets"].values() if v["allow_withdraw"] and v["quote"] and v["decimals"] is not None]
+              direct_open=bool(row["capabilities"]["withdraw"]["attacker"])
+              deposit_open=bool(row["capabilities"]["deposit4"]["attacker"] or row["capabilities"]["deposit3"]["attacker"])
+              for sa in deposits:
+                for da in withdrawals:
+                  candidates_amount=set(range(1,2_000_001))
+                  for s in range(1,1_000_001):
+                    x=(s*(sa["quote"]+1)+p["one"]-1)//p["one"]
+                    candidates_amount.update((max(1,x-1),x,x+1))
+                  for k in range(0,25):candidates_amount.add(10**k)
+                  best=None
+                  for x in candidates_amount:
+                    shares=x*p["one"]//(sa["quote"]+1)
+                    shares=shares*(10_000-sa["premium_bps"])//10_000
+                    y=shares*da["quote"]//p["one"]
+                    src_base=x*base_rate//sa["quote"]
+                    dst_base=y*base_rate//da["quote"]
+                    profit=dst_base-src_base
+                    if best is None or profit>best[0]:best=(profit,x,shares,y,src_base,dst_base)
+                  route={"source":sa["address"],"source_symbol":sa["symbol"],"destination":da["address"],"destination_symbol":da["symbol"],"deposit_open":deposit_open,"withdraw_open":direct_open,"source_quote":sa["quote"],"destination_quote":da["quote"],"source_premium_bps":sa["premium_bps"],"best":{"base_profit":best[0],"input":best[1],"shares":best[2],"output":best[3],"source_base":best[4],"destination_base":best[5],"candidate_count":len(candidates_amount)}}
+                  row["routes"].append(route)
+                  if deposit_open and direct_open and best[0]>0:output["positive_loops"].append({"product":pname,**route})
+            except Exception as exc:
+              row["error"]=repr(exc);row["traceback"]=traceback.format_exc();output["errors"].append({"product":pname,"error":repr(exc)})
+          output["summary"]={"positive_loop_count":len(output["positive_loops"]),"error_count":len(output["errors"]),"products":len(output["products"])}
+          with open("veda-ink-crossasset.json","w",encoding="utf-8") as f:json.dump(output,f,indent=2,sort_keys=True);f.write("\n")
+          print(json.dumps({"summary":output["summary"],"positive_loops":output["positive_loops"],"products":{k:{"base":v.get("base"),"base_rate":v.get("base_rate"),"capabilities":v.get("capabilities"),"assets":v.get("assets"),"helpers":v.get("helpers"),"routes":v.get("routes"),"event_log_errors":v.get("event_log_errors"),"error":v.get("error")} for k,v in output["products"].items()}},indent=2,sort_keys=True))
+          PY
+      - name: Upload cross-asset proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-ink-crossasset
+          path: veda-ink-crossasset.json
+          if-no-files-found: error
+          retention-days: 1
