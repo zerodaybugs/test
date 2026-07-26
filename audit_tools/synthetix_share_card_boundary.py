@@ -9,7 +9,7 @@ Safety:
 - bodies are retained only for small non-image errors; images are represented by hashes/metadata.
 
 Goals:
-- establish the output media type and renderer behavior;
+- establish the output media type and renderer behavior with a valid baseline;
 - detect raw reflected active markup/script in SVG/HTML responses;
 - detect same-origin URL interpretation or local path traversal in imageId;
 - detect stack traces, filesystem paths, or command/template errors;
@@ -37,9 +37,11 @@ MAX_BODY = 8 * 1024 * 1024
 DELAY_SECONDS = 0.45
 CANARY = "ZDB_SHARECARD_CANARY_9f31c7"
 
+# `side` is the renderer's position side, not an order side. A production-valid
+# baseline is required so the input cases actually reach the image renderer.
 BASE = {
     "symbol": "BTC-USDT",
-    "side": "buy",
+    "side": "long",
     "leverage": "2",
     "pnlPercent": "1.25",
     "entryPrice": "100000",
@@ -63,7 +65,7 @@ CASES: list[tuple[str, dict[str, str], list[tuple[str, str]] | None]] = [
     ("nan_numeric", {"pnlPercent": "NaN", "entryPrice": "NaN"}, None),
     ("infinite_numeric", {"pnlPercent": "Infinity", "leverage": "Infinity"}, None),
     ("huge_numeric", {"pnlPercent": "1e100000", "leverage": "1e100000"}, None),
-    ("duplicate_symbol", {}, [("symbol", "BTC-USDT"), ("symbol", CANARY)]),
+    ("duplicate_symbol", {}, [("symbol", "BTC-USDT"), ("symbol", CANARY), ("side", "long"), ("leverage", "2"), ("pnlPercent", "1.25"), ("entryPrice", "100000"), ("priceValue", "101250"), ("isPositive", "true"), ("imageId", "snx-3d"), ("timestamp", "2026-07-26"), ("variant", "mobile")]),
     ("empty_query", {}, []),
 ]
 
@@ -147,7 +149,7 @@ def image_metadata(body: bytes) -> dict[str, Any] | None:
         return {"format": "jpeg", "width": None, "height": None}
     if body.lstrip().startswith(b"<svg") or b"<svg" in body[:2048].lower():
         return {"format": "svg", "width": None, "height": None}
-    if body.startswith((b"RIFF",)) and body[8:12] == b"WEBP":
+    if body.startswith(b"RIFF") and body[8:12] == b"WEBP":
         return {"format": "webp", "width": None, "height": None}
     return None
 
