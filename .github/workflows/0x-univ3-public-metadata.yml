@@ -1,0 +1,130 @@
+name: Collect public 0x UniV3 fork metadata
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/0x-univ3-public-metadata.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout temporary workflow
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
+      - name: Collect public deployment metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/metadata"
+          mkdir -p "$OUT/robinhood" "$OUT/polygon"
+
+          RH_RPC=https://rpc.mainnet.chain.robinhood.com
+          POLY_RPC=https://polygon-bor-rpc.publicnode.com
+
+          {
+            echo "chain_id=$(cast chain-id --rpc-url "$RH_RPC")"
+            echo "head=$(cast block-number --rpc-url "$RH_RPC")"
+          } > "$OUT/robinhood/network.txt"
+          {
+            echo "chain_id=$(cast chain-id --rpc-url "$POLY_RPC")"
+            echo "head=$(cast block-number --rpc-url "$POLY_RPC")"
+          } > "$OUT/polygon/network.txt"
+
+          cat > "$OUT/targets.tsv" <<'EOF'
+          robinhood	uniswap_v3	0x1f7d7550B1b028f7571E69A784071F0205FD2EfA
+          robinhood	sushiswap_v3	0xE51960f1B45f1C9FB6D166E6a884F866fC70433B
+          robinhood	robinswap_v3	0xEa561E058313B96011e5070Ca7d0f027A44E3748
+          robinhood	pancake_v3	0x41ff9AA7e16B8B1a8a8dc4f0eFacd93D02d071c9
+          robinhood	up	0x1ac9dB4a2608ba45D6127B1737949b51Bb54B7F3
+          robinhood	sheriff_deployer	0x9ac30D72168a4498aE5C80226F4d3C86278e8f80
+          robinhood	swaphood_deployer	0xcB42A120795Ca98F762fdcCf43Cc4aB6D62bF1B2
+          robinhood	gigadex_deployer	0x5952F5D501a130da00fa8fE2257d8B35ddc0A57B
+          polygon	quickswap_v4_deployer	0x96B31b1d17dee49e70B950dE33FFF83728f5c181
+          EOF
+
+          while IFS=$'\t' read -r chain label address; do
+            [ -n "$chain" ] || continue
+            if [ "$chain" = robinhood ]; then
+              rpc="$RH_RPC"
+              explorer="https://robinhoodchain.blockscout.com"
+            else
+              rpc="$POLY_RPC"
+              explorer="https://polygon.blockscout.com"
+            fi
+            dir="$OUT/$chain/$label"
+            mkdir -p "$dir"
+            printf '%s\n' "$address" > "$dir/address.txt"
+            cast code "$address" --rpc-url "$rpc" > "$dir/code.hex" 2> "$dir/code.err" || true
+            cast codehash "$address" --rpc-url "$rpc" > "$dir/codehash.txt" 2> "$dir/codehash.err" || true
+            cast balance "$address" --rpc-url "$rpc" > "$dir/native-balance.txt" 2> "$dir/balance.err" || true
+            curl -fsSL --retry 3 --max-time 30 "$explorer/api/v2/smart-contracts/$address" > "$dir/smart-contract.json" 2> "$dir/smart-contract.err" || true
+            curl -fsSL --retry 3 --max-time 30 "$explorer/api/v2/addresses/$address" > "$dir/address.json" 2> "$dir/address.err" || true
+            curl -fsSL --retry 3 --max-time 30 "$explorer/api?module=contract&action=getabi&address=$address" > "$dir/abi-legacy.json" 2> "$dir/abi-legacy.err" || true
+            curl -fsSL --retry 3 --max-time 30 "https://api.routescan.io/v2/network/mainnet/evm/$( [ "$chain" = robinhood ] && echo 4663 || echo 137 )/etherscan/api?module=contract&action=getsourcecode&address=$address" > "$dir/routescan-source.json" 2> "$dir/routescan-source.err" || true
+          done < "$OUT/targets.tsv"
+
+          python3 - "$OUT" <<'PY'
+          import hashlib, json, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          summary = []
+          for addr in root.rglob('address.txt'):
+              d = addr.parent
+              address = addr.read_text().strip()
+              code_path = d / 'code.hex'
+              code = code_path.read_text().strip() if code_path.exists() else ''
+              row = {
+                  'chain': d.parent.name,
+                  'label': d.name,
+                  'address': address,
+                  'runtime_bytes': max(0, (len(code.removeprefix('0x')) // 2)),
+                  'code_sha256': hashlib.sha256(code.encode()).hexdigest() if code else None,
+                  'rpc_code_present': bool(code and code != '0x'),
+              }
+              for name in ['smart-contract.json', 'address.json', 'abi-legacy.json', 'routescan-source.json']:
+                  p = d / name
+                  if p.exists() and p.stat().st_size:
+                      try:
+                          obj = json.loads(p.read_text())
+                          row[name] = {
+                              'valid_json': True,
+                              'keys': sorted(obj.keys())[:30] if isinstance(obj, dict) else [],
+                              'name': obj.get('name') if isinstance(obj, dict) else None,
+                              'is_verified': obj.get('is_verified') if isinstance(obj, dict) else None,
+                              'proxy_type': obj.get('proxy_type') if isinstance(obj, dict) else None,
+                              'implementation_address': obj.get('implementation_address') if isinstance(obj, dict) else None,
+                          }
+                      except Exception as e:
+                          row[name] = {'valid_json': False, 'error': str(e)}
+              summary.append(row)
+          (root / 'summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True))
+          if not all(x['rpc_code_present'] for x in summary):
+              missing = [x for x in summary if not x['rpc_code_present']]
+              raise SystemExit(f'missing runtime code: {missing}')
+          PY
+
+          find "$OUT" -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS"
+          test -s "$OUT/summary.json"
+
+      - name: Upload metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: 0x-univ3-public-metadata-${{ github.run_id }}
+          path: metadata/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
