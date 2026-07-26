@@ -1,0 +1,190 @@
+name: veda-lz-delegate
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Inspect LayerZero delegates and transitive execution surfaces
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, urllib.request
+
+          ENDPOINT="0x1a44076050125825900e736c501f859c50fE728c"
+          ATTACKER="0x1111111111111111111111111111111111111111"
+          SENTINEL="0x0000000000000000000000000000000000000001"
+          CHAINS={
+            "ethereum":{"id":1,"eid":30101,"rpcs":["https://ethereum-rpc.publicnode.com","https://eth.drpc.org","https://rpc.mevblocker.io"]},
+            "optimism":{"id":10,"eid":30111,"rpcs":["https://optimism-rpc.publicnode.com","https://mainnet.optimism.io","https://optimism.drpc.org"]},
+            "scroll":{"id":534352,"eid":30214,"rpcs":["https://scroll-rpc.publicnode.com","https://rpc.scroll.io","https://scroll.drpc.org"]},
+          }
+          TELLERS={
+            "liquidBTC":"0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353",
+            "liquidETH":"0x9AA79C84b79816ab920bBcE20f8f74557B514734",
+            "liquidUSD":"0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387",
+          }
+          def shell(*args):
+            proc=subprocess.run([str(x) for x in args],text=True,capture_output=True)
+            if proc.returncode: raise RuntimeError({"args":args,"stdout":proc.stdout,"stderr":proc.stderr})
+            return proc.stdout.strip()
+          SIG={name:shell("cast","sig",signature) for name,signature in {
+            "delegates":"delegates(address)",
+            "getOwners":"getOwners()",
+            "getThreshold":"getThreshold()",
+            "getModules":"getModulesPaginated(address,uint256)",
+            "getGuard":"getGuard()",
+            "owner":"owner()",
+            "authority":"authority()",
+            "isDeployer":"isDeployer(address)",
+            "setSendLibrary":"setSendLibrary(address,uint32,address)",
+            "setReceiveLibrary":"setReceiveLibrary(address,uint32,address,uint256)",
+            "skip":"skip(address,uint32,bytes32,uint64)",
+            "execModule":"execTransactionFromModule(address,uint256,bytes,uint8)",
+            "execute":"execute(address,uint256,bytes)",
+            "execute2":"execute(address,bytes)",
+            "multicall":"multicall(bytes[])",
+          }.items()}
+          def rpc(endpoint,method,params,timeout=35):
+            body=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
+            request=urllib.request.Request(endpoint,data=body,method="POST",headers={"content-type":"application/json","user-agent":"veda-lz-delegate/1"})
+            with urllib.request.urlopen(request,timeout=timeout) as response: payload=json.loads(response.read().decode())
+            if "error" in payload: raise RuntimeError(payload["error"])
+            return payload["result"]
+          def strip0(value):
+            text=str(value or "");return text[2:] if text.startswith("0x") else text
+          def aw(address): return strip0(address).lower().rjust(64,"0")
+          def uw(value): return hex(int(value))[2:].rjust(64,"0")
+          def b32(value): return strip0(value).lower().rjust(64,"0")
+          def dynamic_bytes(data=b""):
+            padding=(32-len(data)%32)%32
+            return uw(32)+uw(len(data))+data.hex()+"00"*padding
+          def dynamic_array_empty(): return uw(32)+uw(0)
+          def decode_address(raw): return None if not raw or raw=="0x" else "0x"+strip0(raw)[-40:].lower()
+          def decode_uint(raw): return None if not raw or raw=="0x" else int(raw,16)
+          def decode_address_array(raw):
+            value=strip0(raw)
+            if not value: return None
+            try:
+              offset=int(value[:64],16)*2;length=int(value[offset:offset+64],16);cursor=offset+64
+              return ["0x"+value[cursor+i*64+24:cursor+(i+1)*64].lower() for i in range(length)]
+            except Exception: return None
+          def decode_modules(raw):
+            value=strip0(raw)
+            if not value: return None
+            try:
+              array_offset=int(value[:64],16)*2
+              next_address="0x"+value[64+24:128].lower()
+              length=int(value[array_offset:array_offset+64],16)
+              cursor=array_offset+64
+              modules=["0x"+value[cursor+i*64+24:cursor+(i+1)*64].lower() for i in range(length)]
+              return {"modules":modules,"next":next_address}
+            except Exception: return None
+          def eth_call(endpoint,to,data,from_address=None):
+            tx={"to":to,"data":data}
+            if from_address: tx["from"]=from_address
+            return rpc(endpoint,"eth_call",[tx,"latest"])
+          def safe_call(endpoint,to,data,from_address=None):
+            try: return {"ok":True,"raw":eth_call(endpoint,to,data,from_address)}
+            except Exception as exc: return {"ok":False,"error":repr(exc)}
+          output={"endpoint_address":ENDPOINT.lower(),"chains":{},"unique_delegates":{},"errors":[]}
+          for chain_name,config in CHAINS.items():
+            endpoint=None;failures={}
+            for candidate in config["rpcs"]:
+              try:
+                if int(rpc(candidate,"eth_chainId",[]),16)==config["id"]: endpoint=candidate;break
+              except Exception as exc: failures[candidate]=repr(exc)
+            if not endpoint:
+              output["errors"].append({"chain":chain_name,"rpc_failures":failures});continue
+            block=int(rpc(endpoint,"eth_blockNumber",[]),16)
+            endpoint_code=rpc(endpoint,"eth_getCode",[ENDPOINT,"latest"])
+            chain={"rpc":endpoint,"rpc_failures":failures,"block":block,"endpoint_code_bytes":len(strip0(endpoint_code))//2,"tellers":{}}
+            output["chains"][chain_name]=chain
+            for product,teller in TELLERS.items():
+              try:
+                delegate=decode_address(eth_call(endpoint,ENDPOINT,SIG["delegates"]+aw(teller)))
+                direct={
+                  "set_send_library":safe_call(endpoint,ENDPOINT,SIG["setSendLibrary"]+aw(teller)+uw(config["eid"])+aw(ATTACKER),ATTACKER),
+                  "set_receive_library":safe_call(endpoint,ENDPOINT,SIG["setReceiveLibrary"]+aw(teller)+uw(config["eid"])+aw(ATTACKER)+uw(0),ATTACKER),
+                  "skip":safe_call(endpoint,ENDPOINT,SIG["skip"]+aw(teller)+uw(config["eid"])+b32(ATTACKER)+uw(1),ATTACKER),
+                }
+                chain["tellers"][product]={"teller":teller.lower(),"delegate":delegate,"attacker_endpoint_mutations":direct}
+                if delegate:
+                  output["unique_delegates"].setdefault(delegate,{"chains":[],"products":[]})["chains"].append(chain_name)
+                  output["unique_delegates"][delegate]["products"].append(product)
+              except Exception as exc:
+                chain["tellers"][product]={"teller":teller.lower(),"error":repr(exc)}
+          # Inspect each unique delegate on every chain where it is active.
+          for delegate,summary in output["unique_delegates"].items():
+            summary["states"]={}
+            for chain_name in sorted(set(summary["chains"])):
+              endpoint=output["chains"][chain_name]["rpc"]
+              try:
+                code=rpc(endpoint,"eth_getCode",[delegate,"latest"])
+                code_bytes=len(strip0(code))//2
+                state={"code_bytes":code_bytes}
+                if code_bytes:
+                  owners_raw=safe_call(endpoint,delegate,SIG["getOwners"])
+                  threshold_raw=safe_call(endpoint,delegate,SIG["getThreshold"])
+                  modules_raw=safe_call(endpoint,delegate,SIG["getModules"]+aw(SENTINEL)+uw(100))
+                  guard_raw=safe_call(endpoint,delegate,SIG["getGuard"])
+                  owner_raw=safe_call(endpoint,delegate,SIG["owner"])
+                  authority_raw=safe_call(endpoint,delegate,SIG["authority"])
+                  deployer_raw=safe_call(endpoint,delegate,SIG["isDeployer"]+aw(ATTACKER))
+                  state.update({
+                    "safe_owners":decode_address_array(owners_raw.get("raw")) if owners_raw.get("ok") else None,
+                    "safe_threshold":decode_uint(threshold_raw.get("raw")) if threshold_raw.get("ok") else None,
+                    "safe_modules":decode_modules(modules_raw.get("raw")) if modules_raw.get("ok") else None,
+                    "guard":decode_address(guard_raw.get("raw")) if guard_raw.get("ok") else None,
+                    "owner":decode_address(owner_raw.get("raw")) if owner_raw.get("ok") else None,
+                    "authority":decode_address(authority_raw.get("raw")) if authority_raw.get("ok") else None,
+                    "attacker_is_deployer":bool(decode_uint(deployer_raw.get("raw"))) if deployer_raw.get("ok") and deployer_raw.get("raw") not in (None,"0x") else None,
+                    "attacker_generic_calls":{
+                      "safe_module":safe_call(endpoint,delegate,SIG["execModule"]+aw(ATTACKER)+uw(0)+dynamic_bytes()+uw(0),ATTACKER),
+                      "execute":safe_call(endpoint,delegate,SIG["execute"]+aw(ATTACKER)+uw(0)+dynamic_bytes(),ATTACKER),
+                      "execute2":safe_call(endpoint,delegate,SIG["execute2"]+aw(ATTACKER)+dynamic_bytes(),ATTACKER),
+                      "multicall":safe_call(endpoint,delegate,SIG["multicall"]+dynamic_array_empty(),ATTACKER),
+                    },
+                  })
+                  owner_addresses=state.get("safe_owners") or ([state["owner"]] if state.get("owner") else [])
+                  state["owner_code"]={}
+                  for owner_address in owner_addresses:
+                    owner_code=rpc(endpoint,"eth_getCode",[owner_address,"latest"])
+                    state["owner_code"][owner_address]={"code_bytes":len(strip0(owner_code))//2,"eip7702":strip0(owner_code).lower().startswith("ef0100")}
+                summary["states"][chain_name]=state
+              except Exception as exc:
+                summary["states"][chain_name]={"error":repr(exc)}
+          flags=[]
+          for delegate,summary in output["unique_delegates"].items():
+            for chain_name,state in summary.get("states",{}).items():
+              if state.get("attacker_is_deployer"):
+                flags.append({"delegate":delegate,"chain":chain_name,"reason":"attacker_is_deployer"})
+              modules=(state.get("safe_modules") or {}).get("modules") or []
+              if modules:
+                flags.append({"delegate":delegate,"chain":chain_name,"reason":"safe_modules","modules":modules})
+              for owner_address,owner_state in (state.get("owner_code") or {}).items():
+                if owner_state.get("code_bytes") or owner_state.get("eip7702"):
+                  flags.append({"delegate":delegate,"chain":chain_name,"reason":"non_eoa_owner","owner":owner_address,"state":owner_state})
+          output["flags"]=flags
+          output["summary"]={"chain_count":len(output["chains"]),"delegate_count":len(output["unique_delegates"]),"flag_count":len(flags),"errors":len(output["errors"])}
+          with open("veda-lz-delegate.json","w",encoding="utf-8") as handle: json.dump(output,handle,indent=2,sort_keys=True);handle.write("\n")
+          print(json.dumps(output,indent=2,sort_keys=True))
+          PY
+      - name: Upload delegate proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-lz-delegate
+          path: veda-lz-delegate.json
+          if-no-files-found: error
+          retention-days: 1
