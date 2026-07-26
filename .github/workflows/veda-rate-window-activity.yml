@@ -1,0 +1,397 @@
+name: veda-rate-window-activity
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Correlate real deposit-and-bridge activity with stale-rate windows
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import datetime as dt
+          import json
+          import subprocess
+          import time
+          import urllib.parse
+          import urllib.request
+          import traceback
+
+          INSTANCES = {
+              "ethereum": "https://eth.blockscout.com",
+              "optimism": "https://explorer.optimism.io",
+              "scroll": "https://scrollscan.com",
+          }
+          PRODUCTS = {
+              "liquidBTC": {
+                  "accountant": "0xEa23aC6D7D11f6b181d6B98174D334478ADAe6b0",
+                  "teller": "0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353",
+                  "one_share": 10**8,
+              },
+              "liquidETH": {
+                  "accountant": "0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198",
+                  "teller": "0x9AA79C84b79816ab920bBcE20f8f74557B514734",
+                  "one_share": 10**18,
+              },
+              "liquidUSD": {
+                  "accountant": "0xc315D6e14DDCDC7407784e2Caf815d131Bc1D3E7",
+                  "teller": "0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387",
+                  "one_share": 10**6,
+              },
+          }
+          EID_TO_CHAIN = {30101: "ethereum", 30111: "optimism", 30214: "scroll"}
+
+          def run(*args):
+              p = subprocess.run([str(x) for x in args], text=True, capture_output=True)
+              if p.returncode != 0:
+                  raise RuntimeError({"args": args, "stdout": p.stdout, "stderr": p.stderr})
+              return p.stdout.strip()
+
+          TOPICS = {
+              "rate": run("cast", "keccak", "ExchangeRateUpdated(uint96,uint96,uint64)").lower(),
+              "message_sent": run("cast", "keccak", "MessageSent(bytes32,uint256,address)").lower(),
+              "message_received": run("cast", "keccak", "MessageReceived(bytes32,uint256,address)").lower(),
+              "deposit_referral": run("cast", "keccak", "Deposit(uint256,address,address,uint256,uint256,uint256,uint256,address)").lower(),
+              "deposit_legacy": run("cast", "keccak", "Deposit(uint256,address,address,uint256,uint256,uint256,uint256)").lower(),
+          }
+          SELECTORS = {
+              "deposit_bridge_referral": run("cast", "sig", "depositAndBridge(address,uint256,uint256,address,bytes,address,uint256,address)").lower(),
+              "deposit_bridge_legacy": run("cast", "sig", "depositAndBridge(address,uint256,uint256,address,bytes,address,uint256)").lower(),
+              "deposit_bridge_permit_referral": run("cast", "sig", "depositAndBridgeWithPermit((address,uint256,uint256,uint256,uint8,bytes32,bytes32,address,bytes,address,uint256,address))").lower(),
+              "deposit_bridge_permit_referral_alt": run("cast", "sig", "depositAndBridgeWithPermit((address,uint256,uint256,uint256,uint8,bytes32,bytes32,bytes32,address,bytes,address,uint256,address))").lower(),
+              "bridge": run("cast", "sig", "bridge(uint96,address,bytes,address,uint256)").lower(),
+          }
+
+          def get(url, timeout=60):
+              req = urllib.request.Request(url, headers={"accept": "application/json", "user-agent": "veda-rate-window-activity/1.0"})
+              with urllib.request.urlopen(req, timeout=timeout) as response:
+                  return json.loads(response.read().decode())
+
+          def normalize_topic(value):
+              if isinstance(value, dict):
+                  value = value.get("value") or value.get("hex") or value.get("data")
+              return str(value or "").lower()
+
+          def strip0(value):
+              value = str(value or "")
+              return value[2:] if value.startswith("0x") else value
+
+          def blocknum(value):
+              if isinstance(value, int):
+                  return value
+              value = str(value or "0")
+              return int(value, 16) if value.startswith("0x") else int(value)
+
+          def timestamp(value):
+              if isinstance(value, (int, float)):
+                  return int(value)
+              value = str(value or "")
+              if value.isdigit():
+                  return int(value)
+              try:
+                  return int(dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+              except Exception:
+                  return 0
+
+          def words(raw):
+              value = strip0(raw)
+              if not value or len(value) % 64:
+                  return []
+              return [int(value[i:i + 64], 16) for i in range(0, len(value), 64)]
+
+          def topic_address(topic):
+              return "0x" + strip0(topic)[-40:].lower()
+
+          def fetch_address_logs(base, address):
+              url = f"{base}/api/v2/addresses/{address}/logs"
+              params = {}
+              items, errors, seen = [], [], set()
+              pages = 0
+              while True:
+                  full = url + ("?" + urllib.parse.urlencode(params, doseq=True) if params else "")
+                  try:
+                      payload = get(full)
+                  except Exception as exc:
+                      errors.append({"url": full, "error": repr(exc)})
+                      break
+                  pages += 1
+                  batch = payload.get("items") or []
+                  for item in batch:
+                      key = (item.get("transaction_hash") or item.get("tx_hash"), item.get("index") or item.get("log_index"), item.get("block_number"))
+                      if key in seen:
+                          continue
+                      seen.add(key)
+                      items.append(item)
+                  nxt = payload.get("next_page_params")
+                  if not nxt or not batch:
+                      break
+                  params = {key: value for key, value in nxt.items() if value is not None}
+                  if pages >= 3000:
+                      errors.append({"error": "pagination_guard", "pages": pages})
+                      break
+                  time.sleep(0.04)
+              return items, pages, errors
+
+          tx_cache = {}
+          def fetch_transaction(base, tx_hash):
+              key = (base, tx_hash)
+              if key in tx_cache:
+                  return tx_cache[key]
+              try:
+                  item = get(f"{base}/api/v2/transactions/{tx_hash}")
+              except Exception as exc:
+                  item = {"fetch_error": repr(exc)}
+              tx_cache[key] = item
+              return item
+
+          def tx_input(tx):
+              value = tx.get("raw_input") or tx.get("input") or tx.get("input_data") or "0x"
+              if isinstance(value, dict):
+                  value = value.get("raw_input") or value.get("hex") or value.get("data") or "0x"
+              return str(value)
+
+          def decode_dynamic_word(calldata, base_byte, offset_word_index):
+              raw = bytes.fromhex(strip0(calldata))
+              if len(raw) < base_byte + (offset_word_index + 1) * 32:
+                  return None
+              offset = int.from_bytes(raw[base_byte + offset_word_index * 32:base_byte + (offset_word_index + 1) * 32], "big")
+              pos = base_byte + offset
+              if len(raw) < pos + 32:
+                  return None
+              length = int.from_bytes(raw[pos:pos + 32], "big")
+              data = raw[pos + 32:pos + 32 + length]
+              return data
+
+          def decode_destination(input_data):
+              h = strip0(input_data)
+              if len(h) < 8:
+                  return {"selector": "0x" + h, "destination_eid": None, "destination": None}
+              selector = "0x" + h[:8].lower()
+              try:
+                  if selector in {SELECTORS["deposit_bridge_referral"], SELECTORS["deposit_bridge_legacy"]}:
+                      data = decode_dynamic_word("0x" + h, 4, 4)
+                  elif selector in {SELECTORS["deposit_bridge_permit_referral"], SELECTORS["deposit_bridge_permit_referral_alt"]}:
+                      raw = bytes.fromhex(h)
+                      tuple_offset = int.from_bytes(raw[4:36], "big")
+                      tuple_base = 4 + tuple_offset
+                      data = decode_dynamic_word("0x" + h, tuple_base, 8)
+                  elif selector == SELECTORS["bridge"]:
+                      data = decode_dynamic_word("0x" + h, 4, 2)
+                  else:
+                      data = None
+                  eid = int.from_bytes(data[-32:], "big") if data else None
+              except Exception:
+                  eid = None
+              return {"selector": selector, "destination_eid": eid, "destination": EID_TO_CHAIN.get(eid)}
+
+          out = {
+              "generated_at_unix": int(time.time()),
+              "topics": TOPICS,
+              "selectors": SELECTORS,
+              "chains": {},
+              "windows": [],
+              "atomic_deposit_bridges": [],
+              "bridges_in_windows": [],
+              "atomic_deposit_bridges_in_windows": [],
+              "errors": [],
+          }
+
+          # Fetch and decode all relevant accountant/teller logs.
+          for chain_name, base in INSTANCES.items():
+              chain = {"base": base, "products": {}}
+              out["chains"][chain_name] = chain
+              for product_name, config in PRODUCTS.items():
+                  row = {"rate_events": [], "deposits": [], "message_sent": [], "message_received": []}
+                  chain["products"][product_name] = row
+                  try:
+                      account_logs, apages, aerrors = fetch_address_logs(base, config["accountant"])
+                      teller_logs, tpages, terrors = fetch_address_logs(base, config["teller"])
+                      row.update({"accountant_raw_items": len(account_logs), "accountant_pages": apages, "accountant_fetch_errors": aerrors, "teller_raw_items": len(teller_logs), "teller_pages": tpages, "teller_fetch_errors": terrors})
+                      for item in account_logs:
+                          topics = [normalize_topic(x) for x in (item.get("topics") or [])]
+                          if not topics or topics[0] != TOPICS["rate"]:
+                              continue
+                          decoded = words(item.get("data"))
+                          if len(decoded) < 3:
+                              continue
+                          row["rate_events"].append({
+                              "old_rate": decoded[0], "new_rate": decoded[1],
+                              "event_time": decoded[2] or timestamp(item.get("timestamp")),
+                              "block": blocknum(item.get("block_number")),
+                              "tx": item.get("transaction_hash"),
+                              "log_index": blocknum(item.get("index") or item.get("log_index")),
+                          })
+                      for item in teller_logs:
+                          topics = [normalize_topic(x) for x in (item.get("topics") or [])]
+                          if not topics:
+                              continue
+                          base_event = {
+                              "event_time": timestamp(item.get("timestamp")),
+                              "block": blocknum(item.get("block_number")),
+                              "tx": item.get("transaction_hash"),
+                              "log_index": blocknum(item.get("index") or item.get("log_index")),
+                          }
+                          if topics[0] in {TOPICS["deposit_referral"], TOPICS["deposit_legacy"]}:
+                              decoded = words(item.get("data"))
+                              if len(decoded) >= 5:
+                                  row["deposits"].append({
+                                      **base_event,
+                                      "event_topic": topics[0],
+                                      "receiver": topic_address(topics[1]) if len(topics) > 1 else None,
+                                      "deposit_asset": topic_address(topics[2]) if len(topics) > 2 else None,
+                                      "referral": topic_address(topics[3]) if len(topics) > 3 else None,
+                                      "nonce": decoded[0], "deposit_amount": decoded[1], "share_amount": decoded[2],
+                                      "deposit_timestamp": decoded[3], "share_lock_period": decoded[4],
+                                  })
+                          elif topics[0] == TOPICS["message_sent"]:
+                              decoded = words(item.get("data"))
+                              row["message_sent"].append({
+                                  **base_event,
+                                  "message_id": topics[1] if len(topics) > 1 else None,
+                                  "to": topic_address(topics[2]) if len(topics) > 2 else None,
+                                  "share_amount": decoded[0] if decoded else None,
+                              })
+                          elif topics[0] == TOPICS["message_received"]:
+                              decoded = words(item.get("data"))
+                              row["message_received"].append({
+                                  **base_event,
+                                  "message_id": topics[1] if len(topics) > 1 else None,
+                                  "to": topic_address(topics[2]) if len(topics) > 2 else None,
+                                  "share_amount": decoded[0] if decoded else None,
+                              })
+                      for key in ("rate_events", "deposits", "message_sent", "message_received"):
+                          row[key].sort(key=lambda x: (x["event_time"], x["block"], x["log_index"]))
+                      row["counts"] = {key: len(row[key]) for key in ("rate_events", "deposits", "message_sent", "message_received")}
+                  except Exception as exc:
+                      row["error"] = repr(exc)
+                      row["traceback"] = traceback.format_exc()
+                      out["errors"].append({"chain": chain_name, "product": product_name, "error": repr(exc)})
+
+          # Reconstruct stale-rate windows.
+          for product_name in PRODUCTS:
+              histories = {chain: out["chains"][chain]["products"][product_name]["rate_events"] for chain in INSTANCES}
+              by_rate = {}
+              for chain, history in histories.items():
+                  for event in history:
+                      by_rate.setdefault(event["new_rate"], []).append({"chain": chain, **event})
+              for fresh_rate, events in by_rate.items():
+                  if len({event["chain"] for event in events}) < 2:
+                      continue
+                  events.sort(key=lambda x: x["event_time"])
+                  first_per_chain = {}
+                  for event in events:
+                      first_per_chain.setdefault(event["chain"], event)
+                  for destination, destination_event in first_per_chain.items():
+                      start = destination_event["event_time"]
+                      for source, history in histories.items():
+                          if source == destination:
+                              continue
+                          previous = [event for event in history if event["event_time"] <= start]
+                          if not previous:
+                              continue
+                          stale_rate = previous[-1]["new_rate"]
+                          if stale_rate >= fresh_rate:
+                              continue
+                          next_sync = [event for event in history if event["event_time"] > start and event["new_rate"] == fresh_rate]
+                          end = next_sync[0]["event_time"] if next_sync else None
+                          out["windows"].append({
+                              "product": product_name, "source": source, "destination": destination,
+                              "source_stale_rate": stale_rate, "destination_fresh_rate": fresh_rate,
+                              "start_time": start, "end_time": end,
+                              "window_seconds": None if end is None else end - start,
+                              "gross_rate_edge_bps": (fresh_rate - stale_rate) * 10000 / stale_rate,
+                              "destination_event": destination_event,
+                              "source_previous_event": previous[-1],
+                          })
+
+          # Correlate MessageReceived events by message id.
+          received_by_id = {}
+          for chain_name in INSTANCES:
+              for product_name in PRODUCTS:
+                  for event in out["chains"][chain_name]["products"][product_name]["message_received"]:
+                      received_by_id.setdefault(event.get("message_id"), []).append({"chain": chain_name, "product": product_name, **event})
+
+          # Correlate deposits and messages in the same transaction, and decode destination from calldata.
+          for source, base in INSTANCES.items():
+              for product_name, config in PRODUCTS.items():
+                  row = out["chains"][source]["products"][product_name]
+                  deposits_by_tx = {}
+                  for event in row["deposits"]:
+                      deposits_by_tx.setdefault(event["tx"], []).append(event)
+                  for sent in row["message_sent"]:
+                      transaction = fetch_transaction(base, sent["tx"])
+                      decoded_destination = decode_destination(tx_input(transaction))
+                      receiver_records = received_by_id.get(sent.get("message_id"), [])
+                      record = {
+                          "source": source, "product": product_name,
+                          **sent,
+                          "transaction_input": tx_input(transaction),
+                          "transaction_from": ((transaction.get("from") or {}).get("hash") if isinstance(transaction.get("from"), dict) else transaction.get("from")),
+                          "transaction_status": transaction.get("status"),
+                          **decoded_destination,
+                          "deposits_same_tx": deposits_by_tx.get(sent["tx"], []),
+                          "atomic_deposit_bridge": bool(deposits_by_tx.get(sent["tx"])),
+                          "received": receiver_records,
+                      }
+                      if receiver_records:
+                          record["minimum_delivery_seconds"] = min(max(0, event["event_time"] - sent["event_time"]) for event in receiver_records)
+                      if record["atomic_deposit_bridge"]:
+                          out["atomic_deposit_bridges"].append(record)
+
+                      for window in out["windows"]:
+                          if window["product"] != product_name or window["source"] != source:
+                              continue
+                          if record.get("destination") != window["destination"]:
+                              continue
+                          if sent["event_time"] < window["start_time"]:
+                              continue
+                          if window["end_time"] is not None and sent["event_time"] >= window["end_time"]:
+                              continue
+                          one_share = config["one_share"]
+                          gain = (sent["share_amount"] or 0) * (window["destination_fresh_rate"] - window["source_stale_rate"]) // one_share
+                          matched = {**record, "matched_window": window, "theoretical_gross_gain_in_base_units": gain}
+                          out["bridges_in_windows"].append(matched)
+                          if record["atomic_deposit_bridge"]:
+                              out["atomic_deposit_bridges_in_windows"].append(matched)
+
+          out["windows"].sort(key=lambda x: (-x["gross_rate_edge_bps"], -(x["window_seconds"] or -1)))
+          out["summary"] = {
+              "window_count": len(out["windows"]),
+              "atomic_deposit_bridge_count": len(out["atomic_deposit_bridges"]),
+              "bridge_in_window_count": len(out["bridges_in_windows"]),
+              "atomic_deposit_bridge_in_window_count": len(out["atomic_deposit_bridges_in_windows"]),
+              "max_realized_theoretical_gross_gain_base_units": max([x["theoretical_gross_gain_in_base_units"] for x in out["atomic_deposit_bridges_in_windows"]], default=0),
+              "errors": len(out["errors"]),
+              "event_counts": {
+                  chain: {product: out["chains"][chain]["products"][product].get("counts") for product in PRODUCTS}
+                  for chain in INSTANCES
+              },
+          }
+          with open("veda-rate-window-activity.json", "w", encoding="utf-8") as handle:
+              json.dump(out, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+          print(json.dumps({
+              "summary": out["summary"],
+              "atomic_in_windows": out["atomic_deposit_bridges_in_windows"][:100],
+              "all_bridges_in_windows": out["bridges_in_windows"][:100],
+              "errors": out["errors"],
+          }, indent=2, sort_keys=True))
+          PY
+      - name: Upload production-path chronology
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-rate-window-activity
+          path: veda-rate-window-activity.json
+          if-no-files-found: error
+          retention-days: 1
