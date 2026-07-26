@@ -18,6 +18,8 @@ contract NucleusRefundStateExport is NucleusTellerMainnetTest {
     using SafeTransferLib for IERC20;
     using LibBytes for bytes;
 
+    string internal constant OUTPUT_DIR = ".forge-snapshots/settler-refund-export";
+
     function testExportOfficialRefundState() public {
         uint256 shareAmount = 1e18;
 
@@ -46,10 +48,10 @@ contract NucleusRefundStateExport is NucleusTellerMainnetTest {
         assertEq(WPAXG.balanceOf(address(bridgeSettler)), 0, "bridge should consume WPAXG");
         assertEq(address(bridgeSettler).balance, excess, "official LayerZero refund must remain");
 
-        vm.createDir("artifacts", true);
-        vm.writeFile("artifacts/bridge-settler-address.txt", vm.toString(address(bridgeSettler)));
-        vm.writeFile("artifacts/refund-amount.txt", vm.toString(excess));
-        vm.writeFile("artifacts/fork-block.txt", vm.toString(_testBlockNumber()));
-        vm.dumpState("artifacts/refund-state-alloc.json");
+        vm.createDir(OUTPUT_DIR, true);
+        vm.writeFile(string.concat(OUTPUT_DIR, "/bridge-settler-address.txt"), vm.toString(address(bridgeSettler)));
+        vm.writeFile(string.concat(OUTPUT_DIR, "/refund-amount.txt"), vm.toString(excess));
+        vm.writeFile(string.concat(OUTPUT_DIR, "/fork-block.txt"), vm.toString(_testBlockNumber()));
+        vm.dumpState(string.concat(OUTPUT_DIR, "/refund-state-alloc.json"));
     }
 }
