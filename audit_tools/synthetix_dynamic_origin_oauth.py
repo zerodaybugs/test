@@ -14,6 +14,7 @@ import json
 import pathlib
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -84,6 +85,12 @@ def env_from_url(value: Any) -> str | None:
     return match.group(1).lower() if match else None
 
 
+def host_from_url(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return urllib.parse.urlparse(value).hostname
+
+
 def selected_settings(env_id: str) -> dict[str, Any]:
     url = f"{BASE}/sdk/{env_id}/settings"
     item = request(url)
@@ -103,12 +110,8 @@ def selected_settings(env_id: str) -> dict[str, Any]:
                     "createNewAccounts": provider.get("createNewAccounts"),
                     "authorizationEnvironmentId": env_from_url(provider.get("authorizationUrl")),
                     "redirectEnvironmentId": env_from_url(provider.get("redirectUrl")),
-                    "authorizationHost": urllib.request.urlparse(provider.get("authorizationUrl", "")).hostname
-                    if isinstance(provider.get("authorizationUrl"), str)
-                    else None,
-                    "redirectHost": urllib.request.urlparse(provider.get("redirectUrl", "")).hostname
-                    if isinstance(provider.get("redirectUrl"), str)
-                    else None,
+                    "authorizationHost": host_from_url(provider.get("authorizationUrl")),
+                    "redirectHost": host_from_url(provider.get("redirectUrl")),
                 }
             )
         sdk = parsed.get("sdk") if isinstance(parsed.get("sdk"), dict) else {}
