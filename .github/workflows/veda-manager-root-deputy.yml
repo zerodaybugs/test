@@ -1,0 +1,179 @@
+name: veda-manager-root-deputy
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Reconstruct every live manageRoot holder and test transitive public executors
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, time, urllib.request, urllib.parse, traceback
+
+          ATTACKER="0x1111111111111111111111111111111111111111"
+          ZERO="0x0000000000000000000000000000000000000000"
+          CHAINS={
+            "ethereum":{"id":1,"rpcs":["https://ethereum-rpc.publicnode.com","https://eth.drpc.org"],"explorer":"https://eth.blockscout.com","managers":{
+              "liquidBTC":"0xaFa8c08bedB2eC1bbEb64A7fFa44c604e7cca68d","liquidETH":"0x227975088C28DBBb4b421c6d96781a53578f19a8","liquidUSD":"0x7b57Ad1A0AA89583130aCfAD024241170D24C13C"}},
+            "optimism":{"id":10,"rpcs":["https://optimism-rpc.publicnode.com","https://mainnet.optimism.io"],"explorer":"https://optimism.blockscout.com","managers":{
+              "liquidBTC":"0xaFa8c08bedB2eC1bbEb64A7fFa44c604e7cca68d","liquidETH":"0xf9f7969C357ce6dfd7973098Ea0D57173592bCCa","liquidUSD":"0x7b57Ad1A0AA89583130aCfAD024241170D24C13C"}},
+            "scroll":{"id":534352,"rpcs":["https://scroll-rpc.publicnode.com","https://rpc.scroll.io"],"explorer":"https://scroll.blockscout.com","managers":{
+              "liquidBTC":"0xaFa8c08bedB2eC1bbEb64A7fFa44c604e7cca68d","liquidETH":"0xf9f7969C357ce6dfd7973098Ea0D57173592bCCa","liquidUSD":"0x7b57Ad1A0AA89583130aCfAD024241170D24C13C"}},
+            "ink":{"id":57073,"rpcs":["https://rpc-gel.inkonchain.com"],"explorer":"https://explorer.inkonchain.com","managers":{
+              "balanced":"0xA0e501F98A1B5d3d8e6Ffd161c76f92570E42931","boosted":"0xEd23b12e7700BeB638562A22ED65f74291901c25"}},
+          }
+
+          def sh(*a):
+            p=subprocess.run([str(x) for x in a],text=True,capture_output=True)
+            if p.returncode:raise RuntimeError({"args":a,"stdout":p.stdout,"stderr":p.stderr})
+            return p.stdout.strip()
+          def sig(x):return sh("cast","sig",x)
+          def topic(x):return sh("cast","keccak",x).lower()
+          S={
+            "vault":sig("vault()"),"authority":sig("authority()"),"owner":sig("owner()"),"root":sig("manageRoot(address)"),"paused":sig("isPaused()"),
+            "manage":sig("manageVaultWithMerkleVerification(bytes32[][],address[],address[],bytes[],uint256[])"),
+            "can":sig("canCall(address,address,bytes4)"),"pub":sig("isCapabilityPublic(address,bytes4)"),
+            "safeOwners":sig("getOwners()"),"safeThreshold":sig("getThreshold()"),"safeModules":sig("getModulesPaginated(address,uint256)"),
+          }
+          ROOT_TOPIC=topic("ManageRootUpdated(address,bytes32,bytes32)")
+          EXEC_SIGS={x:sig(x) for x in ["execute(address,uint256,bytes)","execute(address,bytes)","forward(address,bytes)","call(address,uint256,bytes)","run(address,bytes)"]}
+
+          def rpc(ep,m,p,t=45):
+            body=json.dumps({"jsonrpc":"2.0","id":1,"method":m,"params":p}).encode();req=urllib.request.Request(ep,data=body,method="POST",headers={"content-type":"application/json","user-agent":"veda-manager-root-deputy/1"})
+            with urllib.request.urlopen(req,timeout=t) as r:o=json.loads(r.read().decode())
+            if "error" in o:raise RuntimeError(o["error"])
+            return o["result"]
+          def choose(c):
+            bad={}
+            for e in c["rpcs"]:
+              try:
+                if int(rpc(e,"eth_chainId",[]),16)==c["id"]:return e,bad
+              except Exception as x:bad[e]=repr(x)
+            raise RuntimeError(bad)
+          def h(x):
+            x=str(x or "");return x[2:] if x.startswith("0x") else x
+          def w(x):return hex(int(x))[2:].rjust(64,"0")
+          def aw(a):return h(a).lower().rjust(64,"0")
+          def bw(s):return h(s).lower().ljust(64,"0")
+          def addr(x):return ZERO if not x or x=="0x" else "0x"+h(x)[-40:].lower()
+          def call(ep,to,data,frm=None):
+            tx={"to":to,"data":data}
+            if frm:tx["from"]=frm
+            return rpc(ep,"eth_call",[tx,"latest"])
+          def safe(ep,to,data,frm=None):
+            try:return {"ok":True,"raw":call(ep,to,data,frm)}
+            except Exception as x:return {"ok":False,"error":repr(x)}
+          def can(ep,auth,user,target,sel):
+            r=safe(ep,auth,S["can"]+aw(user)+aw(target)+bw(sel));return bool(int(r["raw"],16)) if r["ok"] else None
+          def public(ep,auth,target,sel):
+            r=safe(ep,auth,S["pub"]+aw(target)+bw(sel));return bool(int(r["raw"],16)) if r["ok"] else None
+          def http(url,t=45,retries=4):
+            last=None
+            for i in range(retries):
+              try:
+                req=urllib.request.Request(url,headers={"accept":"application/json","user-agent":"veda-manager-root-deputy/1"})
+                with urllib.request.urlopen(req,timeout=t) as r:return json.loads(r.read().decode())
+              except Exception as x:last=repr(x);time.sleep(.3*(i+1))
+            raise RuntimeError({"url":url,"error":last})
+          def logs(explorer,address,max_pages=200):
+            url=f"{explorer}/api/v2/addresses/{address}/logs";out=[];errs=[]
+            for _ in range(max_pages):
+              try:p=http(url)
+              except Exception as x:errs.append(repr(x));break
+              out.extend(p.get("items") or []);nxt=p.get("next_page_params")
+              if not nxt:break
+              url=f"{explorer}/api/v2/addresses/{address}/logs?"+urllib.parse.urlencode(nxt);time.sleep(.04)
+            return out,errs
+          def smart(explorer,a):
+            try:return http(f"{explorer}/api/v2/smart-contracts/{a}")
+            except Exception as x:return {"_error":repr(x)}
+          def functions(sc):
+            abi=sc.get("abi") if isinstance(sc,dict) else []
+            if isinstance(abi,str):
+              try:abi=json.loads(abi)
+              except:abi=[]
+            return [{"name":x.get("name"),"inputs":[i.get("type") for i in x.get("inputs",[])],"state":x.get("stateMutability")} for x in abi or [] if isinstance(x,dict) and x.get("type")=="function"]
+          def arr(raw):
+            x=h(raw)
+            try:
+              off=int(x[:64],16)*2;n=int(x[off:off+64],16);cur=off+64
+              return ["0x"+x[cur+i*64+24:cur+(i+1)*64].lower() for i in range(n)]
+            except:return []
+          # Empty arrays are a harmless authorization proof for manager entry.
+          EMPTY_MANAGE=S["manage"]+w(160)+w(192)+w(224)+w(256)+w(288)+w(0)+w(0)+w(0)+w(0)+w(0)
+          def dyn_bytes(data):
+            x=h(data);pad=((len(x)+63)//64)*64
+            return w(len(x)//2)+x.ljust(pad,"0")
+          def transitive_calldata(name,manager):
+            b=dyn_bytes(EMPTY_MANAGE)
+            if name=="execute(address,uint256,bytes)":return EXEC_SIGS[name]+aw(manager)+w(0)+w(96)+b
+            if name=="execute(address,bytes)":return EXEC_SIGS[name]+aw(manager)+w(64)+b
+            if name=="forward(address,bytes)":return EXEC_SIGS[name]+aw(manager)+w(64)+b
+            if name=="call(address,uint256,bytes)":return EXEC_SIGS[name]+aw(manager)+w(0)+w(96)+b
+            if name=="run(address,bytes)":return EXEC_SIGS[name]+aw(manager)+w(64)+b
+          def inspect_holder(ep,explorer,manager,holder,root,authorized):
+            code=rpc(ep,"eth_getCode",[holder,"latest"]);item={"address":holder,"root":root,"authorized_manage":authorized,"code_bytes":len(h(code))//2}
+            if code=="0x":return item
+            item["eip7702_designator"]=("0x"+h(code)[6:46]) if h(code).startswith("ef0100") and len(h(code))>=46 else None
+            sc=smart(explorer,holder);fs=functions(sc);item["verified_name"]=sc.get("name") or sc.get("contract_name");item["abi_function_count"]=len(fs)
+            names={"execute","executeBatch","forward","call","run","manage","multicall","flashLoan","receiveFlashLoan"};item["interesting_functions"]=[f for f in fs if f["name"] in names]
+            own=safe(ep,holder,S["owner"]);item["owner"]=addr(own.get("raw")) if own["ok"] and own.get("raw")!="0x" else None
+            so=safe(ep,holder,S["safeOwners"]);st=safe(ep,holder,S["safeThreshold"])
+            if so["ok"] and st["ok"] and so.get("raw")!="0x":
+              item["safe"]={"owners":arr(so["raw"]),"threshold":int(st["raw"],16)}
+              mods=safe(ep,holder,S["safeModules"]+aw("0x0000000000000000000000000000000000000001")+w(50));item["safe"]["modules_raw"]=mods.get("raw") if mods["ok"] else None
+            probes={}
+            if authorized:
+              for name in EXEC_SIGS:
+                r=safe(ep,holder,transitive_calldata(name,manager),ATTACKER);probes[name]={"ok":r["ok"],"raw":r.get("raw"),"error":r.get("error")}
+            item["attacker_transitive_manage_probes"]=probes
+            return item
+
+          out={"generated_at_unix":int(time.time()),"root_topic":ROOT_TOPIC,"chains":{},"open_deputies":[],"errors":[]}
+          for cn,c in CHAINS.items():
+            cr={"managers":{}};out["chains"][cn]=cr
+            try:
+              ep,bad=choose(c);cr.update({"endpoint":ep,"block":int(rpc(ep,"eth_blockNumber",[]),16),"rpc_failures":bad})
+              for pn,m in c["managers"].items():
+                row={"manager":m.lower(),"holders":[]};cr["managers"][pn]=row
+                try:
+                  code=rpc(ep,"eth_getCode",[m,"latest"])
+                  if code=="0x":row["not_deployed"]=True;continue
+                  vault=addr(call(ep,m,S["vault"]));auth=addr(call(ep,m,S["authority"]));row.update({"vault":vault,"authority":auth,"paused":bool(int(call(ep,m,S["paused"]),16)),"manage_public":public(ep,auth,m,S["manage"]),"attacker_manage":can(ep,auth,ATTACKER,m,S["manage"])})
+                  ls,errs=logs(c["explorer"],m);row["log_errors"]=errs;candidates={m.lower()}
+                  for log in ls:
+                    ts=[str(x).lower() for x in (log.get("topics") or [])]
+                    if len(ts)>=2 and ts[0]==ROOT_TOPIC:candidates.add("0x"+h(ts[1])[-40:].lower())
+                  for holder in sorted(candidates):
+                    root_raw=safe(ep,m,S["root"]+aw(holder));root=root_raw.get("raw") if root_raw["ok"] else None
+                    if not root or int(root,16)==0:continue
+                    authorized=can(ep,auth,holder,m,S["manage"])
+                    item=inspect_holder(ep,c["explorer"],m,holder,root,authorized);row["holders"].append(item)
+                    successful=[k for k,v in item.get("attacker_transitive_manage_probes",{}).items() if v.get("ok")]
+                    if successful:out["open_deputies"].append({"chain":cn,"product":pn,"manager":m.lower(),"holder":holder,"root":root,"verified_name":item.get("verified_name"),"successful_probes":successful})
+                except Exception as x:
+                  row["error"]=repr(x);row["traceback"]=traceback.format_exc();out["errors"].append({"chain":cn,"product":pn,"error":repr(x)})
+            except Exception as x:
+              cr["error"]=repr(x);out["errors"].append({"chain":cn,"error":repr(x)})
+          out["summary"]={"open_deputy_count":len(out["open_deputies"]),"error_count":len(out["errors"]),"root_holder_count":sum(len(m.get("holders",[])) for c in out["chains"].values() for m in c.get("managers",{}).values())}
+          open("veda-manager-root-deputy.json","w").write(json.dumps(out,indent=2,sort_keys=True)+"\n")
+          print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+      - name: Upload manager-root proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-manager-root-deputy
+          path: veda-manager-root-deputy.json
+          if-no-files-found: error
+          retention-days: 1
