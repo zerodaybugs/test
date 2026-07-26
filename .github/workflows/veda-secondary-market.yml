@@ -1,0 +1,488 @@
+name: veda-secondary-market
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Download historical rate-window evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api repos/${GITHUB_REPOSITORY}/actions/artifacts/8624582055/zip > rate-history.zip
+          unzip -q rate-history.zip
+          test -s veda-rate-sync-history-v4.json
+      - name: Enumerate permissionless secondary-market exits
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import math
+          import subprocess
+          import time
+          import urllib.parse
+          import urllib.request
+          import traceback
+
+          ETH_RPCS = [
+              "https://ethereum-rpc.publicnode.com",
+              "https://eth.drpc.org",
+              "https://rpc.mevblocker.io",
+          ]
+          SCROLL_RPCS = [
+              "https://scroll-rpc.publicnode.com",
+              "https://rpc.scroll.io",
+              "https://scroll.drpc.org",
+          ]
+          BLOCKSCOUT = "https://eth.blockscout.com"
+          ATTACKER = "0x1111111111111111111111111111111111111111"
+          NATIVE = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+
+          UNIV3_FACTORY = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+          UNIV3_QUOTER = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6"
+          UNIV2_FACTORY = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
+          SUSHI_V2_FACTORY = "0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac"
+          ZERO = "0x0000000000000000000000000000000000000000"
+
+          QUOTES = {
+              "WETH": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+              "weETH": "0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee",
+              "eETH": "0x35fA164735182de50811E8e2E824cFb9B6118ac2",
+              "wstETH": "0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0",
+              "WBTC": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
+              "LBTC": "0x8236a87084f8B84306f72007F36F2618A5634494",
+              "cbBTC": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
+              "eBTC": "0x657e8C867D8B37dCC18fA4Caead9C45EB088C642",
+              "USDC": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+              "USDT": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+              "DAI": "0x6B175474E89094C44Da98b954EedeAC495271d0F",
+              "USDe": "0x4c9EDD5852cd905f086C759E8383e09bff1E68B3",
+              "sUSDe": "0x9D39A5DE30e57443BfF2A8307A4256c8797A3497",
+          }
+
+          PRODUCTS = {
+              "liquidBTC": {
+                  "token": "0x5f46d540b6eD704C3c8789105F30E075AA900726",
+                  "accountant": "0xEa23aC6D7D11f6b181d6B98174D334478ADAe6b0",
+                  "teller": "0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353",
+                  "one_share": 10**8,
+                  "quote_names": ["WBTC", "LBTC", "cbBTC", "eBTC", "WETH", "USDC"],
+              },
+              "liquidETH": {
+                  "token": "0xf0bb20865277aBd641a307eCe5Ee04E79073416C",
+                  "accountant": "0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198",
+                  "teller": "0x9AA79C84b79816ab920bBcE20f8f74557B514734",
+                  "one_share": 10**18,
+                  "quote_names": ["WETH", "weETH", "eETH", "wstETH", "USDC", "USDT"],
+              },
+              "liquidUSD": {
+                  "token": "0x08c6F91e2B681FaF5e17227F2a44C307b3C1364C",
+                  "accountant": "0xc315D6e14DDCDC7407784e2Caf815d131Bc1D3E7",
+                  "teller": "0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387",
+                  "one_share": 10**6,
+                  "quote_names": ["USDC", "USDT", "DAI", "USDe", "sUSDe", "WETH"],
+              },
+          }
+
+          def sh(*args):
+              process = subprocess.run([str(x) for x in args], text=True, capture_output=True)
+              if process.returncode != 0:
+                  raise RuntimeError({"args": args, "stdout": process.stdout, "stderr": process.stderr})
+              return process.stdout.strip()
+
+          SIG = {
+              "get_pool": sh("cast", "sig", "getPool(address,address,uint24)"),
+              "get_pair": sh("cast", "sig", "getPair(address,address)"),
+              "token0": sh("cast", "sig", "token0()"),
+              "token1": sh("cast", "sig", "token1()"),
+              "factory": sh("cast", "sig", "factory()"),
+              "fee": sh("cast", "sig", "fee()"),
+              "liquidity": sh("cast", "sig", "liquidity()"),
+              "slot0": sh("cast", "sig", "slot0()"),
+              "reserves": sh("cast", "sig", "getReserves()"),
+              "balance_of": sh("cast", "sig", "balanceOf(address)"),
+              "decimals": sh("cast", "sig", "decimals()"),
+              "symbol": sh("cast", "sig", "symbol()"),
+              "name": sh("cast", "sig", "name()"),
+              "rate_quote": sh("cast", "sig", "getRateInQuoteSafe(address)"),
+              "quote_v3": sh("cast", "sig", "quoteExactInputSingle(address,address,uint24,uint256,uint160)"),
+              "can_send": sh("cast", "sig", "getAmountCanBeSent(uint32)"),
+              "can_receive": sh("cast", "sig", "getAmountCanBeReceived(uint32)"),
+              "preview_fee": sh("cast", "sig", "previewFee(uint96,address,bytes,address)"),
+              "coins": sh("cast", "sig", "coins(uint256)"),
+              "balances": sh("cast", "sig", "balances(uint256)"),
+              "read_tokens": sh("cast", "sig", "readTokens()"),
+              "asset_info": sh("cast", "sig", "assetInfo()"),
+              "exchange_rate": sh("cast", "sig", "exchangeRate()"),
+          }
+
+          def rpc(endpoint, method, params, timeout=40):
+              body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+              request = urllib.request.Request(endpoint, data=body, method="POST", headers={"content-type": "application/json", "user-agent": "veda-secondary-market/1.0"})
+              with urllib.request.urlopen(request, timeout=timeout) as response:
+                  payload = json.loads(response.read().decode())
+              if "error" in payload:
+                  raise RuntimeError(payload["error"])
+              return payload["result"]
+
+          def choose(rpcs, chain_id):
+              failures = {}
+              for endpoint in rpcs:
+                  try:
+                      if int(rpc(endpoint, "eth_chainId", []), 16) == chain_id:
+                          return endpoint, failures
+                  except Exception as exc:
+                      failures[endpoint] = repr(exc)
+              raise RuntimeError(failures)
+
+          def http_json(url, timeout=45):
+              request = urllib.request.Request(url, headers={"accept": "application/json", "user-agent": "veda-secondary-market/1.0"})
+              with urllib.request.urlopen(request, timeout=timeout) as response:
+                  return json.loads(response.read().decode())
+
+          def strip0(value):
+              value = str(value or "")
+              return value[2:] if value.startswith("0x") else value
+
+          def address_word(address):
+              return strip0(address).lower().rjust(64, "0")
+
+          def uint_word(value):
+              return hex(int(value))[2:].rjust(64, "0")
+
+          def decode_address(raw):
+              return None if not raw or raw == "0x" else "0x" + strip0(raw)[-40:].lower()
+
+          def decode_uint(raw):
+              return None if not raw or raw == "0x" else int(raw, 16)
+
+          def words(raw):
+              value = strip0(raw)
+              return [int(value[i:i+64], 16) for i in range(0, len(value), 64)] if value and len(value) % 64 == 0 else []
+
+          def decode_string(raw):
+              value = strip0(raw)
+              if not value:
+                  return None
+              try:
+                  if len(value) == 64:
+                      return bytes.fromhex(value).rstrip(b"\x00").decode(errors="replace")
+                  offset = int(value[:64], 16) * 2
+                  length = int(value[offset:offset+64], 16)
+                  return bytes.fromhex(value[offset+64:offset+64+length*2]).decode(errors="replace")
+              except Exception:
+                  return None
+
+          def call(endpoint, target, data, block="latest"):
+              return rpc(endpoint, "eth_call", [{"to": target, "data": data}, block])
+
+          def safe_call(endpoint, target, data, block="latest"):
+              try:
+                  return {"ok": True, "raw": call(endpoint, target, data, block)}
+              except Exception as exc:
+                  return {"ok": False, "error": repr(exc)}
+
+          def token_balance(endpoint, token, owner):
+              return decode_uint(call(endpoint, token, SIG["balance_of"] + address_word(owner))) or 0
+
+          def token_decimals(endpoint, token):
+              return decode_uint(call(endpoint, token, SIG["decimals"]))
+
+          def rate_in_quote(endpoint, accountant, quote):
+              try:
+                  return decode_uint(call(endpoint, accountant, SIG["rate_quote"] + address_word(quote)))
+              except Exception:
+                  return None
+
+          def v3_quote(endpoint, token_in, token_out, fee, amount):
+              data = SIG["quote_v3"] + address_word(token_in) + address_word(token_out) + uint_word(fee) + uint_word(amount) + uint_word(0)
+              return decode_uint(call(endpoint, UNIV3_QUOTER, data))
+
+          def get_pool(endpoint, token_a, token_b, fee):
+              return decode_address(call(endpoint, UNIV3_FACTORY, SIG["get_pool"] + address_word(token_a) + address_word(token_b) + uint_word(fee)))
+
+          def get_pair(endpoint, factory, token_a, token_b):
+              return decode_address(call(endpoint, factory, SIG["get_pair"] + address_word(token_a) + address_word(token_b)))
+
+          def holder_address(item):
+              address = item.get("address") or item.get("holder")
+              if isinstance(address, dict):
+                  address = address.get("hash") or address.get("address")
+              return str(address or "").lower()
+
+          def fetch_holders(token, max_pages=8):
+              url = f"{BLOCKSCOUT}/api/v2/tokens/{token}/holders"
+              params = {}
+              items, errors, seen = [], [], set()
+              pages = 0
+              while pages < max_pages:
+                  full = url + ("?" + urllib.parse.urlencode(params, doseq=True) if params else "")
+                  try:
+                      payload = http_json(full)
+                  except Exception as exc:
+                      errors.append({"url": full, "error": repr(exc)})
+                      break
+                  pages += 1
+                  batch = payload.get("items") or []
+                  for item in batch:
+                      address = holder_address(item)
+                      if address and address not in seen:
+                          seen.add(address)
+                          items.append(item)
+                  nxt = payload.get("next_page_params")
+                  if not nxt or not batch:
+                      break
+                  params = {key: value for key, value in nxt.items() if value is not None}
+                  time.sleep(0.08)
+              return items, pages, errors
+
+          def probe_contract(endpoint, address, product_token):
+              code = rpc(endpoint, "eth_getCode", [address, "latest"])
+              item = {
+                  "address": address.lower(),
+                  "code_bytes": len(strip0(code)) // 2,
+                  "share_balance": token_balance(endpoint, product_token, address),
+              }
+              if item["code_bytes"] == 0:
+                  return item
+              for field, selector, decoder in (
+                  ("name", SIG["name"], decode_string),
+                  ("symbol", SIG["symbol"], decode_string),
+                  ("token0", SIG["token0"], decode_address),
+                  ("token1", SIG["token1"], decode_address),
+                  ("factory", SIG["factory"], decode_address),
+                  ("fee", SIG["fee"], decode_uint),
+                  ("liquidity", SIG["liquidity"], decode_uint),
+                  ("reserves", SIG["reserves"], words),
+                  ("read_tokens", SIG["read_tokens"], lambda raw: ["0x" + strip0(raw)[i+24:i+64] for i in range(0, len(strip0(raw)), 64)] if raw and len(strip0(raw)) >= 192 else None),
+                  ("asset_info_raw", SIG["asset_info"], lambda raw: raw),
+                  ("exchange_rate", SIG["exchange_rate"], decode_uint),
+              ):
+                  result = safe_call(endpoint, address, selector)
+                  if result["ok"]:
+                      value = decoder(result["raw"])
+                      if value not in (None, [], "0x"):
+                          item[field] = value
+              coins = []
+              balances = []
+              for index in range(4):
+                  coin = safe_call(endpoint, address, SIG["coins"] + uint_word(index))
+                  if not coin["ok"]:
+                      break
+                  decoded_coin = decode_address(coin["raw"])
+                  if not decoded_coin or decoded_coin == ZERO.lower():
+                      break
+                  coins.append(decoded_coin)
+                  balance = safe_call(endpoint, address, SIG["balances"] + uint_word(index))
+                  balances.append(decode_uint(balance["raw"]) if balance["ok"] else None)
+              if coins:
+                  item["coins"] = coins
+                  item["coin_balances"] = balances
+              return item
+
+          eth, eth_failures = choose(ETH_RPCS, 1)
+          scroll, scroll_failures = choose(SCROLL_RPCS, 534352)
+          eth_block_hex = rpc(eth, "eth_blockNumber", [])
+          scroll_block_hex = rpc(scroll, "eth_blockNumber", [])
+          history = json.load(open("veda-rate-sync-history-v4.json", encoding="utf-8"))
+          bounty_start = 1768953600
+          historical_edges = {}
+          for product in PRODUCTS:
+              candidates = [
+                  window for window in history.get("asynchronous_windows", [])
+                  if window.get("product") == product
+                  and window.get("source") == "scroll"
+                  and window.get("destination") == "ethereum"
+                  and int(window.get("start_time", 0)) >= bounty_start
+              ]
+              historical_edges[product] = max([float(window.get("gross_rate_edge_bps", 0)) for window in candidates], default=0.0)
+
+          output = {
+              "generated_at_unix": int(time.time()),
+              "ethereum": {"endpoint": eth, "rpc_failures": eth_failures, "block": int(eth_block_hex, 16)},
+              "scroll": {"endpoint": scroll, "rpc_failures": scroll_failures, "block": int(scroll_block_hex, 16)},
+              "factories": {"uniswap_v3": UNIV3_FACTORY.lower(), "uniswap_v2": UNIV2_FACTORY.lower(), "sushi_v2": SUSHI_V2_FACTORY.lower(), "uniswap_v3_quoter": UNIV3_QUOTER.lower()},
+              "historical_max_scroll_to_ethereum_edge_bps": historical_edges,
+              "products": {},
+              "candidate_permissionless_exits": [],
+              "errors": [],
+          }
+
+          known_pool_addresses = set()
+          for product_name, product in PRODUCTS.items():
+              product_row = {
+                  "token": product["token"].lower(),
+                  "accountant": product["accountant"].lower(),
+                  "one_share": product["one_share"],
+                  "historical_max_edge_bps": historical_edges[product_name],
+                  "quotes": {},
+                  "uniswap_v3": [],
+                  "uniswap_v2": [],
+                  "sushi_v2": [],
+                  "contract_holders": [],
+              }
+              output["products"][product_name] = product_row
+              try:
+                  outbound_words = words(call(scroll, product["teller"], SIG["can_send"] + uint_word(30101)))
+                  inbound_words = words(call(eth, product["teller"], SIG["can_receive"] + uint_word(30214)))
+                  max_route_amount = min(outbound_words[1] if len(outbound_words) > 1 else 0, inbound_words[1] if len(inbound_words) > 1 else 0)
+                  product_row["scroll_outbound"] = outbound_words
+                  product_row["ethereum_inbound"] = inbound_words
+                  product_row["max_route_share_amount"] = max_route_amount
+                  wildcard = uint_word(30101)
+                  preview_data = SIG["preview_fee"] + uint_word(max_route_amount) + address_word(ATTACKER) + uint_word(128) + address_word(NATIVE) + uint_word(32) + wildcard
+                  preview = safe_call(scroll, product["teller"], preview_data)
+                  product_row["max_route_native_bridge_fee"] = decode_uint(preview["raw"]) if preview["ok"] else None
+                  if not preview["ok"]:
+                      product_row["bridge_fee_error"] = preview["error"]
+
+                  amounts = sorted({product["one_share"], max_route_amount} - {0})
+                  for quote_name in product["quote_names"]:
+                      quote = QUOTES[quote_name]
+                      quote_decimals = token_decimals(eth, quote)
+                      rate = rate_in_quote(eth, product["accountant"], quote)
+                      product_row["quotes"][quote_name] = {"address": quote.lower(), "decimals": quote_decimals, "accountant_rate_per_share": rate}
+
+                      for fee in (100, 500, 3000, 10000):
+                          try:
+                              pool = get_pool(eth, product["token"], quote, fee)
+                          except Exception as exc:
+                              output["errors"].append({"product": product_name, "venue": "uniswap_v3", "quote": quote_name, "fee": fee, "stage": "get_pool", "error": repr(exc)})
+                              continue
+                          if not pool or pool == ZERO.lower():
+                              continue
+                          known_pool_addresses.add(pool.lower())
+                          entry = {
+                              "pool": pool,
+                              "quote": quote_name,
+                              "quote_address": quote.lower(),
+                              "fee": fee,
+                              "fee_bps": fee / 100,
+                              "token0": decode_address(call(eth, pool, SIG["token0"])),
+                              "token1": decode_address(call(eth, pool, SIG["token1"])),
+                              "liquidity": decode_uint(call(eth, pool, SIG["liquidity"])),
+                              "slot0": words(call(eth, pool, SIG["slot0"])),
+                              "product_balance": token_balance(eth, product["token"], pool),
+                              "quote_balance": token_balance(eth, quote, pool),
+                              "quotes": [],
+                          }
+                          for amount in amounts:
+                              quote_entry = {"amount_in": amount}
+                              try:
+                                  amount_out = v3_quote(eth, product["token"], quote, fee, amount)
+                                  quote_entry["amount_out"] = amount_out
+                                  if rate:
+                                      nav = amount * rate // product["one_share"]
+                                      quote_entry["accountant_nav_out"] = nav
+                                      quote_entry["market_edge_bps"] = ((amount_out - nav) * 10000 / nav) if nav else None
+                                      quote_entry["historical_headroom_after_market_bps"] = historical_edges[product_name] + quote_entry["market_edge_bps"]
+                                      if amount == max_route_amount and quote_entry["historical_headroom_after_market_bps"] > 0:
+                                          output["candidate_permissionless_exits"].append({"product": product_name, "venue": "uniswap_v3", "pool": pool, "quote": quote_name, "fee": fee, **quote_entry})
+                              except Exception as exc:
+                                  quote_entry["quote_error"] = repr(exc)
+                              entry["quotes"].append(quote_entry)
+                          product_row["uniswap_v3"].append(entry)
+
+                      for venue, factory in (("uniswap_v2", UNIV2_FACTORY), ("sushi_v2", SUSHI_V2_FACTORY)):
+                          try:
+                              pair = get_pair(eth, factory, product["token"], quote)
+                          except Exception as exc:
+                              output["errors"].append({"product": product_name, "venue": venue, "quote": quote_name, "stage": "get_pair", "error": repr(exc)})
+                              continue
+                          if not pair or pair == ZERO.lower():
+                              continue
+                          known_pool_addresses.add(pair.lower())
+                          token0 = decode_address(call(eth, pair, SIG["token0"]))
+                          token1 = decode_address(call(eth, pair, SIG["token1"]))
+                          reserve_words = words(call(eth, pair, SIG["reserves"]))
+                          reserve0 = reserve_words[0] if len(reserve_words) > 0 else 0
+                          reserve1 = reserve_words[1] if len(reserve_words) > 1 else 0
+                          reserve_in, reserve_out = (reserve0, reserve1) if token0 == product["token"].lower() else (reserve1, reserve0)
+                          entry = {"pair": pair, "quote": quote_name, "quote_address": quote.lower(), "token0": token0, "token1": token1, "reserve0": reserve0, "reserve1": reserve1, "product_reserve": reserve_in, "quote_reserve": reserve_out, "quotes": []}
+                          for amount in amounts:
+                              amount_in_with_fee = amount * 997
+                              denominator = reserve_in * 1000 + amount_in_with_fee
+                              amount_out = amount_in_with_fee * reserve_out // denominator if denominator else 0
+                              quote_entry = {"amount_in": amount, "amount_out": amount_out}
+                              if rate:
+                                  nav = amount * rate // product["one_share"]
+                                  quote_entry["accountant_nav_out"] = nav
+                                  quote_entry["market_edge_bps"] = ((amount_out - nav) * 10000 / nav) if nav else None
+                                  quote_entry["historical_headroom_after_market_bps"] = historical_edges[product_name] + quote_entry["market_edge_bps"]
+                                  if amount == max_route_amount and quote_entry["historical_headroom_after_market_bps"] > 0:
+                                      output["candidate_permissionless_exits"].append({"product": product_name, "venue": venue, "pair": pair, "quote": quote_name, **quote_entry})
+                              entry["quotes"].append(quote_entry)
+                          product_row[venue].append(entry)
+
+                  holders, pages, holder_errors = fetch_holders(product["token"])
+                  product_row["holder_scan"] = {"pages": pages, "item_count": len(holders), "errors": holder_errors}
+                  contract_holders = []
+                  for holder in holders[:250]:
+                      address = holder_address(holder)
+                      if not address:
+                          continue
+                      code = rpc(eth, "eth_getCode", [address, "latest"])
+                      if len(strip0(code)) == 0:
+                          continue
+                      try:
+                          probed = probe_contract(eth, address, product["token"])
+                          probed["holder_value"] = holder.get("value") or holder.get("token_balance") or holder.get("balance")
+                          probed["known_factory_pool"] = address in known_pool_addresses
+                          contract_holders.append(probed)
+                      except Exception as exc:
+                          contract_holders.append({"address": address, "probe_error": repr(exc)})
+                  contract_holders.sort(key=lambda item: int(item.get("share_balance") or 0), reverse=True)
+                  product_row["contract_holders"] = contract_holders[:100]
+              except Exception as exc:
+                  product_row["error"] = repr(exc)
+                  product_row["traceback"] = traceback.format_exc()
+                  output["errors"].append({"product": product_name, "stage": "product", "error": repr(exc)})
+
+          output["summary"] = {
+              "v3_pool_count": sum(len(row.get("uniswap_v3", [])) for row in output["products"].values()),
+              "v2_pair_count": sum(len(row.get("uniswap_v2", [])) for row in output["products"].values()),
+              "sushi_pair_count": sum(len(row.get("sushi_v2", [])) for row in output["products"].values()),
+              "contract_holder_count": sum(len(row.get("contract_holders", [])) for row in output["products"].values()),
+              "candidate_permissionless_exit_count": len(output["candidate_permissionless_exits"]),
+              "errors": len(output["errors"]),
+          }
+          with open("veda-secondary-market.json", "w", encoding="utf-8") as handle:
+              json.dump(output, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+          print(json.dumps({
+              "summary": output["summary"],
+              "candidate_permissionless_exits": output["candidate_permissionless_exits"],
+              "venues": {
+                  name: {
+                      "max_route_share_amount": row.get("max_route_share_amount"),
+                      "bridge_fee": row.get("max_route_native_bridge_fee"),
+                      "v3": row.get("uniswap_v3"),
+                      "v2": row.get("uniswap_v2"),
+                      "sushi": row.get("sushi_v2"),
+                      "top_contract_holders": row.get("contract_holders", [])[:20],
+                  }
+                  for name, row in output["products"].items()
+              },
+              "errors": output["errors"][:50],
+          }, indent=2, sort_keys=True))
+          PY
+      - name: Upload secondary-market evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-secondary-market
+          path: veda-secondary-market.json
+          if-no-files-found: error
+          retention-days: 1
