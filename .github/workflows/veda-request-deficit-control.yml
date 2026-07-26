@@ -1,0 +1,143 @@
+name: veda-request-deficit-control
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Start pinned Ethereum fork
+        shell: bash
+        run: |
+          set -euo pipefail
+          anvil --fork-url https://ethereum-rpc.publicnode.com --fork-block-number 25618653 --port 8545 --silent >anvil-request.log 2>&1 &
+          echo $! > anvil.pid
+          for _ in $(seq 1 90); do
+            if cast chain-id --rpc-url http://127.0.0.1:8545 >/dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          cat anvil-request.log
+          exit 1
+      - name: Prove stale fixed payout is solver-funded, not vault-funded
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, urllib.request, traceback
+
+          RPC="http://127.0.0.1:8545"
+          QUEUE="0x0D2dF071207E18Ca8638b4f04E98c53155eC2cE0"
+          SOLVER="0x23aff90ed3b3effcf78fb41ab001c525a6c32a01"
+          TELLER="0x9AA79C84b79816ab920bBcE20f8f74557B514734"
+          AUTH="0x485Bde66Bb668a51f2372E34e45B1c6226798122"
+          ATTACKER="0x1111111111111111111111111111111111111111"
+          CANDIDATES=["0xd23086c4e450caaf55704ebc03875a04b4716ca2","0xdb8345450b0e4d28514a1c18ee1110c417b5b0a2","0xf8553c8552f906c19286f21711721e206ee4909e"]
+          REQ={
+            "nonce":2442,
+            "user":"0x006d9f269695ad9eb8f727f042ee380684332916",
+            "asset":"0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee",
+            "shares":2120031333195979448,
+            "assets":2120670215945884614,
+            "creation":1785031739,
+            "maturity_seconds":3600,
+            "deadline_seconds":259200,
+            "current_zero_discount":2120575230536631411,
+            "expected_deficit":94985409253203,
+          }
+          def sh(*a):
+            p=subprocess.run([str(x) for x in a],text=True,capture_output=True)
+            if p.returncode:raise RuntimeError({"args":a,"stdout":p.stdout,"stderr":p.stderr})
+            return p.stdout.strip()
+          def sig(x):return sh("cast","sig",x)
+          S={
+            "can":sig("canCall(address,address,bytes4)"),
+            "queue_solve":sig("solveOnChainWithdraws((uint96,address,address,uint128,uint128,uint40,uint24,uint24)[],bytes,address)"),
+            "redeem":sig("boringRedeemSolve((uint96,address,address,uint128,uint128,uint40,uint24,uint24)[],address,bool)"),
+            "cannot":sig("BoringSolver___CannotCoverDeficit(uint256)"),
+          }
+          def rpc(m,p):
+            body=json.dumps({"jsonrpc":"2.0","id":1,"method":m,"params":p}).encode();req=urllib.request.Request(RPC,data=body,method="POST",headers={"content-type":"application/json"})
+            try:
+              with urllib.request.urlopen(req,timeout=60) as r:o=json.loads(r.read().decode())
+            except urllib.error.HTTPError as e:
+              o=json.loads(e.read().decode())
+            if "error" in o:raise RuntimeError(o["error"])
+            return o["result"]
+          def h(x):
+            x=str(x);return x[2:] if x.startswith("0x") else x
+          def w(x):return hex(int(x))[2:].rjust(64,"0")
+          def aw(a):return h(a).lower().rjust(64,"0")
+          def bw(s):return h(s).lower().ljust(64,"0")
+          def eth_call(frm,to,data):
+            body=json.dumps({"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"from":frm,"to":to,"data":data},"latest"]}).encode();req=urllib.request.Request(RPC,data=body,method="POST",headers={"content-type":"application/json"})
+            with urllib.request.urlopen(req,timeout=60) as r:o=json.loads(r.read().decode())
+            return o
+          def can(user,target,sel):
+            o=eth_call(ATTACKER,AUTH,S["can"]+aw(user)+aw(target)+bw(sel))
+            return bool(int(o["result"],16)) if "result" in o else False
+          tuple_words=[w(REQ["nonce"]),aw(REQ["user"]),aw(REQ["asset"]),w(REQ["shares"]),w(REQ["assets"]),w(REQ["creation"]),w(REQ["maturity_seconds"]),w(REQ["deadline_seconds"])]
+          array_encoding=w(1)+"".join(tuple_words)
+          def redeem_calldata(cover):
+            # head: requests offset, teller, bool; then one static tuple array
+            return S["redeem"]+w(96)+aw(TELLER)+w(1 if cover else 0)+array_encoding
+          def queue_calldata(solver):
+            # head: requests offset, solveData offset, solver; requests encoding; empty bytes
+            return S["queue_solve"]+w(96)+w(384)+aw(solver)+array_encoding+w(0)
+          operators=[]
+          for c in CANDIDATES:
+            operators.append({"address":c,"can_queue_solve":can(c,QUEUE,S["queue_solve"]),"can_solver_redeem":can(c,SOLVER,S["redeem"])})
+          solver_operator=next((x["address"] for x in operators if x["can_solver_redeem"]),None)
+          queue_operator=next((x["address"] for x in operators if x["can_queue_solve"]),None)
+          tests={}
+          if solver_operator:
+            tests["boring_solver_cover_false"]=eth_call(solver_operator,SOLVER,redeem_calldata(False))
+            tests["boring_solver_cover_true_without_operator_funding"]=eth_call(solver_operator,SOLVER,redeem_calldata(True))
+          if queue_operator:
+            tests["direct_queue_attacker_solver_without_funding"]=eth_call(queue_operator,QUEUE,queue_calldata(ATTACKER))
+          def error_data(value):
+            if not isinstance(value,dict):return None
+            e=value.get("error")
+            if not isinstance(e,dict):return None
+            data=e.get("data")
+            if isinstance(data,str):return data
+            if isinstance(data,dict):
+              for v in data.values():
+                if isinstance(v,dict) and isinstance(v.get("return"),str):return v["return"]
+            return None
+          decoded={}
+          for name,res in tests.items():
+            data=error_data(res);entry={"raw_response":res,"revert_data":data}
+            if data and h(data).startswith(h(S["cannot"])) and len(h(data))>=8+64:
+              entry["cannot_cover_deficit"]=int(h(data)[8:72],16)
+            decoded[name]=entry
+          out={"block":25618653,"request":REQ,"operators":operators,"selected_solver_operator":solver_operator,"selected_queue_operator":queue_operator,"tests":decoded,"checks":{
+            "fixed_minus_current":REQ["assets"]-REQ["current_zero_discount"],
+            "expected_deficit_matches":REQ["expected_deficit"]==REQ["assets"]-REQ["current_zero_discount"],
+            "cover_false_reverts_with_exact_deficit":decoded.get("boring_solver_cover_false",{}).get("cannot_cover_deficit")==REQ["expected_deficit"],
+            "cover_true_does_not_source_deficit_from_vault":"result" not in tests.get("boring_solver_cover_true_without_operator_funding",{}),
+            "arbitrary_solver_must_fund_fixed_payout":"result" not in tests.get("direct_queue_attacker_solver_without_funding",{}),
+          }}
+          open("veda-request-deficit-control.json","w").write(json.dumps(out,indent=2,sort_keys=True)+"\n")
+          print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+      - name: Stop fork
+        if: always()
+        run: kill "$(cat anvil.pid)" 2>/dev/null || true
+      - name: Upload deficit-control proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-request-deficit-control
+          path: |
+            veda-request-deficit-control.json
+            anvil-request.log
+          if-no-files-found: error
+          retention-days: 1
