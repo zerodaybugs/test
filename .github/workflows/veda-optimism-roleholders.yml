@@ -1,0 +1,201 @@
+name: veda-optimism-roleholders
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Reconstruct and inspect Optimism role holders
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, time, urllib.parse, urllib.request, traceback
+
+          BASE="https://explorer.optimism.io"
+          RPCS=["https://optimism-rpc.publicnode.com","https://mainnet.optimism.io","https://optimism.drpc.org"]
+          ATTACKER="0x1111111111111111111111111111111111111111"
+          SENTINEL="0x0000000000000000000000000000000000000001"
+          AUTHORITIES={
+            "liquidBTC":"0x49F954c67ff235034b69b8a59fbe309A40256c8d",
+            "liquidETH":"0x485Bde66Bb668a51f2372E34e45B1c6226798122",
+            "liquidUSD":"0xff90f1B24DFBD25F439B94ed090F373BDE24f60E",
+          }
+          EXPECTED_CORE={x.lower() for x in [
+            "0x5f46d540b6eD704C3c8789105F30E075AA900726","0xf0bb20865277aBd641a307eCe5Ee04E79073416C","0x08c6F91e2B681FaF5e17227F2a44C307b3C1364C",
+            "0xEa23aC6D7D11f6b181d6B98174D334478ADAe6b0","0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198","0xc315D6e14DDCDC7407784e2Caf815d131Bc1D3E7",
+            "0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353","0x9AA79C84b79816ab920bBcE20f8f74557B514734","0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387",
+            "0x77A2fd42F8769d8063F2E75061FC200014E41Edf","0x0D2dF071207E18Ca8638b4f04E98c53155eC2cE0","0x38FC1BA73b7ED289955a07d9F11A85b6E388064A",
+            "0xed41172438897bcb22c9dd72b9f9bbf9a8bf8929","0x23aff90ed3b3effcf78fb41ab001c525a6c32a01","0x92b10e02825986bac2375bdacafa3e89e3f612aa",
+          ]}
+          def shell(*args):
+            proc=subprocess.run([str(x) for x in args],text=True,capture_output=True)
+            if proc.returncode: raise RuntimeError({"args":args,"stdout":proc.stdout,"stderr":proc.stderr})
+            return proc.stdout.strip()
+          TOPIC=shell("cast","keccak","UserRoleUpdated(address,uint8,bool)").lower()
+          SIG={name:shell("cast","sig",signature) for name,signature in {
+            "roles":"getUserRoles(address)","owner":"owner()","authority":"authority()","can":"canCall(address,address,bytes4)",
+            "getOwners":"getOwners()","getThreshold":"getThreshold()","getModules":"getModulesPaginated(address,uint256)","getGuard":"getGuard()",
+            "isDeployer":"isDeployer(address)","execModule":"execTransactionFromModule(address,uint256,bytes,uint8)",
+          }.items()}
+          def http_json(url,timeout=60,retries=5):
+            last=None
+            for attempt in range(retries):
+              try:
+                request=urllib.request.Request(url,headers={"accept":"application/json","user-agent":"veda-optimism-roleholders/1"})
+                with urllib.request.urlopen(request,timeout=timeout) as response:return json.loads(response.read().decode())
+              except Exception as exc:
+                last=repr(exc);time.sleep(min(4,.4*(2**attempt)))
+            raise RuntimeError({"url":url,"error":last})
+          def rpc(endpoint,method,params,timeout=35):
+            body=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
+            request=urllib.request.Request(endpoint,data=body,method="POST",headers={"content-type":"application/json","user-agent":"veda-optimism-roleholders/1"})
+            with urllib.request.urlopen(request,timeout=timeout) as response:payload=json.loads(response.read().decode())
+            if "error" in payload:raise RuntimeError(payload["error"])
+            return payload["result"]
+          endpoint=None;rpc_failures={}
+          for candidate in RPCS:
+            try:
+              if int(rpc(candidate,"eth_chainId",[]),16)==10:endpoint=candidate;break
+            except Exception as exc:rpc_failures[candidate]=repr(exc)
+          if not endpoint:raise RuntimeError(rpc_failures)
+          def strip0(value):
+            text=str(value or "");return text[2:] if text.startswith("0x") else text
+          def norm_topic(value):
+            if isinstance(value,dict):value=value.get("value") or value.get("hex") or value.get("data")
+            return str(value or "").lower()
+          def aw(address):return strip0(address).lower().rjust(64,"0")
+          def uw(value):return hex(int(value))[2:].rjust(64,"0")
+          def bw(value):return strip0(value).lower().ljust(64,"0")
+          def decode_address(raw):return None if not raw or raw=="0x" else "0x"+strip0(raw)[-40:].lower()
+          def decode_uint(raw):return None if not raw or raw=="0x" else int(raw,16)
+          def decode_address_array(raw):
+            value=strip0(raw)
+            try:
+              offset=int(value[:64],16)*2;length=int(value[offset:offset+64],16);cursor=offset+64
+              return ["0x"+value[cursor+i*64+24:cursor+(i+1)*64].lower() for i in range(length)]
+            except Exception:return None
+          def decode_modules(raw):
+            value=strip0(raw)
+            try:
+              offset=int(value[:64],16)*2;next_addr="0x"+value[64+24:128].lower();length=int(value[offset:offset+64],16);cursor=offset+64
+              return {"modules":["0x"+value[cursor+i*64+24:cursor+(i+1)*64].lower() for i in range(length)],"next":next_addr}
+            except Exception:return None
+          def eth_call(to,data,from_address=None):
+            tx={"to":to,"data":data}
+            if from_address:tx["from"]=from_address
+            return rpc(endpoint,"eth_call",[tx,"latest"])
+          def safe_call(to,data,from_address=None):
+            try:return {"ok":True,"raw":eth_call(to,data,from_address)}
+            except Exception as exc:return {"ok":False,"error":repr(exc)}
+          def fetch_logs(address):
+            url=f"{BASE}/api/v2/addresses/{address}/logs";params={};items=[];seen=set();errors=[];pages=0
+            while True:
+              full=url+("?"+urllib.parse.urlencode(params,doseq=True) if params else "")
+              try:payload=http_json(full)
+              except Exception as exc:errors.append({"url":full,"error":repr(exc)});break
+              pages+=1;batch=payload.get("items") or []
+              for item in batch:
+                key=(item.get("transaction_hash"),item.get("index") or item.get("log_index"),item.get("block_number"))
+                if key not in seen:seen.add(key);items.append(item)
+              nxt=payload.get("next_page_params")
+              if not nxt or not batch:break
+              params={k:v for k,v in nxt.items() if v is not None}
+              if pages>=2000:errors.append({"error":"pagination_guard"});break
+              time.sleep(.03)
+            return items,pages,errors
+          def canonical_type(item):
+            typ=item.get("type") or ""
+            if typ.startswith("tuple"):
+              suffix=typ[5:]
+              return "("+",".join(canonical_type(component) for component in item.get("components",[]))+")"+suffix
+            return typ
+          def abi_signature(item):return f"{item.get('name')}({','.join(canonical_type(value) for value in item.get('inputs',[]))})"
+          def smart_contract(address):
+            try:return http_json(f"{BASE}/api/v2/smart-contracts/{address}")
+            except Exception as exc:return {"fetch_error":repr(exc)}
+          block=int(rpc(endpoint,"eth_blockNumber",[]),16)
+          output={"block":block,"rpc":endpoint,"rpc_failures":rpc_failures,"topic":TOPIC,"authorities":{},"holders":{},"flags":[],"errors":[]}
+          candidates=set()
+          for product,authority in AUTHORITIES.items():
+            row={"address":authority.lower()};output["authorities"][product]=row
+            try:
+              logs,pages,errors=fetch_logs(authority);row.update({"raw_log_count":len(logs),"pages":pages,"fetch_errors":errors})
+              users=set()
+              events=[]
+              for item in logs:
+                topics=[norm_topic(value) for value in item.get("topics") or []]
+                if not topics or topics[0]!=TOPIC or len(topics)<3:continue
+                user="0x"+strip0(topics[1])[-40:].lower();role=int(topics[2],16);data=strip0(item.get("data"));enabled=bool(int(data[:64],16)) if len(data)>=64 else None
+                users.add(user);events.append({"user":user,"role":role,"enabled":enabled,"block":int(str(item.get("block_number") or "0"),0) if str(item.get("block_number") or "0").startswith("0x") else int(item.get("block_number") or 0),"tx":item.get("transaction_hash")})
+              owner=decode_address(eth_call(authority,SIG["owner"]));row["owner"]=owner;users.add(owner) if owner else None
+              current=[]
+              for user in sorted(users):
+                bitmap=decode_uint(eth_call(authority,SIG["roles"]+aw(user))) or 0
+                if bitmap:
+                  current.append({"address":user,"bitmap":bitmap,"roles":[role for role in range(256) if bitmap>>role&1]});candidates.add(user)
+              if owner:candidates.add(owner)
+              row.update({"event_count":len(events),"event_users":len(users),"current_holders":current})
+            except Exception as exc:
+              row["error"]=repr(exc);row["traceback"]=traceback.format_exc();output["errors"].append({"product":product,"error":repr(exc)})
+          for address in sorted(candidates):
+            holder={"address":address,"expected_core":address in EXPECTED_CORE};output["holders"][address]=holder
+            try:
+              code=rpc(endpoint,"eth_getCode",[address,"latest"]);holder["code_bytes"]=len(strip0(code))//2;holder["eip7702"]=strip0(code).lower().startswith("ef0100")
+              holder["products_roles"]={product:[entry for entry in row.get("current_holders",[]) if entry["address"]==address] for product,row in output["authorities"].items() if any(entry["address"]==address for entry in row.get("current_holders",[]))}
+              if holder["code_bytes"]:
+                owners=safe_call(address,SIG["getOwners"]);threshold=safe_call(address,SIG["getThreshold"]);modules=safe_call(address,SIG["getModules"]+aw(SENTINEL)+uw(100));guard=safe_call(address,SIG["getGuard"])
+                owner=safe_call(address,SIG["owner"]);authority=safe_call(address,SIG["authority"]);deployer=safe_call(address,SIG["isDeployer"]+aw(ATTACKER))
+                holder.update({"safe_owners":decode_address_array(owners.get("raw")) if owners.get("ok") else None,"safe_threshold":decode_uint(threshold.get("raw")) if threshold.get("ok") else None,"safe_modules":decode_modules(modules.get("raw")) if modules.get("ok") else None,"guard":decode_address(guard.get("raw")) if guard.get("ok") else None,"owner":decode_address(owner.get("raw")) if owner.get("ok") else None,"authority":decode_address(authority.get("raw")) if authority.get("ok") else None,"attacker_is_deployer":bool(decode_uint(deployer.get("raw"))) if deployer.get("ok") and deployer.get("raw") not in (None,"0x") else None})
+                metadata=smart_contract(address);holder["verified_name"]=metadata.get("name") or metadata.get("contract_name");abi=metadata.get("abi")
+                if isinstance(abi,str):
+                  try:abi=json.loads(abi)
+                  except Exception:abi=[]
+                abi=abi if isinstance(abi,list) else []
+                generic=[]
+                for item in abi:
+                  if not isinstance(item,dict) or item.get("type")!="function":continue
+                  name=str(item.get("name") or "")
+                  if any(term in name.lower() for term in ("execute","manage","multicall","delegate","call","batch","forward")):
+                    signature=abi_signature(item)
+                    try:selector=shell("cast","sig",signature)
+                    except Exception:selector=None
+                    auth_can=None
+                    if selector and holder.get("authority") and holder["authority"]!="0x0000000000000000000000000000000000000000":
+                      try:auth_can=bool(int(eth_call(holder["authority"],SIG["can"]+aw(ATTACKER)+aw(address)+bw(selector)),16))
+                      except Exception:auth_can=None
+                    generic.append({"signature":signature,"selector":selector,"state_mutability":item.get("stateMutability"),"attacker_can_via_authority":auth_can})
+                holder["generic_abi_functions"]=generic
+                holder["owner_code"]={}
+                for owner_address in holder.get("safe_owners") or ([holder["owner"]] if holder.get("owner") else []):
+                  owner_code=rpc(endpoint,"eth_getCode",[owner_address,"latest"]);holder["owner_code"][owner_address]={"code_bytes":len(strip0(owner_code))//2,"eip7702":strip0(owner_code).lower().startswith("ef0100")}
+              reasons=[]
+              if holder.get("attacker_is_deployer"):reasons.append("attacker_is_deployer")
+              if (holder.get("safe_modules") or {}).get("modules"):reasons.append("safe_modules")
+              if holder.get("eip7702"):reasons.append("holder_eip7702")
+              if any(value.get("code_bytes") or value.get("eip7702") for value in (holder.get("owner_code") or {}).values()):reasons.append("non_eoa_safe_owner")
+              if any(item.get("attacker_can_via_authority") for item in holder.get("generic_abi_functions") or []):reasons.append("attacker_generic_auth")
+              if reasons:output["flags"].append({"address":address,"reasons":reasons})
+            except Exception as exc:
+              holder["error"]=repr(exc);holder["traceback"]=traceback.format_exc()
+          output["summary"]={"candidate_count":len(candidates),"code_holder_count":sum(1 for holder in output["holders"].values() if holder.get("code_bytes")),"flag_count":len(output["flags"]),"errors":len(output["errors"])}
+          with open("veda-optimism-roleholders.json","w",encoding="utf-8") as handle:json.dump(output,handle,indent=2,sort_keys=True);handle.write("\n")
+          print(json.dumps({"summary":output["summary"],"authorities":output["authorities"],"flags":output["flags"],"code_holders":{address:holder for address,holder in output["holders"].items() if holder.get("code_bytes")},"errors":output["errors"]},indent=2,sort_keys=True))
+          PY
+      - name: Upload Optimism role-holder proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-optimism-roleholders
+          path: veda-optimism-roleholders.json
+          if-no-files-found: error
+          retention-days: 1
