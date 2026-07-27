@@ -1,0 +1,105 @@
+name: veda-latest-delayed-delivery
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Correlate pre-update sends with post-update deliveries
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json,subprocess,time,urllib.parse,urllib.request
+          from pathlib import Path
+
+          ETH_UPDATE_BLOCK=25_612_581
+          SCROLL_UPDATE_BLOCK=34_473_600
+          UPDATE_TIME=1_785_016_151
+          SCROLL_CATCHUP_TIME=1_785_016_281
+          SOURCE_FROM_BLOCK=34_472_900
+          SOURCE_TO_BLOCK=34_473_600
+          DEST_FROM_BLOCK=25_612_500
+          DEST_TO_BLOCK=25_614_500
+          PRODUCTS={
+            'liquidUSD':{'teller':'0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387','accountant':'0xc315D6e14DDCDC7407784e2Caf815d131Bc1D3E7','one':10**6},
+            'liquidETH':{'teller':'0x9AA79C84b79816ab920bBcE20f8f74557B514734','accountant':'0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198','one':10**18},
+            'liquidBTC':{'teller':'0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353','accountant':'0xEa23aC6D7D11f6b181d6B98174D334478ADAe6b0','one':10**8},
+          }
+          SCROLL_API='https://scroll.blockscout.com/api';ETH_API='https://eth.blockscout.com/api'
+          SCROLL_RPCS=['https://scroll-rpc.publicnode.com','https://rpc.scroll.io','https://scroll.drpc.org'];ETH_RPCS=['https://ethereum-rpc.publicnode.com','https://eth.drpc.org','https://rpc.mevblocker.io']
+          def k(s):return subprocess.check_output(['cast','keccak',s],text=True).strip().lower()
+          def sig(s):return subprocess.check_output(['cast','sig',s],text=True).strip().lower()
+          SENT=k('MessageSent(bytes32,uint256,address)');RECEIVED=k('MessageReceived(bytes32,uint256,address)');GET_RATE=sig('getRate()')
+          def get(url,retries=4):
+            last=None
+            for i in range(retries):
+              try:
+                req=urllib.request.Request(url,headers={'accept':'application/json','user-agent':'Mozilla/5.0 VedaResearch/7.0'})
+                with urllib.request.urlopen(req,timeout=55) as r:return json.loads(r.read().decode())
+              except Exception as e:last=e;time.sleep(.25*(i+1))
+            raise last
+          def rpc(url,m,p,timeout=45):
+            body=json.dumps({'jsonrpc':'2.0','id':1,'method':m,'params':p}).encode();req=urllib.request.Request(url,data=body,method='POST',headers={'content-type':'application/json','user-agent':'veda-delayed-delivery/1'})
+            with urllib.request.urlopen(req,timeout=timeout) as r:o=json.loads(r.read().decode())
+            if 'error'in o:raise RuntimeError(o['error'])
+            return o['result']
+          def choose(cands,cid):
+            bad={}
+            for u in cands:
+              try:
+                if int(rpc(u,'eth_chainId',[]),16)!=cid:raise RuntimeError('wrong chain')
+                return u,bad
+              except Exception as e:bad[u]=repr(e)
+            raise RuntimeError(bad)
+          scroll,sbad=choose(SCROLL_RPCS,534352);eth,ebad=choose(ETH_RPCS,1)
+          def legacy(base,address,topic0,lo,hi,topic1=None):
+            q={'module':'logs','action':'getLogs','fromBlock':str(lo),'toBlock':str(hi),'address':address,'topic0':topic0}
+            if topic1:q.update({'topic1':topic1,'topic0_1_opr':'and'})
+            d=get(base+'?'+urllib.parse.urlencode(q));r=d.get('result')
+            if isinstance(r,list):return r
+            if 'No logs found' in (str(d.get('message'))+' '+str(r)):return []
+            raise RuntimeError(d)
+          def num(v):
+            s=str(v or '0');return int(s,16) if s.startswith('0x') else int(s)
+          def block_ts(url,b):return int(rpc(url,'eth_getBlockByNumber',[hex(b),False])['timestamp'],16)
+          def rate(url,accountant,b):return int(rpc(url,'eth_call',[{'to':accountant,'data':GET_RATE},hex(b)]),16)
+          events=[];errors=[]
+          for product,cfg in PRODUCTS.items():
+            try:rows=legacy(SCROLL_API,cfg['teller'],SENT,SOURCE_FROM_BLOCK,SOURCE_TO_BLOCK)
+            except Exception as e:errors.append({'product':product,'stage':'source_logs','error':repr(e)});continue
+            blocks=sorted({num(x['blockNumber']) for x in rows});timestamps={b:block_ts(scroll,b) for b in blocks}
+            for row in rows:
+              b=num(row['blockNumber']);ts=timestamps[b]
+              if not (UPDATE_TIME-1800<=ts<SCROLL_CATCHUP_TIME):continue
+              topics=[x.lower() for x in row.get('topics',[]) if isinstance(x,str)];guid=topics[1] if len(topics)>1 else None;shares=int(row.get('data')or'0x0',16)
+              item={'product':product,'source_block':b,'source_timestamp':ts,'source_tx':row.get('transactionHash'),'guid':guid,'shares_raw':shares,'recipient':'0x'+topics[2][-40:] if len(topics)>2 else None}
+              try:
+                delivered=legacy(ETH_API,cfg['teller'],RECEIVED,DEST_FROM_BLOCK,DEST_TO_BLOCK,guid)
+                item['delivery_found']=bool(delivered)
+                if delivered:
+                  d=delivered[0];db=num(d['blockNumber']);dt=block_ts(eth,db);sr=rate(scroll,cfg['accountant'],b);dr=rate(eth,cfg['accountant'],db);item.update({'destination_block':db,'destination_timestamp':dt,'destination_tx':d.get('transactionHash'),'source_rate':sr,'destination_rate':dr,'rate_edge_raw':dr-sr,'gross_extra_base_raw':shares*max(0,dr-sr)//cfg['one'],'post_update_delivery':dt>=UPDATE_TIME})
+                events.append(item)
+              except Exception as e:errors.append({'product':product,'stage':'delivery','guid':guid,'error':repr(e)});events.append(item)
+          positive=[x for x in events if x.get('delivery_found') and x.get('post_update_delivery') and x.get('rate_edge_raw',0)>0]
+          out={'generated_at_unix':int(time.time()),'ethereum_update_block':ETH_UPDATE_BLOCK,'scroll_update_block':SCROLL_UPDATE_BLOCK,'update_time':UPDATE_TIME,'scroll_catchup_time':SCROLL_CATCHUP_TIME,'source_range':[SOURCE_FROM_BLOCK,SOURCE_TO_BLOCK],'destination_range':[DEST_FROM_BLOCK,DEST_TO_BLOCK],'rpc_failures':{'scroll':sbad,'ethereum':ebad},'candidate_send_count':len(events),'delivered_count':sum(1 for x in events if x.get('delivery_found')),'positive_delayed_delivery_count':len(positive),'sum_positive_extra_by_product':{p:sum(x.get('gross_extra_base_raw',0) for x in positive if x['product']==p) for p in PRODUCTS},'max_positive_extra_by_product':{p:max([x.get('gross_extra_base_raw',0) for x in positive if x['product']==p]or[0]) for p in PRODUCTS},'events':events,'positive_delayed_deliveries':positive,'errors':errors}
+          Path('veda-latest-delayed-delivery.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n');print(json.dumps({k:out[k] for k in ['candidate_send_count','delivered_count','positive_delayed_delivery_count','sum_positive_extra_by_product','max_positive_extra_by_product']},indent=2));print('errors',len(errors))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: veda-latest-delayed-delivery
+          path: veda-latest-delayed-delivery.json
+          if-no-files-found: error
+          retention-days: 1
