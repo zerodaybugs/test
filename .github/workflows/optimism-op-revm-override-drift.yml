@@ -1,0 +1,219 @@
+name: Optimism op-revm semantic override drift inventory
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/optimism-op-revm-override-drift.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout production tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ethereum-optimism/optimism
+          ref: op-reth/v2.3.3
+          path: production
+          fetch-depth: 1
+          submodules: false
+
+      - name: Checkout current develop
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ethereum-optimism/optimism
+          ref: develop
+          path: develop
+          fetch-depth: 1
+          submodules: false
+
+      - name: Verify production lock
+        run: test "$(git -C production rev-parse HEAD)" = "20636578d271888a492ecb566a788570cdc0d7f0"
+
+      - name: Install Rust toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.94.0 --profile minimal
+          rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Fetch exact production and develop dependency sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd production/rust && cargo +1.94.0 fetch --locked)
+          (cd develop/rust && cargo +1.95.0 fetch --locked)
+
+      - name: Build override-drift inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import difflib
+          import hashlib
+          import json
+          import re
+          from dataclasses import dataclass, asdict
+          from pathlib import Path
+
+          PROD_OP = Path("production/rust/op-revm/src/handler.rs")
+          DEV_OP = Path("develop/rust/op-revm/src/handler.rs")
+
+          def locate(version: str) -> Path:
+              roots = list(Path.home().glob(f".cargo/registry/src/*/revm-handler-{version}/src/handler.rs"))
+              if len(roots) != 1:
+                  raise SystemExit(f"expected one revm-handler {version}, found {roots}")
+              return roots[0]
+
+          PROD_UP = locate("40.0.3")
+          DEV_UP = locate("41.0.0")
+
+          IMPL_RE = re.compile(r"impl<[^>]*>\s+Handler\s+for\s+OpHandler[^\{]*\{", re.S)
+          TRAIT_RE = re.compile(r"pub\s+trait\s+Handler\s*\{", re.S)
+          FN_RE = re.compile(r"(?m)^\s*fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+          def block_at(text: str, brace: int) -> tuple[int, int]:
+              depth = 0
+              for i in range(brace, len(text)):
+                  if text[i] == "{":
+                      depth += 1
+                  elif text[i] == "}":
+                      depth -= 1
+                      if depth == 0:
+                          return brace, i + 1
+              raise ValueError("unbalanced braces")
+
+          def container(text: str, pattern: re.Pattern[str]) -> str:
+              m = pattern.search(text)
+              if not m:
+                  raise ValueError(f"container not found: {pattern.pattern}")
+              brace = text.find("{", m.start(), m.end())
+              a, b = block_at(text, brace)
+              return text[a + 1:b - 1]
+
+          def functions(body: str) -> dict[str, str]:
+              out: dict[str, str] = {}
+              matches = list(FN_RE.finditer(body))
+              for m in matches:
+                  name = m.group(1)
+                  brace = body.find("{", m.end())
+                  semi = body.find(";", m.end())
+                  if semi >= 0 and (brace < 0 or semi < brace):
+                      out[name] = body[m.start():semi + 1].strip()
+                      continue
+                  if brace < 0:
+                      continue
+                  a, b = block_at(body, brace)
+                  out[name] = body[m.start():b].strip()
+              return out
+
+          def normalized(value: str | None) -> str:
+              if value is None:
+                  return ""
+              value = re.sub(r"//.*", "", value)
+              value = re.sub(r"/\*.*?\*/", "", value, flags=re.S)
+              return re.sub(r"\s+", " ", value).strip()
+
+          def digest(value: str | None) -> str:
+              return hashlib.sha256(normalized(value).encode()).hexdigest()[:16]
+
+          prod_op_text = PROD_OP.read_text()
+          dev_op_text = DEV_OP.read_text()
+          prod_up_text = PROD_UP.read_text()
+          dev_up_text = DEV_UP.read_text()
+
+          prod_op = functions(container(prod_op_text, IMPL_RE))
+          dev_op = functions(container(dev_op_text, IMPL_RE))
+          prod_up = functions(container(prod_up_text, TRAIT_RE))
+          dev_up = functions(container(dev_up_text, TRAIT_RE))
+
+          method_names = sorted(set(prod_op) | set(dev_op))
+          records = []
+          flagged = []
+          report = [
+              "# OP handler semantic override drift inventory",
+              "",
+              "This is a review inventory, not a vulnerability classification.",
+              "",
+              f"- production OP: `{PROD_OP}`",
+              f"- production upstream: `{PROD_UP}`",
+              f"- develop OP: `{DEV_OP}`",
+              f"- develop upstream: `{DEV_UP}`",
+              "",
+          ]
+
+          for name in method_names:
+              rec = {
+                  "method": name,
+                  "production_op_hash": digest(prod_op.get(name)),
+                  "production_upstream_hash": digest(prod_up.get(name)),
+                  "develop_op_hash": digest(dev_op.get(name)),
+                  "develop_upstream_hash": digest(dev_up.get(name)),
+                  "upstream_changed": normalized(prod_up.get(name)) != normalized(dev_up.get(name)),
+                  "op_changed": normalized(prod_op.get(name)) != normalized(dev_op.get(name)),
+                  "production_override_present": name in prod_op,
+                  "develop_override_present": name in dev_op,
+              }
+              rec["review_priority"] = (
+                  "P0" if rec["upstream_changed"] and not rec["op_changed"] else
+                  "P1" if rec["upstream_changed"] else
+                  "P2"
+              )
+              records.append(rec)
+              if rec["review_priority"] in {"P0", "P1"}:
+                  flagged.append(name)
+
+              report.extend([
+                  f"## `{name}` — {rec['review_priority']}",
+                  "",
+                  f"- upstream changed: `{rec['upstream_changed']}`",
+                  f"- OP override changed: `{rec['op_changed']}`",
+                  f"- hashes: prod-op `{rec['production_op_hash']}`, prod-up `{rec['production_upstream_hash']}`, dev-op `{rec['develop_op_hash']}`, dev-up `{rec['develop_upstream_hash']}`",
+                  "",
+              ])
+              if rec["upstream_changed"]:
+                  diff = difflib.unified_diff(
+                      (prod_up.get(name) or "<missing>").splitlines(),
+                      (dev_up.get(name) or "<missing>").splitlines(),
+                      fromfile=f"revm-handler-40.0.3::{name}",
+                      tofile=f"revm-handler-41.0.0::{name}",
+                      lineterm="",
+                  )
+                  report.extend(["```diff", *list(diff), "```", ""])
+              if rec["op_changed"]:
+                  diff = difflib.unified_diff(
+                      (prod_op.get(name) or "<missing>").splitlines(),
+                      (dev_op.get(name) or "<missing>").splitlines(),
+                      fromfile=f"op-revm-production::{name}",
+                      tofile=f"op-revm-develop::{name}",
+                      lineterm="",
+                  )
+                  report.extend(["```diff", *list(diff), "```", ""])
+
+          Path("evidence/override-drift.json").write_text(json.dumps({
+              "production_commit": "20636578d271888a492ecb566a788570cdc0d7f0",
+              "production_revm_handler": "40.0.3",
+              "develop_revm_handler": "41.0.0",
+              "flagged_methods": flagged,
+              "records": records,
+          }, indent=2) + "\n")
+          Path("evidence/override-drift.md").write_text("\n".join(report) + "\n")
+          print(json.dumps({"methods": len(records), "flagged": flagged}, indent=2))
+          PY
+
+      - name: Upload inventory
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: optimism-op-revm-override-drift
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
