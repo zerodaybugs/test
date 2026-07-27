@@ -1,0 +1,112 @@
+name: veda-accountant-bounds
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Audit live accountant constructor-bound state
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, time, urllib.request
+
+          ACCOUNTS={
+            'ethereum':{
+              'liquidETH':'0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198',
+              'liquidBTC':'0xEa23aC6D7D11f6b181d6B98174D334478ADAe6b0',
+              'liquidUSD':'0xc315D6e14DDCDC7407784e2Caf815d131Bc1D3E7',
+            },
+            'scroll':{
+              'liquidETH':'0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198',
+              'liquidBTC':'0xEa23aC6D7D11f6b181d6B98174D334478ADAe6b0',
+              'liquidUSD':'0xc315D6e14DDCDC7407784e2Caf815d131Bc1D3E7',
+            },
+            'ink':{
+              'balanced':'0x0C4dF79d9e35E5C4876BC1aE4663E834312DDc67',
+              'boosted':'0x9c2477D4Ea17d3cCC45e6b1087c94d14926F54C9',
+            },
+          }
+          RPCS={
+            'ethereum':['https://ethereum-rpc.publicnode.com','https://eth.drpc.org','https://rpc.mevblocker.io'],
+            'scroll':['https://scroll-rpc.publicnode.com','https://rpc.scroll.io','https://scroll.drpc.org'],
+            'ink':['https://rpc-gel.inkonchain.com'],
+          }
+          IDS={'ethereum':1,'scroll':534352,'ink':57073}
+          def sig(s):return subprocess.check_output(['cast','sig',s],text=True).strip()
+          STATE=sig('accountantState()')
+          EXTRA={x:sig(x) for x in ['maxDeviationYield()','maxDeviationLoss()','minimumVestingTime()','maximumVestingTime()','lastStrategistUpdateTimestamp()','lastVirtualSharePrice()']}
+          def rpc(url,m,p):
+            body=json.dumps({'jsonrpc':'2.0','id':1,'method':m,'params':p}).encode();req=urllib.request.Request(url,data=body,method='POST',headers={'content-type':'application/json','user-agent':'veda-accountant-bounds/1'})
+            with urllib.request.urlopen(req,timeout=35) as r:o=json.loads(r.read().decode())
+            if 'error' in o:raise RuntimeError(o['error'])
+            return o['result']
+          def choose(chain):
+            bad={}
+            for u in RPCS[chain]:
+              try:
+                if int(rpc(u,'eth_chainId',[]),16)!=IDS[chain]:raise RuntimeError('wrong chain')
+                return u,int(rpc(u,'eth_blockNumber',[]),16),bad
+              except Exception as e:bad[u]=repr(e)
+            raise RuntimeError(bad)
+          def call(url,to,data):return rpc(url,'eth_call',[{'to':to,'data':data},'latest'])
+          def words(raw):
+            x=raw[2:];return [int(x[i:i+64],16) for i in range(0,len(x),64)]
+          endpoints={};blocks={};failures={};rows=[];flags=[];errors=[]
+          for chain in ACCOUNTS:
+            endpoints[chain],blocks[chain],failures[chain]=choose(chain)
+            for product,address in ACCOUNTS[chain].items():
+              try:
+                w=words(call(endpoints[chain],address,STATE))
+                if len(w)<11:raise RuntimeError({'short_state':len(w),'words':w})
+                row={
+                  'chain':chain,'product':product,'address':address.lower(),
+                  'payout_address':'0x'+hex(w[0])[2:].rjust(40,'0')[-40:],
+                  'highwater_mark':w[1],'fees_owed_in_base':w[2],'total_shares_last_update':w[3],
+                  'exchange_rate':w[4],'allowed_upper':w[5],'allowed_lower':w[6],
+                  'last_update_timestamp':w[7],'is_paused':bool(w[8]),'minimum_update_delay':w[9],
+                  'platform_fee_bps':w[10],'performance_fee_bps':w[11] if len(w)>11 else None,
+                  'raw_word_count':len(w),
+                }
+                extras={}
+                for n,s in EXTRA.items():
+                  try:extras[n]=int(call(endpoints[chain],address,s),16)
+                  except Exception:extras[n]=None
+                row['yield_streaming']=extras
+                reasons=[]
+                if row['allowed_upper']<10000:reasons.append('UPPER_BELOW_100_PERCENT')
+                if row['allowed_lower']>10000:reasons.append('LOWER_ABOVE_100_PERCENT')
+                if row['minimum_update_delay']>14*24*3600:reasons.append('DELAY_ABOVE_14_DAYS')
+                if row['platform_fee_bps']>2000:reasons.append('PLATFORM_FEE_ABOVE_20_PERCENT')
+                if row['performance_fee_bps'] is not None and row['performance_fee_bps']>5000:reasons.append('PERFORMANCE_FEE_ABOVE_50_PERCENT')
+                if extras.get('minimumVestingTime()') is not None and extras.get('maximumVestingTime()') is not None and extras['minimumVestingTime()']>extras['maximumVestingTime()']:
+                  reasons.append('MIN_VEST_ABOVE_MAX_VEST')
+                if extras.get('maxDeviationYield()') is not None and extras['maxDeviationYield()']>10000:reasons.append('YIELD_DEVIATION_ABOVE_100_PERCENT')
+                if extras.get('maxDeviationLoss()') is not None and extras['maxDeviationLoss()']>10000:reasons.append('LOSS_DEVIATION_ABOVE_100_PERCENT')
+                row['flags']=reasons
+                if reasons:flags.append(row)
+                rows.append(row)
+              except Exception as e:errors.append({'chain':chain,'product':product,'address':address,'error':repr(e)})
+          out={'generated_at_unix':int(time.time()),'endpoints':endpoints,'blocks':blocks,'rpc_failures':failures,'rows':rows,'flags':flags,'errors':errors}
+          open('veda-accountant-bounds.json','w').write(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({'flags':flags,'errors':errors,'rows':rows},indent=2,sort_keys=True))
+          PY
+
+      - name: Upload accountant-state proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-accountant-bounds
+          path: veda-accountant-bounds.json
+          if-no-files-found: error
+          retention-days: 1
