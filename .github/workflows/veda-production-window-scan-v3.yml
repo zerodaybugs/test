@@ -1,0 +1,165 @@
+name: veda-production-window-scan-v3
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Scan paginated indexed event ledgers
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64, datetime, gzip, json, re, subprocess, time, urllib.parse, urllib.request
+          from pathlib import Path
+
+          source=Path('.github/workflows/veda-production-window-scan.yml').read_text()
+          m=re.search(r"WINDOW_B64 = '''([^']+)'''",source)
+          if not m:raise RuntimeError('window ledger missing')
+          windows=json.loads(gzip.decompress(base64.b64decode(m.group(1))))
+
+          TELLERS={
+            'liquidETH':'0x9AA79C84b79816ab920bBcE20f8f74557B514734',
+            'liquidBTC':'0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353',
+            'liquidUSD':'0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387',
+          }
+          ONE={'liquidETH':10**18,'liquidBTC':10**8,'liquidUSD':10**6}
+          SCROLL_API='https://scroll.blockscout.com/api/v2'
+          ETH_LEGACY='https://eth.blockscout.com/api'
+          SCROLL_RPCS=['https://scroll-rpc.publicnode.com','https://rpc.scroll.io','https://scroll.drpc.org']
+          ETH_RPCS=['https://ethereum-rpc.publicnode.com','https://eth.drpc.org','https://rpc.mevblocker.io']
+
+          def keccak(s):return subprocess.check_output(['cast','keccak',s],text=True).strip().lower()
+          def selector(s):return subprocess.check_output(['cast','sig',s],text=True).strip().lower()
+          SENT=keccak('MessageSent(bytes32,uint256,address)')
+          RECEIVED=keccak('MessageReceived(bytes32,uint256,address)')
+          DEPOSIT_TOPICS={keccak('Deposit(uint256,address,address,uint256,uint256,uint256,uint256,address)'),keccak('Deposit(uint256,address,address,uint256,uint256,uint256,uint256)')}
+          ATOMIC={selector('depositAndBridge(address,uint256,uint256,address,bytes,address,uint256)'),selector('depositAndBridge(address,uint256,uint256,address,bytes,address,uint256,address)'),selector('depositAndBridgeWithPermit((address,uint256,uint256,uint256,uint8,bytes32,bytes32,address,bytes,address,uint256,address))')}
+
+          def get_json(url,timeout=60):
+            req=urllib.request.Request(url,headers={'accept':'application/json','user-agent':'Mozilla/5.0 VedaResearch/2.0'})
+            with urllib.request.urlopen(req,timeout=timeout) as r:return json.loads(r.read().decode())
+          def rpc(url,m,p,timeout=45):
+            body=json.dumps({'jsonrpc':'2.0','id':1,'method':m,'params':p}).encode();req=urllib.request.Request(url,data=body,method='POST',headers={'content-type':'application/json','user-agent':'veda-production-v3/1'})
+            with urllib.request.urlopen(req,timeout=timeout) as r:o=json.loads(r.read().decode())
+            if 'error' in o:raise RuntimeError(o['error'])
+            return o['result']
+          def choose(candidates,cid):
+            bad={}
+            for u in candidates:
+              try:
+                if int(rpc(u,'eth_chainId',[]),16)!=cid:raise RuntimeError('wrong chain')
+                return u,bad
+              except Exception as e:bad[u]=repr(e)
+            raise RuntimeError(bad)
+          scroll,scroll_bad=choose(SCROLL_RPCS,534352);eth,eth_bad=choose(ETH_RPCS,1)
+          eth_latest=int(rpc(eth,'eth_blockNumber',[]),16)
+
+          def unix(ts):
+            return int(datetime.datetime.fromisoformat(ts.replace('Z','+00:00')).timestamp())
+          def paginated_address_logs(address,min_block,max_pages=5000):
+            base=f'{SCROLL_API}/addresses/{address}/logs';params={};items=[];pages=0;seen=set()
+            while pages<max_pages:
+              url=base+('?' + urllib.parse.urlencode(params) if params else '')
+              data=get_json(url,90);pages+=1
+              batch=data.get('items') or []
+              if not batch:break
+              oldest=None
+              for row in batch:
+                key=(row.get('transaction_hash'),row.get('index'))
+                if key in seen:continue
+                seen.add(key);items.append(row)
+                bn=int(row['block_number']);oldest=bn if oldest is None else min(oldest,bn)
+              nxt=data.get('next_page_params')
+              if oldest is not None and oldest<min_block:break
+              if not nxt:break
+              params=nxt
+            return items,pages,params
+
+          min_by_product={p:min(w['a'] for w in windows if w['p']==p)-100 for p in TELLERS}
+          ledgers={};page_counts={};tails={}
+          for p,a in TELLERS.items():
+            ledgers[p],page_counts[p],tails[p]=paginated_address_logs(a,min_by_product[p])
+
+          by_product={p:[] for p in TELLERS}
+          for i,w in enumerate(windows):by_product[w['p']].append((i,w))
+          hits=[];errors=[];seen=set()
+          for p,rows in ledgers.items():
+            for row in rows:
+              try:
+                topics=[x.lower() for x in (row.get('topics') or [])]
+                if not topics or topics[0]!=SENT:continue
+                ts=unix(row['block_timestamp']);matching=[(i,w) for i,w in by_product[p] if w['t0']<=ts<=w['t1']]
+                if not matching:continue
+                txh=row['transaction_hash'];key=(txh,row.get('index'))
+                if key in seen:continue
+                seen.add(key)
+                tx=rpc(scroll,'eth_getTransactionByHash',[txh]);rc=rpc(scroll,'eth_getTransactionReceipt',[txh])
+                sel=(tx.get('input') or '0x')[:10].lower();receipt_topics={x['topics'][0].lower() for x in rc.get('logs',[]) if x.get('topics')}
+                has_dep=any(x in receipt_topics for x in DEPOSIT_TOPICS);atomic=sel in ATOMIC or has_dep
+                shares=int(row.get('data') or '0x0',16);guid=topics[1] if len(topics)>1 else None;recipient='0x'+topics[2][-40:] if len(topics)>2 else None
+                for i,w in matching:
+                  hits.append({'window_index':i,'window':w,'block':int(row['block_number']),'timestamp':ts,'tx':txh,'selector':sel,'atomic_selector':sel in ATOMIC,'has_deposit_event':has_dep,'atomic':atomic,'guid':guid,'recipient':recipient,'shares_raw':shares,'gross_extra_base_units':shares*(int(w['dr'])-int(w['sr']))//ONE[p],'tx_from':tx.get('from'),'tx_to':tx.get('to')})
+              except Exception as e:errors.append({'stage':'source_hydration','product':p,'row':row,'error':repr(e)})
+
+          # Binary-search an Ethereum block near a Unix timestamp.
+          bcache={}
+          def bts(n):
+            if n not in bcache:bcache[n]=int(rpc(eth,'eth_getBlockByNumber',[hex(n),False])['timestamp'],16)
+            return bcache[n]
+          def block_before(target):
+            lo=1;hi=eth_latest
+            while lo<hi:
+              mid=(lo+hi+1)//2
+              if bts(mid)<=target:lo=mid
+              else:hi=mid-1
+            return lo
+          def legacy_received(address,guid,lo,hi):
+            q={'module':'logs','action':'getLogs','fromBlock':str(lo),'toBlock':str(hi),'address':address,'topic0':RECEIVED,'topic1':guid,'topic0_1_opr':'and'}
+            data=get_json(ETH_LEGACY+'?'+urllib.parse.urlencode(q),90);r=data.get('result')
+            if isinstance(r,list):return r
+            msg=str(data.get('message'))+' '+str(r)
+            if 'No logs found' in msg:return []
+            raise RuntimeError(data)
+
+          delivered=[]
+          for h in hits:
+            if not h['atomic'] or not h['guid']:continue
+            try:
+              start=block_before(h['timestamp']);found=[]
+              # LayerZero delivery can be delayed; search up to roughly 40 hours.
+              for a in range(max(1,start-100),min(eth_latest,start+12000)+1,1800):
+                b=min(eth_latest,a+1799);found.extend(legacy_received(TELLERS[h['window']['p']],h['guid'],a,b))
+                if found:break
+              x=dict(h);x['destination_delivery_found']=bool(found)
+              if found:
+                d=found[0];bn=int(d['blockNumber'],16) if str(d['blockNumber']).startswith('0x') else int(d['blockNumber']);x['destination_block']=bn;x['destination_tx']=d.get('transactionHash');x['destination_timestamp']=bts(bn)
+              delivered.append(x)
+            except Exception as e:errors.append({'stage':'delivery_lookup','tx':h['tx'],'error':repr(e)})
+
+          atomic=[x for x in hits if x['atomic']];delivered_atomic=[x for x in delivered if x.get('destination_delivery_found')]
+          out={'generated_at_unix':int(time.time()),'window_count':len(windows),'min_blocks':min_by_product,'indexed_page_counts':page_counts,'indexed_log_counts':{p:len(v) for p,v in ledgers.items()},'pagination_tails':tails,'rpc_failures':{'scroll':scroll_bad,'ethereum':eth_bad},'source_message_hit_count':len(hits),'atomic_source_hit_count':len(atomic),'delivered_atomic_hit_count':len(delivered_atomic),'max_atomic_gross_extra_base_units':max([x['gross_extra_base_units'] for x in atomic] or [0]),'sum_atomic_gross_extra_base_units':sum(x['gross_extra_base_units'] for x in atomic),'source_hits':hits,'delivered_atomic_hits':delivered_atomic,'errors':errors}
+          Path('veda-production-window-scan-v3.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({k:out[k] for k in ['window_count','indexed_page_counts','indexed_log_counts','source_message_hit_count','atomic_source_hit_count','delivered_atomic_hit_count','max_atomic_gross_extra_base_units','sum_atomic_gross_extra_base_units']},indent=2,sort_keys=True))
+          if errors:print('errors',len(errors))
+          PY
+
+      - name: Upload paginated production evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-production-window-scan-v3
+          path: veda-production-window-scan-v3.json
+          if-no-files-found: error
+          retention-days: 1
