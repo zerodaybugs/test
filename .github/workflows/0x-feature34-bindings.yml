@@ -1,0 +1,189 @@
+name: Record current 0x MetaTxn and Intent bindings
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/0x-feature34-bindings.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
+      - name: Query features 3 and 4 and bind public verified source
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/feature34"
+          REG=0x00000000000004533Fe15556B1E086BB1A72cEae
+          mkdir -p "$OUT"
+
+          RPCS=(
+            https://eth.drpc.org
+            https://ethereum-rpc.publicnode.com
+            https://eth.llamarpc.com
+            https://rpc.mevblocker.io
+            https://1rpc.io/eth
+          )
+
+          printf 'generated_at=%s\nregistry=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$REG" > "$OUT/PROVENANCE.txt"
+          forge --version >> "$OUT/PROVENANCE.txt"
+          cast --version >> "$OUT/PROVENANCE.txt"
+          GIT_TOPIC="$(cast keccak 'GitCommit(bytes20)')"
+          printf 'git_commit_topic=%s\n' "$GIT_TOPIC" >> "$OUT/PROVENANCE.txt"
+
+          for feature in 3 4; do
+            F="$OUT/feature-$feature"
+            mkdir -p "$F/quorum"
+            for rpc in "${RPCS[@]}"; do
+              host="$(printf '%s' "$rpc" | sed -E 's#https?://([^/]+).*#\1#')"
+              Q="$F/quorum/$host.txt"
+              {
+                echo "rpc_host=$host"
+                echo "chain_id=$(cast chain-id --rpc-url "$rpc" 2>&1)"
+                echo "head=$(cast block-number --rpc-url "$rpc" 2>&1)"
+                echo "current=$(cast call "$REG" 'ownerOf(uint256)(address)' "$feature" --rpc-url "$rpc" 2>&1)"
+                echo "prev=$(cast call "$REG" 'prev(uint128)(address)' "$feature" --rpc-url "$rpc" 2>&1)"
+                echo "next=$(cast call "$REG" 'next(uint128)(address)' "$feature" --rpc-url "$rpc" 2>&1)"
+                echo "authorized=$(cast call "$REG" 'authorized(uint128)(address,uint40)' "$feature" --rpc-url "$rpc" 2>&1)"
+                echo "description_hash=$(cast call "$REG" 'descriptionHash(uint128)(bytes32)' "$feature" --rpc-url "$rpc" 2>&1)"
+              } > "$Q"
+            done
+
+            python3 - "$F" "$feature" <<'PY'
+          import collections, pathlib, sys
+          root=pathlib.Path(sys.argv[1]); feature=sys.argv[2]
+          rows=[]
+          for p in sorted((root/'quorum').glob('*.txt')):
+              row={}
+              for line in p.read_text(errors='replace').splitlines():
+                  if '=' in line:
+                      k,v=line.split('=',1); row[k]=v.strip()
+              if row.get('chain_id') == '1' and all(row.get(k,'').startswith('0x') for k in ('current','prev','next')):
+                  rows.append(row)
+          if len(rows) < 2:
+              raise SystemExit(f'feature {feature}: insufficient valid RPC rows: {len(rows)}')
+          for key in ('current','prev','next','authorized','description_hash'):
+              counts=collections.Counter(r.get(key,'') for r in rows)
+              value,n=counts.most_common(1)[0]
+              if n < 2:
+                  raise SystemExit(f'feature {feature}: no quorum for {key}: {counts}')
+              (root/f'{key}.txt').write_text(value+'\n')
+          (root/'valid_rpc_count.txt').write_text(str(len(rows))+'\n')
+          PY
+
+            CURRENT="$(cat "$F/current.txt")"
+            PREV="$(cat "$F/prev.txt")"
+            NEXT="$(cat "$F/next.txt")"
+
+            for kind in current prev next; do
+              eval address="\${${kind^^}}"
+              D="$F/$kind"
+              mkdir -p "$D"
+              printf '%s\n' "$address" > "$D/address.txt"
+              RPC=https://eth.drpc.org
+              cast code "$address" --rpc-url "$RPC" > "$D/code.hex"
+              cast codehash "$address" --rpc-url "$RPC" > "$D/codehash.txt"
+              cast balance "$address" --rpc-url "$RPC" > "$D/native-balance.txt"
+              cast call "$REG" 'deployInfo(address)(uint128,uint32)' "$address" --rpc-url "$RPC" > "$D/deploy-info.txt" 2> "$D/deploy-info.err" || true
+              cast call "$address" 'owner()(address)' --rpc-url "$RPC" > "$D/owner.txt" 2> "$D/owner.err" || true
+              cast call "$address" 'getSolvers()(address[])' --rpc-url "$RPC" > "$D/solvers.txt" 2> "$D/solvers.err" || true
+              cast call "$address" 'supportsInterface(bytes4)(bool)' 0x01ffc9a7 --rpc-url "$RPC" > "$D/erc165.txt" 2> "$D/erc165.err" || true
+
+              curl -fsSL --retry 3 --max-time 45 "https://eth.blockscout.com/api/v2/smart-contracts/$address" > "$D/blockscout-contract.json" || true
+              curl -fsSL --retry 3 --max-time 45 "https://eth.blockscout.com/api/v2/addresses/$address" > "$D/blockscout-address.json" || true
+              curl -fsSL --retry 3 --max-time 45 "https://eth.blockscout.com/api/v2/addresses/$address/transactions" > "$D/blockscout-transactions.json" || true
+              curl -fsSL --retry 3 --max-time 45 "https://eth.blockscout.com/api?module=logs&action=getLogs&fromBlock=0&toBlock=latest&address=$address&topic0=$GIT_TOPIC" > "$D/gitcommit-logs.json" || true
+              curl -fsSL --retry 3 --max-time 45 "https://api.etherscan.io/v2/api?chainid=1&module=contract&action=getsourcecode&address=$address" > "$D/etherscan-source.json" || true
+            done
+          done
+
+          python3 - "$OUT" <<'PY'
+          import json, pathlib, re, sys
+          root=pathlib.Path(sys.argv[1])
+          summary={}
+          for feature in ('3','4'):
+              f=root/f'feature-{feature}'
+              fr={
+                  'current':(f/'current.txt').read_text().strip(),
+                  'prev':(f/'prev.txt').read_text().strip(),
+                  'next':(f/'next.txt').read_text().strip(),
+                  'authorized':(f/'authorized.txt').read_text().strip(),
+                  'description_hash':(f/'description_hash.txt').read_text().strip(),
+                  'valid_rpc_count':int((f/'valid_rpc_count.txt').read_text()),
+                  'instances':{},
+              }
+              for kind in ('current','prev','next'):
+                  d=f/kind
+                  code=(d/'code.hex').read_text().strip()
+                  row={
+                      'address':(d/'address.txt').read_text().strip(),
+                      'runtime_bytes':len(code.removeprefix('0x'))//2,
+                      'codehash':(d/'codehash.txt').read_text().strip(),
+                      'native_balance_wei':(d/'native-balance.txt').read_text().strip(),
+                      'deploy_info':(d/'deploy-info.txt').read_text(errors='replace').strip(),
+                      'owner':(d/'owner.txt').read_text(errors='replace').strip(),
+                      'solvers':(d/'solvers.txt').read_text(errors='replace').strip(),
+                  }
+                  for name in ('blockscout-contract.json','blockscout-address.json','blockscout-transactions.json','gitcommit-logs.json','etherscan-source.json'):
+                      p=d/name
+                      try: row[name]=json.loads(p.read_text())
+                      except Exception as e: row[name]={'parse_error':repr(e),'raw':p.read_text(errors='replace')[:1000] if p.exists() else ''}
+                  commits=[]
+                  logs=row.get('gitcommit-logs.json',{})
+                  if isinstance(logs,dict):
+                      for item in logs.get('result',[]) if isinstance(logs.get('result'),list) else []:
+                          topics=item.get('topics') or []
+                          if len(topics)>1 and isinstance(topics[1],str):
+                              commits.append('0x'+topics[1].removeprefix('0x')[-40:])
+                  row['git_commits_from_logs']=sorted(set(commits))
+                  # Constructor args are a second independent binding when explorers expose them.
+                  constructor=[]
+                  for objkey in ('blockscout-contract.json','etherscan-source.json'):
+                      obj=row.get(objkey)
+                      if isinstance(obj,dict):
+                          vals=[]
+                          if objkey.startswith('etherscan') and isinstance(obj.get('result'),list): vals=obj['result']
+                          else: vals=[obj]
+                          for v in vals:
+                              if not isinstance(v,dict): continue
+                              for k in ('constructor_args','ConstructorArguments'):
+                                  x=v.get(k)
+                                  if isinstance(x,str) and x:
+                                      constructor.append(x)
+                  row['constructor_arguments']=constructor
+                  fr['instances'][kind]=row
+              summary[feature]=fr
+          (root/'summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True))
+          # Hard gate: current and previous deployments for both features must have runtime.
+          for feature,row in summary.items():
+              for kind in ('current','prev'):
+                  if row['instances'][kind]['runtime_bytes'] == 0:
+                      raise SystemExit(f'feature {feature} {kind}: missing runtime')
+          PY
+
+          find "$OUT" -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS"
+          test -s "$OUT/summary.json"
+
+      - name: Upload feature 3/4 evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: 0x-feature34-bindings-${{ github.run_id }}
+          path: feature34/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
