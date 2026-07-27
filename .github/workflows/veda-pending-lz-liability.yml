@@ -1,0 +1,214 @@
+name: veda-pending-lz-liability
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - product: liquidETH
+            teller: "0x9AA79C84b79816ab920bBcE20f8f74557B514734"
+            accountant: "0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198"
+            one_share: "1000000000000000000"
+            decimals: "18"
+          - product: liquidBTC
+            teller: "0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353"
+            accountant: "0xEa23aC6D7D11f6b181d6B98174D334478ADAe6b0"
+            one_share: "100000000"
+            decimals: "8"
+          - product: liquidUSD
+            teller: "0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387"
+            accountant: "0xc315D6e14DDCDC7407784e2Caf815d131Bc1D3E7"
+            one_share: "1000000"
+            decimals: "6"
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Classify unpaired Scroll-to-Ethereum messages and endpoint state
+        shell: bash
+        env:
+          PRODUCT: ${{ matrix.product }}
+          TELLER: ${{ matrix.teller }}
+          ACCOUNTANT: ${{ matrix.accountant }}
+          ONE_SHARE: ${{ matrix.one_share }}
+          DECIMALS: ${{ matrix.decimals }}
+        run: |
+          python3 - <<'PY'
+          from __future__ import annotations
+          import datetime as dt
+          import json, os, subprocess, time, urllib.parse, urllib.request
+
+          PRODUCT=os.environ['PRODUCT'];TELLER=os.environ['TELLER'];ACCOUNTANT=os.environ['ACCOUNTANT']
+          ONE_SHARE=int(os.environ['ONE_SHARE']);DECIMALS=int(os.environ['DECIMALS'])
+          ETH_EID=30101;SCROLL_EID=30214
+          BOUNTY_START=int(dt.datetime(2026,1,21,tzinfo=dt.timezone.utc).timestamp())
+          SCROLL_BS='https://scroll.blockscout.com';ETH_BS='https://eth.blockscout.com'
+          SCROLL_RPCS=['https://scroll-rpc.publicnode.com','https://rpc.scroll.io','https://scroll.drpc.org']
+          ETH_RPCS=['https://ethereum-rpc.publicnode.com','https://eth.drpc.org','https://rpc.mevblocker.io']
+          def cast(*a):return subprocess.check_output(['cast',*a],text=True).strip()
+          SENT={cast('keccak','MessageSent(bytes32,uint256,address)').lower(),cast('keccak','MessageSent(bytes32,address,uint256)').lower()}
+          RECEIVED={cast('keccak','MessageReceived(bytes32,uint256,address)').lower(),cast('keccak','MessageReceived(bytes32,address,uint256)').lower()}
+          PACKET_SENT=cast('keccak','PacketSent(bytes,bytes,address)').lower()
+          GET_RATE=cast('sig','getRate()');ENDPOINT=cast('sig','endpoint()')
+          INBOUND_HASH=cast('sig','inboundPayloadHash(address,uint32,bytes32,uint64)')
+          LAZY_NONCE=cast('sig','lazyInboundNonce(address,uint32,bytes32)')
+          INBOUND_NONCE=cast('sig','inboundNonce(address,uint32,bytes32)')
+          SELECTORS={
+            cast('sig','depositAndBridge(address,uint256,uint256,address,bytes,address,uint256)').lower():('depositAndBridge7',4),
+            cast('sig','depositAndBridge(address,uint256,uint256,address,bytes,address,uint256,address)').lower():('depositAndBridge8',4),
+            cast('sig','bridge(uint96,address,bytes,address,uint256)').lower():('bridge',2),
+          }
+          def http(url,data=None,timeout=45):
+            headers={'accept':'application/json','user-agent':'veda-pending-lz/1'}
+            if data is not None:headers['content-type']='application/json'
+            req=urllib.request.Request(url,data=data,headers=headers,method='POST' if data else 'GET')
+            with urllib.request.urlopen(req,timeout=timeout) as r:return json.loads(r.read().decode())
+          def rpc(url,m,p,timeout=45):
+            o=http(url,json.dumps({'jsonrpc':'2.0','id':1,'method':m,'params':p}).encode(),timeout)
+            if 'error' in o:raise RuntimeError(o['error'])
+            return o['result']
+          def choose(candidates,chainid):
+            bad={}
+            for u in candidates:
+              try:
+                if int(rpc(u,'eth_chainId',[]),16)!=chainid:raise RuntimeError('wrong chain')
+                return u,bad
+              except Exception as e:bad[u]=repr(e)
+            raise RuntimeError(bad)
+          def h(x):return str(x)[2:] if str(x).startswith('0x') else str(x)
+          def as_int(v):
+            if isinstance(v,int):return v
+            s=str(v);return int(s,16) if s.startswith('0x') else int(s)
+          def aw(a):return h(a).lower().rjust(64,'0')
+          def uw(v):return hex(v)[2:].rjust(64,'0')
+          def bw(b):return h(b).lower().ljust(64,'0')
+          def addr(v):
+            if v is None:return None
+            return '0x'+h(v)[-40:].lower()
+          def call(url,to,data,block='latest'):
+            return rpc(url,'eth_call',[{'to':to,'data':data},hex(block) if isinstance(block,int) else block])
+          def logs(base,address):
+            url=f'{base}/api/v2/addresses/{address}/logs';params={};seen=set();items=[]
+            for _ in range(1000):
+              o=http(url+('?' + urllib.parse.urlencode(params) if params else ''),timeout=60)
+              items.extend(o.get('items') or [])
+              nxt=o.get('next_page_params')
+              if not nxt:break
+              mark=json.dumps(nxt,sort_keys=True)
+              if mark in seen:raise RuntimeError('pagination loop')
+              seen.add(mark);params={k:v for k,v in nxt.items() if v is not None}
+            return items
+          def topics(item):return [str(x).lower() for x in (item.get('topics') or []) if x]
+          def parse(item,kind):
+            t=topics(item)
+            if not t:return None
+            decoded=json.dumps(item.get('decoded') or {}).lower()
+            accepted=SENT if kind=='sent' else RECEIVED
+            if t[0] not in accepted and (('messagesent' if kind=='sent' else 'messagereceived') not in decoded):return None
+            guid=t[1] if len(t)>1 else None;recipient=addr(t[2]) if len(t)>2 else None
+            data=h(item.get('data') or '')
+            amount=int(data[:64],16) if len(data)>=64 else None
+            params=((item.get('decoded') or {}).get('parameters') or [])
+            for p in params:
+              n=str(p.get('name') or '').lower();v=p.get('value')
+              if n in ('messageid','guid'):guid=str(v).lower()
+              elif n in ('shareamount','amount'):amount=as_int(v)
+              elif n in ('to','recipient'):recipient=addr(v)
+            if not guid or amount is None:return None
+            return {'guid':guid,'recipient':recipient,'share_amount':amount,'block':as_int(item.get('block_number')),
+                    'tx':str(item.get('transaction_hash') or '').lower(),'log_index':as_int(item.get('index') or 0)}
+          def decode_dst(input_data):
+            x=h(input_data);selector='0x'+x[:8].lower();meta=SELECTORS.get(selector)
+            if not meta:return {'selector':selector,'kind':'other','dst_eid':None}
+            kind,offset_word=meta;head=x[8:]
+            if len(head)<(offset_word+1)*64:return {'selector':selector,'kind':kind,'dst_eid':None}
+            off=int(head[offset_word*64:(offset_word+1)*64],16)*2
+            if len(head)<off+128:return {'selector':selector,'kind':kind,'dst_eid':None}
+            length=int(head[off:off+64],16);payload=head[off+64:off+64+length*2]
+            dst=int(payload[:64],16) if len(payload)>=64 else None
+            return {'selector':selector,'kind':kind,'dst_eid':dst}
+          def decode_dynamic_bytes(data,head_index):
+            x=h(data);off=int(x[head_index*64:(head_index+1)*64],16)*2;n=int(x[off:off+64],16)
+            return bytes.fromhex(x[off+64:off+64+n*2])
+          def packet_from_receipt(receipt):
+            for log in receipt.get('logs') or []:
+              ts=[str(v).lower() for v in (log.get('topics') or []) if v]
+              if not ts or ts[0]!=PACKET_SENT:continue
+              encoded=decode_dynamic_bytes(log.get('data') or '0x',0)
+              # LayerZero PacketV1 layout: version(1)|nonce(8)|srcEid(4)|sender(32)|dstEid(4)|receiver(32)|guid(32)|message
+              if len(encoded)<113:continue
+              return {
+                'version':encoded[0],
+                'nonce':int.from_bytes(encoded[1:9],'big'),
+                'src_eid':int.from_bytes(encoded[9:13],'big'),
+                'sender':'0x'+encoded[13:45].hex(),
+                'dst_eid':int.from_bytes(encoded[45:49],'big'),
+                'receiver':'0x'+encoded[49:81].hex(),
+                'guid':'0x'+encoded[81:113].hex(),
+                'message':'0x'+encoded[113:].hex(),
+                'endpoint':str(log.get('address') or '').lower(),
+              }
+            return None
+          scroll,scroll_fail=choose(SCROLL_RPCS,534352);ethereum,eth_fail=choose(ETH_RPCS,1)
+          source_items=logs(SCROLL_BS,TELLER);dest_items=logs(ETH_BS,TELLER)
+          sends=[x for x in (parse(i,'sent') for i in source_items) if x]
+          receives=[x for x in (parse(i,'received') for i in dest_items) if x]
+          received={x['guid'] for x in receives}
+          unpaired=[x for x in sends if x['guid'] not in received]
+          endpoint=addr(call(ethereum,TELLER,ENDPOINT))
+          current_dest_rate=int(call(ethereum,ACCOUNTANT,GET_RATE),16)
+          candidates=[];errors=[]
+          for send in unpaired:
+            try:
+              tx=rpc(scroll,'eth_getTransactionByHash',[send['tx']]);route=decode_dst((tx or {}).get('input') or '0x')
+              if route.get('dst_eid')!=ETH_EID:continue
+              block=rpc(scroll,'eth_getBlockByNumber',[hex(send['block']),False]);timestamp=int(block['timestamp'],16)
+              if timestamp<BOUNTY_START:continue
+              source_rate=int(call(scroll,ACCOUNTANT,GET_RATE,send['block']),16)
+              receipt=rpc(scroll,'eth_getTransactionReceipt',[send['tx']]);packet=packet_from_receipt(receipt)
+              if not packet:raise RuntimeError('PacketSent not found')
+              sender=packet['sender'];nonce=packet['nonce']
+              receiver=addr(packet['receiver'])
+              payload_hash=call(ethereum,endpoint,INBOUND_HASH+aw(receiver)+uw(SCROLL_EID)+bw(sender)+uw(nonce))
+              lazy=call(ethereum,endpoint,LAZY_NONCE+aw(receiver)+uw(SCROLL_EID)+bw(sender))
+              inbound=call(ethereum,endpoint,INBOUND_NONCE+aw(receiver)+uw(SCROLL_EID)+bw(sender))
+              delta=send['share_amount']*(current_dest_rate-source_rate)//ONE_SHARE
+              candidates.append({**send,'timestamp':timestamp,'route':route,'packet':packet,'source_rate':source_rate,
+                                 'current_destination_rate':current_dest_rate,'potential_current_value_delta_base_raw':delta,
+                                 'endpoint':endpoint,'inbound_payload_hash':payload_hash,
+                                 'lazy_inbound_nonce':int(lazy,16),'inbound_nonce':int(inbound,16),
+                                 'verified_payload_pending':int(payload_hash,16)!=0})
+            except Exception as e:errors.append({'send':send,'error':repr(e)})
+          positive=[x for x in candidates if x['potential_current_value_delta_base_raw']>0]
+          verified_positive=[x for x in positive if x['verified_payload_pending']]
+          out={'generated_at_unix':int(time.time()),'product':PRODUCT,'teller':TELLER.lower(),'endpoint':endpoint,
+               'scroll_rpc':scroll,'ethereum_rpc':ethereum,'rpc_failures':{'scroll':scroll_fail,'ethereum':eth_fail},
+               'source_log_count':len(source_items),'destination_log_count':len(dest_items),'sent_count':len(sends),
+               'received_count':len(receives),'unpaired_send_count':len(unpaired),'ethereum_destination_unpaired_count':len(candidates),
+               'positive_current_delta_count':len(positive),'verified_positive_pending_count':len(verified_positive),
+               'positive_current_delta_total_base_raw':sum(x['potential_current_value_delta_base_raw'] for x in positive),
+               'verified_positive_pending_total_base_raw':sum(x['potential_current_value_delta_base_raw'] for x in verified_positive),
+               'candidates':candidates,'errors':errors,
+               'verdict':{'current_deliverable_value_creation':bool(verified_positive),'submission_gate_candidate':bool(verified_positive)}}
+          path=f'veda-pending-lz-{PRODUCT}.json';open(path,'w').write(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({k:out[k] for k in ['product','sent_count','received_count','unpaired_send_count','ethereum_destination_unpaired_count','positive_current_delta_count','verified_positive_pending_count','positive_current_delta_total_base_raw','verified_positive_pending_total_base_raw','verdict','errors']},indent=2,sort_keys=True))
+          PY
+
+      - name: Upload pending liability evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-pending-lz-${{ matrix.product }}
+          path: veda-pending-lz-${{ matrix.product }}.json
+          if-no-files-found: error
+          retention-days: 1
