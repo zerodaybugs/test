@@ -1,0 +1,517 @@
+name: veda-guid-conservation-ledger
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ledger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Reconcile every Ethereum-Scroll bridge GUID at exact send and receive rates
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import concurrent.futures
+          import datetime as dt
+          import json
+          import subprocess
+          import time
+          import urllib.parse
+          import urllib.request
+          from collections import defaultdict
+
+          PRODUCTS = {
+              "liquidETH": {
+                  "teller": "0x9AA79C84b79816ab920bBcE20f8f74557B514734",
+                  "accountant": "0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198",
+                  "vault": "0xf0bb20865277aBd641a307eCe5Ee04E79073416C",
+                  "one_share": 10**18,
+                  "decimals": 18,
+              },
+              "liquidBTC": {
+                  "teller": "0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353",
+                  "accountant": "0xEa23aC6D7D11f6b181d6B98174D334478ADAe6b0",
+                  "vault": "0x5f46d540b6eD704C3c8789105F30E075AA900726",
+                  "one_share": 10**8,
+                  "decimals": 8,
+              },
+              "liquidUSD": {
+                  "teller": "0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387",
+                  "accountant": "0xc315D6e14DDCDC7407784e2Caf815d131Bc1D3E7",
+                  "vault": "0x08c6F91e2B681FaF5e17227F2a44C307b3C1364C",
+                  "one_share": 10**6,
+                  "decimals": 6,
+              },
+          }
+          CHAINS = {
+              "ethereum": {
+                  "chain_id": 1,
+                  "blockscout": "https://eth.blockscout.com",
+                  "rpcs": [
+                      "https://ethereum-rpc.publicnode.com",
+                      "https://eth.drpc.org",
+                      "https://rpc.mevblocker.io",
+                  ],
+              },
+              "scroll": {
+                  "chain_id": 534352,
+                  "blockscout": "https://scroll.blockscout.com",
+                  "rpcs": [
+                      "https://scroll-rpc.publicnode.com",
+                      "https://rpc.scroll.io",
+                      "https://scroll.drpc.org",
+                  ],
+              },
+          }
+          BOUNTY_START = int(dt.datetime(2026, 1, 21, tzinfo=dt.timezone.utc).timestamp())
+
+          def cast(*args: str) -> str:
+              return subprocess.check_output(["cast", *args], text=True).strip()
+
+          GET_RATE = cast("sig", "getRate()")
+          BALANCE_OF = cast("sig", "balanceOf(address)")
+          SENT_TOPICS = {
+              cast("keccak", "MessageSent(bytes32,uint256,address)").lower(),
+              cast("keccak", "MessageSent(bytes32,address,uint256)").lower(),
+          }
+          RECEIVED_TOPICS = {
+              cast("keccak", "MessageReceived(bytes32,uint256,address)").lower(),
+              cast("keccak", "MessageReceived(bytes32,address,uint256)").lower(),
+          }
+          DEPOSIT_BRIDGE_SELECTORS = {
+              cast("sig", "depositAndBridge(address,uint256,uint256,address,bytes,address,uint256)").lower(),
+              cast("sig", "depositAndBridge(address,uint256,uint256,address,bytes,address,uint256,address)").lower(),
+          }
+          BRIDGE_SELECTORS = {
+              cast("sig", "bridge(uint96,address,bytes,address,uint256)").lower(),
+          }
+
+          def http_json(url: str, *, data: bytes | None = None, timeout: int = 45):
+              headers = {
+                  "user-agent": "veda-guid-conservation-ledger/1.0",
+                  "accept": "application/json",
+              }
+              if data is not None:
+                  headers["content-type"] = "application/json"
+              req = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
+              with urllib.request.urlopen(req, timeout=timeout) as response:
+                  return json.loads(response.read().decode())
+
+          def rpc(url: str, method: str, params: list, timeout: int = 45):
+              body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+              out = http_json(url, data=body, timeout=timeout)
+              if "error" in out:
+                  raise RuntimeError(out["error"])
+              return out["result"]
+
+          def choose_rpc(chain: str, historical_block: int | None = None):
+              failures = {}
+              cfg = CHAINS[chain]
+              for endpoint in cfg["rpcs"]:
+                  try:
+                      if int(rpc(endpoint, "eth_chainId", []), 16) != cfg["chain_id"]:
+                          raise RuntimeError("wrong chain")
+                      if historical_block is not None:
+                          block = rpc(endpoint, "eth_getBlockByNumber", [hex(historical_block), False])
+                          if block is None:
+                              raise RuntimeError("historical block unavailable")
+                      return endpoint, failures
+                  except Exception as exc:
+                      failures[endpoint] = repr(exc)
+              raise RuntimeError({"chain": chain, "rpc_failures": failures})
+
+          def normalize_topics(item: dict) -> list[str]:
+              return [str(topic).lower() for topic in (item.get("topics") or []) if topic]
+
+          def decoded_name(item: dict) -> str:
+              decoded = item.get("decoded") or {}
+              return str(decoded.get("method_call") or decoded.get("method") or decoded.get("name") or "")
+
+          def decoded_parameters(item: dict) -> dict[str, object]:
+              decoded = item.get("decoded") or {}
+              params = decoded.get("parameters") or []
+              result = {}
+              for param in params:
+                  if isinstance(param, dict) and param.get("name"):
+                      result[str(param["name"]).lower()] = param.get("value")
+              return result
+
+          def as_int(value) -> int:
+              if value is None:
+                  raise ValueError("missing integer")
+              if isinstance(value, int):
+                  return value
+              text = str(value)
+              return int(text, 16) if text.startswith("0x") else int(text)
+
+          def as_address(value) -> str | None:
+              if value is None:
+                  return None
+              text = str(value).lower()
+              if text.startswith("0x") and len(text) >= 42:
+                  return "0x" + text[-40:]
+              try:
+                  return "0x" + hex(as_int(value))[2:].rjust(40, "0")[-40:]
+              except Exception:
+                  return None
+
+          def parse_log(item: dict, kind: str):
+              topics = normalize_topics(item)
+              if not topics:
+                  return None
+              name = decoded_name(item).lower()
+              accepted = SENT_TOPICS if kind == "sent" else RECEIVED_TOPICS
+              if topics[0] not in accepted and ("messagesent" if kind == "sent" else "messagereceived") not in name.replace(" ", ""):
+                  return None
+              params = decoded_parameters(item)
+              guid = params.get("messageid") or params.get("guid")
+              amount = params.get("shareamount") or params.get("amount")
+              recipient = params.get("to") or params.get("recipient")
+              if guid is None and len(topics) > 1:
+                  guid = topics[1]
+              if recipient is None and len(topics) > 2:
+                  recipient = as_address(topics[2])
+              if amount is None:
+                  data = str(item.get("data") or "0x")
+                  raw = data[2:] if data.startswith("0x") else data
+                  if len(raw) >= 64:
+                      amount = int(raw[:64], 16)
+              if guid is None or amount is None:
+                  return None
+              block_number = as_int(item.get("block_number"))
+              tx_hash = str(item.get("transaction_hash") or item.get("transactionHash") or "").lower()
+              log_index = as_int(item.get("index") or item.get("log_index") or 0)
+              return {
+                  "guid": str(guid).lower(),
+                  "share_amount": as_int(amount),
+                  "recipient": as_address(recipient),
+                  "block_number": block_number,
+                  "transaction_hash": tx_hash,
+                  "log_index": log_index,
+              }
+
+          def fetch_address_logs(chain: str, address: str):
+              base = f'{CHAINS[chain]["blockscout"]}/api/v2/addresses/{address}/logs'
+              params = {}
+              items = []
+              seen = set()
+              pages = 0
+              while True:
+                  url = base + ("?" + urllib.parse.urlencode(params) if params else "")
+                  out = http_json(url, timeout=60)
+                  batch = out.get("items") or []
+                  items.extend(batch)
+                  pages += 1
+                  next_params = out.get("next_page_params")
+                  if not next_params:
+                      break
+                  marker = json.dumps(next_params, sort_keys=True)
+                  if marker in seen:
+                      raise RuntimeError({"pagination_loop": next_params, "address": address, "chain": chain})
+                  seen.add(marker)
+                  params = {k: v for k, v in next_params.items() if v is not None}
+                  if pages > 1000:
+                      raise RuntimeError({"too_many_pages": pages, "address": address, "chain": chain})
+              return items, pages
+
+          def batch_rpc(url: str, calls: list[tuple[str, list]], batch_size: int = 100):
+              results = []
+              for start in range(0, len(calls), batch_size):
+                  chunk = calls[start:start + batch_size]
+                  body = [
+                      {"jsonrpc": "2.0", "id": start + i, "method": method, "params": params}
+                      for i, (method, params) in enumerate(chunk)
+                  ]
+                  try:
+                      out = http_json(url, data=json.dumps(body).encode(), timeout=90)
+                      by_id = {entry["id"]: entry for entry in out}
+                      for i in range(len(chunk)):
+                          entry = by_id[start + i]
+                          if "error" in entry:
+                              raise RuntimeError(entry["error"])
+                          results.append(entry["result"])
+                  except Exception:
+                      for method, params in chunk:
+                          results.append(rpc(url, method, params, timeout=60))
+              return results
+
+          def address_word(address: str) -> str:
+              return address.lower().replace("0x", "").rjust(64, "0")
+
+          output = {
+              "generated_at_unix": int(time.time()),
+              "bounty_start_unix": BOUNTY_START,
+              "chains": {},
+              "products": {},
+              "global_errors": [],
+          }
+
+          # Fetch all teller event ledgers concurrently.
+          fetched = {}
+          with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+              futures = {}
+              for product, cfg in PRODUCTS.items():
+                  for chain in CHAINS:
+                      futures[executor.submit(fetch_address_logs, chain, cfg["teller"])] = (product, chain)
+              for future in concurrent.futures.as_completed(futures):
+                  product, chain = futures[future]
+                  try:
+                      items, pages = future.result()
+                      fetched[(product, chain)] = items
+                      output["chains"].setdefault(chain, {})[product] = {
+                          "address_log_count": len(items),
+                          "pages": pages,
+                      }
+                  except Exception as exc:
+                      output["global_errors"].append({"product": product, "chain": chain, "stage": "blockscout", "error": repr(exc)})
+                      fetched[(product, chain)] = []
+
+          # Choose archive RPCs after obtaining an earliest relevant block.
+          rpcs = {}
+          rpc_failures = {}
+          for chain in CHAINS:
+              blocks = []
+              for product in PRODUCTS:
+                  for item in fetched[(product, chain)]:
+                      try:
+                          blocks.append(as_int(item.get("block_number")))
+                      except Exception:
+                          pass
+              earliest = min(blocks) if blocks else None
+              try:
+                  rpcs[chain], rpc_failures[chain] = choose_rpc(chain, earliest)
+              except Exception as exc:
+                  output["global_errors"].append({"chain": chain, "stage": "rpc_select", "error": repr(exc)})
+          output["rpc_endpoints"] = rpcs
+          output["rpc_failures"] = rpc_failures
+
+          for product, cfg in PRODUCTS.items():
+              result = {
+                  "one_share": cfg["one_share"],
+                  "decimals": cfg["decimals"],
+                  "directions": {},
+                  "errors": [],
+              }
+              output["products"][product] = result
+              parsed = {}
+              for chain in CHAINS:
+                  sent = []
+                  received = []
+                  for item in fetched[(product, chain)]:
+                      try:
+                          event = parse_log(item, "sent")
+                          if event:
+                              sent.append(event)
+                          event = parse_log(item, "received")
+                          if event:
+                              received.append(event)
+                      except Exception as exc:
+                          result["errors"].append({"chain": chain, "stage": "parse", "error": repr(exc)})
+                  parsed[chain] = {
+                      "sent": sorted(sent, key=lambda row: (row["block_number"], row["log_index"])),
+                      "received": sorted(received, key=lambda row: (row["block_number"], row["log_index"])),
+                  }
+
+              for source, destination in [("scroll", "ethereum"), ("ethereum", "scroll")]:
+                  direction = f"{source}_to_{destination}"
+                  sends = parsed[source]["sent"]
+                  receives = parsed[destination]["received"]
+                  received_by_guid = defaultdict(list)
+                  for row in receives:
+                      received_by_guid[row["guid"]].append(row)
+                  pairs = []
+                  for send in sends:
+                      candidates = received_by_guid.get(send["guid"], [])
+                      if not candidates:
+                          continue
+                      receive = min(candidates, key=lambda row: (row["block_number"], row["log_index"]))
+                      pairs.append({"send": send, "receive": receive})
+
+                  unique_source_blocks = sorted({pair["send"]["block_number"] for pair in pairs})
+                  unique_destination_blocks = sorted({pair["receive"]["block_number"] for pair in pairs})
+                  unique_all_blocks = {
+                      source: unique_source_blocks,
+                      destination: unique_destination_blocks,
+                  }
+                  block_timestamp = {}
+                  rate_by_chain_block = {}
+                  for chain, blocks in unique_all_blocks.items():
+                      if chain not in rpcs or not blocks:
+                          continue
+                      block_calls = [("eth_getBlockByNumber", [hex(block), False]) for block in blocks]
+                      rate_calls = [
+                          ("eth_call", [{"to": cfg["accountant"], "data": GET_RATE}, hex(block)])
+                          for block in blocks
+                      ]
+                      block_results = batch_rpc(rpcs[chain], block_calls)
+                      rate_results = batch_rpc(rpcs[chain], rate_calls)
+                      for block, block_obj, raw_rate in zip(blocks, block_results, rate_results):
+                          block_timestamp[(chain, block)] = int(block_obj["timestamp"], 16)
+                          rate_by_chain_block[(chain, block)] = int(raw_rate, 16)
+
+                  positive = []
+                  negative = []
+                  zero = []
+                  total_delta = 0
+                  post_bounty_delta = 0
+                  post_bounty_positive = []
+                  source_tx_hashes = []
+                  for pair in pairs:
+                      send = pair["send"]
+                      receive = pair["receive"]
+                      send_block = send["block_number"]
+                      receive_block = receive["block_number"]
+                      send_ts = block_timestamp.get((source, send_block))
+                      receive_ts = block_timestamp.get((destination, receive_block))
+                      source_rate = rate_by_chain_block.get((source, send_block))
+                      destination_rate = rate_by_chain_block.get((destination, receive_block))
+                      if None in (send_ts, receive_ts, source_rate, destination_rate):
+                          continue
+                      shares = send["share_amount"]
+                      delta_numerator = shares * (destination_rate - source_rate)
+                      delta = delta_numerator // cfg["one_share"] if delta_numerator >= 0 else -((-delta_numerator) // cfg["one_share"])
+                      row = {
+                          "guid": send["guid"],
+                          "recipient": send["recipient"],
+                          "share_amount": shares,
+                          "send_block": send_block,
+                          "send_timestamp": send_ts,
+                          "send_tx": send["transaction_hash"],
+                          "receive_block": receive_block,
+                          "receive_timestamp": receive_ts,
+                          "receive_tx": receive["transaction_hash"],
+                          "delivery_seconds": receive_ts - send_ts,
+                          "source_rate": source_rate,
+                          "destination_rate": destination_rate,
+                          "value_delta_base_raw": delta,
+                      }
+                      total_delta += delta
+                      if send_ts >= BOUNTY_START:
+                          post_bounty_delta += delta
+                      if delta > 0:
+                          positive.append(row)
+                          source_tx_hashes.append(send["transaction_hash"])
+                          if send_ts >= BOUNTY_START:
+                              post_bounty_positive.append(row)
+                      elif delta < 0:
+                          negative.append(row)
+                      else:
+                          zero.append(row)
+
+                  # Classify source transaction selectors for positive deltas.
+                  selector_by_tx = {}
+                  if source in rpcs and source_tx_hashes:
+                      tx_calls = [("eth_getTransactionByHash", [tx_hash]) for tx_hash in sorted(set(source_tx_hashes))]
+                      tx_results = batch_rpc(rpcs[source], tx_calls)
+                      for tx_hash, tx in zip(sorted(set(source_tx_hashes)), tx_results):
+                          selector = str((tx or {}).get("input") or "0x")[:10].lower()
+                          selector_by_tx[tx_hash] = selector
+                  for row in positive:
+                      selector = selector_by_tx.get(row["send_tx"], "0x")
+                      row["source_tx_selector"] = selector
+                      row["atomic_deposit_and_bridge"] = selector in DEPOSIT_BRIDGE_SELECTORS
+                      row["plain_bridge"] = selector in BRIDGE_SELECTORS
+
+                  positive.sort(key=lambda row: row["value_delta_base_raw"], reverse=True)
+                  negative.sort(key=lambda row: row["value_delta_base_raw"])
+                  post_bounty_positive.sort(key=lambda row: row["value_delta_base_raw"], reverse=True)
+                  result["directions"][direction] = {
+                      "sent_event_count": len(sends),
+                      "received_event_count": len(receives),
+                      "paired_guid_count": len(pairs),
+                      "unpaired_send_count": len(sends) - len(pairs),
+                      "positive_count": len(positive),
+                      "negative_count": len(negative),
+                      "zero_count": len(zero),
+                      "net_value_delta_base_raw": total_delta,
+                      "post_bounty_net_value_delta_base_raw": post_bounty_delta,
+                      "post_bounty_positive_count": len(post_bounty_positive),
+                      "post_bounty_positive_value_base_raw": sum(row["value_delta_base_raw"] for row in post_bounty_positive),
+                      "positive_atomic_deposit_and_bridge_count": sum(bool(row.get("atomic_deposit_and_bridge")) for row in positive),
+                      "largest_positive": positive[:20],
+                      "largest_negative": negative[:20],
+                      "post_bounty_positive": post_bounty_positive[:100],
+                  }
+
+              # Current exact rates for an independent submission-time gate.
+              try:
+                  current_rates = {}
+                  for chain in CHAINS:
+                      current_rates[chain] = int(rpc(rpcs[chain], "eth_call", [{"to": cfg["accountant"], "data": GET_RATE}, "latest"]), 16)
+                  result["current_rates"] = current_rates
+                  result["current_scroll_to_ethereum_edge_raw"] = current_rates["ethereum"] - current_rates["scroll"]
+                  result["current_ethereum_to_scroll_edge_raw"] = current_rates["scroll"] - current_rates["ethereum"]
+              except Exception as exc:
+                  result["errors"].append({"stage": "current_rates", "error": repr(exc)})
+
+          # Consolidated decision. A historical accounting delta is evidence, but not a submission-time gate by itself.
+          total_post_bounty_positive = 0
+          current_positive_edge = False
+          for product, result in output["products"].items():
+              for direction in result["directions"].values():
+                  total_post_bounty_positive += direction["post_bounty_positive_value_base_raw"]
+              current_positive_edge = current_positive_edge or result.get("current_scroll_to_ethereum_edge_raw", 0) > 0 or result.get("current_ethereum_to_scroll_edge_raw", 0) > 0
+          output["decision"] = {
+              "historical_production_positive_value_raw_sum_cross_asset_noncomparable": total_post_bounty_positive,
+              "any_current_rate_edge": current_positive_edge,
+              "technical_production_evidence": any(
+                  direction["post_bounty_positive_count"] > 0
+                  for result in output["products"].values()
+                  for direction in result["directions"].values()
+              ),
+              "submission_ready": False,
+              "submission_ready_reason": "Requires current exploitability or a separately proven current unresolved deficit; historical message-level deltas alone are insufficient.",
+          }
+
+          with open("veda-guid-conservation-ledger.json", "w", encoding="utf-8") as handle:
+              json.dump(output, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+
+          compact = {
+              "global_errors": output["global_errors"],
+              "decision": output["decision"],
+              "products": {
+                  product: {
+                      "current_rates": result.get("current_rates"),
+                      "current_scroll_to_ethereum_edge_raw": result.get("current_scroll_to_ethereum_edge_raw"),
+                      "directions": {
+                          direction: {
+                              key: data[key]
+                              for key in [
+                                  "paired_guid_count",
+                                  "unpaired_send_count",
+                                  "positive_count",
+                                  "post_bounty_positive_count",
+                                  "post_bounty_positive_value_base_raw",
+                                  "post_bounty_net_value_delta_base_raw",
+                                  "positive_atomic_deposit_and_bridge_count",
+                              ]
+                          }
+                          for direction, data in result["directions"].items()
+                      },
+                      "errors": result["errors"],
+                  }
+                  for product, result in output["products"].items()
+              },
+          }
+          print(json.dumps(compact, indent=2, sort_keys=True))
+          PY
+
+      - name: Upload GUID conservation evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-guid-conservation-ledger
+          path: veda-guid-conservation-ledger.json
+          if-no-files-found: error
+          retention-days: 1
