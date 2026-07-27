@@ -1,0 +1,104 @@
+name: veda-inflight-delivery-correlation-v3
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  correlate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Resolve five candidates through targeted Blockscout V2 cursors
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import datetime,json,subprocess,time,urllib.parse,urllib.request
+          from pathlib import Path
+
+          C=[
+            {'product':'liquidETH','teller':'0x9AA79C84b79816ab920bBcE20f8f74557B514734','accountant':'0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198','one':10**18,'guid':'0x8f0a7530f2f79932550e6335df60f0f4ca2de611e32168aae5651c81e057e9e1','source_block':30932878,'source_timestamp':1772234290,'update_time':1772234339,'shares':94011967841297,'anchor':24551506},
+            {'product':'liquidETH','teller':'0x9AA79C84b79816ab920b8f74557B514734'.replace('920b8','920bBcE20f8'),'accountant':'0x0d05D94a5F1E76C18fbeB7A13d17C8a314088198','one':10**18,'guid':'0x4fb116b702290d7876b522e50bd14528e9d0e96bed707038c5013fe1f50ed93e','source_block':31176489,'source_timestamp':1772580369,'update_time':1772581643,'shares':130424307382454028,'anchor':24580309},
+            {'product':'liquidUSD','teller':'0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387','accountant':'0xc315D6e14DDCDC7407784e2Caf815d131Bc1D3E7','one':10**6,'guid':'0x2f0ccd504501ed1e96d259d201ad1e142a9312e0bc2975c4b8dff44727323d63','source_block':28912407,'source_timestamp':1769556275,'update_time':1769557547,'shares':286395633,'anchor':24329542},
+            {'product':'liquidUSD','teller':'0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387','accountant':'0xc315D6e14DDCDC7407784e2Caf815d131Bc1D3E7','one':10**6,'guid':'0xdbe4b87eee629f09d2c954cf1546470daa559bdf478993cd09d58817d954f537','source_block':30563082,'source_timestamp':1771718078,'update_time':1771718159,'shares':8726353,'anchor':24508661},
+            {'product':'liquidUSD','teller':'0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387','accountant':'0xc315D6e14DDCDC7407784e2Caf815d131Bc1D3E7','one':10**6,'guid':'0x19cee498fcc7bd2c53466cb46da1380ff2217b82e85bd691ae6057fb827a6904','source_block':33168221,'source_timestamp':1775519587,'update_time':1775519843,'shares':766122,'anchor':24824064},
+          ]
+          # Normalize the synthetic string expression above before grouping.
+          C[1]['teller']='0x9AA79C84b79816ab920bBcE20f8f74557B514734'
+          API='https://eth.blockscout.com/api/v2/addresses/{}/logs'
+          ETH_RPCS=['https://ethereum-rpc.publicnode.com','https://eth.drpc.org','https://rpc.mevblocker.io'];SCROLL_RPCS=['https://scroll-rpc.publicnode.com','https://rpc.scroll.io','https://scroll.drpc.org']
+          def sig(s):return subprocess.check_output(['cast','sig',s],text=True).strip()
+          def keccak(s):return subprocess.check_output(['cast','keccak',s],text=True).strip().lower()
+          RECEIVED=keccak('MessageReceived(bytes32,uint256,address)');GET_RATE=sig('getRate()')
+          def get_json(url,retries=5):
+            last=None
+            for i in range(retries):
+              try:
+                req=urllib.request.Request(url,headers={'accept':'application/json','user-agent':'Mozilla/5.0 VedaResearchCursor/2.0'})
+                with urllib.request.urlopen(req,timeout=50) as r:return json.loads(r.read().decode())
+              except Exception as e:last=e;time.sleep(.2*(i+1))
+            raise last
+          def rpc(url,m,p,timeout=45):
+            body=json.dumps({'jsonrpc':'2.0','id':1,'method':m,'params':p}).encode();req=urllib.request.Request(url,data=body,method='POST',headers={'content-type':'application/json','user-agent':'veda-inflight-v3/1'})
+            with urllib.request.urlopen(req,timeout=timeout) as r:o=json.loads(r.read().decode())
+            if 'error' in o:raise RuntimeError(o['error'])
+            return o['result']
+          def choose(cands,cid):
+            bad={}
+            for u in cands:
+              try:
+                if int(rpc(u,'eth_chainId',[]),16)!=cid:raise RuntimeError('wrong chain')
+                return u,bad
+              except Exception as e:bad[u]=repr(e)
+            raise RuntimeError(bad)
+          eth,ebad=choose(ETH_RPCS,1);scroll,sbad=choose(SCROLL_RPCS,534352)
+          def uts(s):return int(datetime.datetime.fromisoformat(s.replace('Z','+00:00')).timestamp())
+          def rate(url,a,b):return int(rpc(url,'eth_call',[{'to':a,'data':GET_RATE},hex(b)]),16)
+
+          ledger={};meta={};errors=[]
+          for teller in sorted({x['teller'] for x in C}):
+            tc=[x for x in C if x['teller']==teller];start=max(x['anchor'] for x in tc)+15000;stop=min(x['anchor'] for x in tc)-250
+            params={'block_number':start,'index':2147483647,'items_count':50};rows=[];pages=0;seen_params=set();reason=None
+            while pages<250:
+              key=tuple(sorted(params.items()))
+              if key in seen_params:reason='repeated_cursor';break
+              seen_params.add(key);url=API.format(teller)+'?'+urllib.parse.urlencode(params);d=get_json(url);pages+=1;batch=d.get('items') or []
+              if not batch:reason='empty_page';break
+              rows.extend(batch);oldest=min(int(x['block_number']) for x in batch)
+              if oldest<stop:reason='reached_stop';break
+              nxt=d.get('next_page_params')
+              if not nxt:reason='no_next_page';break
+              params=nxt
+            ledger[teller]=rows;meta[teller]={'pages':pages,'rows':len(rows),'start_block':start,'stop_block':stop,'oldest_block':min([int(x['block_number']) for x in rows]or[0]),'newest_block':max([int(x['block_number']) for x in rows]or[0]),'stop_reason':reason}
+
+          results=[]
+          for c in C:
+            try:
+              found=[]
+              for row in ledger[c['teller']]:
+                topics=[x.lower() for x in (row.get('topics') or []) if isinstance(x,str)]
+                if len(topics)>=2 and topics[0]==RECEIVED and topics[1]==c['guid'].lower():found.append(row)
+              x=dict(c);x['delivery_found']=bool(found);x['matching_log_count']=len(found)
+              if found:
+                row=sorted(found,key=lambda r:(int(r['block_number']),int(r['index'])))[0];db=int(row['block_number']);dt=uts(row['block_timestamp']);sr=rate(scroll,c['accountant'],c['source_block']);dr=rate(eth,c['accountant'],db);x.update({'destination_block':db,'destination_timestamp':dt,'destination_tx':row['transaction_hash'],'destination_log_index':int(row['index']),'source_rate':sr,'destination_rate':dr,'rate_edge_raw':dr-sr,'delivered_after_update':dt>=c['update_time'],'actual_extra_base_raw':c['shares']*max(0,dr-sr)//c['one']})
+              results.append(x)
+            except Exception as e:errors.append({'candidate':c,'error':repr(e)})
+          positive=[x for x in results if x.get('delivery_found') and x.get('delivered_after_update') and x.get('rate_edge_raw',0)>0]
+          out={'generated_at_unix':int(time.time()),'ethereum_rpc':eth,'scroll_rpc':scroll,'rpc_failures':{'ethereum':ebad,'scroll':sbad},'ledger_meta':meta,'candidate_count':len(C),'resolved_count':len(results),'delivery_found_count':sum(1 for x in results if x.get('delivery_found')),'positive_delayed_count':len(positive),'sum_actual_extra_by_product':{p:sum(x.get('actual_extra_base_raw',0) for x in positive if x['product']==p) for p in ['liquidETH','liquidUSD']},'results':results,'positive':positive,'errors':errors}
+          Path('veda-inflight-delivery-correlation-v3.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n');print(json.dumps({k:out[k] for k in ['candidate_count','resolved_count','delivery_found_count','positive_delayed_count','sum_actual_extra_by_product','ledger_meta']},indent=2));print('errors',len(errors))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: veda-inflight-delivery-correlation-v3
+          path: veda-inflight-delivery-correlation-v3.json
+          if-no-files-found: error
+          retention-days: 1
