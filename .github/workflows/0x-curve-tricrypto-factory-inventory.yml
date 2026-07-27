@@ -1,0 +1,128 @@
+name: Inventory public Curve Tricrypto factory creations
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/0x-curve-tricrypto-factory-inventory.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+      - name: Inventory factory CREATE sequence and registered pools
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/curve-tricrypto-inventory"
+          mkdir -p "$OUT"
+          FACTORY=0xbC0797015fcFc47d9C1856639CaE50D0e69FbEE8
+          RPCS=(
+            https://arbitrum-one-rpc.publicnode.com
+            https://arbitrum.drpc.org
+            https://arb1.arbitrum.io/rpc
+          )
+          RPC=''
+          for candidate in "${RPCS[@]}"; do
+            if [ "$(cast chain-id --rpc-url "$candidate" 2>/dev/null || true)" = 42161 ]; then RPC="$candidate"; break; fi
+          done
+          test -n "$RPC"
+
+          head=$(cast block-number --rpc-url "$RPC")
+          count=$(cast call "$FACTORY" 'pool_count()(uint256)' --rpc-url "$RPC" | awk '{print $1}')
+          account_nonce=$(cast nonce "$FACTORY" --rpc-url "$RPC")
+          admin=$(cast call "$FACTORY" 'admin()(address)' --rpc-url "$RPC")
+          math=$(cast call "$FACTORY" 'math_implementation()(address)' --rpc-url "$RPC")
+          views=$(cast call "$FACTORY" 'views_implementation()(address)' --rpc-url "$RPC")
+          printf 'factory=%s\nhead=%s\npool_count=%s\naccount_nonce=%s\nadmin=%s\nmath=%s\nviews=%s\n' "$FACTORY" "$head" "$count" "$account_nonce" "$admin" "$math" "$views" > "$OUT/provenance.txt"
+
+          printf 'index\tpool\tderived_nonce\timplementation\tcodehash\tcode_bytes\tcoin0\tcoin1\tcoin2\n' > "$OUT/pools.tsv"
+          declare -A POOL_TO_INDEX
+          for ((i=0;i<count;i++)); do
+            pool=$(cast call "$FACTORY" 'pool_list(uint256)(address)' "$i" --rpc-url "$RPC")
+            POOL_TO_INDEX[${pool,,}]=$i
+            impl=$(cast call "$FACTORY" 'get_implementation_address(address)(address)' "$pool" --rpc-url "$RPC")
+            codehash=$(cast codehash "$pool" --rpc-url "$RPC")
+            code=$(cast code "$pool" --rpc-url "$RPC")
+            code_bytes=$(( (${#code} - 2) / 2 ))
+            coins=$(cast call "$FACTORY" 'get_coins(address)(address[3])' "$pool" --rpc-url "$RPC" | tr -d '[],' )
+            read -r c0 c1 c2 <<< "$coins"
+            nonce_match=''
+            # EIP-161 contract accounts start at nonce 1; brute force a small safety margin.
+            for ((n=1;n<=account_nonce+3;n++)); do
+              derived=$(cast compute-address "$FACTORY" --nonce "$n")
+              if [ "${derived,,}" = "${pool,,}" ]; then nonce_match=$n; break; fi
+            done
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$i" "$pool" "$nonce_match" "$impl" "$codehash" "$code_bytes" "$c0" "$c1" "$c2" >> "$OUT/pools.tsv"
+          done
+
+          printf 'nonce\tderived\tregistered_index\tcodehash\tcode_bytes\n' > "$OUT/create-sequence.tsv"
+          for ((n=1;n<=account_nonce+3;n++)); do
+            derived=$(cast compute-address "$FACTORY" --nonce "$n")
+            idx=${POOL_TO_INDEX[${derived,,}]:-}
+            code=$(cast code "$derived" --rpc-url "$RPC")
+            codehash=$(cast codehash "$derived" --rpc-url "$RPC")
+            code_bytes=$(( (${#code} - 2) / 2 ))
+            printf '%s\t%s\t%s\t%s\t%s\n' "$n" "$derived" "$idx" "$codehash" "$code_bytes" >> "$OUT/create-sequence.tsv"
+          done
+
+          printf 'implementation_id\taddress\tcodehash\tcode_bytes\n' > "$OUT/implementations.tsv"
+          for ((id=0;id<32;id++)); do
+            impl=$(cast call "$FACTORY" 'pool_implementations(uint256)(address)' "$id" --rpc-url "$RPC")
+            if [ "${impl,,}" != 0x0000000000000000000000000000000000000000 ]; then
+              code=$(cast code "$impl" --rpc-url "$RPC")
+              codehash=$(cast codehash "$impl" --rpc-url "$RPC")
+              code_bytes=$(( (${#code} - 2) / 2 ))
+              printf '%s\t%s\t%s\t%s\n' "$id" "$impl" "$codehash" "$code_bytes" >> "$OUT/implementations.tsv"
+            fi
+          done
+
+          python3 - "$OUT" <<'PY'
+          import csv, json, pathlib, sys
+          root=pathlib.Path(sys.argv[1])
+          pools=list(csv.DictReader((root/'pools.tsv').open(), delimiter='\t'))
+          seq=list(csv.DictReader((root/'create-sequence.tsv').open(), delimiter='\t'))
+          impls=list(csv.DictReader((root/'implementations.tsv').open(), delimiter='\t'))
+          anomalies=[]
+          for p in pools:
+              if not p['derived_nonce']:
+                  anomalies.append({'type':'registered_pool_not_in_factory_create_sequence','pool':p['pool'],'index':p['index']})
+              if int(p['code_bytes']) == 0:
+                  anomalies.append({'type':'registered_pool_without_code','pool':p['pool'],'index':p['index']})
+          for r in seq:
+              if int(r['code_bytes']) > 0 and not r['registered_index']:
+                  anomalies.append({'type':'factory_created_contract_not_registered_as_pool','nonce':r['nonce'],'address':r['derived'],'codehash':r['codehash']})
+          summary={
+              'pool_count':len(pools),
+              'implementation_count':len(impls),
+              'pool_codehashes':sorted(set(p['codehash'] for p in pools)),
+              'pool_runtime_sizes':sorted(set(int(p['code_bytes']) for p in pools)),
+              'anomalies':anomalies,
+          }
+          (root/'summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True))
+          if anomalies:
+              print(json.dumps(anomalies, indent=2))
+          PY
+
+          find "$OUT" -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS"
+          test -s "$OUT/summary.json"
+      - name: Upload inventory
+        uses: actions/upload-artifact@v4
+        with:
+          name: 0x-curve-tricrypto-inventory-${{ github.run_id }}
+          path: curve-tricrypto-inventory/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
