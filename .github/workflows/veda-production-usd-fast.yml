@@ -1,0 +1,84 @@
+name: veda-production-usd-fast
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Fast LiquidUSD production-window scan
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64,datetime,gzip,json,re,subprocess,time,urllib.parse,urllib.request
+          from pathlib import Path
+          src=Path('.github/workflows/veda-production-window-scan.yml').read_text();m=re.search(r"WINDOW_B64 = '''([^']+)'''",src)
+          windows=[w for w in json.loads(gzip.decompress(base64.b64decode(m.group(1)))) if w['p']=='liquidUSD']
+          TELLER='0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387';API=f'https://scroll.blockscout.com/api/v2/addresses/{TELLER}/logs'
+          RPCS=['https://scroll-rpc.publicnode.com','https://rpc.scroll.io','https://scroll.drpc.org']
+          def k(s):return subprocess.check_output(['cast','keccak',s],text=True).strip().lower()
+          def sel(s):return subprocess.check_output(['cast','sig',s],text=True).strip().lower()
+          SENT=k('MessageSent(bytes32,uint256,address)');DEPS={k('Deposit(uint256,address,address,uint256,uint256,uint256,uint256,address)'),k('Deposit(uint256,address,address,uint256,uint256,uint256,uint256)')};ATOMIC={sel('depositAndBridge(address,uint256,uint256,address,bytes,address,uint256)'),sel('depositAndBridge(address,uint256,uint256,address,bytes,address,uint256,address)')}
+          def get(url):
+            req=urllib.request.Request(url,headers={'accept':'application/json','user-agent':'Mozilla/5.0 VedaResearch/3.0'})
+            with urllib.request.urlopen(req,timeout=60) as r:return json.loads(r.read().decode())
+          def rpc(url,m,p):
+            body=json.dumps({'jsonrpc':'2.0','id':1,'method':m,'params':p}).encode();req=urllib.request.Request(url,data=body,method='POST',headers={'content-type':'application/json','user-agent':'veda-usd-fast/1'})
+            with urllib.request.urlopen(req,timeout=40) as r:o=json.loads(r.read().decode())
+            if 'error'in o:raise RuntimeError(o['error'])
+            return o['result']
+          bad={};rpcurl=None
+          for u in RPCS:
+            try:
+              if int(rpc(u,'eth_chainId',[]),16)==534352:rpcurl=u;break
+            except Exception as e:bad[u]=repr(e)
+          if not rpcurl:raise RuntimeError(bad)
+          minblock=min(w['a'] for w in windows)-100;params={};rows=[];seen=set();seen_params=set();pages=0;stop_reason=None
+          while pages<200:
+            key=tuple(sorted(params.items()))
+            if key in seen_params:stop_reason='repeated_pagination';break
+            seen_params.add(key)
+            data=get(API+('?' + urllib.parse.urlencode(params) if params else ''));pages+=1;batch=data.get('items') or []
+            if not batch:stop_reason='empty_page';break
+            oldest=min(int(x['block_number']) for x in batch)
+            for x in batch:
+              q=(x.get('transaction_hash'),x.get('index'))
+              if q not in seen:seen.add(q);rows.append(x)
+            if oldest<minblock:stop_reason='reached_min_block';break
+            nxt=data.get('next_page_params')
+            if not nxt:stop_reason='no_next_page';break
+            params=nxt
+          if stop_reason is None:stop_reason='page_cap'
+          def uts(s):return int(datetime.datetime.fromisoformat(s.replace('Z','+00:00')).timestamp())
+          hits=[];errors=[]
+          for r in rows:
+            try:
+              topics=[x.lower() for x in r.get('topics',[])]
+              if not topics or topics[0]!=SENT:continue
+              ts=uts(r['block_timestamp']);ms=[w for w in windows if w['t0']<=ts<=w['t1']]
+              if not ms:continue
+              txh=r['transaction_hash'];tx=rpc(rpcurl,'eth_getTransactionByHash',[txh]);rc=rpc(rpcurl,'eth_getTransactionReceipt',[txh]);s=(tx.get('input') or '0x')[:10].lower();rt={x['topics'][0].lower() for x in rc.get('logs',[]) if x.get('topics')};dep=any(x in rt for x in DEPS);shares=int(r.get('data') or '0x0',16)
+              for w in ms:hits.append({'tx':txh,'block':int(r['block_number']),'timestamp':ts,'selector':s,'atomic':s in ATOMIC or dep,'atomic_selector':s in ATOMIC,'deposit_event':dep,'guid':topics[1] if len(topics)>1 else None,'recipient':'0x'+topics[2][-40:] if len(topics)>2 else None,'shares_raw':shares,'gross_extra_usd_raw':shares*(w['dr']-w['sr'])//10**6,'window':w})
+            except Exception as e:errors.append({'row':r,'error':repr(e)})
+          out={'generated_at_unix':int(time.time()),'rpc':rpcurl,'rpc_failures':bad,'window_count':len(windows),'min_block':minblock,'pages':pages,'indexed_rows':len(rows),'stop_reason':stop_reason,'oldest_indexed_block':min(int(x['block_number']) for x in rows) if rows else None,'newest_indexed_block':max(int(x['block_number']) for x in rows) if rows else None,'message_sent_total':sum(1 for x in rows if x.get('topics') and x['topics'][0].lower()==SENT),'positive_window_hits':hits,'positive_window_hit_count':len(hits),'atomic_hit_count':sum(1 for x in hits if x['atomic']),'max_gross_extra_usd_raw':max([x['gross_extra_usd_raw'] for x in hits if x['atomic']] or [0]),'errors':errors}
+          Path('veda-production-usd-fast.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n');print(json.dumps({k:out[k] for k in ['window_count','pages','indexed_rows','stop_reason','oldest_indexed_block','newest_indexed_block','message_sent_total','positive_window_hit_count','atomic_hit_count','max_gross_extra_usd_raw']},indent=2))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: veda-production-usd-fast
+          path: veda-production-usd-fast.json
+          if-no-files-found: error
+          retention-days: 1
