@@ -1,0 +1,149 @@
+name: Hermetica FLH operator state
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-flh-state.yml'
+      - 'public-data/hermetica-flh-state-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconstruct public FLH ownership and operator state
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT=/tmp/hermetica-flh-state
+          mkdir -p "$OUT/raw" "$OUT/operator-contracts"
+          python3 - <<'PY'
+          import datetime as dt
+          import json
+          import pathlib
+          import re
+          import time
+          import urllib.parse
+          import urllib.request
+
+          OUT=pathlib.Path('/tmp/hermetica-flh-state')
+          API='https://api.hiro.so'
+          CID='SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.flh'
+
+          def get(url, attempts=10):
+              last=None
+              for i in range(attempts):
+                  try:
+                      req=urllib.request.Request(url,headers={'User-Agent':'read-only-security-research/1.0','Accept':'application/json'})
+                      with urllib.request.urlopen(req,timeout=40) as r:
+                          return json.loads(r.read().decode())
+                  except Exception as exc:
+                      last=exc
+                      time.sleep(min(12,1.5*(i+1)))
+              raise RuntimeError(f'{url}: {last}')
+
+          def all_txs(address):
+              rows=[]; offset=0; limit=50
+              while True:
+                  q=urllib.parse.urlencode({'limit':limit,'offset':offset})
+                  body=get(f'{API}/extended/v1/address/{address}/transactions?{q}')
+                  page=body.get('results') or []
+                  rows.extend(page)
+                  total=int(body.get('total') or len(rows))
+                  if not page or len(rows)>=total: break
+                  offset += len(page)
+                  time.sleep(.15)
+              return rows
+
+          def arg_principal(arg):
+              value=arg.get('repr') or ''
+              m=re.search(r"'((?:SP|SM|ST)[A-Z0-9]+(?:\.[A-Za-z0-9_-]+)?)", value)
+              return m.group(1) if m else None
+
+          def arg_bool(arg):
+              value=(arg.get('repr') or '').strip()
+              if value=='true': return True
+              if value=='false': return False
+              return None
+
+          txs=all_txs(CID)
+          (OUT/'raw'/'transactions.json').write_text(json.dumps(txs,indent=2))
+          chronological=sorted(txs,key=lambda x:(int(x.get('block_height') or 0),int(x.get('tx_index') or 0)))
+          deploy=next((x for x in chronological if x.get('tx_type')=='smart_contract' and (x.get('smart_contract') or {}).get('contract_id')==CID and x.get('tx_status')=='success'),None)
+          owner=deploy.get('sender_address') if deploy else None
+          operators={}
+          state_events=[]
+          execute_calls=[]
+          all_calls=[]
+          for tx in chronological:
+              if tx.get('tx_type')!='contract_call' or tx.get('tx_status')!='success': continue
+              c=tx.get('contract_call') or {}
+              if c.get('contract_id')!=CID: continue
+              fn=c.get('function_name')
+              args=c.get('function_args') or []
+              row={'tx_id':tx.get('tx_id'),'block_height':tx.get('block_height'),'block_time':tx.get('block_time'),'block_iso':dt.datetime.fromtimestamp(int(tx.get('block_time') or 0),dt.timezone.utc).isoformat() if tx.get('block_time') else None,'sender':tx.get('sender_address'),'function_name':fn,'args':args,'result':(tx.get('tx_result') or {}).get('repr')}
+              all_calls.append(row)
+              if fn=='set-operator' and len(args)>=2:
+                  op=arg_principal(args[0]); val=arg_bool(args[1])
+                  if op is not None and val is not None:
+                      operators[op]=val
+                      state_events.append({**row,'operator':op,'authorized':val,'owner_at_call':owner})
+              elif fn=='transfer-ownership' and args:
+                  new_owner=arg_principal(args[0])
+                  state_events.append({**row,'old_owner':owner,'new_owner':new_owner})
+                  if new_owner: owner=new_owner
+              elif fn=='execute':
+                  execute_calls.append(row)
+
+          observed=set(operators)
+          observed.update(x.get('sender') for x in execute_calls if x.get('sender'))
+          principal_details=[]
+          for p in sorted(observed):
+              is_contract='.' in p
+              detail={'principal':p,'current_authorized':operators.get(p,False),'is_contract':is_contract,'successful_execute_calls':sum(1 for x in execute_calls if x.get('sender')==p)}
+              if is_contract:
+                  try:
+                      addr,name=p.split('.',1)
+                      meta=get(f'{API}/extended/v1/contract/{p}')
+                      src=get(f'{API}/v2/contracts/source/{addr}/{name}?proof=0').get('source') or ''
+                      safe=p.replace('.','__')
+                      (OUT/'operator-contracts'/f'{safe}.clar').write_text(src)
+                      (OUT/'operator-contracts'/f'{safe}.metadata.json').write_text(json.dumps(meta,indent=2))
+                      detail.update({'source_bytes':len(src.encode()),'public_functions':sorted(set(re.findall(r'\(define-public\s+\(([^\s\)]+)',src)))})
+                  except Exception as exc:
+                      detail['source_error']=str(exc)
+              principal_details.append(detail)
+
+          summary={
+            'generated_at':dt.datetime.now(dt.timezone.utc).isoformat(),
+            'source':'Hiro public read-only API',
+            'contract_id':CID,
+            'deployment_tx':deploy,
+            'current_owner_reconstructed':owner,
+            'current_authorized_operators':sorted([p for p,v in operators.items() if v]),
+            'operator_state':operators,
+            'principal_details':principal_details,
+            'successful_call_count':len(all_calls),
+            'successful_execute_count':len(execute_calls),
+            'execute_callers':sorted(set(x.get('sender') for x in execute_calls if x.get('sender'))),
+            'state_events':state_events,
+            'execute_calls':execute_calls,
+            'all_calls':all_calls,
+          }
+          (OUT/'summary.json').write_text(json.dumps(summary,indent=2))
+          print(json.dumps({k:v for k,v in summary.items() if k not in ('deployment_tx','state_events','execute_calls','all_calls')},indent=2))
+          PY
+          (cd "$OUT" && find . -type f -not -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-flh-state
+          path: /tmp/hermetica-flh-state
+          retention-days: 2
+          if-no-files-found: error
+          compression-level: 0
