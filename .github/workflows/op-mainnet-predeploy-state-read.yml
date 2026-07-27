@@ -1,0 +1,127 @@
+name: OP Mainnet read-only predeploy state inventory
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/op-mainnet-predeploy-state-read.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Query read-only OP Mainnet state
+        shell: bash
+        env:
+          RPC_URL: https://mainnet.optimism.io
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python3 - <<'PY' > out/request.json
+          import json
+
+          addresses = {
+              "L2CrossDomainMessenger": "0x4200000000000000000000000000000000000007",
+              "GasPriceOracle": "0x420000000000000000000000000000000000000f",
+              "L2StandardBridge": "0x4200000000000000000000000000000000000010",
+              "SequencerFeeVault": "0x4200000000000000000000000000000000000011",
+              "OptimismMintableERC20Factory": "0x4200000000000000000000000000000000000012",
+              "L2ERC721Bridge": "0x4200000000000000000000000000000000000014",
+              "L1Block": "0x4200000000000000000000000000000000000015",
+              "L2ToL1MessagePasser": "0x4200000000000000000000000000000000000016",
+              "OptimismMintableERC721Factory": "0x4200000000000000000000000000000000000017",
+              "L2ProxyAdmin": "0x4200000000000000000000000000000000000018",
+              "BaseFeeVault": "0x4200000000000000000000000000000000000019",
+              "L1FeeVault": "0x420000000000000000000000000000000000001a",
+              "OperatorFeeVault": "0x420000000000000000000000000000000000001b",
+              "ConditionalDeployer": "0x420000000000000000000000000000000000002c",
+              "L2DevFeatureFlags": "0x420000000000000000000000000000000000002d",
+          }
+          impl_slot = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+          owner_slot = "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103"
+          oz_v5_slot = "0xf0c57e16840df040f15088dc2f81fe391c3923bec73e23a9662efc9c229c6a00"
+          req = []
+          n = 1
+          def add(method, params, label):
+              nonlocal_n[0] += 1
+              req.append({"jsonrpc":"2.0","id":label,"method":method,"params":params})
+          nonlocal_n=[0]
+          req.append({"jsonrpc":"2.0","id":"blockNumber","method":"eth_blockNumber","params":[]})
+          for name, address in addresses.items():
+              req.append({"jsonrpc":"2.0","id":f"{name}.code","method":"eth_getCode","params":[address,"latest"]})
+              req.append({"jsonrpc":"2.0","id":f"{name}.implementation","method":"eth_getStorageAt","params":[address,impl_slot,"latest"]})
+              req.append({"jsonrpc":"2.0","id":f"{name}.slot0","method":"eth_getStorageAt","params":[address,"0x0","latest"]})
+              req.append({"jsonrpc":"2.0","id":f"{name}.slot1","method":"eth_getStorageAt","params":[address,"0x1","latest"]})
+              req.append({"jsonrpc":"2.0","id":f"{name}.ozV5Initializable","method":"eth_getStorageAt","params":[address,oz_v5_slot,"latest"]})
+              req.append({"jsonrpc":"2.0","id":f"{name}.version","method":"eth_call","params":[{"to":address,"data":"0x54fd4d50"},"latest"]})
+          req.append({"jsonrpc":"2.0","id":"L2ProxyAdmin.ownerSlot","method":"eth_getStorageAt","params":[addresses["L2ProxyAdmin"],owner_slot,"latest"]})
+          req.append({"jsonrpc":"2.0","id":"L2ProxyAdmin.owner","method":"eth_call","params":[{"to":addresses["L2ProxyAdmin"],"data":"0x8da5cb5b"},"latest"]})
+          print(json.dumps(req))
+          PY
+
+          curl --fail-with-body --silent --show-error \
+            -H 'Content-Type: application/json' \
+            --data-binary @out/request.json \
+            "$RPC_URL" | tee out/raw-response.json
+
+      - name: Normalize and decode inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          raw = json.loads(Path('out/raw-response.json').read_text())
+          if not isinstance(raw, list):
+              raise SystemExit(f'unexpected RPC response: {raw!r}')
+
+          def decode_abi_string(value):
+              if not isinstance(value, str) or not value.startswith('0x') or len(value) < 2 + 64 * 2:
+                  return None
+              try:
+                  b = bytes.fromhex(value[2:])
+                  offset = int.from_bytes(b[:32], 'big')
+                  length = int.from_bytes(b[offset:offset+32], 'big')
+                  return b[offset+32:offset+32+length].decode('utf-8')
+              except Exception:
+                  return None
+
+          by_id = {}
+          errors = []
+          for item in raw:
+              ident = item.get('id')
+              if 'error' in item:
+                  errors.append({'id': ident, 'error': item['error']})
+                  by_id[ident] = {'error': item['error']}
+              else:
+                  result = item.get('result')
+                  entry = {'raw': result}
+                  if isinstance(ident, str) and ident.endswith('.version'):
+                      entry['decoded'] = decode_abi_string(result)
+                  by_id[ident] = entry
+
+          report = {
+              'rpc': 'https://mainnet.optimism.io',
+              'block': by_id.get('blockNumber'),
+              'errors': errors,
+              'results': dict(sorted(by_id.items())),
+          }
+          Path('out/predeploy-state.json').write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
+          if errors:
+              print(f'RPC returned {len(errors)} method errors; retained in report')
+          print(json.dumps(report, indent=2, sort_keys=True))
+          PY
+          sha256sum out/request.json out/raw-response.json out/predeploy-state.json > out/SHA256SUMS
+
+      - name: Upload read-only evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: op-mainnet-predeploy-state-read
+          path: out
+          if-no-files-found: error
+          retention-days: 3
