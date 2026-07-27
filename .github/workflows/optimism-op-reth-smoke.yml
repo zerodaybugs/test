@@ -1,4 +1,4 @@
-name: Optimism op-reth public baseline smoke
+name: Optimism op-reth v2.3.3 public baseline
 
 on:
   pull_request:
@@ -9,18 +9,28 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: optimism-op-reth-public-baseline-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
-  smoke:
+  baseline:
+    name: Locked production build and consensus-surface tests
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 360
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+      CARGO_INCREMENTAL: "0"
     steps:
-      - name: Runner and network smoke
+      - name: Runner metadata
         shell: bash
         run: |
           set -euo pipefail
           uname -a
           python3 --version
           git --version
+          df -h
 
       - name: Checkout exact Optimism production tag
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -29,11 +39,152 @@ jobs:
           ref: op-reth/v2.3.3
           path: upstream
           fetch-depth: 1
-          submodules: false
+          submodules: recursive
 
-      - name: Verify source lock
+      - name: Verify immutable source lock
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C upstream rev-parse HEAD)" = "20636578d271888a492ecb566a788570cdc0d7f0"
-          git -C upstream rev-parse HEAD
+          expected="20636578d271888a492ecb566a788570cdc0d7f0"
+          actual="$(git -C upstream rev-parse HEAD)"
+          printf 'expected=%s\nactual=%s\n' "$expected" "$actual"
+          test "$actual" = "$expected"
+
+      - name: Install native build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake libclang-dev libssl-dev pkg-config protobuf-compiler
+
+      - name: Install locked Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.94.0 --profile minimal
+          rustup default 1.94.0
+          rustc -Vv
+          cargo -V
+
+      - name: Fetch locked dependency graph
+        shell: bash
+        working-directory: upstream/rust
+        run: cargo fetch --locked
+
+      - name: Run production-tag consensus-surface tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit-results
+          cd upstream/rust
+          set -o pipefail
+          cargo test --locked \
+            -p op-revm \
+            -p alloy-op-evm \
+            -p reth-optimism-evm \
+            -p reth-optimism-consensus \
+            -p reth-optimism-txpool \
+            -p reth-optimism-payload-builder \
+            -p revm-ee-tests \
+            --lib --tests -- --nocapture \
+            2>&1 | tee ../../audit-results/consensus-surface-tests.log
+
+      - name: Build production op-reth binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd upstream/rust
+          set -o pipefail
+          cargo build --locked --release -p op-reth \
+            2>&1 | tee ../../audit-results/op-reth-release-build.log
+          sha256sum target/release/op-reth | tee ../../audit-results/op-reth.sha256
+          target/release/op-reth --version | tee ../../audit-results/op-reth-version.txt
+
+      - name: Extract high-risk review locations
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+          import hashlib
+          import json
+          import re
+          from pathlib import Path
+
+          root = Path("upstream")
+          prefixes = (
+              "rust/op-revm",
+              "rust/alloy-op-evm",
+              "rust/op-alloy",
+              "rust/op-reth/crates/consensus",
+              "rust/op-reth/crates/evm",
+              "rust/op-reth/crates/node",
+              "rust/op-reth/crates/payload",
+              "rust/op-reth/crates/rpc",
+              "rust/op-reth/crates/trie",
+              "rust/op-reth/crates/txpool",
+              "rust/kona/crates/proof",
+              "rust/kona/crates/protocol",
+          )
+          patterns = {
+              "panic": re.compile(r"\\bpanic!\\s*\\("),
+              "unreachable": re.compile(r"\\bunreachable!\\s*\\("),
+              "expect": re.compile(r"\\.expect\\s*\\("),
+              "unwrap": re.compile(r"\\.unwrap\\s*\\("),
+              "unsafe": re.compile(r"\\bunsafe\\s*\\{"),
+              "unchecked_access": re.compile(r"\\bget_unchecked(?:_mut)?\\s*\\("),
+          }
+          records = []
+          for prefix in prefixes:
+              base = root / prefix
+              if not base.exists():
+                  continue
+              for path in sorted(base.rglob("*.rs")):
+                  rel = path.relative_to(root).as_posix()
+                  source = path.read_text(encoding="utf-8")
+                  for name, pattern in patterns.items():
+                      for match in pattern.finditer(source):
+                          line = source.count("\\n", 0, match.start()) + 1
+                          excerpt = source.splitlines()[line - 1].strip()[:240]
+                          records.append({
+                              "path": rel,
+                              "line": line,
+                              "pattern": name,
+                              "excerpt_hash": hashlib.sha256(excerpt.encode()).hexdigest()[:16],
+                              "excerpt": excerpt,
+                          })
+          records.sort(key=lambda item: (item["path"], item["line"], item["pattern"]))
+          output = Path("audit-results/source-risk-locations.json")
+          output.parent.mkdir(parents=True, exist_ok=True)
+          output.write_text(json.dumps({
+              "classification": "manual-review locations only; not findings or severity",
+              "source_commit": "20636578d271888a492ecb566a788570cdc0d7f0",
+              "count": len(records),
+              "records": records,
+          }, indent=2) + "\\n", encoding="utf-8")
+          print(f"wrote {len(records)} review locations")
+          PY
+
+      - name: Record provenance
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit-results
+          {
+            echo "source_tag=op-reth/v2.3.3"
+            echo "source_commit=$(git -C upstream rev-parse HEAD 2>/dev/null || true)"
+            echo "rustc=$(rustc --version 2>/dev/null || true)"
+            echo "cargo=$(cargo --version 2>/dev/null || true)"
+            echo "runner=$(uname -a)"
+          } | tee audit-results/environment.txt
+
+      - name: Upload baseline evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: optimism-op-reth-v2.3.3-public-baseline
+          path: audit-results/
+          if-no-files-found: error
+          retention-days: 14
