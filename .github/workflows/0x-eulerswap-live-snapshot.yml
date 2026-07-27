@@ -1,0 +1,116 @@
+name: Capture public 0x EulerSwap live state
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/0x-eulerswap-live-snapshot.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
+      - name: Capture read-only live pool and vault state
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/eulerswap-live"
+          POOL=0x47bF727906669E8d06993e8D252912B4B90C28a8
+          EVC=0x0C9a3dd6b8F28529d72d7f9cE918D493519EE383
+          RPCS=(
+            https://eth.drpc.org
+            https://ethereum-rpc.publicnode.com
+            https://eth.llamarpc.com
+            https://rpc.mevblocker.io
+          )
+          mkdir -p "$OUT/quorum"
+          printf 'generated_at=%s\npool=%s\nevc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$POOL" "$EVC" > "$OUT/PROVENANCE.txt"
+          forge --version >> "$OUT/PROVENANCE.txt"
+          cast --version >> "$OUT/PROVENANCE.txt"
+
+          for rpc in "${RPCS[@]}"; do
+            host="$(printf '%s' "$rpc" | sed -E 's#https?://([^/]+).*#\1#')"
+            D="$OUT/quorum/$host"
+            mkdir -p "$D"
+            {
+              echo "chain_id=$(cast chain-id --rpc-url "$rpc" 2>&1)"
+              echo "head=$(cast block-number --rpc-url "$rpc" 2>&1)"
+              echo "codehash=$(cast codehash "$POOL" --rpc-url "$rpc" 2>&1)"
+              echo "runtime_bytes=$(( ( $(cast code "$POOL" --rpc-url "$rpc" | wc -c) - 3 ) / 2 ))"
+              echo "reserves=$(cast call "$POOL" 'getReserves()(uint112,uint112,uint32)' --rpc-url "$rpc" 2>&1)"
+              echo "params=$(cast call "$POOL" 'getParams()((address,address,address,uint112,uint112,uint256,uint256,uint256,uint256,uint256,uint256,address))' --rpc-url "$rpc" 2>&1)"
+            } > "$D/core.txt"
+          done
+
+          RPC=https://eth.drpc.org
+          PARAMS="$(cast call "$POOL" 'getParams()((address,address,address,uint112,uint112,uint256,uint256,uint256,uint256,uint256,uint256,address))' --rpc-url "$RPC")"
+          printf '%s\n' "$PARAMS" > "$OUT/params.raw.txt"
+          python3 - "$OUT/params.raw.txt" "$OUT/addresses.env" <<'PY'
+          import pathlib,re,sys
+          raw=pathlib.Path(sys.argv[1]).read_text()
+          a=re.findall(r'0x[a-fA-F0-9]{40}',raw)
+          if len(a)<3: raise SystemExit(f'expected at least 3 addresses, got {a}')
+          pathlib.Path(sys.argv[2]).write_text(f'VAULT0={a[0]}\nVAULT1={a[1]}\nACCOUNT={a[2]}\n')
+          PY
+          . "$OUT/addresses.env"
+          ASSET0="$(cast call "$VAULT0" 'asset()(address)' --rpc-url "$RPC")"
+          ASSET1="$(cast call "$VAULT1" 'asset()(address)' --rpc-url "$RPC")"
+          printf 'ASSET0=%s\nASSET1=%s\n' "$ASSET0" "$ASSET1" >> "$OUT/addresses.env"
+
+          {
+            echo "authorized=$(cast call "$EVC" 'isAccountOperatorAuthorized(address,address)(bool)' "$ACCOUNT" "$POOL" --rpc-url "$RPC")"
+            echo "collaterals=$(cast call "$EVC" 'getCollaterals(address)(address[])' "$ACCOUNT" --rpc-url "$RPC")"
+            echo "controllers=$(cast call "$EVC" 'getControllers(address)(address[])' "$ACCOUNT" --rpc-url "$RPC")"
+            echo "limits_0_to_1=$(cast call "$POOL" 'getLimits(address,address)(uint256,uint256)' "$ASSET0" "$ASSET1" --rpc-url "$RPC")"
+            echo "limits_1_to_0=$(cast call "$POOL" 'getLimits(address,address)(uint256,uint256)' "$ASSET1" "$ASSET0" --rpc-url "$RPC")"
+            echo "quote_0_to_1_1e6=$(cast call "$POOL" 'computeQuote(address,address,uint256,bool)(uint256)' "$ASSET0" "$ASSET1" 1000000 true --rpc-url "$RPC" 2>&1)"
+            echo "quote_1_to_0_1e6=$(cast call "$POOL" 'computeQuote(address,address,uint256,bool)(uint256)' "$ASSET1" "$ASSET0" 1000000 true --rpc-url "$RPC" 2>&1)"
+          } > "$OUT/pool-state.txt"
+
+          for item in VAULT0 VAULT1; do
+            eval vault="\$$item"
+            D="$OUT/${item,,}"
+            mkdir -p "$D"
+            {
+              echo "address=$vault"
+              echo "asset=$(cast call "$vault" 'asset()(address)' --rpc-url "$RPC")"
+              echo "cash=$(cast call "$vault" 'cash()(uint256)' --rpc-url "$RPC")"
+              echo "total_borrows=$(cast call "$vault" 'totalBorrows()(uint256)' --rpc-url "$RPC")"
+              echo "debt_of_account=$(cast call "$vault" 'debtOf(address)(uint256)' "$ACCOUNT" --rpc-url "$RPC")"
+              echo "balance_of_account=$(cast call "$vault" 'balanceOf(address)(uint256)' "$ACCOUNT" --rpc-url "$RPC")"
+              echo "convert_account_shares=$(cast call "$vault" 'convertToAssets(uint256)(uint256)' "$(cast call "$vault" 'balanceOf(address)(uint256)' "$ACCOUNT" --rpc-url "$RPC")" --rpc-url "$RPC")"
+              echo "max_deposit_account=$(cast call "$vault" 'maxDeposit(address)(uint256)' "$ACCOUNT" --rpc-url "$RPC")"
+              echo "caps=$(cast call "$vault" 'caps()(uint16,uint16)' --rpc-url "$RPC")"
+              echo "oracle=$(cast call "$vault" 'oracle()(address)' --rpc-url "$RPC")"
+              echo "unit_of_account=$(cast call "$vault" 'unitOfAccount()(address)' --rpc-url "$RPC")"
+              echo "pool_operator_authorized=$(cast call "$EVC" 'isAccountOperatorAuthorized(address,address)(bool)' "$ACCOUNT" "$POOL" --rpc-url "$RPC")"
+            } > "$D/state.txt"
+          done
+
+          curl -fsSL --retry 3 --max-time 45 "https://eth.blockscout.com/api/v2/addresses/$POOL/transactions" > "$OUT/blockscout-transactions.json" || true
+          curl -fsSL --retry 3 --max-time 45 "https://eth.blockscout.com/api/v2/smart-contracts/$POOL" > "$OUT/blockscout-contract.json" || true
+          find "$OUT" -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS"
+          grep -Fx 'authorized=true' "$OUT/pool-state.txt"
+          test -s "$OUT/params.raw.txt"
+
+      - name: Upload live EulerSwap snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: 0x-eulerswap-live-${{ github.run_id }}
+          path: eulerswap-live/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
