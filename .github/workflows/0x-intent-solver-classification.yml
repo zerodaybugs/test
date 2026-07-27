@@ -1,0 +1,137 @@
+name: Classify public 0x Intent solver addresses
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/0x-intent-solver-classification.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  classify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
+      - name: Classify live solver list using public chain data
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/solver-classification"
+          RPC=https://eth.drpc.org
+          INTENT=0x59Da89BaEE7c773F991731FCA0a8BBa58d511C05
+          mkdir -p "$OUT/solvers"
+          cast call "$INTENT" 'getSolvers()(address[])' --rpc-url "$RPC" > "$OUT/solvers.raw.txt"
+          python3 - "$OUT/solvers.raw.txt" "$OUT/solvers.txt" <<'PY'
+          import pathlib,re,sys
+          raw=pathlib.Path(sys.argv[1]).read_text()
+          addrs=[]
+          seen=set()
+          for a in re.findall(r'0x[a-fA-F0-9]{40}',raw):
+              k=a.lower()
+              if k not in seen:
+                  seen.add(k); addrs.append(a)
+          if len(addrs) < 1: raise SystemExit('no solvers decoded')
+          pathlib.Path(sys.argv[2]).write_text('\n'.join(addrs)+'\n')
+          print(f'solver_count={len(addrs)}')
+          PY
+
+          IMPL_SLOT=0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc
+          ADMIN_SLOT=0xb53127684a568b3173ae13b9f8a6016e0190a4e243e63b6e8ee1178d6a717850b5d6103
+          BEACON_SLOT=0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50
+
+          index=0
+          while IFS= read -r address; do
+            index=$((index+1))
+            D="$OUT/solvers/$(printf '%03d' "$index")-$address"
+            mkdir -p "$D"
+            printf '%s\n' "$address" > "$D/address.txt"
+            cast code "$address" --rpc-url "$RPC" > "$D/code.hex"
+            cast codehash "$address" --rpc-url "$RPC" > "$D/codehash.txt"
+            cast balance "$address" --rpc-url "$RPC" > "$D/native-balance.txt"
+            cast nonce "$address" --rpc-url "$RPC" > "$D/nonce.txt"
+            bytes=$(( ( $(wc -c < "$D/code.hex") - 3 ) / 2 ))
+            printf '%s\n' "$bytes" > "$D/runtime-bytes.txt"
+            if [ "$bytes" -gt 0 ]; then
+              cast storage "$address" "$IMPL_SLOT" --rpc-url "$RPC" > "$D/eip1967-implementation.txt" 2> "$D/eip1967-implementation.err" || true
+              cast storage "$address" "$ADMIN_SLOT" --rpc-url "$RPC" > "$D/eip1967-admin.txt" 2> "$D/eip1967-admin.err" || true
+              cast storage "$address" "$BEACON_SLOT" --rpc-url "$RPC" > "$D/eip1967-beacon.txt" 2> "$D/eip1967-beacon.err" || true
+              for sig in \
+                'owner()(address)' \
+                'getOwner()(address)' \
+                'admin()(address)' \
+                'implementation()(address)' \
+                'entryPoint()(address)' \
+                'paused()(bool)' \
+                'VERSION()(string)' \
+                'version()(string)' \
+                'name()(string)'
+              do
+                safe="$(printf '%s' "$sig" | tr -cd '[:alnum:]' | cut -c1-60)"
+                cast call "$address" "$sig" --rpc-url "$RPC" > "$D/call-$safe.txt" 2> "$D/call-$safe.err" || true
+              done
+              curl -fsSL --retry 2 --max-time 35 "https://eth.blockscout.com/api/v2/smart-contracts/$address" > "$D/blockscout-contract.json" || true
+              curl -fsSL --retry 2 --max-time 35 "https://eth.blockscout.com/api/v2/addresses/$address" > "$D/blockscout-address.json" || true
+            fi
+          done < "$OUT/solvers.txt"
+
+          python3 - "$OUT" <<'PY'
+          import json,pathlib,re,sys
+          root=pathlib.Path(sys.argv[1])
+          rows=[]
+          for d in sorted((root/'solvers').iterdir()):
+              address=(d/'address.txt').read_text().strip()
+              code=(d/'code.hex').read_text().strip()
+              row={
+                'address':address,
+                'runtime_bytes':len(code.removeprefix('0x'))//2,
+                'codehash':(d/'codehash.txt').read_text().strip(),
+                'native_balance_wei':(d/'native-balance.txt').read_text().strip(),
+                'nonce':(d/'nonce.txt').read_text().strip(),
+              }
+              for slot in ('implementation','admin','beacon'):
+                  p=d/f'eip1967-{slot}.txt'
+                  row[f'eip1967_{slot}']=p.read_text(errors='replace').strip() if p.exists() else ''
+              calls={}
+              for p in d.glob('call-*.txt'):
+                  if p.stat().st_size: calls[p.stem]=p.read_text(errors='replace').strip()
+              row['successful_common_calls']=calls
+              for name in ('blockscout-contract.json','blockscout-address.json'):
+                  p=d/name
+                  if p.exists() and p.stat().st_size:
+                      try: row[name]=json.loads(p.read_text())
+                      except Exception as e: row[name]={'parse_error':repr(e)}
+              rows.append(row)
+          summary={
+            'solver_count':len(rows),
+            'eoa_count':sum(r['runtime_bytes']==0 for r in rows),
+            'contract_count':sum(r['runtime_bytes']>0 for r in rows),
+            'rows':rows,
+          }
+          (root/'summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True))
+          (root/'contracts.tsv').write_text(''.join(
+            f"{r['address']}\t{r['runtime_bytes']}\t{r['codehash']}\n" for r in rows if r['runtime_bytes']>0
+          ))
+          PY
+
+          find "$OUT" -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS"
+          test -s "$OUT/summary.json"
+
+      - name: Upload solver classification
+        uses: actions/upload-artifact@v4
+        with:
+          name: 0x-intent-solver-classification-${{ github.run_id }}
+          path: solver-classification/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
