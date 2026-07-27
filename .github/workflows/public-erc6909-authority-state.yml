@@ -1,0 +1,187 @@
+name: Collect public ERC6909 authority state
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/public-erc6909-authority-state.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: ethereum, chain_id: 1, rpc: 'https://ethereum-rpc.publicnode.com', authority: '0x0000000000001fF3684f28c67538d4D072C22734'}
+          - {name: base, chain_id: 8453, rpc: 'https://base-rpc.publicnode.com', authority: '0x0000000000001fF3684f28c67538d4D072C22734'}
+          - {name: arbitrum, chain_id: 42161, rpc: 'https://arbitrum-one-rpc.publicnode.com', authority: '0x0000000000001fF3684f28c67538d4D072C22734'}
+          - {name: polygon, chain_id: 137, rpc: 'https://polygon-bor-rpc.publicnode.com', authority: '0x0000000000001fF3684f28c67538d4D072C22734'}
+          - {name: bsc, chain_id: 56, rpc: 'https://bsc-rpc.publicnode.com', authority: '0x0000000000001fF3684f28c67538d4D072C22734'}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - name: Collect public ERC6909 authority events and current state
+        env:
+          CHAIN_NAME: ${{ matrix.name }}
+          EXPECTED_CHAIN_ID: ${{ matrix.chain_id }}
+          RPC_URL: ${{ matrix.rpc }}
+          AUTHORITY: ${{ matrix.authority }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/erc6909-$CHAIN_NAME"
+          mkdir -p "$OUT"
+          python3 - "$OUT" <<'PY'
+          import json, os, pathlib, sys, time, urllib.request
+
+          out = pathlib.Path(sys.argv[1])
+          chain_name = os.environ['CHAIN_NAME']
+          expected_chain_id = int(os.environ['EXPECTED_CHAIN_ID'])
+          rpc_url = os.environ['RPC_URL']
+          authority = os.environ['AUTHORITY'].lower()
+          authority_topic = '0x' + '0' * 24 + authority[2:]
+          operator_topic = '0xceb576d9f15e4e200fdb5096d64d5dfd667e16def20c1eefd14256d8e3faa267'
+          approval_topic = '0xb3fd5071835887567a0671151121894ddccc2842f1d10bedad13e0d17cace9a7'
+          request_id = 0
+
+          def rpc(method, params, attempts=6):
+              global request_id
+              last = None
+              for attempt in range(attempts):
+                  request_id += 1
+                  body = json.dumps({'jsonrpc':'2.0','id':request_id,'method':method,'params':params}).encode()
+                  try:
+                      req = urllib.request.Request(rpc_url, data=body, headers={'Content-Type':'application/json','User-Agent':'public-erc6909-inventory/1.0'})
+                      with urllib.request.urlopen(req, timeout=90) as response:
+                          obj = json.load(response)
+                      if 'error' in obj:
+                          raise RuntimeError(obj['error'])
+                      return obj['result']
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(20, 2 ** attempt))
+              raise RuntimeError(f'{method}: {last!r}')
+
+          def scan(topic0, start, end):
+              rows, ranges = [], []
+              cursor, chunk = start, 500_000
+              while cursor <= end:
+                  stop = min(end, cursor + chunk - 1)
+                  query = {'fromBlock':hex(cursor),'toBlock':hex(stop),'topics':[topic0,None,authority_topic]}
+                  try:
+                      batch = rpc('eth_getLogs',[query],attempts=3)
+                  except Exception as exc:
+                      if chunk <= 250:
+                          ranges.append({'from':cursor,'to':stop,'error':repr(exc)})
+                          cursor = stop + 1
+                      else:
+                          chunk = max(250, chunk // 4)
+                      continue
+                  rows.extend(batch)
+                  ranges.append({'from':cursor,'to':stop,'count':len(batch)})
+                  cursor = stop + 1
+                  if not batch:
+                      chunk = min(2_000_000, chunk * 2)
+                  elif len(batch) > 5_000:
+                      chunk = max(250, chunk // 2)
+              return rows, ranges
+
+          def address_from_topic(topic): return '0x' + topic[-40:].lower()
+          def address_word(address): return '0' * 24 + address[2:].lower()
+          def call(to, data):
+              try: return rpc('eth_call',[{'to':to,'data':data},'latest'],attempts=4)
+              except Exception as exc: return {'error':repr(exc)}
+          def uint_call(to, data):
+              raw = call(to,data)
+              if isinstance(raw,dict): return None, raw
+              try: return int(raw,16), raw
+              except Exception: return None, raw
+          def bool_call(to,data):
+              value, raw = uint_call(to,data)
+              return value not in (None,0), raw
+
+          chain_id = int(rpc('eth_chainId',[]),16)
+          if chain_id != expected_chain_id: raise SystemExit(f'wrong chain {chain_id}')
+          head = int(rpc('eth_blockNumber',[]),16)
+          operator_logs, operator_ranges = scan(operator_topic,0,head)
+          approval_logs, approval_ranges = scan(approval_topic,0,head)
+
+          operators = []
+          for log in operator_logs:
+              topics = log.get('topics',[])
+              if len(topics) < 3: continue
+              operators.append({
+                  'token':log['address'].lower(),
+                  'owner':address_from_topic(topics[1]),
+                  'authority':address_from_topic(topics[2]),
+                  'approved':int(log.get('data','0x0'),16) != 0,
+                  'block':int(log['blockNumber'],16),
+                  'tx_index':int(log.get('transactionIndex','0x0'),16),
+                  'log_index':int(log.get('logIndex','0x0'),16),
+                  'tx_hash':log.get('transactionHash'),
+              })
+          operators.sort(key=lambda x:(x['block'],x['tx_index'],x['log_index']))
+
+          approvals = []
+          for log in approval_logs:
+              topics = log.get('topics',[])
+              if len(topics) < 4: continue
+              approvals.append({
+                  'token':log['address'].lower(),
+                  'owner':address_from_topic(topics[1]),
+                  'authority':address_from_topic(topics[2]),
+                  'id':int(topics[3],16),
+                  'amount':int(log.get('data','0x0'),16),
+                  'block':int(log['blockNumber'],16),
+                  'tx_index':int(log.get('transactionIndex','0x0'),16),
+                  'log_index':int(log.get('logIndex','0x0'),16),
+                  'tx_hash':log.get('transactionHash'),
+              })
+          approvals.sort(key=lambda x:(x['block'],x['tx_index'],x['log_index']))
+
+          latest_operators = {}
+          for row in operators: latest_operators[(row['token'],row['owner'])] = row
+          latest_approvals = {}
+          for row in approvals: latest_approvals[(row['token'],row['owner'],row['id'])] = row
+
+          active_operators = []
+          for (token,owner),row in sorted(latest_operators.items()):
+              approved, raw = bool_call(token,'0xb6363cf2'+address_word(owner)+address_word(authority))
+              erc6909, interface_raw = bool_call(token,'0x01ffc9a7'+'0f632fb3'+'0'*56)
+              item = {**row,'approved_now':approved,'erc6909':erc6909,'approved_now_raw':raw,'interface_raw':interface_raw}
+              if approved: active_operators.append(item)
+
+          active_allowances = []
+          for (token,owner,token_id),row in sorted(latest_approvals.items()):
+              amount, raw = uint_call(token,'0x598af9e7'+address_word(owner)+address_word(authority)+token_id.to_bytes(32,'big').hex())
+              erc6909, interface_raw = bool_call(token,'0x01ffc9a7'+'0f632fb3'+'0'*56)
+              item = {**row,'allowance_now':amount,'erc6909':erc6909,'allowance_now_raw':raw,'interface_raw':interface_raw}
+              if amount not in (None,0): active_allowances.append(item)
+
+          summary = {
+              'chain':chain_name,'chain_id':chain_id,'head':head,'authority':authority,
+              'operator_event_count':len(operators),'approval_event_count':len(approvals),
+              'active_operator_count':len(active_operators),'active_allowance_count':len(active_allowances),
+              'active_operators':active_operators,'active_allowances':active_allowances,
+          }
+          (out/'summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True))
+          (out/'operator-events.json').write_text(json.dumps(operators,indent=2,sort_keys=True))
+          (out/'approval-events.json').write_text(json.dumps(approvals,indent=2,sort_keys=True))
+          (out/'operator-ranges.json').write_text(json.dumps(operator_ranges,indent=2,sort_keys=True))
+          (out/'approval-ranges.json').write_text(json.dumps(approval_ranges,indent=2,sort_keys=True))
+          PY
+          find "$OUT" -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS"
+          test -s "$OUT/summary.json"
+
+      - name: Upload state evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-erc6909-state-${{ matrix.name }}-${{ github.run_id }}
+          path: erc6909-${{ matrix.name }}/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
