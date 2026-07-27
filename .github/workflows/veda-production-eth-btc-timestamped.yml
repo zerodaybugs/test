@@ -1,0 +1,113 @@
+name: veda-production-eth-btc-timestamped
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - product: liquidETH
+            teller: '0x9AA79C84b79816ab920bBcE20f8f74557B514734'
+            one_share: '1000000000000000000'
+          - product: liquidBTC
+            teller: '0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353'
+            one_share: '100000000'
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Timestamp-filter exact positive windows
+        shell: bash
+        env:
+          PRODUCT: ${{ matrix.product }}
+          TELLER: ${{ matrix.teller }}
+          ONE_SHARE: ${{ matrix.one_share }}
+        run: |
+          python3 - <<'PY'
+          import base64,gzip,json,os,re,subprocess,time,urllib.parse,urllib.request
+          from pathlib import Path
+          product=os.environ['PRODUCT'];teller=os.environ['TELLER'];one=int(os.environ['ONE_SHARE'])
+          source=Path('.github/workflows/veda-production-window-scan.yml').read_text();m=re.search(r"WINDOW_B64 = '''([^']+)'''",source)
+          if not m:raise RuntimeError('window ledger missing')
+          windows=[w for w in json.loads(gzip.decompress(base64.b64decode(m.group(1)))) if w['p']==product]
+          LEGACY='https://scroll.blockscout.com/api';RPCS=['https://scroll-rpc.publicnode.com','https://rpc.scroll.io','https://scroll.drpc.org']
+          def k(s):return subprocess.check_output(['cast','keccak',s],text=True).strip().lower()
+          def sel(s):return subprocess.check_output(['cast','sig',s],text=True).strip().lower()
+          SENT=k('MessageSent(bytes32,uint256,address)');DEPS={k('Deposit(uint256,address,address,uint256,uint256,uint256,uint256,address)'),k('Deposit(uint256,address,address,uint256,uint256,uint256,uint256)')};ATOMIC={sel('depositAndBridge(address,uint256,uint256,address,bytes,address,uint256)'),sel('depositAndBridge(address,uint256,uint256,address,bytes,address,uint256,address)')}
+          def get(url,retries=5):
+            last=None
+            for i in range(retries):
+              try:
+                req=urllib.request.Request(url,headers={'accept':'application/json','user-agent':'Mozilla/5.0 VedaResearch/6.0'})
+                with urllib.request.urlopen(req,timeout=50) as r:return json.loads(r.read().decode())
+              except Exception as e:last=e;time.sleep(.2*(i+1))
+            raise last
+          def rpc(url,m,p,timeout=45):
+            body=json.dumps({'jsonrpc':'2.0','id':1,'method':m,'params':p}).encode();req=urllib.request.Request(url,data=body,method='POST',headers={'content-type':'application/json','user-agent':'veda-eth-btc-ts/1'})
+            with urllib.request.urlopen(req,timeout=timeout) as r:o=json.loads(r.read().decode())
+            if 'error'in o:raise RuntimeError(o['error'])
+            return o['result']
+          bad={};rpcurl=None
+          for u in RPCS:
+            try:
+              if int(rpc(u,'eth_chainId',[]),16)==534352:rpcurl=u;break
+            except Exception as e:bad[u]=repr(e)
+          if not rpcurl:raise RuntimeError(bad)
+          def logs(lo,hi):
+            q={'module':'logs','action':'getLogs','fromBlock':str(lo),'toBlock':str(hi),'address':teller,'topic0':SENT};d=get(LEGACY+'?'+urllib.parse.urlencode(q));r=d.get('result')
+            if isinstance(r,list):return r
+            if 'No logs found' in (str(d.get('message'))+' '+str(r)):return []
+            raise RuntimeError(d)
+          def num(v):
+            s=str(v or '0');return int(s,16) if s.startswith('0x') else int(s)
+          raw=[];errors=[];seen=set();queried=0
+          for i,w in enumerate(windows):
+            try:
+              for row in logs(w['a'],w['b']):
+                key=(row.get('transactionHash'),row.get('logIndex'),i)
+                if key in seen:continue
+                seen.add(key);raw.append({'wi':i,'w':w,'row':row})
+              queried+=1
+            except Exception as e:errors.append({'stage':'window_query','wi':i,'window':w,'error':repr(e)})
+          blocks=sorted({num(x['row']['blockNumber']) for x in raw});timestamps={}
+          for off in range(0,len(blocks),100):
+            chunk=blocks[off:off+100];payload=[{'jsonrpc':'2.0','id':j,'method':'eth_getBlockByNumber','params':[hex(b),False]} for j,b in enumerate(chunk)]
+            req=urllib.request.Request(rpcurl,data=json.dumps(payload).encode(),method='POST',headers={'content-type':'application/json','user-agent':'veda-eth-btc-batch/1'})
+            with urllib.request.urlopen(req,timeout=60) as r:resp=json.loads(r.read().decode())
+            byid={x['id']:x for x in resp}
+            for j,b in enumerate(chunk):
+              x=byid[j]
+              if 'error'in x:raise RuntimeError({'block':b,'error':x['error']})
+              timestamps[b]=int(x['result']['timestamp'],16)
+          exact=[]
+          for x in raw:
+            b=num(x['row']['blockNumber']);ts=timestamps[b];w=x['w']
+            if w['t0']<=ts<=w['t1']:exact.append((x,ts))
+          hits=[]
+          for x,ts in exact:
+            try:
+              row=x['row'];txh=row['transactionHash'];tx=rpc(rpcurl,'eth_getTransactionByHash',[txh]);rc=rpc(rpcurl,'eth_getTransactionReceipt',[txh]);s=(tx.get('input')or'0x')[:10].lower();rt={z['topics'][0].lower() for z in rc.get('logs',[]) if z.get('topics') and z['topics'][0]};dep=any(z in rt for z in DEPS);topics=[z.lower() for z in row.get('topics',[]) if isinstance(z,str)];shares=int(row.get('data')or'0x0',16);w=x['w']
+              hits.append({'window_index':x['wi'],'window':w,'block':num(row['blockNumber']),'timestamp':ts,'tx':txh,'selector':s,'atomic_selector':s in ATOMIC,'has_deposit_event':dep,'atomic':s in ATOMIC or dep,'guid':topics[1] if len(topics)>1 else None,'recipient':'0x'+topics[2][-40:] if len(topics)>2 else None,'shares_raw':shares,'gross_extra_base_raw':shares*(w['dr']-w['sr'])//one,'tx_from':tx.get('from'),'tx_to':tx.get('to')})
+            except Exception as e:errors.append({'stage':'hydrate_exact','row':x['row'],'error':repr(e)})
+          out={'generated_at_unix':int(time.time()),'product':product,'teller':teller,'one_share':one,'rpc':rpcurl,'rpc_failures':bad,'window_count':len(windows),'queried_window_count':queried,'broad_source_hit_count':len(raw),'unique_broad_blocks':len(blocks),'exact_timestamp_hit_count':len(hits),'atomic_exact_hit_count':sum(1 for x in hits if x['atomic']),'sum_exact_gross_extra_base_raw':sum(x['gross_extra_base_raw'] for x in hits),'max_exact_gross_extra_base_raw':max([x['gross_extra_base_raw'] for x in hits]or[0]),'hits':hits,'errors':errors}
+          fn=f'veda-production-{product}-timestamped.json';Path(fn).write_text(json.dumps(out,indent=2,sort_keys=True)+'\n');print(json.dumps({k:out[k] for k in ['product','window_count','queried_window_count','broad_source_hit_count','unique_broad_blocks','exact_timestamp_hit_count','atomic_exact_hit_count','sum_exact_gross_extra_base_raw','max_exact_gross_extra_base_raw']},indent=2));print('errors',len(errors))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: veda-production-${{ matrix.product }}-timestamped
+          path: veda-production-${{ matrix.product }}-timestamped.json
+          if-no-files-found: error
+          retention-days: 1
