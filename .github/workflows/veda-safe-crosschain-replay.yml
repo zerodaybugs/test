@@ -1,0 +1,139 @@
+name: veda-safe-crosschain-replay
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Compare live authority-owner Safe domains across chains
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from __future__ import annotations
+          import json, subprocess, time, urllib.request
+          from collections import defaultdict
+
+          CHAINS={
+            'ethereum':{'id':1,'rpcs':['https://ethereum-rpc.publicnode.com','https://eth.drpc.org','https://rpc.mevblocker.io']},
+            'scroll':{'id':534352,'rpcs':['https://scroll-rpc.publicnode.com','https://rpc.scroll.io','https://scroll.drpc.org']},
+            'ink':{'id':57073,'rpcs':['https://rpc-gel.inkonchain.com']},
+          }
+          AUTHORITIES={
+            'ethereum':{
+              'liquidETH':'0x485Bde66Bb668a51f2372E34e45B1c6226798122',
+              'liquidBTC':'0x49F954c67ff235034b69b8a59fbe309A40256c8d',
+              'liquidUSD':'0xAba6BA1E95E0926a6a6b917FE4e2f19ceAe4FF2E',
+            },
+            'scroll':{
+              'liquidETH':'0x485Bde66Bb668a51f2372E34e45B1c6226798122',
+              'liquidBTC':'0x49F954c67ff235034b69b8a59fbe309A40256c8d',
+              'liquidUSD':'0xAba6BA1E95E0926a6a6b917FE4e2f19ceAe4FF2E',
+            },
+            'ink':{
+              'balanced':'0x3E8B0ee1D05267fE9F8d2b1f8CB48F2e23d69c6B',
+              'boosted':'0x1F53135155d6fF516bCcfDd9424fcdB8AD1eFB77',
+            }
+          }
+          def sig(x):return subprocess.check_output(['cast','sig',x],text=True).strip()
+          S={x:sig(x) for x in [
+            'owner()','VERSION()','nonce()','domainSeparator()','getChainId()',
+            'getOwners()','getThreshold()','getModulesPaginated(address,uint256)'
+          ]}
+          SENTINEL='0x0000000000000000000000000000000000000001'
+          def rpc(url,m,p,timeout=35):
+            body=json.dumps({'jsonrpc':'2.0','id':1,'method':m,'params':p}).encode();req=urllib.request.Request(url,data=body,method='POST',headers={'content-type':'application/json','user-agent':'veda-safe-replay/1'})
+            with urllib.request.urlopen(req,timeout=timeout) as r:o=json.loads(r.read().decode())
+            if 'error' in o:raise RuntimeError(o['error'])
+            return o['result']
+          def choose(chain):
+            bad={}
+            for u in CHAINS[chain]['rpcs']:
+              try:
+                if int(rpc(u,'eth_chainId',[]),16)!=CHAINS[chain]['id']:raise RuntimeError('wrong chain')
+                return u,int(rpc(u,'eth_blockNumber',[]),16),bad
+              except Exception as e:bad[u]=repr(e)
+            raise RuntimeError(bad)
+          def h(x):return str(x)[2:] if str(x).startswith('0x') else str(x)
+          def aw(a):return h(a).lower().rjust(64,'0')
+          def uw(v):return hex(v)[2:].rjust(64,'0')
+          def call(url,to,data):return rpc(url,'eth_call',[{'to':to,'data':data},'latest'])
+          def safe(url,to,data):
+            try:return {'ok':True,'raw':call(url,to,data)}
+            except Exception as e:return {'ok':False,'error':repr(e)}
+          def address(raw):return '0x'+h(raw)[-40:].lower()
+          def dynamic_addresses(raw):
+            x=h(raw)
+            if len(x)<128:return []
+            off=int(x[:64],16)*2
+            n=int(x[off:off+64],16)
+            return ['0x'+x[off+64+i*64:off+64+(i+1)*64][-40:].lower() for i in range(n)]
+          def dynamic_string(raw):
+            x=h(raw)
+            if len(x)<128:return None
+            off=int(x[:64],16)*2;n=int(x[off:off+64],16)
+            return bytes.fromhex(x[off+64:off+64+n*2]).decode(errors='replace')
+          endpoints={};blocks={};rpc_failures={};rows=[];errors=[]
+          for chain in CHAINS:
+            endpoints[chain],blocks[chain],rpc_failures[chain]=choose(chain)
+            for product,auth in AUTHORITIES[chain].items():
+              try:
+                owner=address(call(endpoints[chain],auth,S['owner()']))
+                code=rpc(endpoints[chain],'eth_getCode',[owner,'latest'])
+                row={'chain':chain,'product':product,'authority':auth.lower(),'owner':owner,'owner_code_bytes':(len(code)-2)//2}
+                if len(code)>2:
+                  vr=safe(endpoints[chain],owner,S['VERSION()']);row['version']=dynamic_string(vr['raw']) if vr['ok'] else None
+                  nr=safe(endpoints[chain],owner,S['nonce()']);row['nonce']=int(nr['raw'],16) if nr['ok'] else None
+                  dr=safe(endpoints[chain],owner,S['domainSeparator()']);row['domain_separator']=dr.get('raw') if dr['ok'] else None
+                  cr=safe(endpoints[chain],owner,S['getChainId()']);row['safe_reported_chain_id']=int(cr['raw'],16) if cr['ok'] else None
+                  orr=safe(endpoints[chain],owner,S['getOwners()']);row['owners']=dynamic_addresses(orr['raw']) if orr['ok'] else []
+                  tr=safe(endpoints[chain],owner,S['getThreshold()']);row['threshold']=int(tr['raw'],16) if tr['ok'] else None
+                  mr=safe(endpoints[chain],owner,S['getModulesPaginated(address,uint256)']+aw(SENTINEL)+uw(100))
+                  if mr['ok']:
+                    raw=h(mr['raw']);off=int(raw[:64],16)*2;n=int(raw[off:off+64],16);row['modules']=['0x'+raw[off+64+i*64:off+64+(i+1)*64][-40:].lower() for i in range(n)]
+                  else:row['modules']=[]
+                rows.append(row)
+              except Exception as e:errors.append({'chain':chain,'product':product,'authority':auth,'error':repr(e)})
+          by_owner=defaultdict(list)
+          for row in rows:by_owner[row['owner']].append(row)
+          comparisons=[];flags=[]
+          for owner,items in by_owner.items():
+            if len({r['chain'] for r in items})<2:continue
+            domains={r.get('domain_separator') for r in items if r.get('domain_separator')}
+            versions={r.get('version') for r in items if r.get('version')}
+            owner_sets={tuple(sorted(r.get('owners') or [])) for r in items}
+            entry={'owner':owner,'chains':[r['chain'] for r in items],'products':[r['product'] for r in items],
+                   'versions':sorted(versions),'domain_separators':sorted(domains),'nonces':{r['chain']:r.get('nonce') for r in items},
+                   'reported_chain_ids':{r['chain']:r.get('safe_reported_chain_id') for r in items},
+                   'same_domain_across_chains':len(domains)==1 and len(items)>1,
+                   'same_owner_set':len(owner_sets)==1,'modules':{r['chain']:r.get('modules') for r in items}}
+            comparisons.append(entry)
+            if entry['same_domain_across_chains']:flags.append({'type':'CROSS_CHAIN_DOMAIN_COLLISION',**entry})
+            for r in items:
+              if r.get('safe_reported_chain_id') not in (None,CHAINS[r['chain']]['id']):flags.append({'type':'SAFE_CHAIN_ID_MISMATCH','row':r})
+              if r.get('modules'):flags.append({'type':'ENABLED_MODULE','row':r})
+          out={'generated_at_unix':int(time.time()),'endpoints':endpoints,'blocks':blocks,'rpc_failures':rpc_failures,
+               'rows':rows,'cross_chain_comparisons':comparisons,'flags':flags,'errors':errors,
+               'verdict':{'cross_chain_safe_replay':any(f['type']=='CROSS_CHAIN_DOMAIN_COLLISION' for f in flags),
+                          'permissionless_module_path':any(f['type']=='ENABLED_MODULE' for f in flags)}}
+          open('veda-safe-crosschain-replay.json','w').write(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({'verdict':out['verdict'],'flags':flags,'errors':errors,'comparisons':comparisons},indent=2,sort_keys=True))
+          PY
+
+      - name: Upload Safe replay proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-safe-crosschain-replay
+          path: veda-safe-crosschain-replay.json
+          if-no-files-found: error
+          retention-days: 1
