@@ -1,0 +1,214 @@
+name: veda-production-window-scan-v2
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Scan indexed production bridge traffic inside positive rate windows
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64, gzip, json, re, subprocess, time, urllib.parse, urllib.request
+          from pathlib import Path
+
+          source = Path('.github/workflows/veda-production-window-scan.yml').read_text()
+          match = re.search(r"WINDOW_B64 = '''([^']+)'''", source)
+          if not match:
+              raise RuntimeError('embedded window ledger not found')
+          windows = json.loads(gzip.decompress(base64.b64decode(match.group(1))))
+
+          TELLERS = {
+              'liquidETH': '0x9AA79C84b79816ab920bBcE20f8f74557B514734',
+              'liquidBTC': '0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353',
+              'liquidUSD': '0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387',
+          }
+          ONE = {'liquidETH': 10**18, 'liquidBTC': 10**8, 'liquidUSD': 10**6}
+          SCROLL_EXPLORERS = ['https://scroll.blockscout.com/api']
+          ETH_EXPLORERS = ['https://eth.blockscout.com/api']
+          SCROLL_RPCS = ['https://scroll-rpc.publicnode.com','https://rpc.scroll.io','https://scroll.drpc.org']
+          ETH_RPCS = ['https://ethereum-rpc.publicnode.com','https://eth.drpc.org','https://rpc.mevblocker.io']
+
+          def keccak(s): return subprocess.check_output(['cast','keccak',s],text=True).strip().lower()
+          def selector(s): return subprocess.check_output(['cast','sig',s],text=True).strip().lower()
+          SENT = keccak('MessageSent(bytes32,uint256,address)')
+          RECEIVED = keccak('MessageReceived(bytes32,uint256,address)')
+          DEPOSIT_TOPICS = {
+              keccak('Deposit(uint256,address,address,uint256,uint256,uint256,uint256,address)'),
+              keccak('Deposit(uint256,address,address,uint256,uint256,uint256,uint256)'),
+          }
+          ATOMIC_SELECTORS = {
+              selector('depositAndBridge(address,uint256,uint256,address,bytes,address,uint256)'),
+              selector('depositAndBridge(address,uint256,uint256,address,bytes,address,uint256,address)'),
+              selector('depositAndBridgeWithPermit((address,uint256,uint256,uint256,uint8,bytes32,bytes32,address,bytes,address,uint256,address))'),
+          }
+
+          def json_get(url, timeout=60):
+              req=urllib.request.Request(url,headers={'accept':'application/json','user-agent':'veda-production-window-scan-v2/1'})
+              with urllib.request.urlopen(req,timeout=timeout) as r:
+                  return json.loads(r.read().decode())
+
+          def rpc(url,method,params,timeout=45):
+              body=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
+              req=urllib.request.Request(url,data=body,method='POST',headers={'content-type':'application/json','user-agent':'veda-production-window-scan-v2/1'})
+              with urllib.request.urlopen(req,timeout=timeout) as r:o=json.loads(r.read().decode())
+              if 'error' in o:raise RuntimeError(o['error'])
+              return o['result']
+
+          def choose_rpc(candidates,chain_id):
+              failures={}
+              for u in candidates:
+                  try:
+                      if int(rpc(u,'eth_chainId',[]),16)!=chain_id: raise RuntimeError('wrong chain')
+                      return u,failures
+                  except Exception as e: failures[u]=repr(e)
+              raise RuntimeError(failures)
+
+          def legacy_once(base,address,topic0,lo,hi,topic1=None):
+              q={'module':'logs','action':'getLogs','fromBlock':str(lo),'toBlock':str(hi),'address':address,'topic0':topic0}
+              if topic1:
+                  q['topic1']=topic1;q['topic0_1_opr']='and'
+              data=json_get(base+'?'+urllib.parse.urlencode(q),90)
+              result=data.get('result')
+              if isinstance(result,list): return result,data
+              message=str(data.get('message',''))+' '+str(result)
+              if 'No logs found' in message or data.get('status')=='0' and result==[]: return [],data
+              raise RuntimeError({'url':base,'response':data})
+
+          def indexed_logs(bases,address,topic0,lo,hi,topic1=None):
+              errors={}
+              for base in bases:
+                  try:
+                      def walk(a,b):
+                          try:
+                              rows,raw=legacy_once(base,address,topic0,a,b,topic1)
+                              if len(rows)>=1000 and a<b:
+                                  mid=(a+b)//2
+                                  return walk(a,mid)+walk(mid+1,b)
+                              return rows
+                          except Exception:
+                              if a>=b: raise
+                              mid=(a+b)//2
+                              return walk(a,mid)+walk(mid+1,b)
+                      rows=walk(lo,hi)
+                      # Normalize and deduplicate.
+                      out=[];seen=set()
+                      for row in rows:
+                          key=(row.get('transactionHash'),row.get('logIndex'))
+                          if key in seen:continue
+                          seen.add(key);out.append(row)
+                      return out,base,errors
+                  except Exception as e: errors[base]=repr(e)
+              raise RuntimeError(errors)
+
+          scroll,scroll_rpc_fail=choose_rpc(SCROLL_RPCS,534352)
+          eth,eth_rpc_fail=choose_rpc(ETH_RPCS,1)
+          eth_latest=int(rpc(eth,'eth_blockNumber',[]),16)
+          block_cache={}
+          def block(url,n):
+              k=(url,n)
+              if k not in block_cache:
+                  block_cache[k]=rpc(url,'eth_getBlockByNumber',[hex(n),False])
+              return block_cache[k]
+          def block_ts(url,n): return int(block(url,n)['timestamp'],16)
+          def find_block_at_or_before(url,hi,target):
+              lo=1
+              while lo<hi:
+                  mid=(lo+hi+1)//2
+                  if block_ts(url,mid)<=target:lo=mid
+                  else:hi=mid-1
+              return lo
+          def h(x):return x[2:] if isinstance(x,str) and x.startswith('0x') else str(x or '')
+          def parse_num(v):
+              if isinstance(v,int):return v
+              s=str(v or '0')
+              return int(s,16) if s.startswith('0x') else int(s)
+          def topic_addr(t):return '0x'+h(t)[-40:]
+
+          # Fetch MessageSent once per product over the entire covered history.
+          product_logs={};explorer_used={};explorer_failures={}
+          for product,teller in TELLERS.items():
+              ws=[w for w in windows if w['p']==product]
+              lo=min(w['a'] for w in ws)-2000
+              hi=max(w['b'] for w in ws)+100
+              rows,used,failed=indexed_logs(SCROLL_EXPLORERS,teller,SENT,lo,hi)
+              product_logs[product]=rows;explorer_used[product]=used;explorer_failures[product]=failed
+
+          raw_hits=[];errors=[];seen=set()
+          by_product={p:[] for p in TELLERS}
+          for i,w in enumerate(windows): by_product[w['p']].append((i,w))
+          for product,rows in product_logs.items():
+              for row in rows:
+                  try:
+                      bn=parse_num(row.get('blockNumber'))
+                      ts=block_ts(scroll,bn)
+                      matching=[(i,w) for i,w in by_product[product] if w['t0']<=ts<=w['t1']]
+                      if not matching:continue
+                      tx_hash=row.get('transactionHash') or row.get('transaction_hash')
+                      log_index=row.get('logIndex') if row.get('logIndex') is not None else row.get('index')
+                      key=(tx_hash,log_index)
+                      if key in seen:continue
+                      seen.add(key)
+                      tx=rpc(scroll,'eth_getTransactionByHash',[tx_hash])
+                      rc=rpc(scroll,'eth_getTransactionReceipt',[tx_hash])
+                      selector4=(tx.get('input') or '0x')[:10].lower()
+                      receipt_topics={x['topics'][0].lower() for x in rc.get('logs',[]) if x.get('topics')}
+                      has_deposit_event=any(t in receipt_topics for t in DEPOSIT_TOPICS)
+                      atomic=selector4 in ATOMIC_SELECTORS or has_deposit_event
+                      topics=row.get('topics') or []
+                      data=row.get('data') or '0x0'
+                      shares=int(data,16)
+                      guid=topics[1] if len(topics)>1 else None
+                      recipient=topic_addr(topics[2]) if len(topics)>2 else None
+                      # A timestamp can overlap only one product window in practice; preserve all if not.
+                      for i,w in matching:
+                          extra=shares*(int(w['dr'])-int(w['sr']))//ONE[product]
+                          raw_hits.append({'window_index':i,'window':w,'block':bn,'timestamp':ts,'tx':tx_hash,'log_index':log_index,'selector':selector4,'atomic_selector':selector4 in ATOMIC_SELECTORS,'has_deposit_event':has_deposit_event,'atomic':atomic,'guid':guid,'recipient':recipient,'shares_raw':shares,'gross_extra_base_units':extra,'tx_from':tx.get('from'),'tx_to':tx.get('to')})
+                  except Exception as e:errors.append({'stage':'hydrate_source_log','product':product,'row':row,'error':repr(e)})
+
+          delivered=[]
+          for hit in raw_hits:
+              if not hit['atomic'] or not hit.get('guid'):continue
+              try:
+                  start=find_block_at_or_before(eth,eth_latest,hit['timestamp'])
+                  found=[]
+                  for a in range(max(1,start-200),min(eth_latest,start+15000)+1,2000):
+                      b=min(eth_latest,a+1999)
+                      rows,used,failed=indexed_logs(ETH_EXPLORERS,TELLERS[hit['window']['p']],RECEIVED,a,b,hit['guid'])
+                      if rows:
+                          found=rows;break
+                  item=dict(hit);item['destination_delivery_found']=bool(found)
+                  if found:
+                      d=found[0];item['destination_block']=parse_num(d.get('blockNumber'));item['destination_tx']=d.get('transactionHash') or d.get('transaction_hash');item['destination_timestamp']=block_ts(eth,item['destination_block'])
+                  delivered.append(item)
+              except Exception as e:errors.append({'stage':'destination_delivery','tx':hit['tx'],'error':repr(e)})
+
+          atomic=[x for x in raw_hits if x['atomic']]
+          delivered_atomic=[x for x in delivered if x.get('destination_delivery_found')]
+          out={'generated_at_unix':int(time.time()),'window_count':len(windows),'indexed_source_log_counts':{p:len(v) for p,v in product_logs.items()},'explorer_used':explorer_used,'explorer_failures':explorer_failures,'rpc_failures':{'scroll':scroll_rpc_fail,'ethereum':eth_rpc_fail},'source_message_hit_count':len(raw_hits),'atomic_source_hit_count':len(atomic),'delivered_atomic_hit_count':len(delivered_atomic),'max_atomic_gross_extra_base_units':max([x['gross_extra_base_units'] for x in atomic] or [0]),'sum_atomic_gross_extra_base_units':sum(x['gross_extra_base_units'] for x in atomic),'source_hits':raw_hits,'delivered_atomic_hits':delivered_atomic,'errors':errors}
+          Path('veda-production-window-scan-v2.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({k:out[k] for k in ['window_count','indexed_source_log_counts','source_message_hit_count','atomic_source_hit_count','delivered_atomic_hit_count','max_atomic_gross_extra_base_units','sum_atomic_gross_extra_base_units']},indent=2,sort_keys=True))
+          if errors:print('errors',len(errors))
+          PY
+
+      - name: Upload indexed production-window evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veda-production-window-scan-v2
+          path: veda-production-window-scan-v2.json
+          if-no-files-found: error
+          retention-days: 1
