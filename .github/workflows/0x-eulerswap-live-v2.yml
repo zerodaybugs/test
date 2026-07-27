@@ -1,0 +1,153 @@
+name: Capture public 0x EulerSwap live state v2
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/0x-eulerswap-live-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
+      - name: Capture read-only live pool and vault state
+        shell: bash
+        run: |
+          set +e
+          OUT="$GITHUB_WORKSPACE/eulerswap-live-v2"
+          POOL=0x47bF727906669E8d06993e8D252912B4B90C28a8
+          EVC=0x0C9a3dd6b8F28529d72d7f9cE918D493519EE383
+          RPC=https://eth.drpc.org
+          mkdir -p "$OUT"
+          printf 'generated_at=%s\npool=%s\nevc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$POOL" "$EVC" > "$OUT/PROVENANCE.txt"
+          forge --version >> "$OUT/PROVENANCE.txt" 2>&1
+          cast --version >> "$OUT/PROVENANCE.txt" 2>&1
+
+          core_rc=99
+          params_rc=99
+          state_rc=99
+          vaults_rc=99
+
+          PARAMS_SELECTOR="$(cast sig 'getParams()')"
+          RESERVES_SELECTOR="$(cast sig 'getReserves()')"
+          cast call "$POOL" "$PARAMS_SELECTOR" --rpc-url "$RPC" > "$OUT/params.raw.hex" 2> "$OUT/params.err"
+          params_rc=$?
+          cast call "$POOL" "$RESERVES_SELECTOR" --rpc-url "$RPC" > "$OUT/reserves.raw.hex" 2> "$OUT/reserves.err"
+          reserves_rc=$?
+          cast code "$POOL" --rpc-url "$RPC" > "$OUT/code.hex" 2> "$OUT/code.err"
+          code_rc=$?
+          cast codehash "$POOL" --rpc-url "$RPC" > "$OUT/codehash.txt" 2> "$OUT/codehash.err"
+          codehash_rc=$?
+          if [ "$params_rc" = 0 ] && [ "$reserves_rc" = 0 ] && [ "$code_rc" = 0 ] && [ "$codehash_rc" = 0 ]; then core_rc=0; fi
+
+          if [ "$params_rc" = 0 ]; then
+            python3 - "$OUT" <<'PY'
+          import json,pathlib,sys
+          root=pathlib.Path(sys.argv[1])
+          raw=(root/'params.raw.hex').read_text().strip().removeprefix('0x')
+          if len(raw) < 12*64: raise SystemExit(f'short params returndata: {len(raw)} hex chars')
+          w=[raw[i:i+64] for i in range(0,12*64,64)]
+          addr=lambda x:'0x'+x[-40:]
+          obj={
+            'vault0':addr(w[0]), 'vault1':addr(w[1]), 'eulerAccount':addr(w[2]),
+            'equilibriumReserve0':int(w[3],16), 'equilibriumReserve1':int(w[4],16),
+            'priceX':int(w[5],16), 'priceY':int(w[6],16),
+            'concentrationX':int(w[7],16), 'concentrationY':int(w[8],16),
+            'fee':int(w[9],16), 'protocolFee':int(w[10],16), 'protocolFeeRecipient':addr(w[11]),
+          }
+          (root/'params.json').write_text(json.dumps(obj,indent=2,sort_keys=True))
+          (root/'addresses.env').write_text(
+            f"VAULT0={obj['vault0']}\nVAULT1={obj['vault1']}\nACCOUNT={obj['eulerAccount']}\n"
+          )
+          rawr=(root/'reserves.raw.hex').read_text().strip().removeprefix('0x')
+          wr=[rawr[i:i+64] for i in range(0,min(len(rawr),3*64),64)]
+          if len(wr)<3: raise SystemExit('short reserves returndata')
+          (root/'reserves.json').write_text(json.dumps({
+            'reserve0':int(wr[0],16),'reserve1':int(wr[1],16),'status':int(wr[2],16)
+          },indent=2,sort_keys=True))
+          PY
+            decode_rc=$?
+            if [ "$decode_rc" = 0 ]; then params_rc=0; else params_rc=$decode_rc; fi
+          fi
+
+          if [ "$params_rc" = 0 ]; then
+            . "$OUT/addresses.env"
+            ASSET0="$(cast call "$VAULT0" 'asset()(address)' --rpc-url "$RPC" 2> "$OUT/asset0.err")"
+            a0_rc=$?
+            ASSET1="$(cast call "$VAULT1" 'asset()(address)' --rpc-url "$RPC" 2> "$OUT/asset1.err")"
+            a1_rc=$?
+            printf 'ASSET0=%s\nASSET1=%s\n' "$ASSET0" "$ASSET1" >> "$OUT/addresses.env"
+
+            {
+              echo "authorized=$(cast call "$EVC" 'isAccountOperatorAuthorized(address,address)(bool)' "$ACCOUNT" "$POOL" --rpc-url "$RPC" 2>&1)"
+              echo "collaterals=$(cast call "$EVC" 'getCollaterals(address)(address[])' "$ACCOUNT" --rpc-url "$RPC" 2>&1)"
+              echo "controllers=$(cast call "$EVC" 'getControllers(address)(address[])' "$ACCOUNT" --rpc-url "$RPC" 2>&1)"
+              echo "limits_0_to_1=$(cast call "$POOL" 'getLimits(address,address)(uint256,uint256)' "$ASSET0" "$ASSET1" --rpc-url "$RPC" 2>&1)"
+              echo "limits_1_to_0=$(cast call "$POOL" 'getLimits(address,address)(uint256,uint256)' "$ASSET1" "$ASSET0" --rpc-url "$RPC" 2>&1)"
+              echo "quote_0_to_1_1e6=$(cast call "$POOL" 'computeQuote(address,address,uint256,bool)(uint256)' "$ASSET0" "$ASSET1" 1000000 true --rpc-url "$RPC" 2>&1)"
+              echo "quote_1_to_0_1e6=$(cast call "$POOL" 'computeQuote(address,address,uint256,bool)(uint256)' "$ASSET1" "$ASSET0" 1000000 true --rpc-url "$RPC" 2>&1)"
+            } > "$OUT/pool-state.txt"
+            state_rc=0
+
+            for spec in "vault0:$VAULT0" "vault1:$VAULT1"; do
+              name="${spec%%:*}"; vault="${spec#*:}"
+              D="$OUT/$name"; mkdir -p "$D"
+              balance="$(cast call "$vault" 'balanceOf(address)(uint256)' "$ACCOUNT" --rpc-url "$RPC" 2> "$D/balance.err")"
+              {
+                echo "address=$vault"
+                echo "asset=$(cast call "$vault" 'asset()(address)' --rpc-url "$RPC" 2>&1)"
+                echo "cash=$(cast call "$vault" 'cash()(uint256)' --rpc-url "$RPC" 2>&1)"
+                echo "total_borrows=$(cast call "$vault" 'totalBorrows()(uint256)' --rpc-url "$RPC" 2>&1)"
+                echo "debt_of_account=$(cast call "$vault" 'debtOf(address)(uint256)' "$ACCOUNT" --rpc-url "$RPC" 2>&1)"
+                echo "balance_of_account=$balance"
+                echo "convert_account_shares=$(cast call "$vault" 'convertToAssets(uint256)(uint256)' "$balance" --rpc-url "$RPC" 2>&1)"
+                echo "max_deposit_account=$(cast call "$vault" 'maxDeposit(address)(uint256)' "$ACCOUNT" --rpc-url "$RPC" 2>&1)"
+                echo "caps=$(cast call "$vault" 'caps()(uint16,uint16)' --rpc-url "$RPC" 2>&1)"
+                echo "oracle=$(cast call "$vault" 'oracle()(address)' --rpc-url "$RPC" 2>&1)"
+                echo "unit_of_account=$(cast call "$vault" 'unitOfAccount()(address)' --rpc-url "$RPC" 2>&1)"
+              } > "$D/state.txt"
+            done
+            vaults_rc=0
+          fi
+
+          curl -fsSL --retry 3 --max-time 45 "https://eth.blockscout.com/api/v2/addresses/$POOL/transactions" > "$OUT/blockscout-transactions.json" || true
+          curl -fsSL --retry 3 --max-time 45 "https://eth.blockscout.com/api/v2/smart-contracts/$POOL" > "$OUT/blockscout-contract.json" || true
+          printf '%s\n' "core_rc=$core_rc" "params_rc=$params_rc" "state_rc=$state_rc" "vaults_rc=$vaults_rc" > "$OUT/status.txt"
+          find "$OUT" -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS"
+          exit 0
+
+      - name: Upload live EulerSwap snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 0x-eulerswap-live-v2-${{ github.run_id }}
+          path: eulerswap-live-v2/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
+
+      - name: Enforce snapshot gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fx 'core_rc=0' eulerswap-live-v2/status.txt
+          grep -Fx 'params_rc=0' eulerswap-live-v2/status.txt
+          grep -Fx 'state_rc=0' eulerswap-live-v2/status.txt
+          grep -Fx 'vaults_rc=0' eulerswap-live-v2/status.txt
+          grep -Fx 'authorized=true' eulerswap-live-v2/pool-state.txt
+          test -s eulerswap-live-v2/params.json
+          test -s eulerswap-live-v2/reserves.json
