@@ -1,0 +1,151 @@
+name: Record public 0x Settler token balances
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/0x-settler-public-balance-snapshot.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
+      - name: Record balances and allowances through independent public RPCs
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/balance-snapshot"
+          mkdir -p "$OUT"
+
+          cat > "$OUT/addresses.tsv" <<'EOF'
+          feature3_current	0x82CC35Ea953c87dBE61d6B6feABD91371201d9Bb
+          feature3_previous	0x0476C2483f4c6AA4Dfb6EFA29815AB74d9C1e508
+          feature4_current	0x59Da89BaEE7c773F991731FCA0a8BBa58d511C05
+          feature4_previous	0xF24be3404B723e35d9EbC60977B646d2581F57F0
+          EOF
+
+          cat > "$OUT/tokens.tsv" <<'EOF'
+          DAI	0x6B175474E89094C44Da98b954EedeAC495271d0F	18
+          USDS	0xdC035D45d973E3EC169d2276DDab16f1e407384F	18
+          USDD	0x4f8e5DE400DE08B164E7421B3EE387f461beCD1A	18
+          USDC	0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48	6
+          USDT	0xdAC17F958D2ee523a2206206994597C13D831ec7	6
+          WETH	0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2	18
+          WBTC	0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599	8
+          EOF
+
+          cat > "$OUT/spenders.tsv" <<'EOF'
+          LitePSM	0xf6e72Db5454dd049d0788e411b06CfAF16853042
+          SkyPSM	0xA188EEC8F81263234dA3622A406892F3D630f98c
+          UsddPSM	0xcE355440c00014A229bbEc030A2B8f8EB45a2897
+          UsddGemJoin	0x217e42CEB2eAE9ECB788fDF0e31c806c531760A3
+          Bebop	0xbbbbbBB520d69a9775E85b458C58c648259FAD5F
+          Permit2	0x000000000022D473030F116dDEE9F6B43aC78BA3
+          EOF
+
+          cat > "$OUT/rpcs.tsv" <<'EOF'
+          drpc	https://eth.drpc.org
+          publicnode	https://ethereum-rpc.publicnode.com
+          llama	https://eth.llamarpc.com
+          EOF
+
+          : > "$OUT/balances.tsv"
+          : > "$OUT/allowances.tsv"
+          : > "$OUT/rpc-status.tsv"
+
+          while IFS=$'\t' read -r rpc_name rpc; do
+            head=$(cast block-number --rpc-url "$rpc" 2>/dev/null || true)
+            chain=$(cast chain-id --rpc-url "$rpc" 2>/dev/null || true)
+            printf '%s\t%s\t%s\n' "$rpc_name" "$chain" "$head" >> "$OUT/rpc-status.tsv"
+            [ "$chain" = "1" ] || continue
+
+            while IFS=$'\t' read -r instance owner; do
+              native=$(cast balance "$owner" --rpc-url "$rpc" 2>/dev/null || true)
+              codehash=$(cast codehash "$owner" --rpc-url "$rpc" 2>/dev/null || true)
+              printf '%s\t%s\tNATIVE\t%s\t%s\n' "$rpc_name" "$instance" "$native" "$codehash" >> "$OUT/balances.tsv"
+
+              while IFS=$'\t' read -r token_name token decimals; do
+                bal=$(cast call "$token" 'balanceOf(address)(uint256)' "$owner" --rpc-url "$rpc" 2>/dev/null || true)
+                printf '%s\t%s\t%s\t%s\t%s\n' "$rpc_name" "$instance" "$token_name" "$decimals" "$bal" >> "$OUT/balances.tsv"
+
+                while IFS=$'\t' read -r spender_name spender; do
+                  allowance=$(cast call "$token" 'allowance(address,address)(uint256)' "$owner" "$spender" --rpc-url "$rpc" 2>/dev/null || true)
+                  printf '%s\t%s\t%s\t%s\t%s\n' "$rpc_name" "$instance" "$token_name" "$spender_name" "$allowance" >> "$OUT/allowances.tsv"
+                done < "$OUT/spenders.tsv"
+              done < "$OUT/tokens.tsv"
+            done < "$OUT/addresses.tsv"
+          done < "$OUT/rpcs.tsv"
+
+          python3 - "$OUT" <<'PY'
+          import csv, json, pathlib, sys
+          root=pathlib.Path(sys.argv[1])
+
+          addresses=dict(csv.reader((root/'addresses.tsv').open(), delimiter='\t'))
+          tokens={r[0]: {'address':r[1], 'decimals':int(r[2])} for r in csv.reader((root/'tokens.tsv').open(), delimiter='\t')}
+          balances={}
+          for rpc, instance, token, decimals_or_balance, value in csv.reader((root/'balances.tsv').open(), delimiter='\t'):
+              balances.setdefault(instance,{}).setdefault(token,{}).setdefault(rpc, value)
+          allowances={}
+          for rpc, instance, token, spender, value in csv.reader((root/'allowances.tsv').open(), delimiter='\t'):
+              allowances.setdefault(instance,{}).setdefault(token,{}).setdefault(spender,{})[rpc]=value
+
+          def parse_uint(v):
+              try:
+                  return int(v.split()[0], 0)
+              except Exception:
+                  return None
+
+          consensus={}
+          nonzero=[]
+          for instance, by_token in balances.items():
+              consensus[instance]={}
+              for token, by_rpc in by_token.items():
+                  vals=[parse_uint(v) for v in by_rpc.values()]
+                  vals=[v for v in vals if v is not None]
+                  agreed = vals[0] if vals and all(v==vals[0] for v in vals) else None
+                  consensus[instance][token]={'value':agreed,'rpc_values':by_rpc}
+                  if agreed not in (None,0) and token != 'NATIVE':
+                      nonzero.append({'instance':instance,'token':token,'raw':agreed})
+          result={
+              'addresses':addresses,
+              'tokens':tokens,
+              'consensus':consensus,
+              'nonzero_erc20':nonzero,
+              'allowances':allowances,
+          }
+          (root/'summary.json').write_text(json.dumps(result, indent=2, sort_keys=True))
+          (root/'nonzero.json').write_text(json.dumps(nonzero, indent=2, sort_keys=True))
+          if len([x for x in (root/'rpc-status.tsv').read_text().splitlines() if '\t1\t' in x]) < 2:
+              raise SystemExit('fewer than two working Ethereum RPCs')
+          PY
+
+          for addr in $(cut -f2 "$OUT/addresses.tsv"); do
+            safe=$(echo "$addr" | tr '[:upper:]' '[:lower:]')
+            curl -fsSL --retry 3 --max-time 45 "https://eth.blockscout.com/api/v2/addresses/$addr/tokens?type=ERC-20" > "$OUT/blockscout-$safe-tokens.json" || true
+            curl -fsSL --retry 3 --max-time 45 "https://eth.blockscout.com/api/v2/addresses/$addr/token-transfers?type=ERC-20" > "$OUT/blockscout-$safe-transfers.json" || true
+          done
+
+          find "$OUT" -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS"
+          test -s "$OUT/summary.json"
+
+      - name: Upload public balance evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: 0x-settler-public-balances-${{ github.run_id }}
+          path: balance-snapshot/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
