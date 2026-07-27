@@ -1,0 +1,217 @@
+name: Hermetica contract-call delta scan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-contract-call-delta.yml'
+      - 'public-data/hermetica-contract-call-delta-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Capture public calls and events for production control contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT=/tmp/hermetica-contract-call-delta
+          mkdir -p "$OUT/raw"
+          cat > "$OUT/scan.py" <<'PY'
+          import datetime as dt
+          import json
+          import pathlib
+          import re
+          import time
+          import urllib.parse
+          import urllib.request
+
+          OUT = pathlib.Path('/tmp/hermetica-contract-call-delta')
+          API = 'https://api.hiro.so'
+          SINCE = int(dt.datetime(2026, 6, 1, tzinfo=dt.timezone.utc).timestamp())
+
+          TARGETS = {
+              'hbtc_hq': 'SP1S1HSFH0SQQGWKB69EYFNY0B1MHRMGXR3J1FH4D.hq-v1',
+              'hbtc_state': 'SP1S1HSFH0SQQGWKB69EYFNY0B1MHRMGXR3J1FH4D.state-hbtc-v1',
+              'hbtc_blacklist': 'SP1S1HSFH0SQQGWKB69EYFNY0B1MHRMGXR3J1FH4D.blacklist-v1',
+              'hbtc_controller': 'SP1S1HSFH0SQQGWKB69EYFNY0B1MHRMGXR3J1FH4D.controller-hbtc-v1',
+              'hbtc_vault': 'SP1S1HSFH0SQQGWKB69EYFNY0B1MHRMGXR3J1FH4D.vault-hbtc-v1-2',
+              'hbtc_trading': 'SP1S1HSFH0SQQGWKB69EYFNY0B1MHRMGXR3J1FH4D.trading-hbtc-v1',
+              'hbtc_token': 'SP1S1HSFH0SQQGWKB69EYFNY0B1MHRMGXR3J1FH4D.token-hbtc',
+              'usdh_hq': 'SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG.hq-v1',
+              'usdh_minting_state': 'SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG.minting-state-v1',
+              'usdh_minting_auto_state': 'SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG.minting-auto-state-v1',
+              'usdh_staking_state': 'SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG.staking-state-v1',
+              'usdh_controller': 'SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG.controller-v1-1',
+              'usdh_minting_auto': 'SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG.minting-auto-v1-2',
+              'usdh_staking': 'SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG.staking-v1-1',
+              'usdh_silo': 'SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG.staking-silo-v1-1',
+              'usdh_redeeming_reserve': 'SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG.redeeming-reserve-v1-2',
+          }
+
+          CONTROL_RE = re.compile(
+              r'(set-|request-|confirm-|cancel-|disable-|enable-|role|owner|guardian|trader|rewarder|manager|protocol|whitelist|asset|external|fee|cooldown|cap|limit|staleness|blacklist|migration|pause|emergency)',
+              re.I,
+          )
+
+          def get_json(url, attempts=10):
+              last = None
+              for i in range(attempts):
+                  try:
+                      req = urllib.request.Request(url, headers={'User-Agent': 'read-only-security-research/1.0', 'Accept': 'application/json'})
+                      with urllib.request.urlopen(req, timeout=40) as response:
+                          return json.loads(response.read().decode('utf-8'))
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(15, 1.5 * (i + 1)))
+              raise RuntimeError(f'{url}: {last}')
+
+          def paged(url_base, max_rows=5000):
+              rows = []
+              offset = 0
+              limit = 50
+              while True:
+                  sep = '&' if '?' in url_base else '?'
+                  body = get_json(f'{url_base}{sep}{urllib.parse.urlencode({"limit": limit, "offset": offset})}')
+                  page = body.get('results') or []
+                  rows.extend(page)
+                  total = int(body.get('total') or len(rows))
+                  if not page or len(rows) >= total:
+                      return rows
+                  offset += len(page)
+                  if offset > max_rows:
+                      raise RuntimeError(f'row cap exceeded: {url_base}')
+                  time.sleep(0.1)
+
+          all_calls = []
+          all_events = []
+          target_summaries = []
+          errors = []
+
+          for label, contract_id in TARGETS.items():
+              target_calls = []
+              target_events = []
+              try:
+                  txs = paged(f'{API}/extended/v1/address/{contract_id}/transactions')
+                  (OUT / 'raw' / f'{label}-transactions.json').write_text(json.dumps(txs, indent=2), encoding='utf-8')
+                  for tx in txs:
+                      observed = int(tx.get('block_time') or tx.get('burn_block_time') or 0)
+                      call = tx.get('contract_call') or {}
+                      if tx.get('tx_type') != 'contract_call' or call.get('contract_id') != contract_id:
+                          continue
+                      row = {
+                          'label': label,
+                          'contract_id': contract_id,
+                          'tx_id': tx.get('tx_id'),
+                          'tx_status': tx.get('tx_status'),
+                          'sender_address': tx.get('sender_address'),
+                          'sponsor_address': tx.get('sponsor_address'),
+                          'nonce': tx.get('nonce'),
+                          'fee_rate': tx.get('fee_rate'),
+                          'block_height': tx.get('block_height'),
+                          'observed_time': observed,
+                          'observed_iso': dt.datetime.fromtimestamp(observed, dt.timezone.utc).isoformat() if observed else None,
+                          'function_name': call.get('function_name'),
+                          'function_args': call.get('function_args') or [],
+                          'control_like': bool(CONTROL_RE.search(call.get('function_name') or '')),
+                      }
+                      target_calls.append(row)
+                      all_calls.append(row)
+              except Exception as exc:
+                  errors.append({'label': label, 'contract_id': contract_id, 'stage': 'transactions', 'error': str(exc)})
+
+              try:
+                  events = paged(f'{API}/extended/v1/contract/{contract_id}/events')
+                  (OUT / 'raw' / f'{label}-events.json').write_text(json.dumps(events, indent=2), encoding='utf-8')
+                  for event in events:
+                      observed = int(event.get('block_time') or event.get('burn_block_time') or 0)
+                      log = event.get('contract_log') or {}
+                      value = log.get('value') or {}
+                      row = {
+                          'label': label,
+                          'contract_id': contract_id,
+                          'tx_id': event.get('tx_id'),
+                          'event_index': event.get('event_index'),
+                          'block_height': event.get('block_height'),
+                          'observed_time': observed,
+                          'observed_iso': dt.datetime.fromtimestamp(observed, dt.timezone.utc).isoformat() if observed else None,
+                          'event_type': event.get('event_type'),
+                          'asset_event_type': event.get('asset_event_type'),
+                          'contract_log_topic': log.get('topic'),
+                          'contract_log_repr': value.get('repr'),
+                      }
+                      target_events.append(row)
+                      all_events.append(row)
+              except Exception as exc:
+                  errors.append({'label': label, 'contract_id': contract_id, 'stage': 'events', 'error': str(exc)})
+
+              recent_calls = [x for x in target_calls if x['observed_time'] >= SINCE]
+              recent_events = [x for x in target_events if x['observed_time'] >= SINCE]
+              target_summaries.append({
+                  'label': label,
+                  'contract_id': contract_id,
+                  'call_count': len(target_calls),
+                  'event_count': len(target_events),
+                  'recent_call_count': len(recent_calls),
+                  'recent_event_count': len(recent_events),
+                  'recent_control_calls': [x for x in recent_calls if x['control_like']],
+                  'latest_call': max(target_calls, key=lambda x: x['observed_time']) if target_calls else None,
+                  'latest_event': max(target_events, key=lambda x: x['observed_time']) if target_events else None,
+              })
+
+          all_calls.sort(key=lambda x: x['observed_time'], reverse=True)
+          all_events.sort(key=lambda x: x['observed_time'], reverse=True)
+          recent_calls = [x for x in all_calls if x['observed_time'] >= SINCE]
+          recent_events = [x for x in all_events if x['observed_time'] >= SINCE]
+          control_calls = [x for x in recent_calls if x['control_like']]
+
+          grouped = {}
+          for row in recent_calls:
+              key = f"{row['contract_id']}::{row['function_name']}"
+              item = grouped.setdefault(key, {'count': 0, 'latest_iso': row['observed_iso'], 'senders': set(), 'tx_ids': []})
+              item['count'] += 1
+              if row.get('sender_address'):
+                  item['senders'].add(row['sender_address'])
+              if len(item['tx_ids']) < 10:
+                  item['tx_ids'].append(row['tx_id'])
+          grouped = {k: {**v, 'senders': sorted(v['senders'])} for k, v in grouped.items()}
+
+          summary = {
+              'generated_at': dt.datetime.now(dt.timezone.utc).isoformat(),
+              'source': 'Hiro public read-only contract-principal transaction and event APIs',
+              'since': dt.datetime.fromtimestamp(SINCE, dt.timezone.utc).isoformat(),
+              'target_count': len(TARGETS),
+              'total_call_count': len(all_calls),
+              'total_event_count': len(all_events),
+              'recent_call_count': len(recent_calls),
+              'recent_event_count': len(recent_events),
+              'recent_control_call_count': len(control_calls),
+              'recent_control_calls': control_calls,
+              'grouped_recent_calls': grouped,
+              'targets': target_summaries,
+              'errors': errors,
+          }
+
+          (OUT / 'all-calls.json').write_text(json.dumps(all_calls, indent=2), encoding='utf-8')
+          (OUT / 'all-events.json').write_text(json.dumps(all_events, indent=2), encoding='utf-8')
+          (OUT / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+          print(json.dumps(summary, indent=2))
+          PY
+
+          python3 "$OUT/scan.py"
+          (cd "$OUT" && find . -type f -not -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-contract-call-delta
+          path: /tmp/hermetica-contract-call-delta
+          retention-days: 2
+          if-no-files-found: error
+          compression-level: 0
