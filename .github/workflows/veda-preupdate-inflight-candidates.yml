@@ -1,0 +1,107 @@
+name: veda-preupdate-inflight-candidates
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - product: liquidUSD
+            teller: '0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387'
+            one_share: '1000000'
+          - product: liquidETH
+            teller: '0x9AA79C84b79816ab920bBcE20f8f74557B514734'
+            one_share: '1000000000000000000'
+          - product: liquidBTC
+            teller: '0x8Ea0B382D054dbEBeB1d0aE47ee4AC433C730353'
+            one_share: '100000000'
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Find source sends shortly before destination updates
+        shell: bash
+        env:
+          PRODUCT: ${{ matrix.product }}
+          TELLER: ${{ matrix.teller }}
+          ONE_SHARE: ${{ matrix.one_share }}
+        run: |
+          python3 - <<'PY'
+          import base64,gzip,json,os,re,subprocess,time,urllib.parse,urllib.request
+          from pathlib import Path
+          product=os.environ['PRODUCT'];teller=os.environ['TELLER'];one=int(os.environ['ONE_SHARE'])
+          src=Path('.github/workflows/veda-production-window-scan.yml').read_text();m=re.search(r"WINDOW_B64 = '''([^']+)'''",src)
+          windows=[w for w in json.loads(gzip.decompress(base64.b64decode(m.group(1)))) if w['p']==product]
+          LEGACY='https://scroll.blockscout.com/api';RPCS=['https://scroll-rpc.publicnode.com','https://rpc.scroll.io','https://scroll.drpc.org']
+          SENT=subprocess.check_output(['cast','keccak','MessageSent(bytes32,uint256,address)'],text=True).strip().lower()
+          def get(url,retries=5):
+            last=None
+            for i in range(retries):
+              try:
+                req=urllib.request.Request(url,headers={'accept':'application/json','user-agent':'Mozilla/5.0 VedaResearch/8.0'})
+                with urllib.request.urlopen(req,timeout=50) as r:return json.loads(r.read().decode())
+              except Exception as e:last=e;time.sleep(.2*(i+1))
+            raise last
+          def rpc(url,m,p,timeout=45):
+            body=json.dumps({'jsonrpc':'2.0','id':1,'method':m,'params':p}).encode();req=urllib.request.Request(url,data=body,method='POST',headers={'content-type':'application/json','user-agent':'veda-inflight-source/1'})
+            with urllib.request.urlopen(req,timeout=timeout) as r:o=json.loads(r.read().decode())
+            if 'error'in o:raise RuntimeError(o['error'])
+            return o['result']
+          bad={};rpcurl=None
+          for u in RPCS:
+            try:
+              if int(rpc(u,'eth_chainId',[]),16)==534352:rpcurl=u;break
+            except Exception as e:bad[u]=repr(e)
+          if not rpcurl:raise RuntimeError(bad)
+          def logs(lo,hi):
+            q={'module':'logs','action':'getLogs','fromBlock':str(lo),'toBlock':str(hi),'address':teller,'topic0':SENT};d=get(LEGACY+'?'+urllib.parse.urlencode(q));r=d.get('result')
+            if isinstance(r,list):return r
+            if 'No logs found' in (str(d.get('message'))+' '+str(r)):return []
+            raise RuntimeError(d)
+          def num(v):
+            s=str(v or '0');return int(s,16) if s.startswith('0x') else int(s)
+          raw=[];errors=[];seen=set();queried=0
+          for i,w in enumerate(windows):
+            lo=max(int(w['a']),int(w['b'])-900);hi=int(w['b'])
+            try:
+              for row in logs(lo,hi):
+                key=(row.get('transactionHash'),row.get('logIndex'),i)
+                if key in seen:continue
+                seen.add(key);raw.append({'wi':i,'w':w,'row':row})
+              queried+=1
+            except Exception as e:errors.append({'stage':'query','wi':i,'window':w,'error':repr(e)})
+          blocks=sorted({num(x['row']['blockNumber']) for x in raw});timestamps={}
+          for off in range(0,len(blocks),100):
+            chunk=blocks[off:off+100];payload=[{'jsonrpc':'2.0','id':j,'method':'eth_getBlockByNumber','params':[hex(b),False]} for j,b in enumerate(chunk)]
+            req=urllib.request.Request(rpcurl,data=json.dumps(payload).encode(),method='POST',headers={'content-type':'application/json','user-agent':'veda-inflight-batch/1'})
+            with urllib.request.urlopen(req,timeout=60) as r:resp=json.loads(r.read().decode())
+            byid={x['id']:x for x in resp}
+            for j,b in enumerate(chunk):timestamps[b]=int(byid[j]['result']['timestamp'],16)
+          candidates=[]
+          for x in raw:
+            row=x['row'];b=num(row['blockNumber']);ts=timestamps[b];w=x['w']
+            if not (w['t0']-1800<=ts<w['t1']):continue
+            topics=[z.lower() for z in row.get('topics',[]) if isinstance(z,str)];shares=int(row.get('data')or'0x0',16)
+            candidates.append({'window_index':x['wi'],'window':w,'block':b,'timestamp':ts,'tx':row.get('transactionHash'),'log_index':num(row.get('logIndex')),'guid':topics[1] if len(topics)>1 else None,'recipient':'0x'+topics[2][-40:] if len(topics)>2 else None,'shares_raw':shares,'max_possible_extra_base_raw':shares*(w['dr']-w['sr'])//one,'sent_after_destination_update':ts>=w['t0']})
+          out={'generated_at_unix':int(time.time()),'product':product,'teller':teller,'one_share':one,'rpc':rpcurl,'rpc_failures':bad,'window_count':len(windows),'queried_window_count':queried,'narrow_source_log_count':len(raw),'unique_blocks':len(blocks),'preupdate_or_window_candidate_count':len(candidates),'already_in_window_count':sum(1 for x in candidates if x['sent_after_destination_update']),'max_possible_extra_base_raw':max([x['max_possible_extra_base_raw'] for x in candidates]or[0]),'sum_possible_extra_base_raw':sum(x['max_possible_extra_base_raw'] for x in candidates),'candidates':candidates,'errors':errors}
+          fn=f'veda-inflight-candidates-{product}.json';Path(fn).write_text(json.dumps(out,indent=2,sort_keys=True)+'\n');print(json.dumps({k:out[k] for k in ['product','window_count','queried_window_count','narrow_source_log_count','unique_blocks','preupdate_or_window_candidate_count','already_in_window_count','max_possible_extra_base_raw','sum_possible_extra_base_raw']},indent=2));print('errors',len(errors))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: veda-inflight-candidates-${{ matrix.product }}
+          path: veda-inflight-candidates-${{ matrix.product }}.json
+          if-no-files-found: error
+          retention-days: 1
