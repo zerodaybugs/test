@@ -1,0 +1,167 @@
+name: Hermetica residual custody census
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-residual-custody.yml'
+      - 'public-data/hermetica-residual-custody-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Capture contract balances and public recovery surfaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT=/tmp/hermetica-residual-custody
+          mkdir -p "$OUT/raw" "$OUT/sources"
+          python3 - <<'PY'
+          import datetime as dt
+          import hashlib
+          import json
+          import pathlib
+          import re
+          import time
+          import urllib.parse
+          import urllib.request
+
+          OUT=pathlib.Path('/tmp/hermetica-residual-custody')
+          API='https://api.hiro.so'
+          DEPLOYERS={
+            'hbtc':'SP1S1HSFH0SQQGWKB69EYFNY0B1MHRMGXR3J1FH4D',
+            'usdh':'SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG',
+          }
+          RELEVANT=(
+            'usdh-token-v1::', 'susdh-token-v1::', 'token-hbtc::',
+            'sbtc-token::sbtc-token', 'sbtc-token::sbtc-token-locked',
+            'token-aeusdc::',
+          )
+          AUTH_TERMS=re.compile(r'(check-is-|is-owner|is-admin|is-protocol|is-manager|is-trader|is-rewarder|is-blacklister|whitelist|authorized|contract-caller|tx-sender)',re.I)
+          VALUE_TERMS=re.compile(r'(transfer|withdraw|redeem|claim|sweep|recover|mint|burn|refund|cancel|migrate)',re.I)
+
+          def get(url, attempts=10):
+            last=None
+            for i in range(attempts):
+              try:
+                req=urllib.request.Request(url,headers={'User-Agent':'read-only-security-research/1.0','Accept':'application/json'})
+                with urllib.request.urlopen(req,timeout=40) as r:
+                  return json.loads(r.read().decode())
+              except Exception as e:
+                last=e; time.sleep(min(12,1.3*(i+1)))
+            raise RuntimeError(f'{url}: {last}')
+
+          def paged_txs(address):
+            rows=[]; offset=0; limit=50
+            while True:
+              q=urllib.parse.urlencode({'limit':limit,'offset':offset})
+              body=get(f'{API}/extended/v1/address/{address}/transactions?{q}')
+              page=body.get('results') or []
+              rows.extend(page)
+              total=int(body.get('total') or len(rows))
+              if not page or len(rows)>=total: break
+              offset+=len(page)
+              if offset>5000: raise RuntimeError('unexpectedly large history')
+              time.sleep(.12)
+            return rows
+
+          deployments={}
+          for label,address in DEPLOYERS.items():
+            txs=paged_txs(address)
+            (OUT/'raw'/f'{label}-transactions.json').write_text(json.dumps(txs,indent=2))
+            for tx in txs:
+              if tx.get('tx_type')!='smart_contract' or tx.get('tx_status')!='success': continue
+              cid=(tx.get('smart_contract') or {}).get('contract_id')
+              if not cid: continue
+              deployments[cid]={
+                'label':label,'contract_id':cid,'deploy_tx':tx.get('tx_id'),
+                'block_height':tx.get('block_height'),
+                'block_time':int(tx.get('block_time') or tx.get('burn_block_time') or 0),
+              }
+
+          rows=[]; errors=[]
+          for index,(cid,base) in enumerate(sorted(deployments.items())):
+            try:
+              addr,name=cid.split('.',1)
+              balances=get(f'{API}/extended/v1/address/{cid}/balances')
+              source_body=get(f'{API}/v2/contracts/source/{addr}/{name}?proof=0')
+              source=source_body.get('source') or ''
+              (OUT/'raw'/f'{cid}.balances.json').write_text(json.dumps(balances,indent=2))
+              (OUT/'sources'/f'{cid}.clar').write_text(source)
+              ft=balances.get('fungible_tokens') or {}
+              relevant={k:{'balance':str(v.get('balance','0')),'total_sent':str(v.get('total_sent','0')),'total_received':str(v.get('total_received','0'))} for k,v in ft.items() if any(term in k for term in RELEVANT)}
+              nonzero={k:v for k,v in relevant.items() if int(v['balance'])!=0}
+              public=[]
+              matches=list(re.finditer(r'\(define-public\s+\(([^\s\)]+)',source))
+              for i,m in enumerate(matches):
+                end=matches[i+1].start() if i+1<len(matches) else len(source)
+                snippet=source[m.start():end]
+                fn=m.group(1)
+                public.append({
+                  'name':fn,
+                  'value_moving_name':bool(VALUE_TERMS.search(fn)),
+                  'auth_terms':sorted(set(AUTH_TERMS.findall(snippet))),
+                  'snippet_sha256':hashlib.sha256(snippet.encode()).hexdigest(),
+                })
+              stx=(balances.get('stx') or {}).get('balance','0')
+              row={**base,
+                'observed_iso':dt.datetime.fromtimestamp(base['block_time'],dt.timezone.utc).isoformat() if base['block_time'] else None,
+                'source_bytes':len(source.encode()),
+                'source_sha256':hashlib.sha256(source.encode()).hexdigest(),
+                'public_functions':public,
+                'stx_balance':str(stx),
+                'relevant_token_balances':relevant,
+                'nonzero_relevant_token_balances':nonzero,
+                'has_relevant_value':bool(nonzero) or int(stx)!=0,
+                'deprecated_name_hint':any(x in name.lower() for x in ('deprecated','v0','old','test')),
+              }
+              rows.append(row)
+            except Exception as e:
+              errors.append({'contract_id':cid,'error':str(e)})
+            if index%10==0: time.sleep(.2)
+
+          rows.sort(key=lambda r:(r['has_relevant_value'],sum(int(v['balance']) for v in r['nonzero_relevant_token_balances'].values()),int(r['stx_balance'])),reverse=True)
+          nonzero=[r for r in rows if r['has_relevant_value']]
+          review=[]
+          for r in nonzero:
+            value_funcs=[f for f in r['public_functions'] if f['value_moving_name']]
+            unauth_named=[f for f in value_funcs if not f['auth_terms']]
+            review.append({
+              'contract_id':r['contract_id'],
+              'observed_iso':r['observed_iso'],
+              'stx_balance':r['stx_balance'],
+              'nonzero_relevant_token_balances':r['nonzero_relevant_token_balances'],
+              'value_moving_public_functions':value_funcs,
+              'value_moving_without_detected_auth_terms':unauth_named,
+              'source_sha256':r['source_sha256'],
+            })
+          summary={
+            'generated_at':dt.datetime.now(dt.timezone.utc).isoformat(),
+            'source':'Hiro public read-only API',
+            'deployment_count':len(deployments),
+            'scanned_contract_count':len(rows),
+            'contracts_with_relevant_balance_count':len(nonzero),
+            'error_count':len(errors),
+            'contracts_for_manual_review':review,
+            'errors':errors,
+          }
+          (OUT/'all-contracts.json').write_text(json.dumps(rows,indent=2))
+          (OUT/'nonzero-contracts.json').write_text(json.dumps(nonzero,indent=2))
+          (OUT/'summary.json').write_text(json.dumps(summary,indent=2))
+          print(json.dumps(summary,indent=2))
+          PY
+          (cd "$OUT" && find . -type f -not -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-residual-custody
+          path: /tmp/hermetica-residual-custody
+          retention-days: 2
+          if-no-files-found: error
+          compression-level: 0
