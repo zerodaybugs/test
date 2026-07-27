@@ -1,0 +1,122 @@
+name: Snapshot public TermMax router matrix
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/snapshot-termmax-router-matrix.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install pinned Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Capture current router matrix read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/router-matrix"
+          SLOT='0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
+          mkdir -p "$OUT"
+
+          RPC=''
+          for candidate in \
+            https://ethereum-rpc.publicnode.com \
+            https://eth.llamarpc.com \
+            https://rpc.flashbots.net \
+            https://1rpc.io/eth
+          do
+            if [ "$(cast chain-id --rpc-url "$candidate" 2>/dev/null || true)" = '1' ]; then
+              RPC="$candidate"
+              break
+            fi
+          done
+          test -n "$RPC"
+          BLOCK="$(cast block-number --rpc-url "$RPC")"
+          cast block "$BLOCK" --json --rpc-url "$RPC" > "$OUT/block.json"
+
+          python3 - "$OUT" "$RPC" "$BLOCK" "$SLOT" <<'PY'
+          from __future__ import annotations
+          import json, pathlib, subprocess, sys
+
+          out = pathlib.Path(sys.argv[1])
+          rpc = sys.argv[2]
+          block = sys.argv[3]
+          slot = sys.argv[4]
+          addresses = {
+              'frontend_router': '0xc47591f5c023e44931c78d5a993834875b79fb11',
+              'deployment_router_v2': '0x324596c1682a5675008f6e58f9c4e0a894b079c7',
+              'api_router_v2_address': '0xd7b162c1fa3c8cd0cb03e2c256715a4f4bec42d0',
+          }
+
+          def run(*args: str, allow_fail: bool = False) -> tuple[int, str, str]:
+              cp = subprocess.run(args, text=True, capture_output=True)
+              if cp.returncode and not allow_fail:
+                  raise RuntimeError(f'{args}: {cp.stderr}')
+              return cp.returncode, cp.stdout.strip(), cp.stderr.strip()
+
+          result = {'chain_id': 1, 'block_number': int(block), 'transactions_broadcast': 0, 'contracts': {}}
+          for label, address in addresses.items():
+              _, code, _ = run('cast', 'code', address, '--block', block, '--rpc-url', rpc)
+              item = {
+                  'address': address,
+                  'runtime_bytes': (len(code) - 2) // 2 if code.startswith('0x') else 0,
+                  'runtime_keccak256': run('cast', 'keccak', code)[1] if code != '0x' else None,
+                  'code_file': f'{label}_runtime.hex',
+              }
+              (out / item['code_file']).write_text(code + '\n')
+
+              rc, storage, err = run('cast', 'storage', address, slot, '--block', block, '--rpc-url', rpc, allow_fail=True)
+              item['implementation_slot_rc'] = rc
+              item['implementation_storage'] = storage
+              if rc == 0 and storage.startswith('0x') and len(storage) >= 42:
+                  implementation = '0x' + storage[-40:]
+                  item['implementation'] = implementation
+                  _, impl_code, _ = run('cast', 'code', implementation, '--block', block, '--rpc-url', rpc)
+                  item['implementation_runtime_bytes'] = (len(impl_code) - 2) // 2 if impl_code.startswith('0x') else 0
+                  item['implementation_runtime_keccak256'] = run('cast', 'keccak', impl_code)[1] if impl_code != '0x' else None
+                  impl_file = f'{label}_implementation_runtime.hex'
+                  item['implementation_code_file'] = impl_file
+                  (out / impl_file).write_text(impl_code + '\n')
+
+              for signature, key in [
+                  ('paused()(bool)', 'paused'),
+                  ('owner()(address)', 'owner'),
+                  ('version()(string)', 'version'),
+              ]:
+                  rc, value, err = run('cast', 'call', address, signature, '--block', block, '--rpc-url', rpc, allow_fail=True)
+                  item[key + '_rc'] = rc
+                  item[key] = value if rc == 0 else None
+                  if rc != 0:
+                      item[key + '_error'] = err[-500:]
+
+              result['contracts'][label] = item
+
+          block_data = json.loads((out / 'block.json').read_text())
+          result['block_hash'] = block_data.get('hash')
+          result['block_timestamp'] = block_data.get('timestamp')
+          result['rpc'] = 'read-only public Ethereum endpoint; URL intentionally omitted'
+          (out / 'ROUTER_MATRIX.json').write_text(json.dumps(result, indent=2) + '\n')
+          print(json.dumps(result, indent=2))
+          PY
+
+          cd "$OUT"
+          sha256sum * > SHA256SUMS.txt.tmp
+          mv SHA256SUMS.txt.tmp SHA256SUMS.txt
+
+      - name: Upload router matrix
+        uses: actions/upload-artifact@v4
+        with:
+          name: termmax-router-matrix-${{ github.run_id }}
+          path: router-matrix/
+          if-no-files-found: error
+          retention-days: 3
