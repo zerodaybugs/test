@@ -1,0 +1,196 @@
+name: Collect public operator approval state
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/public-approval-state.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: ethereum, chain_id: 1, rpc: 'https://ethereum-rpc.publicnode.com', operator: '0x0000000000001fF3684f28c67538d4D072C22734'}
+          - {name: base, chain_id: 8453, rpc: 'https://base-rpc.publicnode.com', operator: '0x0000000000001fF3684f28c67538d4D072C22734'}
+          - {name: arbitrum, chain_id: 42161, rpc: 'https://arbitrum-one-rpc.publicnode.com', operator: '0x0000000000001fF3684f28c67538d4D072C22734'}
+          - {name: polygon, chain_id: 137, rpc: 'https://polygon-bor-rpc.publicnode.com', operator: '0x0000000000001fF3684f28c67538d4D072C22734'}
+          - {name: bsc, chain_id: 56, rpc: 'https://bsc-rpc.publicnode.com', operator: '0x0000000000001fF3684f28c67538d4D072C22734'}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - name: Collect public event and interface state
+        env:
+          CHAIN_NAME: ${{ matrix.name }}
+          EXPECTED_CHAIN_ID: ${{ matrix.chain_id }}
+          RPC_URL: ${{ matrix.rpc }}
+          OPERATOR: ${{ matrix.operator }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/state-$CHAIN_NAME"
+          mkdir -p "$OUT"
+          python3 - "$OUT" <<'PY'
+          import json, os, pathlib, sys, time, urllib.request
+
+          out = pathlib.Path(sys.argv[1])
+          chain_name = os.environ['CHAIN_NAME']
+          expected_chain_id = int(os.environ['EXPECTED_CHAIN_ID'])
+          rpc_url = os.environ['RPC_URL']
+          operator = os.environ['OPERATOR'].lower()
+          approval_topic = '0x17307eab39ab6107e8899845ad3d59bd9653f200f220920489ca2b5937696c31'
+          operator_topic = '0x' + '0' * 24 + operator[2:]
+          request_id = 0
+
+          def rpc(method, params, attempts=6):
+              global request_id
+              last = None
+              for attempt in range(attempts):
+                  request_id += 1
+                  body = json.dumps({'jsonrpc':'2.0','id':request_id,'method':method,'params':params}).encode()
+                  try:
+                      req = urllib.request.Request(
+                          rpc_url,
+                          data=body,
+                          headers={'Content-Type':'application/json','User-Agent':'public-event-inventory/1.0'},
+                      )
+                      with urllib.request.urlopen(req, timeout=90) as response:
+                          obj = json.load(response)
+                      if 'error' in obj:
+                          raise RuntimeError(obj['error'])
+                      return obj['result']
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(20, 2 ** attempt))
+              raise RuntimeError(f'{method}: {last!r}')
+
+          def get_logs(start, end):
+              rows, ranges = [], []
+              cursor, chunk = start, 500_000
+              while cursor <= end:
+                  stop = min(end, cursor + chunk - 1)
+                  query = {
+                      'fromBlock':hex(cursor),
+                      'toBlock':hex(stop),
+                      'topics':[approval_topic, None, operator_topic],
+                  }
+                  try:
+                      batch = rpc('eth_getLogs', [query], attempts=3)
+                  except Exception as exc:
+                      if chunk <= 250:
+                          ranges.append({'from':cursor,'to':stop,'error':repr(exc)})
+                          cursor = stop + 1
+                      else:
+                          chunk = max(250, chunk // 4)
+                      continue
+                  rows.extend(batch)
+                  ranges.append({'from':cursor,'to':stop,'count':len(batch)})
+                  cursor = stop + 1
+                  if not batch:
+                      chunk = min(2_000_000, chunk * 2)
+                  elif len(batch) > 5_000:
+                      chunk = max(250, chunk // 2)
+              return rows, ranges
+
+          def topic_address(topic):
+              return '0x' + topic[-40:].lower()
+
+          def address_word(address):
+              return '0' * 24 + address[2:].lower()
+
+          def eth_call(to, data):
+              try:
+                  return rpc('eth_call', [{'to':to,'data':data}, 'latest'], attempts=4)
+              except Exception as exc:
+                  return {'error':repr(exc)}
+
+          def bool_call(to, data):
+              raw = eth_call(to, data)
+              if isinstance(raw, dict):
+                  return False, raw
+              try:
+                  return int(raw, 16) != 0, raw
+              except Exception:
+                  return False, raw
+
+          chain_id = int(rpc('eth_chainId', []), 16)
+          if chain_id != expected_chain_id:
+              raise SystemExit(f'wrong chain {chain_id}')
+          head = int(rpc('eth_blockNumber', []), 16)
+          operator_code = rpc('eth_getCode', [operator, 'latest'])
+          logs, ranges = get_logs(0, head)
+
+          events = []
+          for log in logs:
+              topics = log.get('topics', [])
+              if len(topics) < 3:
+                  continue
+              events.append({
+                  'token':log['address'].lower(),
+                  'owner':topic_address(topics[1]),
+                  'operator':topic_address(topics[2]),
+                  'approved':int(log.get('data','0x0'),16) != 0,
+                  'block':int(log['blockNumber'],16),
+                  'tx_index':int(log.get('transactionIndex','0x0'),16),
+                  'log_index':int(log.get('logIndex','0x0'),16),
+                  'tx_hash':log.get('transactionHash'),
+              })
+          events.sort(key=lambda x:(x['block'],x['tx_index'],x['log_index']))
+          latest = {}
+          for event in events:
+              latest[(event['token'],event['owner'])] = event
+
+          rows = []
+          for (token, owner), event in sorted(latest.items()):
+              now, now_raw = bool_call(
+                  token,
+                  '0xe985e9c5' + address_word(owner) + address_word(operator),
+              )
+              erc721, erc721_raw = bool_call(token, '0x01ffc9a7' + '80ac58cd' + '0' * 56)
+              erc1155, erc1155_raw = bool_call(token, '0x01ffc9a7' + 'd9b67a26' + '0' * 56)
+              code = rpc('eth_getCode', [token, 'latest'])
+              rows.append({
+                  **event,
+                  'approved_now':now,
+                  'erc721':erc721,
+                  'erc1155':erc1155,
+                  'token_code_bytes':max(0,(len(code)-2)//2),
+                  'approved_now_raw':now_raw,
+                  'erc721_raw':erc721_raw,
+                  'erc1155_raw':erc1155_raw,
+              })
+
+          active_1155 = [row for row in rows if row['approved_now'] and row['erc1155']]
+          summary = {
+              'chain':chain_name,
+              'chain_id':chain_id,
+              'head':head,
+              'operator':operator,
+              'operator_code_bytes':max(0,(len(operator_code)-2)//2),
+              'raw_log_count':len(logs),
+              'event_count':len(events),
+              'unique_pairs':len(latest),
+              'active_erc1155_count':len(active_1155),
+              'active_erc1155':active_1155,
+          }
+          (out/'summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True))
+          (out/'events.json').write_text(json.dumps(events, indent=2, sort_keys=True))
+          (out/'classified.json').write_text(json.dumps(rows, indent=2, sort_keys=True))
+          (out/'ranges.json').write_text(json.dumps(ranges, indent=2, sort_keys=True))
+          PY
+          find "$OUT" -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS"
+          test -s "$OUT/summary.json"
+
+      - name: Upload state evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-approval-state-${{ matrix.name }}-${{ github.run_id }}
+          path: state-${{ matrix.name }}/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
