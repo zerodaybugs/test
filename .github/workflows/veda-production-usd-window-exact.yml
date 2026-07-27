@@ -1,0 +1,103 @@
+name: veda-production-usd-window-exact
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Query each positive LiquidUSD window with indexed topic filtering
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64, gzip, json, re, subprocess, time, urllib.parse, urllib.request
+          from pathlib import Path
+
+          source=Path('.github/workflows/veda-production-window-scan.yml').read_text()
+          match=re.search(r"WINDOW_B64 = '''([^']+)'''",source)
+          if not match:raise RuntimeError('window ledger missing')
+          windows=[w for w in json.loads(gzip.decompress(base64.b64decode(match.group(1)))) if w['p']=='liquidUSD']
+
+          TELLER='0x4DE413a26fC24c3FC27Cc983be70aA9c5C299387'
+          LEGACY='https://scroll.blockscout.com/api'
+          RPCS=['https://scroll-rpc.publicnode.com','https://rpc.scroll.io','https://scroll.drpc.org']
+          def keccak(s):return subprocess.check_output(['cast','keccak',s],text=True).strip().lower()
+          def selector(s):return subprocess.check_output(['cast','sig',s],text=True).strip().lower()
+          SENT=keccak('MessageSent(bytes32,uint256,address)')
+          DEPS={keccak('Deposit(uint256,address,address,uint256,uint256,uint256,uint256,address)'),keccak('Deposit(uint256,address,address,uint256,uint256,uint256,uint256)')}
+          ATOMIC={selector('depositAndBridge(address,uint256,uint256,address,bytes,address,uint256)'),selector('depositAndBridge(address,uint256,uint256,address,bytes,address,uint256,address)')}
+
+          def get_json(url,timeout=45,retries=4):
+            last=None
+            for i in range(retries):
+              try:
+                req=urllib.request.Request(url,headers={'accept':'application/json','user-agent':'Mozilla/5.0 VedaResearch/4.0'})
+                with urllib.request.urlopen(req,timeout=timeout) as r:return json.loads(r.read().decode())
+              except Exception as e:last=e;time.sleep(.25*(i+1))
+            raise last
+          def rpc(url,m,p,timeout=40):
+            body=json.dumps({'jsonrpc':'2.0','id':1,'method':m,'params':p}).encode();req=urllib.request.Request(url,data=body,method='POST',headers={'content-type':'application/json','user-agent':'veda-usd-window-exact/1'})
+            with urllib.request.urlopen(req,timeout=timeout) as r:o=json.loads(r.read().decode())
+            if 'error' in o:raise RuntimeError(o['error'])
+            return o['result']
+          failures={};rpcurl=None
+          for u in RPCS:
+            try:
+              if int(rpc(u,'eth_chainId',[]),16)==534352:rpcurl=u;break
+            except Exception as e:failures[u]=repr(e)
+          if not rpcurl:raise RuntimeError(failures)
+
+          def logs_for(lo,hi):
+            q={'module':'logs','action':'getLogs','fromBlock':str(lo),'toBlock':str(hi),'address':TELLER,'topic0':SENT}
+            d=get_json(LEGACY+'?'+urllib.parse.urlencode(q),60)
+            r=d.get('result')
+            if isinstance(r,list):return r
+            msg=str(d.get('message',''))+' '+str(r)
+            if 'No logs found' in msg:return []
+            raise RuntimeError(d)
+          def parse_num(v):
+            s=str(v or '0');return int(s,16) if s.startswith('0x') else int(s)
+
+          raw=[];errors=[];seen=set();queried=0;nonempty=0
+          for idx,w in enumerate(windows):
+            try:
+              rows=logs_for(int(w['a']),int(w['b']));queried+=1
+              if rows:nonempty+=1
+              for row in rows:
+                key=(row.get('transactionHash'),row.get('logIndex'))
+                if key in seen:continue
+                seen.add(key)
+                txh=row.get('transactionHash');tx=rpc(rpcurl,'eth_getTransactionByHash',[txh]);rc=rpc(rpcurl,'eth_getTransactionReceipt',[txh])
+                sel=(tx.get('input') or '0x')[:10].lower();receipt_topics={x['topics'][0].lower() for x in rc.get('logs',[]) if x.get('topics') and x['topics'][0]}
+                has_dep=any(x in receipt_topics for x in DEPS);atomic=sel in ATOMIC or has_dep
+                topics=[x.lower() for x in row.get('topics',[]) if isinstance(x,str)]
+                shares=int(row.get('data') or '0x0',16)
+                raw.append({'window_index':idx,'window':w,'block':parse_num(row.get('blockNumber')),'tx':txh,'log_index':parse_num(row.get('logIndex')),'selector':sel,'atomic_selector':sel in ATOMIC,'has_deposit_event':has_dep,'atomic':atomic,'guid':topics[1] if len(topics)>1 else None,'recipient':'0x'+topics[2][-40:] if len(topics)>2 else None,'shares_raw':shares,'gross_extra_usd_raw':shares*(int(w['dr'])-int(w['sr']))//10**6,'tx_from':tx.get('from'),'tx_to':tx.get('to')})
+              time.sleep(.03)
+            except Exception as e:errors.append({'window_index':idx,'window':w,'error':repr(e)})
+
+          atomic=[x for x in raw if x['atomic']]
+          out={'generated_at_unix':int(time.time()),'rpc':rpcurl,'rpc_failures':failures,'message_sent_topic':SENT,'window_count':len(windows),'queried_window_count':queried,'nonempty_window_count':nonempty,'source_hit_count':len(raw),'atomic_hit_count':len(atomic),'max_atomic_gross_extra_usd_raw':max([x['gross_extra_usd_raw'] for x in atomic] or [0]),'sum_atomic_gross_extra_usd_raw':sum(x['gross_extra_usd_raw'] for x in atomic),'hits':raw,'atomic_hits':atomic,'errors':errors}
+          Path('veda-production-usd-window-exact.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({k:out[k] for k in ['window_count','queried_window_count','nonempty_window_count','source_hit_count','atomic_hit_count','max_atomic_gross_extra_usd_raw','sum_atomic_gross_extra_usd_raw']},indent=2))
+          if errors:print('errors',len(errors))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: veda-production-usd-window-exact
+          path: veda-production-usd-window-exact.json
+          if-no-files-found: error
+          retention-days: 1
