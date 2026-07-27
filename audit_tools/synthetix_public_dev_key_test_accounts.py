@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import pathlib
 import re
 import shutil
@@ -22,10 +21,11 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any
 
 from eth_account import Account
+from eth_utils import to_checksum_address
 
 Account.enable_unaudited_hdwallet_features()
 
@@ -38,8 +38,9 @@ TMP.mkdir(parents=True, exist_ok=True)
 TEST_INFO = "https://api.test.synthetix.io/v1/info"
 UA = "Mozilla/5.0 (compatible; authorized-read-only-security-review/1.0)"
 MAX_BODY = 2 * 1024 * 1024
-DELAY = 0.16
+DELAY = 0.18
 MAX_CANDIDATES = 1_500
+MAX_DIAGNOSTICS = 20
 
 REPOS = (
     "Synthetixio/synthetix-deployments",
@@ -48,7 +49,6 @@ REPOS = (
     "Synthetixio/governance.synthetix.eth",
 )
 
-# Ubiquitous public development mnemonics only. Never use these for real funds.
 MNEMONICS = (
     "test test test test test test test test test test test junk",
     "myth like bonus scare over problem client lizard pioneer submit female collect",
@@ -94,7 +94,6 @@ def clone(repo: str) -> tuple[pathlib.Path | None, dict[str, Any]]:
 
 def valid_key(hex_key: str) -> bool:
     value = int(hex_key, 16)
-    # secp256k1 order
     return 0 < value < 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 
 
@@ -125,12 +124,7 @@ def scan_repo(repo: str, root: pathlib.Path) -> tuple[dict[str, list[dict[str, A
                     address = Account.from_key("0x" + key).address.lower()
                 except Exception:
                     continue
-                record = {
-                    "repository": repo,
-                    "path": rel,
-                    "line": line_no,
-                    "keySha256": sha(key),
-                }
+                record = {"repository": repo, "path": rel, "line": line_no, "keySha256": sha(key)}
                 if record not in by_address[address]:
                     by_address[address].append(record)
     return by_address, {
@@ -161,22 +155,30 @@ def mnemonic_candidates() -> dict[str, list[dict[str, Any]]]:
 
 
 def post_json(payload: dict[str, Any]) -> tuple[int, bytes]:
-    req = urllib.request.Request(
-        TEST_INFO,
-        data=json.dumps(payload, separators=(",", ":")).encode(),
-        headers={"User-Agent": UA, "Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=45) as response:
-            body = response.read(MAX_BODY + 1)
-            status = response.status
-    except urllib.error.HTTPError as exc:
-        body = exc.read(MAX_BODY + 1)
-        status = exc.code
-    if len(body) > MAX_BODY:
+    body_bytes = json.dumps(payload, separators=(",", ":")).encode()
+    last_status = 0
+    last_body = b""
+    for attempt in range(3):
+        req = urllib.request.Request(
+            TEST_INFO,
+            data=body_bytes,
+            headers={"User-Agent": UA, "Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=45) as response:
+                body = response.read(MAX_BODY + 1)
+                status = response.status
+        except urllib.error.HTTPError as exc:
+            body = exc.read(MAX_BODY + 1)
+            status = exc.code
+        last_status, last_body = status, body
+        if status != 429 and status < 500:
+            break
+        time.sleep(1.5 * (attempt + 1))
+    if len(last_body) > MAX_BODY:
         raise RuntimeError("response exceeds safety cap")
-    return status, body
+    return last_status, last_body
 
 
 def parse_access(status: int, body: bytes) -> tuple[dict[str, list[str]], dict[str, Any]]:
@@ -194,10 +196,13 @@ def parse_access(status: int, body: bytes) -> tuple[dict[str, list[str]], dict[s
             roles["managed"] = [str(x) for x in (response.get("managedSubAccountIds") or [])]
             roles["delegated"] = [str(x) for x in (response.get("delegatedSubAccountIds") or [])]
     error = parsed.get("error") if isinstance(parsed, dict) else None
+    message = error.get("message") if isinstance(error, dict) else error
     return roles, {
         "httpStatus": status,
         "apiStatus": parsed.get("status") if isinstance(parsed, dict) else None,
         "errorCode": error.get("code") if isinstance(error, dict) else None,
+        "messageSha256": sha(str(message)) if message is not None else None,
+        "messageExcerpt": str(message)[:300] if message is not None else None,
         "bodySha256": sha(body),
         "bodyBytes": len(body),
     }
@@ -207,7 +212,6 @@ def main() -> None:
     candidates: dict[str, list[dict[str, Any]]] = defaultdict(list)
     clone_results = []
     repo_results = []
-
     for repo in REPOS:
         root, clone_meta = clone(repo)
         clone_results.append(clone_meta)
@@ -229,8 +233,11 @@ def main() -> None:
     positives = []
     non_ok = 0
     role_totals = defaultdict(int)
+    status_counts: Counter[str] = Counter()
+    diagnostics = []
     addresses = sorted(candidates)
-    for index, address in enumerate(addresses):
+    for index, address_lower in enumerate(addresses):
+        address = to_checksum_address(address_lower)
         status, body = post_json({
             "params": {
                 "action": "getSubAccountIds",
@@ -240,15 +247,19 @@ def main() -> None:
         })
         roles, meta = parse_access(status, body)
         access_count = sum(len(values) for values in roles.values())
+        status_key = f"http={meta['httpStatus']};api={meta['apiStatus']};code={meta['errorCode']}"
+        status_counts[status_key] += 1
         if meta["httpStatus"] != 200 or meta["apiStatus"] != "ok":
             non_ok += 1
+            if len(diagnostics) < MAX_DIAGNOSTICS:
+                diagnostics.append({"addressSha256": sha(address_lower), "response": meta})
         if access_count:
             for role, values in roles.items():
                 role_totals[role] += len(values)
             positives.append({
                 "address": address,
-                "addressSha256": sha(address),
-                "origins": candidates[address],
+                "addressSha256": sha(address_lower),
+                "origins": candidates[address_lower],
                 "counts": {role: len(values) for role, values in roles.items()},
                 "accountIdSha256": {
                     role: sorted(sha(value) for value in values)
@@ -261,10 +272,12 @@ def main() -> None:
             "total": len(addresses),
             "positiveCount": len(positives),
             "nonOkCount": non_ok,
+            "statusCounts": dict(status_counts),
         }, indent=2), encoding="utf-8")
         if index + 1 < len(addresses):
             time.sleep(DELAY)
 
+    reliable = non_ok == 0
     summary = {
         "safety": "Unsigned official test-info queries only; no raw private key or mnemonic retained.",
         "repositoryScans": repo_results,
@@ -273,17 +286,28 @@ def main() -> None:
         "commonMnemonicDerivedAddressCount": len(mnemonic_map),
         "uniqueCandidateAddressCount": len(addresses),
         "queryNonOkCount": non_ok,
+        "queryStatusCounts": dict(status_counts),
+        "diagnostics": diagnostics,
         "positiveAddressCount": len(positives),
         "positiveRoleTotals": dict(role_totals),
         "positives": positives,
-        "verdict": "CONTROLLED_PUBLIC_TEST_ACCOUNT_FOUND" if positives else "NO_CONTROLLED_PUBLIC_TEST_ACCOUNT_FOUND",
+        "resultReliable": reliable,
+        "verdict": (
+            "CONTROLLED_PUBLIC_TEST_ACCOUNT_FOUND"
+            if positives
+            else "NO_CONTROLLED_PUBLIC_TEST_ACCOUNT_FOUND"
+            if reliable
+            else "INCONCLUSIVE_TEST_API_REJECTED_CANDIDATES"
+        ),
     }
     (OUT / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps({
         "uniqueCandidateAddressCount": summary["uniqueCandidateAddressCount"],
         "queryNonOkCount": summary["queryNonOkCount"],
+        "queryStatusCounts": summary["queryStatusCounts"],
         "positiveAddressCount": summary["positiveAddressCount"],
         "positiveRoleTotals": summary["positiveRoleTotals"],
+        "resultReliable": summary["resultReliable"],
         "verdict": summary["verdict"],
     }, indent=2))
 
