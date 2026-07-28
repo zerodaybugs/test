@@ -1,0 +1,117 @@
+name: Rootstock collateral economics publish 20260728
+
+on:
+  push:
+    branches:
+      - ci/dependency-snapshot-20260727
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ci/dependency-snapshot-20260727
+          fetch-depth: 0
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Generate public read-only economics snapshot
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ROOT="$RUNNER_TEMP/rootstock-collateral-publish"
+          SRC="$ROOT/liquidity-bridge-contract"
+          NODEDIR="$ROOT/node"
+          RPC="https://public-node.rsk.co"
+          DISCOVERY="0x9A48C6b18Aa000d0bd35D55616bCc98aD3553e7a"
+          COLLATERAL="0xBe4D93B3aFD9921CAC66704fFD3Caf662886fb73"
+          COMMIT="4066b8fb726bb6c7cf9c0fb7d2761ff6739c8793"
+          RESULT="$GITHUB_WORKSPACE/research/rootstock/collateral-economics-public.json"
+          SUMMARY="$GITHUB_WORKSPACE/research/rootstock/collateral-economics-public.txt"
+          mkdir -p "$NODEDIR" "$(dirname "$RESULT")"
+
+          git clone --quiet https://github.com/rsksmart/liquidity-bridge-contract.git "$SRC"
+          git -C "$SRC" checkout --detach "$COMMIT"
+          git -C "$SRC" submodule update --init --recursive
+          cd "$SRC"
+          npm ci --ignore-scripts >/dev/null
+          forge build --silent
+          forge inspect CollateralManagement abi > "$ROOT/collateral.abi.json"
+
+          cd "$NODEDIR"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund ethers@6.15.0 >/dev/null
+          RPC="$RPC" DISCOVERY="$DISCOVERY" COLLATERAL="$COLLATERAL" ABI="$ROOT/collateral.abi.json" RESULT="$RESULT" node <<'NODE'
+          const fs = require('fs');
+          const { JsonRpcProvider, Contract } = require('ethers');
+          const clean = (v) => JSON.parse(JSON.stringify(v, (_, x) => typeof x === 'bigint' ? x.toString() : x));
+          async function main() {
+            const provider = new JsonRpcProvider(process.env.RPC, undefined, { staticNetwork: false });
+            const discovery = new Contract(process.env.DISCOVERY, [
+              'function getProviders() view returns ((uint256 id,address providerAddress,bool status,uint8 providerType,string name,string apiBaseUrl)[])'
+            ], provider);
+            const raw = await discovery.getProviders();
+            const providers = raw.map(p => ({id:p.id.toString(),address:p.providerAddress,status:Boolean(p.status),providerType:Number(p.providerType),name:p.name,apiBaseUrl:p.apiBaseUrl}));
+            const abi = JSON.parse(fs.readFileSync(process.env.ABI, 'utf8'));
+            const c = new Contract(process.env.COLLATERAL, abi, provider);
+            const noArgViews = {};
+            const providerAddressViews = {};
+            const errors = [];
+            for (const e of abi) {
+              if (e.type !== 'function' || !['view','pure'].includes(e.stateMutability) || !(e.outputs||[]).length) continue;
+              try {
+                if ((e.inputs||[]).length === 0) noArgViews[e.name] = clean(await c[e.name]());
+                if ((e.inputs||[]).length === 1 && e.inputs[0].type === 'address') {
+                  providerAddressViews[e.name] = {};
+                  for (const p of providers) providerAddressViews[e.name][p.address] = clean(await c[e.name](p.address));
+                }
+              } catch (err) { errors.push({function:e.name,message:String(err.shortMessage||err.message||err)}); }
+            }
+            const network = await provider.getNetwork();
+            const result = {
+              generatedAt:new Date().toISOString(),mode:'read-only eth_call/getBalance only; no transaction submitted',
+              chainId:network.chainId.toString(),blockNumber:await provider.getBlockNumber(),rpc:process.env.RPC,
+              discoveryAddress:process.env.DISCOVERY,collateralAddress:process.env.COLLATERAL,
+              collateralContractBalanceWei:(await provider.getBalance(process.env.COLLATERAL)).toString(),
+              providers,noArgViews,providerAddressViews,errors
+            };
+            fs.writeFileSync(process.env.RESULT, JSON.stringify(result,null,2)+'\n');
+          }
+          main().catch(e=>{console.error(e);process.exit(1)});
+          NODE
+
+          python3 - "$RESULT" "$SUMMARY" <<'PY'
+          import json, sys
+          obj=json.load(open(sys.argv[1]))
+          lines=[f"generated_at={obj['generatedAt']}",f"chain_id={obj['chainId']}",f"block_number={obj['blockNumber']}",f"collateral_contract_balance_wei={obj['collateralContractBalanceWei']}"]
+          for p in obj['providers']:
+              lines.append(f"provider={p['name']}|{p['address']}|type={p['providerType']}|status={p['status']}")
+          for k,v in sorted(obj['noArgViews'].items()): lines.append(f"view.{k}={v}")
+          for k,m in sorted(obj['providerAddressViews'].items()):
+              for a,v in m.items(): lines.append(f"view.{k}[{a}]={v}")
+          open(sys.argv[2],'w').write('\n'.join(lines)+'\n')
+          PY
+
+      - name: Commit public snapshot
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add research/rootstock/collateral-economics-public.json research/rootstock/collateral-economics-public.txt
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'data: publish Rootstock collateral economics snapshot [skip ci]'
+          git push origin HEAD:ci/dependency-snapshot-20260727
