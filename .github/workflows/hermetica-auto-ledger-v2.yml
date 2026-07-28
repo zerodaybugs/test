@@ -1,0 +1,123 @@
+name: Hermetica auto mint ledger v2
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-auto-ledger-v2.yml'
+      - 'public-data/hermetica-auto-ledger-v2-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ledger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconstruct all minting-auto logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT=/tmp/hermetica-auto-ledger-v2
+          mkdir -p "$OUT"
+          python3 - <<'PY'
+          import datetime as dt, json, pathlib, re, time, urllib.parse, urllib.request
+          OUT=pathlib.Path('/tmp/hermetica-auto-ledger-v2')
+          API='https://api.hiro.so'
+          CONTRACT='SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG.minting-auto-v1-2'
+          LIMIT=50_000_000_000_000
+          RESET=600
+          INITIAL_RESET=1_757_221_858
+          BASES={
+            'SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token':100_000_000,
+            'SP120SBRBQJ00MCWS7TM5R8WJNTTKD5K0HFRC2CNE.usdcx':1_000_000,
+          }
+          def get(url,attempts=12):
+            last=None
+            for i in range(attempts):
+              try:
+                req=urllib.request.Request(url,headers={'User-Agent':'read-only-security-research/1.0','Accept':'application/json'})
+                with urllib.request.urlopen(req,timeout=45) as r:return json.loads(r.read().decode())
+              except Exception as e:last=e;time.sleep(min(15,1.5*(i+1)))
+            raise RuntimeError(f'{url}: {last}')
+          def pages(url,max_rows=10000):
+            rows=[]; offset=0; limit=50
+            while True:
+              sep='&' if '?' in url else '?'
+              body=get(f'{url}{sep}{urllib.parse.urlencode({"limit":limit,"offset":offset})}')
+              page=body.get('results') or []
+              if not page:break
+              rows.extend(page)
+              total=body.get('total')
+              if len(page)<limit or (total is not None and len(rows)>=int(total)):break
+              offset+=len(page)
+              if offset>max_rows:raise RuntimeError(f'row cap exceeded {url}')
+              time.sleep(.08)
+            return rows
+          def u(s,k):
+            m=re.search(rf'\({re.escape(k)} u(\d+)\)',s or '')
+            return int(m.group(1)) if m else None
+          def p(s,k):
+            m=re.search(rf'\({re.escape(k)} \'([^\s\)]+)\)',s or '')
+            return m.group(1) if m else None
+          txs=pages(f'{API}/extended/v1/address/{urllib.parse.quote(CONTRACT,safe="")}/transactions')
+          events=pages(f'{API}/extended/v1/contract/{urllib.parse.quote(CONTRACT,safe="")}/events')
+          txmap={x.get('tx_id'):x for x in txs}
+          rows=[]
+          for ev in events:
+            log=ev.get('contract_log') or {}
+            if ev.get('event_type')!='smart_contract_log' or log.get('contract_id')!=CONTRACT:continue
+            rep=((log.get('value') or {}).get('repr') or '')
+            asset=p(rep,'minting-asset'); direction='mint'
+            if not asset:asset=p(rep,'redeeming-asset');direction='redeem'
+            if not asset:continue
+            tx=txmap.get(ev.get('tx_id')) or {}
+            rows.append({
+              'tx_id':ev.get('tx_id'),'block_height':int(tx.get('block_height') or ev.get('block_height') or 0),
+              'tx_index':int(tx.get('tx_index') or 0),'event_index':int(ev.get('event_index') or 0),
+              'block_time':int(tx.get('block_time') or ev.get('block_time') or 0),'sender':tx.get('sender_address'),
+              'direction':direction,'asset':asset,'amount_usdh':u(rep,'amount-usdh-requested'),
+              'amount_asset':u(rep,'amount-asset-required'),'price':u(rep,'price'),'price_conf':u(rep,'price-conf'),
+              'oracle_timestamp':u(rep,'oracle-timestamp'),'slippage_in_price':u(rep,'slippage-in-price'),
+              'fee_amount':u(rep,'fee-amount'),'repr':rep})
+          rows.sort(key=lambda x:(x['block_height'],x['tx_index'],x['event_index']))
+          cur=LIMIT; last=INITIAL_RESET; epochs=[]; ep=None; violations=[]; reused={}; econ=[]
+          for r in rows:
+            if r['direction']=='mint':
+              ts=r['oracle_timestamp']; amount=r['amount_usdh']
+              if ts is None or amount is None:violations.append({'type':'missing_fields','row':r});continue
+              if ts>=last+RESET:
+                if ep:epochs.append(ep)
+                last=ts;cur=LIMIT;ep={'reset_timestamp':ts,'minted':0,'transactions':[]}
+              elif ep is None:ep={'reset_timestamp':last,'minted':0,'transactions':[]}
+              if amount>cur:violations.append({'type':'successful_mint_exceeded_current_limit','current_before':cur,'row':r})
+              cur-=amount;ep['minted']+=amount;ep['transactions'].append(r['tx_id'])
+              if ep['minted']>LIMIT:violations.append({'type':'epoch_above_limit','epoch':dict(ep),'row':r})
+              reused.setdefault(str(ts),[]).append(r['tx_id'])
+            base=BASES.get(r['asset'])
+            if base and r['price'] and r['amount_usdh'] is not None and r['amount_asset'] is not None:
+              value=r['amount_asset']*r['price']//base
+              econ.append({'tx_id':r['tx_id'],'direction':r['direction'],'asset':r['asset'],'amount_usdh':r['amount_usdh'],'amount_asset':r['amount_asset'],'price':r['price'],'oracle_value_usdh_base':value,'delta_base':value-r['amount_usdh']})
+          if ep:epochs.append(ep)
+          m=[x for x in econ if x['direction']=='mint'];d=[x for x in econ if x['direction']=='redeem']
+          summary={'generated_at':dt.datetime.now(dt.timezone.utc).isoformat(),'source':'Hiro public read-only APIs','contract':CONTRACT,
+            'transaction_count':len(txs),'event_count':len(events),'parsed_log_count':len(rows),'mint_count':sum(x['direction']=='mint' for x in rows),'redeem_count':sum(x['direction']=='redeem' for x in rows),
+            'simulated_current_mint_limit':cur,'simulated_last_reset':last,'epoch_count':len(epochs),'max_minted_per_epoch':max((x['minted'] for x in epochs),default=0),
+            'reused_oracle_timestamps':{k:v for k,v in reused.items() if len(v)>1},'violation_count':len(violations),'violations':violations,
+            'min_mint_delta_base':min((x['delta_base'] for x in m),default=None),'max_mint_delta_base':max((x['delta_base'] for x in m),default=None),
+            'min_redeem_delta_base':min((x['delta_base'] for x in d),default=None),'max_redeem_delta_base':max((x['delta_base'] for x in d),default=None)}
+          for name,obj in [('transactions',txs),('events',events),('ledger',rows),('epochs',epochs),('economics',econ),('summary',summary)]:
+            (OUT/f'{name}.json').write_text(json.dumps(obj,indent=2))
+          print(json.dumps(summary,indent=2))
+          PY
+          (cd "$OUT" && find . -type f -not -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-auto-ledger-v2
+          path: /tmp/hermetica-auto-ledger-v2
+          retention-days: 2
+          if-no-files-found: error
+          compression-level: 0
