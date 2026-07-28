@@ -44,10 +44,15 @@ jobs:
           checkout_rc=99
           deps_rc=99
           copy_rc=99
+          stateful_copy_rc=99
           build_rc=99
           targeted_rc=99
+          stateful_rc=99
           full_rc=99
+          audit_extract_rc=99
+          shadow_deploy_rc=99
           live_state_rc=99
+          runtime_binding_rc=99
 
           {
             echo "foundry_action_outcome=${FOUNDRY_ACTION_OUTCOME}"
@@ -81,9 +86,36 @@ jobs:
             cp tmp-research/horizen-20260728/HorizenDeepAudit.t.sol \
               "$ROOT/test/HorizenDeepAudit.t.sol"
             copy_rc=$?
+            cp tmp-research/horizen-20260728/HorizenStatefulInvariant.t.sol \
+              "$ROOT/test/HorizenStatefulInvariant.t.sol"
+            stateful_copy_rc=$?
           fi
 
-          if [ "$forge_rc" = 0 ] && [ "$copy_rc" = 0 ]; then
+          if command -v pdftotext >/dev/null 2>&1; then
+            audit_extract_rc=0
+          else
+            sudo apt-get update > collected/poppler-install.log 2>&1
+            sudo apt-get install -y poppler-utils >> collected/poppler-install.log 2>&1
+            audit_extract_rc=$?
+          fi
+
+          if [ "$audit_extract_rc" = 0 ] && [ "$checkout_rc" = 0 ]; then
+            mkdir -p collected/audit-text
+            audit_fail=0
+            while IFS= read -r -d '' pdf; do
+              rel=${pdf#"$ROOT/"}
+              safe=${rel//\//__}
+              safe=${safe// /_}
+              pdfinfo "$pdf" > "collected/audit-text/${safe}.pdfinfo.txt" 2>&1 || audit_fail=1
+              pdftotext -layout "$pdf" "collected/audit-text/${safe}.txt" \
+                2>> collected/audit-text/extraction-errors.log || audit_fail=1
+            done < <(find "$ROOT/audits" -type f -name '*.pdf' -print0 | sort -z)
+            cp "$ROOT/audits/unistaker/2024_03_UniStaker_Code4rena_Contest.md" \
+              collected/audit-text/2024_03_UniStaker_Code4rena_Contest.md 2>/dev/null || true
+            audit_extract_rc=$audit_fail
+          fi
+
+          if [ "$forge_rc" = 0 ] && [ "$copy_rc" = 0 ] && [ "$stateful_copy_rc" = 0 ]; then
             (cd "$ROOT" && forge build --sizes) > collected/build.log 2>&1
             build_rc=$?
 
@@ -93,15 +125,103 @@ jobs:
             targeted_rc=$?
 
             (cd "$ROOT" && \
+              FOUNDRY_PROFILE=ci \
+              FOUNDRY_FUZZ_SEED=2026072801 \
+              FOUNDRY_INVARIANT_RUNS=1000 \
+              FOUNDRY_INVARIANT_DEPTH=75 \
+              FOUNDRY_INVARIANT_FAIL_ON_REVERT=false \
+              forge test --match-contract HorizenStatefulInvariants -vvv) \
+              > collected/stateful-invariant.log 2>&1
+            stateful_rc=$?
+
+            (cd "$ROOT" && \
               FOUNDRY_PROFILE=ci FOUNDRY_FUZZ_SEED=20260728 forge test -vv) \
               > collected/full-suite.log 2>&1
             full_rc=$?
+          fi
+
+          if [ "$build_rc" = 0 ]; then
+            ANVIL_PORT=18547
+            anvil --silent --host 127.0.0.1 --port "$ANVIL_PORT" \
+              > collected/anvil.log 2>&1 &
+            ANVIL_PID=$!
+            sleep 2
+            PK='0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80'
+            LIVE_TOKEN='0x57da2D504bf8b83Ef304759d9f2648522D7a9280'
+            LIVE_CALC='0xf518b3c7Cd5cc1595D10E7268677Da0Fe364E191'
+            LIVE_ADMIN='0x1Afb144aaD0aE02f3Bb04C1eae4AC6020a727A21'
+            LIVE_STAKER='0x6BF7CF29a8bcE11Aa62Cf593d165C244fA4d3E31'
+
+            (cd "$ROOT" && forge create src/ZenStaker.sol:ZenStaker \
+              --rpc-url "http://127.0.0.1:${ANVIL_PORT}" \
+              --private-key "$PK" --broadcast \
+              --constructor-args "$LIVE_TOKEN" "$LIVE_CALC" 0 "$LIVE_ADMIN") \
+              > collected/shadow-staker-create.log 2>&1
+            shadow_staker_rc=$?
+            SHADOW_STAKER=$(grep -E 'Deployed to:' collected/shadow-staker-create.log \
+              | tail -1 | awk '{print $3}')
+
+            (cd "$ROOT" && forge create src/RewardAccumulator.sol:RewardAccumulator \
+              --rpc-url "http://127.0.0.1:${ANVIL_PORT}" \
+              --private-key "$PK" --broadcast \
+              --constructor-args "$LIVE_STAKER" "$LIVE_TOKEN" 431700 false) \
+              > collected/shadow-acc-create.log 2>&1
+            shadow_acc_rc=$?
+            SHADOW_ACC=$(grep -E 'Deployed to:' collected/shadow-acc-create.log \
+              | tail -1 | awk '{print $3}')
+
+            if [ -n "$SHADOW_STAKER" ]; then
+              cast code "$SHADOW_STAKER" --rpc-url "http://127.0.0.1:${ANVIL_PORT}" \
+                > collected/local-shadow-staker-code.hex 2>&1
+            fi
+            if [ -n "$SHADOW_ACC" ]; then
+              cast code "$SHADOW_ACC" --rpc-url "http://127.0.0.1:${ANVIL_PORT}" \
+                > collected/local-shadow-acc-code.hex 2>&1
+            fi
+            kill "$ANVIL_PID" 2>/dev/null || true
+            wait "$ANVIL_PID" 2>/dev/null || true
+
+            if [ "$shadow_staker_rc" = 0 ] && [ "$shadow_acc_rc" = 0 ]; then
+              shadow_deploy_rc=0
+            else
+              shadow_deploy_rc=1
+            fi
           fi
 
           if [ "$forge_rc" = 0 ]; then
             bash tmp-research/horizen-20260728/read_live_state.sh collected \
               > collected/live-state-runner.log 2>&1
             live_state_rc=$?
+          fi
+
+          if [ "$shadow_deploy_rc" = 0 ] && [ "$live_state_rc" = 0 ]; then
+            python3 - <<'PY' > collected/runtime-binding.txt 2>&1
+          from hashlib import sha256
+          from pathlib import Path
+
+          pairs = [
+              ('staker', Path('collected/local-shadow-staker-code.hex'), Path('collected/main-official-staker-code.hex'), Path('collected/main-thirdweb-staker-code.hex')),
+              ('accumulator', Path('collected/local-shadow-acc-code.hex'), Path('collected/main-official-acc-code.hex'), Path('collected/main-thirdweb-acc-code.hex')),
+          ]
+
+          ok = True
+          for name, local, official, independent in pairs:
+              values = []
+              for path in (local, official, independent):
+                  text = ''.join(path.read_text().split()).lower()
+                  if text.startswith('0x'):
+                      text = text[2:]
+                  raw = bytes.fromhex(text)
+                  values.append((len(raw), sha256(raw).hexdigest()))
+              same = values[0] == values[1] == values[2]
+              ok &= same
+              print(f'{name}_local={values[0][0]}:{values[0][1]}')
+              print(f'{name}_official={values[1][0]}:{values[1][1]}')
+              print(f'{name}_independent={values[2][0]}:{values[2][1]}')
+              print(f'{name}_all_equal={str(same).lower()}')
+          raise SystemExit(0 if ok else 1)
+          PY
+            runtime_binding_rc=$?
           fi
 
           printf '%s\n' \
@@ -111,10 +231,15 @@ jobs:
             "checkout_rc=${checkout_rc}" \
             "deps_rc=${deps_rc}" \
             "copy_rc=${copy_rc}" \
+            "stateful_copy_rc=${stateful_copy_rc}" \
             "build_rc=${build_rc}" \
             "targeted_rc=${targeted_rc}" \
+            "stateful_rc=${stateful_rc}" \
             "full_rc=${full_rc}" \
+            "audit_extract_rc=${audit_extract_rc}" \
+            "shadow_deploy_rc=${shadow_deploy_rc}" \
             "live_state_rc=${live_state_rc}" \
+            "runtime_binding_rc=${runtime_binding_rc}" \
             > collected/status.txt
 
           printf '%s\n' "No transaction was broadcast to mainnet or public testnet." \
