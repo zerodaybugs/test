@@ -1,0 +1,121 @@
+name: Katana Ethereum archive RPC probe
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-archive-rpc-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install authenticated Foundry toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/probe/bin /tmp/probe/project/test /tmp/probe/project/lib evidence
+          curl -fsSL --retry 4 --retry-all-errors \
+            https://github.com/foundry-rs/foundry/releases/download/v1.7.1/foundry_v1.7.1_linux_amd64.tar.gz \
+            -o /tmp/foundry.tar.gz
+          echo 'cf7e688ed0c4c48adffca788b496076e31060b67ac5afe1e43dbb5499c20c88b  /tmp/foundry.tar.gz' \
+            | sha256sum --check --strict
+          tar -xzf /tmp/foundry.tar.gz -C /tmp
+          install -m 0755 /tmp/forge /tmp/probe/bin/forge
+          curl -fsSL --retry 4 --retry-all-errors \
+            'https://binaries.soliditylang.org/linux-amd64/solc-linux-amd64-v0.8.24+commit.e11b9ed9' \
+            -o /tmp/probe/bin/solc-0.8.24
+          echo 'fb03a29a517452b9f12bcf459ef37d0a543765bb3bbc911e70a87d6a37c30d5f  /tmp/probe/bin/solc-0.8.24' \
+            | sha256sum --check --strict
+          chmod 0755 /tmp/probe/bin/solc-0.8.24
+          git clone --quiet --depth 1 --branch v1.9.7 \
+            https://github.com/foundry-rs/forge-std.git /tmp/probe/project/lib/forge-std
+
+      - name: Build exact historical-state probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/probe/project/foundry.toml <<'TOML'
+          [profile.default]
+          src = "src"
+          test = "test"
+          out = "out"
+          cache_path = "cache"
+          libs = ["lib"]
+          solc = "/tmp/probe/bin/solc-0.8.24"
+          evm_version = "cancun"
+          optimizer = true
+          optimizer_runs = 200
+          remappings = ["forge-std/=lib/forge-std/src/"]
+          TOML
+          cat > /tmp/probe/project/test/ArchiveProbe.t.sol <<'SOL'
+          // SPDX-License-Identifier: MIT
+          pragma solidity ^0.8.24;
+          import {Test} from "forge-std/Test.sol";
+          interface IVbUSDS { function totalSupply() external view returns (uint256); function totalAssets() external view returns (uint256); }
+          contract ArchiveProbe is Test {
+              address constant VB_USDS = 0x3DD459dE96F9C28e3a343b831cbDC2B93c8C4855;
+              address constant USDS = 0xdC035D45d973E3EC169d2276DDab16f1e407384F;
+              uint256 constant BLOCK_NO = 25_631_252;
+              function test_ArchiveState() public {
+                  vm.createSelectFork(vm.envString("RPC_URL"), BLOCK_NO);
+                  assertEq(block.chainid, 1);
+                  assertEq(block.number, BLOCK_NO);
+                  assertGt(VB_USDS.code.length, 0);
+                  assertGt(USDS.code.length, 0);
+                  uint256 supply = IVbUSDS(VB_USDS).totalSupply();
+                  uint256 assets = IVbUSDS(VB_USDS).totalAssets();
+                  emit log_named_uint("supply", supply);
+                  emit log_named_uint("assets", assets);
+                  assertGt(supply, 0);
+                  assertGt(assets, 0);
+              }
+          }
+          SOL
+          (cd /tmp/probe/project && /tmp/probe/bin/forge build --force) | tee evidence/build.log
+
+      - name: Probe candidate archive endpoints with Forge
+        shell: bash
+        run: |
+          set -uo pipefail
+          endpoints=(
+            'https://eth.llamarpc.com'
+            'https://1rpc.io/eth'
+            'https://eth.drpc.org'
+            'https://rpc.flashbots.net'
+            'https://ethereum-rpc.publicnode.com'
+            'https://rpc.ankr.com/eth'
+          )
+          : > evidence/summary.tsv
+          printf 'endpoint\texit\tpass\tarchive_error\n' >> evidence/summary.tsv
+          i=0
+          for url in "${endpoints[@]}"; do
+            i=$((i+1)); log="evidence/endpoint_${i}.log"
+            rm -rf /tmp/probe/project/out /tmp/probe/project/cache
+            set +e
+            (cd /tmp/probe/project && RPC_URL="$url" timeout 180 /tmp/probe/bin/forge test --jobs 1 --match-test test_ArchiveState -vvvv) > "$log" 2>&1
+            status=$?
+            set -e
+            pass=no; grep -q '^\[PASS\] test_ArchiveState()' "$log" && pass=yes
+            archive_error=no; grep -Eqi 'archive|historical|403|missing trie|state is not available|personal token' "$log" && archive_error=yes
+            printf '%s\t%s\t%s\t%s\n' "$url" "$status" "$pass" "$archive_error" >> evidence/summary.tsv
+          done
+          cat evidence/summary.tsv
+          sha256sum evidence/* > evidence/SHA256SUMS
+
+      - name: Upload probe evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-archive-rpc-probe-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
