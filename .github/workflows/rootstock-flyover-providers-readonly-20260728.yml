@@ -1,0 +1,254 @@
+name: Rootstock Flyover providers read-only 20260728
+
+on:
+  push:
+    branches:
+      - ci/dependency-snapshot-20260727
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout runner repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Query public discovery and provider GET endpoints only
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ROOT="$RUNNER_TEMP/rootstock-flyover-providers"
+          NODEDIR="$RUNNER_TEMP/provider-ethers"
+          OUT="$ROOT/evidence"
+          RPC="https://public-node.rsk.co"
+          DISCOVERY="0x9A48C6b18Aa000d0bd35D55616bCc98aD3553e7a"
+          mkdir -p "$OUT" "$NODEDIR"
+
+          cd "$NODEDIR"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund ethers@6.15.0 \
+            2>&1 | tee "$OUT/npm-install.log"
+
+          RPC="$RPC" DISCOVERY="$DISCOVERY" OUT="$OUT" node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const { JsonRpcProvider, Contract } = require('ethers');
+
+          async function main() {
+            const rpc = process.env.RPC;
+            const discovery = process.env.DISCOVERY;
+            const out = process.env.OUT;
+            const provider = new JsonRpcProvider(rpc, undefined, { staticNetwork: false });
+            const network = await provider.getNetwork();
+            const blockNumber = await provider.getBlockNumber();
+            const abi = [
+              'function getProviders() view returns ((uint256 id,address providerAddress,bool status,uint8 providerType,string name,string apiBaseUrl)[])'
+            ];
+            const contract = new Contract(discovery, abi, provider);
+            const result = await contract.getProviders();
+            const providers = result.map((p) => ({
+              id: p.id.toString(),
+              providerAddress: p.providerAddress,
+              status: Boolean(p.status),
+              providerType: Number(p.providerType),
+              name: p.name,
+              apiBaseUrl: p.apiBaseUrl
+            }));
+            fs.writeFileSync(path.join(out, 'providers.json'), JSON.stringify({
+              rpc,
+              discovery,
+              chainId: network.chainId.toString(),
+              blockNumber,
+              providers
+            }, null, 2) + '\n');
+            console.log(JSON.stringify({ chainId: network.chainId.toString(), blockNumber, providerCount: providers.length }, null, 2));
+          }
+
+          main().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
+
+          python3 - "$OUT" <<'PY'
+          import ipaddress
+          import json
+          import pathlib
+          import socket
+          import subprocess
+          import sys
+          import urllib.parse
+
+          out = pathlib.Path(sys.argv[1])
+          source = json.loads((out / "providers.json").read_text())
+          endpoints = [
+              "/health",
+              "/version",
+              "/providers/details",
+              "/providers/liquidity",
+              "/getProviders",
+          ]
+          type_names = {0: "PegIn", 1: "PegOut", 2: "Both"}
+          snapshots = []
+
+          def safe_target(base_url: str):
+              try:
+                  parsed = urllib.parse.urlsplit(base_url)
+              except ValueError as exc:
+                  return None, f"invalid URL: {exc}"
+              if parsed.scheme.lower() != "https":
+                  return None, "only HTTPS providers are queried"
+              if parsed.username or parsed.password:
+                  return None, "userinfo in URL rejected"
+              if not parsed.hostname:
+                  return None, "missing hostname"
+              try:
+                  port = parsed.port or 443
+              except ValueError as exc:
+                  return None, f"invalid port: {exc}"
+              if port != 443:
+                  return None, "only HTTPS port 443 is queried"
+              host = parsed.hostname.rstrip(".")
+              try:
+                  infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+              except OSError as exc:
+                  return None, f"DNS resolution failed: {exc}"
+              ips = []
+              for info in infos:
+                  ip = info[4][0]
+                  try:
+                      obj = ipaddress.ip_address(ip)
+                  except ValueError:
+                      continue
+                  if obj.version == 4 and obj.is_global:
+                      ips.append(ip)
+              ips = sorted(set(ips))
+              if not ips:
+                  return None, "no public global IPv4 address"
+              base_path = parsed.path.rstrip("/")
+              normalized = urllib.parse.urlunsplit(("https", host, base_path, "", ""))
+              return {"host": host, "ip": ips[0], "base": normalized}, None
+
+          def fetch(provider_dir: pathlib.Path, target, endpoint: str):
+              endpoint_name = endpoint.strip("/").replace("/", "__") or "root"
+              body_path = provider_dir / f"{endpoint_name}.body"
+              headers_path = provider_dir / f"{endpoint_name}.headers"
+              url = target["base"] + endpoint
+              cmd = [
+                  "curl",
+                  "--silent", "--show-error",
+                  "--proto", "=https",
+                  "--connect-timeout", "10",
+                  "--max-time", "30",
+                  "--max-redirs", "0",
+                  "--max-filesize", "1048576",
+                  "--resolve", f'{target["host"]}:443:{target["ip"]}',
+                  "--dump-header", str(headers_path),
+                  "--output", str(body_path),
+                  "--write-out", "%{http_code}\t%{content_type}\t%{size_download}\t%{remote_ip}",
+                  url,
+              ]
+              proc = subprocess.run(cmd, text=True, capture_output=True, timeout=40)
+              meta = {
+                  "endpoint": endpoint,
+                  "url": url,
+                  "resolvedIp": target["ip"],
+                  "curlExit": proc.returncode,
+                  "curlStderr": proc.stderr.strip(),
+              }
+              if proc.stdout:
+                  parts = proc.stdout.split("\t")
+                  if len(parts) == 4:
+                      meta.update({
+                          "httpStatus": parts[0],
+                          "contentType": parts[1],
+                          "sizeDownload": parts[2],
+                          "remoteIp": parts[3],
+                      })
+              if body_path.exists():
+                  raw = body_path.read_bytes()
+                  meta["bodySha256InputBytes"] = len(raw)
+                  try:
+                      meta["json"] = json.loads(raw.decode("utf-8"))
+                  except (UnicodeDecodeError, json.JSONDecodeError):
+                      meta["bodyPreview"] = raw[:300].decode("utf-8", errors="replace")
+              return meta
+
+          for provider in source["providers"]:
+              item = dict(provider)
+              item["providerTypeName"] = type_names.get(provider["providerType"], "Unknown")
+              provider_dir = out / f'provider-{provider["id"]}'
+              provider_dir.mkdir(parents=True, exist_ok=True)
+              target, error = safe_target(provider["apiBaseUrl"])
+              item["querySafetyError"] = error
+              item["responses"] = []
+              if target:
+                  item["resolvedHost"] = target["host"]
+                  item["resolvedIp"] = target["ip"]
+                  for endpoint in endpoints:
+                      try:
+                          item["responses"].append(fetch(provider_dir, target, endpoint))
+                      except Exception as exc:
+                          item["responses"].append({"endpoint": endpoint, "exception": repr(exc)})
+              snapshots.append(item)
+
+          (out / "provider-endpoint-snapshot.json").write_text(json.dumps({
+              "chainId": source["chainId"],
+              "blockNumber": source["blockNumber"],
+              "discovery": source["discovery"],
+              "mode": "read-only eth_call plus public HTTPS GET requests; no quote requested or accepted",
+              "providers": snapshots,
+          }, indent=2) + "\n")
+
+          summary = []
+          for item in snapshots:
+              row = {
+                  "id": item["id"],
+                  "name": item["name"],
+                  "providerAddress": item["providerAddress"],
+                  "providerType": item["providerTypeName"],
+                  "apiBaseUrl": item["apiBaseUrl"],
+                  "querySafetyError": item.get("querySafetyError"),
+              }
+              for response in item["responses"]:
+                  endpoint = response.get("endpoint")
+                  row[f"{endpoint}:status"] = response.get("httpStatus")
+                  if endpoint == "/version" and isinstance(response.get("json"), dict):
+                      row["version"] = response["json"]
+                  elif endpoint == "/providers/details" and isinstance(response.get("json"), dict):
+                      row["details"] = response["json"]
+                  elif endpoint == "/providers/liquidity" and isinstance(response.get("json"), dict):
+                      row["liquidity"] = response["json"]
+                  elif endpoint == "/health" and isinstance(response.get("json"), dict):
+                      row["health"] = response["json"]
+              summary.append(row)
+          (out / "SUMMARY.json").write_text(json.dumps(summary, indent=2) + "\n")
+          print(json.dumps(summary, indent=2))
+          PY
+
+          {
+            echo "generated_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "rpc=$RPC"
+            echo "discovery=$DISCOVERY"
+            echo "mode=read-only eth_call and HTTPS GET only"
+            echo "post_requests=0"
+            echo "transactions_submitted=0"
+          } > "$OUT/MANIFEST.txt"
+          find "$OUT" -type f -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS.txt"
+
+      - name: Upload read-only evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootstock-flyover-providers-readonly-20260728
+          path: ${{ runner.temp }}/rootstock-flyover-providers/evidence
+          if-no-files-found: error
+          retention-days: 1
