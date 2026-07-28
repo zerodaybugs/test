@@ -1,0 +1,150 @@
+name: Katana CustomToken role ledger v3
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-customtoken-role-ledger-v3.yml'
+      - 'katana-customtoken-roles-v3/**'
+
+permissions:
+  contents: read
+
+jobs:
+  roles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Resolve exact event topics, history, and current memberships
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          import json,time,urllib.request
+          from pathlib import Path
+
+          RPCS=['https://rpc.katana.network/','https://rpc.katanarpc.com/','https://katana.gateway.tenderly.co/']
+          TOKENS={
+            'USDC_CUSTOM':{'address':'0x203A662b0BD271A6ed5a60EdFbd04bFce608FD36','owner':'0xf4F2f5F6bAdBE05433C4604320ecC56BbECBC04E','converter':'0x97a3500083348a147f419b8a65717909762c389f','deploy':1600576},
+            'USDT_CUSTOM':{'address':'0x2DCa96907fde857dd3D816880A0df407eeB2D2F2','owner':'0x2De242e27386e224E5fbF110EA8406d5B70740ec','converter':'0x053fa9b934b83e1e0ffc7e98a41aadc3640bb462','deploy':1612106},
+            'WBTC_CUSTOM':{'address':'0x0913DA6Da4b42f538B445599b46Bb4622342Cf52','owner':'0x2De242e27386e224E5fbF110EA8406d5B70740ec','converter':'0xb00aa68b87256e2f22058fb2ba3246eec54a44fc','deploy':1604036},
+            'USDS_CUSTOM':{'address':'0x62D6A123E8D19d06d68cf0d2294F9A3A0362c6b3','owner':'0xA8C31B2edd84c654d06d626383f4154D1E40C5Ff','converter':'0x639f13d5f30b47c792b6851238c05d0b623c77de','deploy':1604421},
+            'WETH_CUSTOM':{'address':'0xEE7D8BCFb72bC1880D0Cf19822eB0A2e6577aB62','owner':'0x2De242e27386e224E5fbF110EA8406d5B70740ec','converter':'0xa6b0db1293144ebe9478b6a84f75dd651e45914a','deploy':1601346},
+          }
+          EXTRA={
+            'KATANA_ADMIN':'0xd512543315c95506E4209805b888414EEF15C8C4',
+            'POLYGON_ENGINEERING':'0x4e981bAe8E3cd06Ca911ffFE5504B2653ac1C38a',
+            'AGGLAYER_BRIDGE':'0x2a3DD3EB832aF982ec71669E178424b10Dca2EDe',
+            'MIGRATION_MANAGER':'0x417d01B64Ea30C4E163873f3a1f77b727c689e02',
+          }
+          req_id=0
+          def rpc(method,params,tries=6):
+            global req_id
+            last=None
+            for attempt in range(tries):
+              for url in RPCS:
+                req_id+=1
+                body=json.dumps({'jsonrpc':'2.0','id':req_id,'method':method,'params':params}).encode()
+                req=urllib.request.Request(url,data=body,headers={'content-type':'application/json','user-agent':'Katana-role-ledger-v3'})
+                try:
+                  with urllib.request.urlopen(req,timeout=45) as resp: obj=json.loads(resp.read())
+                  if 'error' in obj: last=RuntimeError(f'{url} {obj["error"]}'); continue
+                  return obj['result']
+                except Exception as exc: last=exc
+              time.sleep(min(2**attempt,8))
+            raise RuntimeError(f'{method} failed: {last!r}')
+          def keccak(text): return rpc('web3_sha3',['0x'+text.encode().hex()])
+          def word_addr(addr): return addr[2:].lower().rjust(64,'0')
+          def call_raw(to,selector,args=''):
+            return rpc('eth_call',[{'to':to,'data':selector+args},'latest'])
+          def public_bytes32(to,sig):
+            return call_raw(to,keccak(sig)[:10])
+          def has_role(to,role,account):
+            raw=call_raw(to,keccak('hasRole(bytes32,address)')[:10],role[2:]+word_addr(account))
+            return int(raw,16)!=0
+          def topic_addr(topic): return '0x'+topic[-40:].lower()
+          def logs_adaptive(addr,start,end,topic0):
+            try:
+              return rpc('eth_getLogs',[{'address':addr,'fromBlock':hex(start),'toBlock':hex(end),'topics':[topic0]}],tries=2)
+            except Exception:
+              if start>=end: raise
+              mid=(start+end)//2
+              return logs_adaptive(addr,start,mid,topic0)+logs_adaptive(addr,mid+1,end,topic0)
+
+          latest=int(rpc('eth_blockNumber',[]),16)
+          topics={
+            'RoleGranted':keccak('RoleGranted(bytes32,address,address)'),
+            'RoleRevoked':keccak('RoleRevoked(bytes32,address,address)'),
+          }
+          expected_role_hashes={
+            'DEFAULT_ADMIN_ROLE':'0x'+'00'*32,
+            'PAUSER_ROLE':keccak('PAUSER_ROLE'),
+            'MINTER_BURNER_ROLE':keccak('MINTER_BURNER_ROLE'),
+          }
+          report={'latest_block':latest,'topics':topics,'expected_role_hashes':expected_role_hashes,'tokens':{}}
+          global_candidates={v.lower() for v in EXTRA.values()}
+          for cfg in TOKENS.values():
+            global_candidates.update([cfg['address'].lower(),cfg['owner'].lower(),cfg['converter'].lower()])
+
+          for label,cfg in TOKENS.items():
+            addr=cfg['address']
+            onchain_roles={
+              'PAUSER_ROLE':public_bytes32(addr,'PAUSER_ROLE()'),
+              'MINTER_BURNER_ROLE':public_bytes32(addr,'MINTER_BURNER_ROLE()'),
+            }
+            events=[]
+            candidates=set(global_candidates)
+            for kind,topic0 in topics.items():
+              for log in logs_adaptive(addr,cfg['deploy'],latest,topic0):
+                ts=log.get('topics',[])
+                if len(ts)<4: continue
+                e={'kind':kind,'role':ts[1].lower(),'account':topic_addr(ts[2]),'sender':topic_addr(ts[3]),'block':int(log['blockNumber'],16),'tx':log['transactionHash'],'logIndex':int(log['logIndex'],16)}
+                events.append(e); candidates.update([e['account'],e['sender']])
+            events.sort(key=lambda x:(x['block'],x['logIndex']))
+            memberships=[]
+            role_hashes={'DEFAULT_ADMIN_ROLE':expected_role_hashes['DEFAULT_ADMIN_ROLE'],**onchain_roles}
+            for role_name,role in role_hashes.items():
+              members=[]
+              for account in sorted(candidates):
+                try:
+                  if has_role(addr,role,account): members.append(account)
+                except Exception: pass
+              memberships.append({'role_name':role_name,'role':role,'members':members})
+            report['tokens'][label]={**cfg,'onchain_roles':onchain_roles,'events':events,'memberships':memberships}
+
+          inconsistencies=[]
+          minters=[]
+          for label,row in report['tokens'].items():
+            by={m['role_name']:m['members'] for m in row['memberships']}
+            if row['owner'].lower() not in by.get('DEFAULT_ADMIN_ROLE',[]):
+              inconsistencies.append(f'{label}: documented owner missing DEFAULT_ADMIN_ROLE')
+            if row['owner'].lower() not in by.get('PAUSER_ROLE',[]):
+              inconsistencies.append(f'{label}: documented owner missing PAUSER_ROLE')
+            if by.get('MINTER_BURNER_ROLE'):
+              minters.append({'token':label,'members':by['MINTER_BURNER_ROLE']})
+            if row['onchain_roles']['PAUSER_ROLE'].lower()!=expected_role_hashes['PAUSER_ROLE'].lower():
+              inconsistencies.append(f'{label}: PAUSER_ROLE hash mismatch')
+            if row['onchain_roles']['MINTER_BURNER_ROLE'].lower()!=expected_role_hashes['MINTER_BURNER_ROLE'].lower():
+              inconsistencies.append(f'{label}: MINTER_BURNER_ROLE hash mismatch')
+          verdict={'consistent':not inconsistencies,'inconsistencies':inconsistencies,'minter_burner_memberships':minters,'minter_burner_open':bool(minters)}
+          report['verdict']=verdict
+          Path('evidence/customtoken_role_ledger_v3.json').write_text(json.dumps(report,indent=2,sort_keys=True)+'\n')
+          Path('evidence/verdict.json').write_text(json.dumps(verdict,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(verdict,indent=2,sort_keys=True))
+          PY
+          (cd evidence && sha256sum * > SHA256SUMS)
+
+      - name: Upload validated role ledger
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-customtoken-role-ledger-v3-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
