@@ -1,0 +1,108 @@
+name: Temporary TermMax B2 fast balance gate 20260728
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    if: github.head_ref == 'monitor/termmax-public-state-20260728'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      ROUTER_V1: '0x3cb5fa87703c7165cc5f2087B3e80b58fb6d8CE8'
+      ROUTER_V2: '0x830fBad7Cd1c3Cc5B693Dc64b985f2901B253C5B'
+      ADAPTER: '0xBd795F755dbB5A5358D6c60AED53ceB486Fa8517'
+      WHITELIST: '0x03c4FCF963E5FBC0dC5851d2340624E70492acb9'
+      RPC: 'https://223.rpc.thirdweb.com'
+      EXPLORER: 'https://explorer.bsquared.network'
+    steps:
+      - name: Checkout exact PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --no-input web3==7.13.0 requests==2.32.4
+
+      - name: Query current B2 Router state
+        shell: bash
+        run: |
+          set +e
+          mkdir -p evidence
+          python - <<'PY' > >(tee evidence/stdout.log) 2> >(tee evidence/stderr.log >&2)
+          import json, os, requests
+          from web3 import Web3
+
+          router_v1 = Web3.to_checksum_address(os.environ['ROUTER_V1'])
+          router_v2 = Web3.to_checksum_address(os.environ['ROUTER_V2'])
+          adapter = Web3.to_checksum_address(os.environ['ADAPTER'])
+          whitelist = Web3.to_checksum_address(os.environ['WHITELIST'])
+          rpc = os.environ['RPC']
+          explorer = os.environ['EXPLORER'].rstrip('/')
+          w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout': 45}))
+          latest = w3.eth.block_number
+          block = w3.eth.get_block(latest)
+          wl_abi=[{'type':'function','name':'isWhitelisted','stateMutability':'view','inputs':[{'type':'address'},{'type':'uint8'}],'outputs':[{'type':'bool'}]}]
+          router_abi=[{'type':'function','name':'paused','stateMutability':'view','inputs':[],'outputs':[{'type':'bool'}]}]
+          out={
+            'chainId': w3.eth.chain_id,
+            'block': {'number':latest,'hash':'0x'+bytes(block.hash).hex(),'timestamp':int(block.timestamp)},
+            'addresses': {'routerV1':router_v1,'routerV2':router_v2,'adapter':adapter,'whitelist':whitelist},
+            'codeBytes': {a:len(w3.eth.get_code(a,block_identifier=latest)) for a in [router_v1,router_v2,adapter,whitelist]},
+            'adapterWhitelisted': w3.eth.contract(address=whitelist,abi=wl_abi).functions.isWhitelisted(adapter,0).call(block_identifier=latest),
+            'routerPaused': {router_v1:w3.eth.contract(address=router_v1,abi=router_abi).functions.paused().call(block_identifier=latest),router_v2:w3.eth.contract(address=router_v2,abi=router_abi).functions.paused().call(block_identifier=latest)},
+            'explorer':{},
+          }
+          session=requests.Session(); session.headers['User-Agent']='ZeroDayBugs-TermMax-B2-Readonly/1.0'
+          for router in [router_v1,router_v2]:
+            entry={}
+            for suffix in ['token-balances','tokens','token-transfers']:
+              url=f'{explorer}/api/v2/addresses/{router}/{suffix}'
+              try:
+                r=session.get(url,timeout=60); entry[suffix]={'status':r.status_code,'contentType':r.headers.get('content-type'),'body':r.json() if 'json' in (r.headers.get('content-type') or '') else r.text[:2000]}
+              except Exception as e:
+                entry[suffix]={'error':f'{type(e).__name__}: {e}'}
+            out['explorer'][router]=entry
+          def balances(router):
+            raw=out['explorer'][router].get('token-balances',{}).get('body',[])
+            if not isinstance(raw,list): return []
+            rows=[]
+            for item in raw:
+              token=item.get('token') or {}; value=int(item.get('value') or 0); dec=int(token.get('decimals') or 0)
+              rate=token.get('exchange_rate'); usd=(value/(10**dec))*float(rate) if rate not in (None,'') and dec>=0 else None
+              if value: rows.append({'token':token.get('address_hash'),'name':token.get('name'),'symbol':token.get('symbol'),'decimals':dec,'value':value,'human':value/(10**dec),'exchangeRate':rate,'usd':usd,'type':token.get('type')})
+            return sorted(rows,key=lambda x:float(x.get('usd') or 0),reverse=True)
+          out['nonzeroBalances']={router:balances(router) for router in [router_v1,router_v2]}
+          with open('evidence/B2_FAST_GATE.json','w') as f: json.dump(out,f,indent=2)
+          print(json.dumps({'chainId':out['chainId'],'block':out['block'],'codeBytes':out['codeBytes'],'adapterWhitelisted':out['adapterWhitelisted'],'routerPaused':out['routerPaused'],'nonzeroBalances':out['nonzeroBalances']},indent=2))
+          PY
+          rc=$?
+          printf '%s\n' "$rc" > evidence/exit_code.txt
+          find evidence -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS.txt
+          exit 0
+
+      - name: Upload fast-gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: termmax-b2-fast-gate-20260728-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
+
+      - name: Final gate
+        if: always()
+        run: test "$(cat evidence/exit_code.txt 2>/dev/null || echo 99)" = 0
