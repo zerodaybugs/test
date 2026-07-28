@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Fast indexed-log wrapper for the public TermMax cross-chain inventory.
+"""Strict fast indexed-log wrapper for public TermMax cross-chain inventory.
 
 The underlying scanner performs current read-only RPC inspection. This wrapper
-replaces expensive block-by-block `eth_getLogs` range splitting with Routescan's
-public indexed `getLogs` endpoint, falling back to the original RPC scanner if
-an explorer does not support a chain. No signer, key, transaction construction,
-or broadcast capability is present.
+uses Routescan's indexed getLogs endpoint with short bounded retries. Unsupported
+chains are recorded as scan errors instead of falling back to potentially long
+block-range RPC scans. No signer, key, transaction construction, or broadcast
+capability is present.
 """
 from __future__ import annotations
 
 import importlib.util
-import json
 import time
 from pathlib import Path
 from typing import Any
@@ -27,7 +26,7 @@ base = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(base)
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "ZeroDayBugs-TermMax-Indexed-Inventory/1.0"})
+SESSION.headers.update({"User-Agent": "ZeroDayBugs-TermMax-Indexed-Inventory/2.0"})
 
 
 def parse_int(value: Any, fallback: int = 0) -> int:
@@ -63,22 +62,22 @@ def routescan_logs(
             "page": page,
             "offset": 1000,
         }
-        last: Exception | None = None
         payload: dict[str, Any] | None = None
-        for attempt in range(7):
+        last: Exception | None = None
+        for attempt in range(2):
             try:
-                response = SESSION.get(endpoint, params=params, timeout=75)
+                response = SESSION.get(endpoint, params=params, timeout=15)
                 if response.status_code == 429:
-                    time.sleep(2.0 * (attempt + 1))
+                    time.sleep(1.0 + attempt)
                     continue
                 response.raise_for_status()
                 payload = response.json()
                 break
             except Exception as exc:  # noqa: BLE001
                 last = exc
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(0.75 + attempt)
         if payload is None:
-            raise RuntimeError(f"Routescan getLogs failed: {last}")
+            raise RuntimeError(f"Routescan getLogs failed after bounded retries: {last}")
         result = payload.get("result", []) if isinstance(payload, dict) else []
         diagnostics.append(
             {
@@ -101,6 +100,8 @@ def routescan_logs(
         if len(result) < 1000:
             break
         page += 1
+        if page > 20:
+            raise RuntimeError("indexed result pagination exceeded 20 pages")
 
     normalized: list[dict[str, Any]] = []
     for row in rows:
@@ -120,9 +121,6 @@ def routescan_logs(
     return normalized, diagnostics
 
 
-_original_scan_logs = base.scan_logs
-
-
 def indexed_scan_logs(
     w3: Web3,
     address: str,
@@ -133,15 +131,17 @@ def indexed_scan_logs(
     chain_id = int(w3.eth.chain_id)
     try:
         logs, diagnostics = routescan_logs(chain_id, address, start_block, end_block, event_topic)
-        return logs, [{"mode": "routescan-indexed", **row} for row in diagnostics]
+        return logs, [{"mode": "routescan-indexed-strict", **row} for row in diagnostics]
     except Exception as exc:  # noqa: BLE001
-        logs, diagnostics = _original_scan_logs(w3, address, start_block, end_block, event_topic)
-        return logs, [
+        return [], [
             {
-                "mode": "routescan-indexed-failed-rpc-fallback",
+                "mode": "routescan-indexed-strict-error",
                 "error": f"{type(exc).__name__}: {exc}",
-            },
-            *diagnostics,
+                "chainId": chain_id,
+                "address": address,
+                "startBlock": start_block,
+                "endBlock": end_block,
+            }
         ]
 
 
