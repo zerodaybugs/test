@@ -2,8 +2,9 @@
 """Corrected public read-only TermMax V2 cross-chain vault census.
 
 This wrapper replaces stale factory addresses with the current factory set used
-by the public DefiLlama TermMax adapter and adds BNB Chain PoA middleware. It
-uses only public JSON-RPC calls and indexed explorer GET requests. It has no
+by the public DefiLlama TermMax adapter, adds BNB Chain PoA middleware, and
+supplements factory discovery with the public DefiLlama yield-pool index. It
+uses only public JSON-RPC calls and indexed HTTPS GET requests. It has no
 private key, signer, or transaction-broadcast capability.
 """
 from __future__ import annotations
@@ -13,6 +14,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import requests
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 
@@ -28,6 +30,8 @@ SPEC.loader.exec_module(base)
 base.CHAINS = [
     {
         "name": "base",
+        "defiLlamaChain": "Base",
+        "defiLlamaPoolSuffix": "base",
         "chainId": 8453,
         "routescanId": 8453,
         "factories": [
@@ -43,6 +47,8 @@ base.CHAINS = [
     },
     {
         "name": "bnb",
+        "defiLlamaChain": "BSC",
+        "defiLlamaPoolSuffix": "bsc",
         "chainId": 56,
         "routescanId": 56,
         "factories": [
@@ -59,6 +65,8 @@ base.CHAINS = [
     },
     {
         "name": "arbitrum",
+        "defiLlamaChain": "Arbitrum",
+        "defiLlamaPoolSuffix": "arbitrum",
         "chainId": 42161,
         "routescanId": 42161,
         "factories": [
@@ -79,6 +87,27 @@ base.CHAINS = [
 ]
 
 
+_DEFILLAMA_POOLS: list[dict[str, Any]] | None = None
+
+
+def defi_llama_pools() -> list[dict[str, Any]]:
+    global _DEFILLAMA_POOLS
+    if _DEFILLAMA_POOLS is not None:
+        return _DEFILLAMA_POOLS
+    response = requests.get(
+        "https://yields.llama.fi/pools",
+        timeout=60,
+        headers={"User-Agent": "termmax-public-census/2"},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload.get("data", []) if isinstance(payload, dict) else []
+    _DEFILLAMA_POOLS = [
+        row for row in rows if str(row.get("project", "")).lower() == "termmax"
+    ]
+    return _DEFILLAMA_POOLS
+
+
 def corrected_connect(config: dict[str, Any]) -> tuple[Web3, str, list[dict[str, Any]]]:
     attempts: list[dict[str, Any]] = []
     for url in config["rpcs"]:
@@ -88,8 +117,8 @@ def corrected_connect(config: dict[str, Any]) -> tuple[Web3, str, list[dict[str,
                 w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
             chain_id = w3.eth.chain_id
             block_number = w3.eth.block_number
-            # Force a block decode here so PoA/header middleware failures are
-            # detected before the census starts.
+            # Force block decoding here so PoA/header middleware failures are
+            # caught before the census starts.
             block = w3.eth.get_block(block_number)
             if chain_id != config["chainId"]:
                 raise RuntimeError(f"chainId={chain_id}")
@@ -115,12 +144,35 @@ def corrected_connect(config: dict[str, Any]) -> tuple[Web3, str, list[dict[str,
     raise RuntimeError(json.dumps(attempts))
 
 
+def defillama_vaults(config: dict[str, Any]) -> list[tuple[str, int]]:
+    output: list[tuple[str, int]] = []
+    minimum_start = min(int(block) for _, block in config.get("factories", []))
+    wanted_chain = str(config["defiLlamaChain"]).lower()
+    wanted_suffix = str(config["defiLlamaPoolSuffix"]).lower()
+    for row in defi_llama_pools():
+        if str(row.get("chain", "")).lower() != wanted_chain:
+            continue
+        pool_id = str(row.get("pool", ""))
+        address = pool_id.split("-", 1)[0]
+        if not address.startswith("0x") or len(address) != 42:
+            continue
+        # The public TermMax adapter formats pool IDs as address-chain.
+        if "-" in pool_id and not pool_id.lower().endswith("-" + wanted_suffix):
+            continue
+        try:
+            output.append((Web3.to_checksum_address(address), minimum_start))
+        except ValueError:
+            continue
+    return output
+
+
 def corrected_discover_vaults(config: dict[str, Any], latest: int) -> list[tuple[str, int]]:
     output = [
         (Web3.to_checksum_address(address), int(block_number))
         for address, block_number in config.get("staticVaults", [])
     ]
-    discovery_errors: list[str] = []
+    discovery_notes: list[str] = []
+
     for factory_address, start_block in config.get("factories", []):
         factory = Web3.to_checksum_address(factory_address)
         try:
@@ -131,6 +183,7 @@ def corrected_discover_vaults(config: dict[str, Any], latest: int) -> list[tuple
                 latest,
                 base.VAULT_CREATED_TOPIC,
             )
+            discovery_notes.append(f"{factory}: routescan_rows={len(rows)}")
             for row in rows:
                 topics = row.get("topics", [])
                 if len(topics) >= 2:
@@ -141,13 +194,21 @@ def corrected_discover_vaults(config: dict[str, Any], latest: int) -> list[tuple
                         )
                     )
         except Exception as exc:
-            discovery_errors.append(
-                f"{factory}: {type(exc).__name__}: {exc}"
+            discovery_notes.append(
+                f"{factory}: routescan_error={type(exc).__name__}: {exc}"
             )
 
-    if discovery_errors:
-        path = base.OUT / f"{config['name']}_factory_discovery_errors.log"
-        path.write_text("\n".join(discovery_errors) + "\n", encoding="utf-8")
+    try:
+        llama_rows = defillama_vaults(config)
+        output.extend(llama_rows)
+        discovery_notes.append(f"defillama_rows={len(llama_rows)}")
+    except Exception as exc:
+        discovery_notes.append(
+            f"defillama_error={type(exc).__name__}: {exc}"
+        )
+
+    path = base.OUT / f"{config['name']}_vault_discovery.log"
+    path.write_text("\n".join(discovery_notes) + "\n", encoding="utf-8")
 
     unique: dict[str, tuple[str, int]] = {}
     for address, block_number in output:
