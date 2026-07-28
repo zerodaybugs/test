@@ -1,0 +1,230 @@
+name: Katana primary vbToken financial state v2
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-primary-vbtoken-state-v2.yml'
+      - 'katana-primary-state-v2/**'
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Read exact Ethereum production state with raw JSON-RPC
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          import json, time, urllib.request
+          from pathlib import Path
+
+          RPCS = [
+              'https://ethereum-rpc.publicnode.com',
+              'https://eth.llamarpc.com',
+              'https://1rpc.io/eth',
+          ]
+          TOKENS = {
+              'vbUSDS':'0x3DD459dE96F9C28e3a343b831cbDC2B93c8C4855',
+              'vbUSDT':'0x6d4f9f9f8f0155509ecd6Ac6c544fF27999845CC',
+              'vbUSDC':'0x53E82ABbb12638F09d9e624578ccB666217a765e',
+              'vbWBTC':'0x2C24B57e2CCd1f273045Af6A5f632504C432374F',
+              'vbETH':'0x2DC70fb75b88d2eB4715bc06E1595E6D97c34DFF',
+          }
+          MIGRATION_MANAGER='0x417d01B64Ea30C4E163873f3a1f77b727c689e02'
+          IMPL_SLOT='0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
+          ADMIN_SLOT='0xb53127684a568b3173ae13b9f8a6016e019a4f791a76d2f0a3b5c9f3b1e8a9c'
+          req_id=0
+
+          def rpc(method, params, tries=6):
+              global req_id
+              last=None
+              for attempt in range(tries):
+                  for url in RPCS:
+                      req_id += 1
+                      body=json.dumps({'jsonrpc':'2.0','id':req_id,'method':method,'params':params}).encode()
+                      req=urllib.request.Request(url,data=body,headers={'content-type':'application/json','user-agent':'Katana-read-only-inventory/1.0'})
+                      try:
+                          with urllib.request.urlopen(req,timeout=45) as resp:
+                              obj=json.loads(resp.read())
+                          if 'error' in obj:
+                              last=RuntimeError(f'{url}: {obj["error"]}')
+                              continue
+                          return obj['result']
+                      except Exception as exc:
+                          last=exc
+                  time.sleep(min(2**attempt,8))
+              raise RuntimeError(f'{method} failed: {last!r}')
+
+          def selector(sig):
+              return rpc('web3_sha3',['0x'+sig.encode().hex()])[:10]
+          def word_address(addr):
+              return addr.lower().replace('0x','').rjust(64,'0')
+          def word_uint(value):
+              return hex(int(value))[2:].rjust(64,'0')
+          def raw_call(to,sig,args=()):
+              data=selector(sig)
+              for typ,val in args:
+                  if typ=='address': data += word_address(val)
+                  elif typ=='uint256': data += word_uint(val)
+                  else: raise ValueError(typ)
+              try:
+                  return {'ok':True,'raw':rpc('eth_call',[{'to':to,'data':data},'latest'])}
+              except Exception as exc:
+                  return {'ok':False,'error':repr(exc)}
+          def storage(addr,slot):
+              try: return {'ok':True,'raw':rpc('eth_getStorageAt',[addr,slot,'latest'])}
+              except Exception as exc: return {'ok':False,'error':repr(exc)}
+          def code(addr):
+              try:
+                  c=rpc('eth_getCode',[addr,'latest'])
+                  return {'ok':True,'raw':c,'bytes':max(0,(len(c)-2)//2),'codehash':rpc('web3_sha3',[c]) if c!='0x' else None}
+              except Exception as exc: return {'ok':False,'error':repr(exc)}
+
+          def words(raw):
+              h=raw[2:]
+              return [h[i:i+64] for i in range(0,len(h),64)]
+          def dec_uint(result):
+              if not result.get('ok') or result.get('raw') in (None,'0x'): return None
+              return int(result['raw'],16)
+          def dec_bool(result):
+              v=dec_uint(result); return None if v is None else bool(v)
+          def dec_address(result):
+              if not result.get('ok') or result.get('raw') in (None,'0x'): return None
+              return '0x'+result['raw'][-40:]
+          def dec_string(result):
+              if not result.get('ok') or result.get('raw') in (None,'0x'): return None
+              try:
+                  h=result['raw'][2:]
+                  offset=int(h[:64],16)*2
+                  length=int(h[offset:offset+64],16)
+                  start=offset+64
+                  return bytes.fromhex(h[start:start+length*2]).decode(errors='replace')
+              except Exception:
+                  return None
+          def dec_bool_uint(result):
+              if not result.get('ok') or result.get('raw') in (None,'0x'): return None
+              ws=words(result['raw'])
+              return {'positive':bool(int(ws[0],16)),'difference':str(int(ws[1],16))} if len(ws)>=2 else None
+
+          def read(to,sig,kind,args=()):
+              r=raw_call(to,sig,args)
+              dec={'uint':dec_uint,'bool':dec_bool,'address':dec_address,'string':dec_string,'bool_uint':dec_bool_uint}[kind](r)
+              return {'call':sig,'ok':r.get('ok',False),'value':str(dec) if isinstance(dec,int) else dec,'raw':r.get('raw'),'error':r.get('error')}
+
+          latest=int(rpc('eth_blockNumber',[]),16)
+          chain_id=int(rpc('eth_chainId',[]),16)
+          report={'chain_id':chain_id,'latest_block':latest,'tokens':[]}
+
+          for label,addr in TOKENS.items():
+              row={'label':label,'address':addr.lower(),'code':code(addr),'implementation':storage(addr,IMPL_SLOT),'admin':storage(addr,ADMIN_SLOT)}
+              for key,sig,kind in [
+                  ('version','version()(string)','string'),
+                  ('protocolVersion','VAULT_BRIDGE_PROTOCOL()(string)','string'),
+                  ('name','name()(string)','string'),
+                  ('symbol','symbol()(string)','string'),
+                  ('decimals','decimals()(uint8)','uint'),
+                  ('asset','asset()(address)','address'),
+                  ('underlyingToken','underlyingToken()(address)','address'),
+                  ('yieldVault','yieldVault()(address)','address'),
+                  ('yieldRecipient','yieldRecipient()(address)','address'),
+                  ('migrationManager','migrationManager()(address)','address'),
+                  ('lxlyBridge','lxlyBridge()(address)','address'),
+                  ('agglayerBridge','agglayerBridge()(address)','address'),
+                  ('totalSupply','totalSupply()(uint256)','uint'),
+                  ('totalAssets','totalAssets()(uint256)','uint'),
+                  ('reservedAssets','reservedAssets()(uint256)','uint'),
+                  ('stakedAssets','stakedAssets()(uint256)','uint'),
+                  ('yield','yield()(uint256)','uint'),
+                  ('backingDifference','backingDifference()(bool,uint256)','bool_uint'),
+                  ('reservePercentage','reservePercentage()(uint256)','uint'),
+                  ('minimumReservePercentage','minimumReservePercentage()(uint256)','uint'),
+                  ('minimumYieldVaultDeposit','minimumYieldVaultDeposit()(uint256)','uint'),
+                  ('yieldVaultMaximumSlippagePercentage','yieldVaultMaximumSlippagePercentage()(uint256)','uint'),
+                  ('migrationFeesFund','migrationFeesFund()(uint256)','uint'),
+                  ('paused','paused()(bool)','bool'),
+              ]:
+                  row[key]=read(addr,sig,kind)
+
+              asset=(row['asset']['value'] or row['underlyingToken']['value'])
+              vault=row['yieldVault']['value']
+              if asset:
+                  row['physicalUnderlyingBalance']=read(asset,'balanceOf(address)(uint256)','uint',(('address',addr),))
+                  row['assetName']=read(asset,'name()(string)','string')
+                  row['assetSymbol']=read(asset,'symbol()(string)','string')
+                  row['assetDecimals']=read(asset,'decimals()(uint8)','uint')
+                  row['assetCode']=code(asset)
+                  row['assetImplementation']=storage(asset,IMPL_SLOT)
+              if vault:
+                  row['yieldVaultCode']=code(vault)
+                  row['yieldVaultImplementation']=storage(vault,IMPL_SLOT)
+                  row['yieldVaultName']=read(vault,'name()(string)','string')
+                  row['yieldVaultSymbol']=read(vault,'symbol()(string)','string')
+                  row['yieldVaultAsset']=read(vault,'asset()(address)','address')
+                  row['yieldVaultTotalAssets']=read(vault,'totalAssets()(uint256)','uint')
+                  row['yieldVaultTotalSupply']=read(vault,'totalSupply()(uint256)','uint')
+                  row['yieldVaultSharesHeld']=read(vault,'balanceOf(address)(uint256)','uint',(('address',addr),))
+                  shares=int(row['yieldVaultSharesHeld']['value']) if row['yieldVaultSharesHeld']['value'] is not None else None
+                  if shares is not None:
+                      row['yieldVaultAssetsForHeldShares']=read(vault,'convertToAssets(uint256)(uint256)','uint',(('uint256',shares),))
+                      row['yieldVaultPreviewRedeemHeldShares']=read(vault,'previewRedeem(uint256)(uint256)','uint',(('uint256',shares),))
+                  row['yieldVaultMaxWithdraw']=read(vault,'maxWithdraw(address)(uint256)','uint',(('address',addr),))
+                  row['yieldVaultMaxRedeem']=read(vault,'maxRedeem(address)(uint256)','uint',(('address',addr),))
+              report['tokens'].append(row)
+
+          report['migrationManager']={
+              'address':MIGRATION_MANAGER.lower(),
+              'code':code(MIGRATION_MANAGER),
+              'implementation':storage(MIGRATION_MANAGER,IMPL_SLOT),
+              'admin':storage(MIGRATION_MANAGER,ADMIN_SLOT),
+              'version':read(MIGRATION_MANAGER,'version()(string)','string'),
+              'protocolVersion':read(MIGRATION_MANAGER,'VAULT_BRIDGE_PROTOCOL()(string)','string'),
+              'paused':read(MIGRATION_MANAGER,'paused()(bool)','bool'),
+          }
+
+          Path('evidence/primary_vbtoken_state_v2.json').write_text(json.dumps(report,indent=2,sort_keys=True)+'\n')
+          compact=[]
+          for row in report['tokens']:
+              def v(k):
+                  x=row.get(k)
+                  return x.get('value') if isinstance(x,dict) else None
+              compact.append({
+                  'label':row['label'],'address':row['address'],
+                  'implementation':row['implementation'].get('raw'),
+                  'version':v('version') or v('protocolVersion'),
+                  'asset':v('asset') or v('underlyingToken'),'assetSymbol':v('assetSymbol'),
+                  'yieldVault':v('yieldVault'),'yieldVaultName':v('yieldVaultName'),
+                  'yieldVaultImplementation':row.get('yieldVaultImplementation',{}).get('raw'),
+                  'totalSupply':v('totalSupply'),'totalAssets':v('totalAssets'),
+                  'reservedAssets':v('reservedAssets'),'physicalUnderlyingBalance':v('physicalUnderlyingBalance'),
+                  'stakedAssets':v('stakedAssets'),'yield':v('yield'),'backingDifference':v('backingDifference'),
+                  'migrationFeesFund':v('migrationFeesFund'),
+                  'yieldVaultSharesHeld':v('yieldVaultSharesHeld'),
+                  'yieldVaultAssetsForHeldShares':v('yieldVaultAssetsForHeldShares'),
+                  'yieldVaultPreviewRedeemHeldShares':v('yieldVaultPreviewRedeemHeldShares'),
+                  'yieldVaultMaxWithdraw':v('yieldVaultMaxWithdraw'),'yieldVaultMaxRedeem':v('yieldVaultMaxRedeem'),
+                  'paused':v('paused'),
+              })
+          Path('evidence/primary_vbtoken_state_v2_compact.json').write_text(json.dumps(compact,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(compact,indent=2,sort_keys=True))
+          PY
+          (cd evidence && sha256sum * > SHA256SUMS)
+
+      - name: Upload raw-RPC financial state
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-primary-vbtoken-state-v2-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
