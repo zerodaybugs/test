@@ -1,0 +1,182 @@
+name: Temporary encrypted Horizen runtime differential
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/tmp-horizen-runtime-differential.yml"
+      - "tmp-research/horizen-runtime-diff-20260728/**"
+
+permissions:
+  contents: read
+
+jobs:
+  differential:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout sanitized harness
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install Foundry v1.7.1
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Build and compare runtime bytecode
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT=/tmp/horizen-runtime-diff
+          IN="$GITHUB_WORKSPACE/private-evidence/input"
+          PRIVATE_RESULT="$GITHUB_WORKSPACE/private-evidence/result"
+          SANITIZED="$GITHUB_WORKSPACE/sanitized"
+          rm -rf "$ROOT" "$GITHUB_WORKSPACE/private-evidence" "$SANITIZED"
+          mkdir -p "$IN" "$PRIVATE_RESULT" "$SANITIZED"
+
+          git clone --no-checkout https://github.com/HorizenOfficial/staker.git "$ROOT"
+          git -C "$ROOT" checkout --detach ab92502e9da98784dfe3bd3ef933d4e9345ff628
+          git -C "$ROOT" submodule update --init --recursive
+
+          ANVIL_PORT=18631
+          anvil --silent --host 127.0.0.1 --port "$ANVIL_PORT" > "$IN/anvil.log" 2>&1 &
+          ANVIL_PID=$!
+          trap 'kill "$ANVIL_PID" 2>/dev/null || true' EXIT
+          sleep 2
+
+          PK='0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80'
+          LIVE_TOKEN='0x57da2D504bf8b83Ef304759d9f2648522D7a9280'
+          LIVE_CALC='0xf518b3c7Cd5cc1595D10E7268677Da0Fe364E191'
+          LIVE_ADMIN='0x1Afb144aaD0aE02f3Bb04C1eae4AC6020a727A21'
+          LIVE_STAKER='0x6BF7CF29a8bcE11Aa62Cf593d165C244fA4d3E31'
+
+          build_and_capture() {
+            local ref="$1" label="$2"
+            git -C "$ROOT" checkout --detach "$ref" > "$IN/${label}-checkout.log" 2>&1
+            git -C "$ROOT" submodule sync --recursive >> "$IN/${label}-checkout.log" 2>&1
+            git -C "$ROOT" submodule update --init --recursive >> "$IN/${label}-checkout.log" 2>&1
+            (
+              cd "$ROOT"
+              forge clean
+              forge build --sizes
+              forge create src/ZenStaker.sol:ZenStaker \
+                --rpc-url "http://127.0.0.1:${ANVIL_PORT}" \
+                --private-key "$PK" --broadcast \
+                --constructor-args "$LIVE_TOKEN" "$LIVE_CALC" 0 "$LIVE_ADMIN"
+            ) > "$IN/${label}-staker-create.log" 2>&1
+            local staker_address
+            staker_address=$(grep -E 'Deployed to:' "$IN/${label}-staker-create.log" | tail -1 | awk '{print $3}')
+            test -n "$staker_address"
+            cast code "$staker_address" --rpc-url "http://127.0.0.1:${ANVIL_PORT}" \
+              > "$IN/${label}-staker.hex"
+
+            (
+              cd "$ROOT"
+              forge create src/RewardAccumulator.sol:RewardAccumulator \
+                --rpc-url "http://127.0.0.1:${ANVIL_PORT}" \
+                --private-key "$PK" --broadcast \
+                --constructor-args "$LIVE_STAKER" "$LIVE_TOKEN" 431700 false
+            ) > "$IN/${label}-accumulator-create.log" 2>&1
+            local accumulator_address
+            accumulator_address=$(grep -E 'Deployed to:' "$IN/${label}-accumulator-create.log" | tail -1 | awk '{print $3}')
+            test -n "$accumulator_address"
+            cast code "$accumulator_address" --rpc-url "http://127.0.0.1:${ANVIL_PORT}" \
+              > "$IN/${label}-accumulator.hex"
+
+            sha256sum \
+              "$ROOT/src/Staker.sol" "$ROOT/src/ZenStaker.sol" "$ROOT/src/RewardAccumulator.sol" \
+              > "$IN/${label}-source-sha256.txt"
+          }
+
+          build_and_capture ab92502e9da98784dfe3bd3ef933d4e9345ff628 pinned
+          build_and_capture 0559c9c2d55ab97f69d9f2c33f7fae93d5f8ad3c deployment
+
+          for endpoint_label in live_official live_independent; do
+            if [ "$endpoint_label" = live_official ]; then
+              endpoint='https://horizen.calderachain.xyz/http'
+            else
+              endpoint='https://26514.rpc.thirdweb.com'
+            fi
+            cast code 0x6BF7CF29a8bcE11Aa62Cf593d165C244fA4d3E31 --rpc-url "$endpoint" \
+              > "$IN/${endpoint_label}-staker.hex"
+            cast code 0x06f5555fee73EDdc385b6d76FE00DB2D96ccDaE8 --rpc-url "$endpoint" \
+              > "$IN/${endpoint_label}-accumulator.hex"
+          done
+
+          python3 tmp-research/horizen-runtime-diff-20260728/runtime_diff.py \
+            --input "$IN" --output "$PRIVATE_RESULT"
+          cp "$PRIVATE_RESULT/RESULT.json" "$PRIVATE_RESULT/RESULT.md" "$SANITIZED/"
+          printf '%s\n' 'No transaction was signed or broadcast to mainnet or public testnet.' \
+            > "$SANITIZED/network-safety.txt"
+          sha256sum "$SANITIZED"/* > "$SANITIZED/SHA256SUMS"
+
+          verdict=$(jq -r '.security_verdict' "$SANITIZED/RESULT.json")
+          if [ "$verdict" != 'KILL_METADATA_ONLY' ]; then
+            for contract in staker accumulator; do
+              for label in pinned deployment live_official; do
+                cast disassemble "$(cat "$PRIVATE_RESULT/${label}-${contract}-executable.hex")" \
+                  > "$PRIVATE_RESULT/${label}-${contract}-disassembly.txt" 2>&1 || true
+              done
+            done
+          fi
+
+      - name: Encrypt complete technical evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted-output private-evidence sanitized
+          test -s tmp-research/horizen-runtime-diff-20260728/output-public.pem
+          tar --sort=name --mtime='UTC 2026-07-28' --owner=0 --group=0 --numeric-owner \
+            -czf /tmp/horizen-runtime-diff-evidence.tar.gz private-evidence
+          sha256sum /tmp/horizen-runtime-diff-evidence.tar.gz | awk '{print $1}' \
+            > encrypted-output/evidence-plaintext.sha256
+          openssl rand 32 > /tmp/key.bin
+          openssl rand 16 > /tmp/iv.bin
+          cat /tmp/key.bin /tmp/iv.bin > /tmp/keyinfo.bin
+          KEY=$(od -An -tx1 -v /tmp/key.bin | tr -d ' \n')
+          IV=$(od -An -tx1 -v /tmp/iv.bin | tr -d ' \n')
+          openssl enc -aes-256-cbc -K "$KEY" -iv "$IV" \
+            -in /tmp/horizen-runtime-diff-evidence.tar.gz \
+            -out encrypted-output/evidence.tar.gz.enc
+          openssl pkeyutl -encrypt \
+            -pubin -inkey tmp-research/horizen-runtime-diff-20260728/output-public.pem \
+            -in /tmp/keyinfo.bin -out encrypted-output/evidence-keyinfo.enc \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          sha256sum encrypted-output/* > encrypted-output/SHA256SUMS
+          rm -rf private-evidence
+          rm -f /tmp/key.bin /tmp/iv.bin /tmp/keyinfo.bin /tmp/horizen-runtime-diff-evidence.tar.gz
+
+      - name: Upload sanitized verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizen-runtime-diff-sanitized-${{ github.run_id }}
+          path: sanitized/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload encrypted technical evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizen-runtime-diff-encrypted-${{ github.run_id }}
+          path: encrypted-output/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Verify result materialization
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s sanitized/RESULT.json
+          test -s sanitized/RESULT.md
+          test -s sanitized/SHA256SUMS
+          test -s encrypted-output/evidence.tar.gz.enc
+          test -s encrypted-output/evidence-keyinfo.enc
+          jq -e '.public_network_writes == 0' sanitized/RESULT.json >/dev/null
