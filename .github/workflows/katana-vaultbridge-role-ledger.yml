@@ -1,0 +1,162 @@
+name: Katana Vault Bridge role ledger
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-vaultbridge-role-ledger.yml'
+      - 'katana-vb-roles/**'
+
+permissions:
+  contents: read
+
+jobs:
+  roles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Build public role grant/revoke ledger and current membership
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          import json,time,urllib.request
+          from pathlib import Path
+          from hashlib import sha3_256
+
+          RPCS=[
+            'https://rpc.katana.network/',
+            'https://rpc.katanarpc.com/',
+            'https://katana.gateway.tenderly.co/',
+          ]
+          CONTRACTS={
+            'USDC_CUSTOM':'0xfd415D011FfaA8e6f17fa753CdB080d1dE266784',
+            'USDT_CUSTOM':'0xf44e3BCB7A2461CC08185E127B324f2486a74E20',
+            'WBTC_CUSTOM':'0xB33e43A3F276e8e75792b941bccC996EcB2c0bBD',
+            'USDS_CUSTOM':'0x2134866886ce784fE2E0DE819118E4D32b4Be32C',
+            'WETH_CUSTOM':'0x815955d051C6262C16c720b19D735426254Bec5B',
+            'USDC_CONVERTER':'0x97a3500083348a147f419b8a65717909762c389f',
+            'USDT_CONVERTER':'0x053fa9b934b83e1e0ffc7e98a41aadc3640bb462',
+            'WBTC_CONVERTER':'0xb00aa68b87256e2f22058fb2ba3246eec54a44fc',
+            'USDS_CONVERTER':'0x639f13d5f30b47c792b6851238c05d0b623c77de',
+            'WETH_CONVERTER':'0xa6b0db1293144ebe9478b6a84f75dd651e45914a',
+          }
+          ROLE_NAMES=['MINTER_BURNER_ROLE','MIGRATOR_ROLE','PAUSER_ROLE','DEFAULT_ADMIN_ROLE']
+          ROLE_GRANTED='0x2f8788117e7eff1d82a5fba9f469ac78ca822fbd37d5d7e9f6fcf16a0f21e5b0'
+          ROLE_REVOKED='0xf6391f5c32d9c2d3a7fc30d9b01c8c3a8a7529fe5e48c24c2f22f78b9b0b24a2'
+          request_id=0
+
+          def rpc(method,params,tries=5):
+            global request_id
+            last=None
+            for attempt in range(tries):
+              for url in RPCS:
+                request_id+=1
+                body=json.dumps({'jsonrpc':'2.0','id':request_id,'method':method,'params':params}).encode()
+                req=urllib.request.Request(url,data=body,headers={'content-type':'application/json'})
+                try:
+                  with urllib.request.urlopen(req,timeout=45) as resp:
+                    obj=json.loads(resp.read())
+                  if 'error' in obj:
+                    last=RuntimeError(obj['error']); continue
+                  return obj['result']
+                except Exception as exc:
+                  last=exc
+              time.sleep(min(2**attempt,8))
+            raise RuntimeError(f'{method} failed: {last!r}')
+
+          def keccak_text(text):
+            # Ask the EVM node via web3_sha3 to avoid SHA3/Keccak ambiguity.
+            return rpc('web3_sha3',['0x'+text.encode().hex()])
+
+          role_hashes={name:('0x'+'00'*32 if name=='DEFAULT_ADMIN_ROLE' else keccak_text(name)) for name in ROLE_NAMES}
+          latest=int(rpc('eth_blockNumber',[]),16)
+
+          def first_code_block(addr):
+            lo,hi=0,latest
+            if rpc('eth_getCode',[addr,hex(hi)]) in ('0x','0x0'):
+              return None
+            while lo<hi:
+              mid=(lo+hi)//2
+              if rpc('eth_getCode',[addr,hex(mid)]) in ('0x','0x0'):
+                lo=mid+1
+              else:
+                hi=mid
+            return lo
+
+          def logs_adaptive(addr,start,end,topics):
+            try:
+              return rpc('eth_getLogs',[{
+                'address':addr,
+                'fromBlock':hex(start),
+                'toBlock':hex(end),
+                'topics':topics,
+              }],tries=2)
+            except Exception:
+              if start>=end: raise
+              mid=(start+end)//2
+              return logs_adaptive(addr,start,mid,topics)+logs_adaptive(addr,mid+1,end,topics)
+
+          def topic_address(topic): return '0x'+topic[-40:].lower()
+          def has_role(addr,role,account):
+            data='0x91d14854'+role[2:]+account[2:].lower().rjust(64,'0')
+            try:
+              out=rpc('eth_call',[{'to':addr,'data':data},'latest'])
+              return int(out,16)!=0
+            except Exception:
+              return None
+
+          report={'latest_block':latest,'role_hashes':role_hashes,'contracts':{}}
+          all_accounts=set()
+          for label,addr in CONTRACTS.items():
+            start=first_code_block(addr)
+            events=[]
+            for sig,kind in ((ROLE_GRANTED,'granted'),(ROLE_REVOKED,'revoked')):
+              for log in logs_adaptive(addr,start,latest,[sig]):
+                topics=log.get('topics',[])
+                if len(topics)<4: continue
+                row={
+                  'kind':kind,
+                  'role':topics[1].lower(),
+                  'account':topic_address(topics[2]),
+                  'sender':topic_address(topics[3]),
+                  'block':int(log['blockNumber'],16),
+                  'transactionHash':log['transactionHash'],
+                  'logIndex':int(log['logIndex'],16),
+                }
+                events.append(row); all_accounts.add(row['account'])
+            events.sort(key=lambda x:(x['block'],x['logIndex']))
+            report['contracts'][label]={'address':addr.lower(),'deployment_block':start,'events':events}
+
+          # Include configured peers and zero/bridge-ish accounts even if no event was decoded.
+          all_accounts.update(a.lower() for a in CONTRACTS.values())
+          current=[]
+          for label,c in report['contracts'].items():
+            for role_name,role in role_hashes.items():
+              members=[]
+              for account in sorted(all_accounts):
+                state=has_role(c['address'],role,account)
+                if state: members.append(account)
+              if members:
+                current.append({'contract':label,'address':c['address'],'role_name':role_name,'role':role,'members':members})
+          report['current_known_memberships']=current
+          Path('evidence/katana_role_ledger.json').write_text(json.dumps(report,indent=2,sort_keys=True)+'\n')
+          Path('evidence/katana_role_memberships.json').write_text(json.dumps(current,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(current,indent=2,sort_keys=True))
+          PY
+          sha256sum evidence/* > evidence/SHA256SUMS
+
+      - name: Upload read-only role ledger
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-vaultbridge-roles-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
