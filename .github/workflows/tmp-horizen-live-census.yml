@@ -1,0 +1,183 @@
+name: Temporary encrypted Horizen production-state census
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/tmp-horizen-live-census.yml"
+      - "tmp-horizen-r2/HorizenLiveCensus.t.sol"
+
+permissions:
+  contents: write
+
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout research branch
+        uses: actions/checkout@v4
+        with:
+          ref: horizen-live-state-20260728-a
+          persist-credentials: true
+          fetch-depth: 1
+
+      - name: Install Foundry v1.7.1
+        id: foundry
+        continue-on-error: true
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Execute census on a local mainnet fork
+        if: always()
+        shell: bash
+        env:
+          FOUNDRY_ACTION_OUTCOME: ${{ steps.foundry.outcome }}
+        run: |
+          set +e
+          ROOT=/tmp/horizen-live-census
+          rm -rf "$ROOT" collected encrypted-output
+          mkdir -p collected
+
+          MAINNET_RPC_URL='https://horizen.calderachain.xyz/http'
+          forge_rc=127
+          clone_rc=99
+          checkout_rc=99
+          deps_rc=99
+          build_rc=99
+          block_rc=99
+          census_rc=99
+
+          forge --version > collected/foundry-version.log 2>&1
+          forge_rc=$?
+
+          git clone --no-checkout https://github.com/HorizenOfficial/staker.git "$ROOT" \
+            > collected/clone.log 2>&1
+          clone_rc=$?
+          if [ "$clone_rc" = 0 ]; then
+            git -C "$ROOT" checkout --detach ab92502e9da98784dfe3bd3ef933d4e9345ff628 \
+              >> collected/clone.log 2>&1
+            checkout_rc=$?
+          fi
+          if [ "$checkout_rc" = 0 ]; then
+            git -C "$ROOT" submodule update --init --recursive \
+              > collected/dependencies.log 2>&1
+            deps_rc=$?
+          fi
+          if [ "$deps_rc" = 0 ]; then
+            cp tmp-horizen-r2/HorizenLiveCensus.t.sol "$ROOT/test/HorizenLiveCensus.t.sol"
+            (cd "$ROOT" && forge build) > collected/build.log 2>&1
+            build_rc=$?
+          fi
+
+          LATEST=$(timeout 30 cast block-number --rpc-url "$MAINNET_RPC_URL" \
+            > collected/latest-block.log 2>&1; cat collected/latest-block.log)
+          block_rc=$?
+          if [[ "$LATEST" =~ ^[0-9]+$ ]] && [ "$LATEST" -gt 5 ]; then
+            PINNED_BLOCK=$((LATEST - 5))
+            echo "$PINNED_BLOCK" > collected/pinned-block.txt
+          else
+            PINNED_BLOCK=0
+            block_rc=1
+          fi
+
+          if [ "$build_rc" = 0 ] && [ "$block_rc" = 0 ]; then
+            (cd "$ROOT" && \
+              MAINNET_RPC_URL="$MAINNET_RPC_URL" \
+              PINNED_BLOCK="$PINNED_BLOCK" \
+              forge test --match-contract HorizenLiveCensus -vvv) \
+              > "$GITHUB_WORKSPACE/collected/census.log" 2>&1
+            census_rc=$?
+          fi
+
+          {
+            echo "foundry_action_outcome=${FOUNDRY_ACTION_OUTCOME}"
+            echo "forge_rc=${forge_rc}"
+            echo "clone_rc=${clone_rc}"
+            echo "checkout_rc=${checkout_rc}"
+            echo "deps_rc=${deps_rc}"
+            echo "build_rc=${build_rc}"
+            echo "block_rc=${block_rc}"
+            echo "census_rc=${census_rc}"
+            echo "pinned_block=${PINNED_BLOCK}"
+            echo "target_commit=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
+            echo "public_network_writes=0"
+            if [ "$census_rc" = 0 ]; then
+              echo '--- sanitized successful census ---'
+              grep -E 'Suite result:|CENSUS_' collected/census.log 2>/dev/null || true
+            else
+              echo 'census_output_redacted_due_failure=1'
+            fi
+          } > /tmp/horizen-census-summary.txt
+
+          printf '%s\n' \
+            'The public Horizen endpoint was used only to create a local read-only fork. No public transaction was signed or broadcast.' \
+            > collected/network-safety.txt
+          exit 0
+
+      - name: Encrypt raw census evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted-output collected
+          test -s tmp-horizen-r2/output-public.pem
+          tar --sort=name --mtime='UTC 2026-07-28' --owner=0 --group=0 --numeric-owner \
+            -czf /tmp/horizen-census.tar.gz collected
+          sha256sum /tmp/horizen-census.tar.gz | awk '{print $1}' \
+            > encrypted-output/evidence-plaintext.sha256
+
+          openssl rand 32 > /tmp/key.bin
+          openssl rand 16 > /tmp/iv.bin
+          cat /tmp/key.bin /tmp/iv.bin > /tmp/keyinfo.bin
+          KEY=$(od -An -tx1 -v /tmp/key.bin | tr -d ' \n')
+          IV=$(od -An -tx1 -v /tmp/iv.bin | tr -d ' \n')
+          openssl enc -aes-256-cbc -K "$KEY" -iv "$IV" \
+            -in /tmp/horizen-census.tar.gz \
+            -out encrypted-output/evidence.tar.gz.enc
+          openssl pkeyutl -encrypt \
+            -pubin -inkey tmp-horizen-r2/output-public.pem \
+            -in /tmp/keyinfo.bin \
+            -out encrypted-output/evidence-keyinfo.enc \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          sha256sum encrypted-output/* > encrypted-output/SHA256SUMS
+          rm -rf collected /tmp/horizen-live-census
+          rm -f /tmp/key.bin /tmp/iv.bin /tmp/keyinfo.bin /tmp/horizen-census.tar.gz
+
+      - name: Persist sanitized census result only
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s /tmp/horizen-census-summary.txt
+          cp /tmp/horizen-census-summary.txt tmp-horizen-r2/latest-live-census-status.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add tmp-horizen-r2/latest-live-census-status.txt
+          if ! git diff --cached --quiet; then
+            git commit -m 'ci: record sanitized Horizen live census [skip ci]'
+            git push origin HEAD:horizen-live-state-20260728-a
+          fi
+
+      - name: Upload encrypted evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizen-live-census-${{ github.run_id }}
+          path: encrypted-output/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Verify encrypted-only output
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s encrypted-output/evidence.tar.gz.enc
+          test -s encrypted-output/evidence-keyinfo.enc
+          test -s encrypted-output/evidence-plaintext.sha256
+          test -s encrypted-output/SHA256SUMS
+          test ! -e collected
