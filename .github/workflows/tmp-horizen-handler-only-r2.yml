@@ -1,0 +1,316 @@
+name: Temporary encrypted Horizen handler-only R2 audit
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/tmp-horizen-handler-only-r2.yml"
+      - "tmp-horizen-r2/**"
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout sanitized harness
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install Foundry v1.7.1
+        id: foundry
+        continue-on-error: true
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Execute handler-only invariant and evidence gates
+        if: always()
+        shell: bash
+        env:
+          FOUNDRY_ACTION_OUTCOME: ${{ steps.foundry.outcome }}
+        run: |
+          set +e
+          ROOT=/tmp/horizen-staker-r2
+          rm -rf "$ROOT" collected encrypted-output
+          mkdir -p collected
+
+          forge_rc=127
+          clone_rc=99
+          checkout_rc=99
+          deps_rc=99
+          copy_rc=99
+          build_rc=99
+          invariant_rc=99
+          audit_extract_rc=99
+          shadow_rc=99
+          rpc_rc=99
+          normalized_binding_rc=99
+
+          {
+            echo "foundry_action_outcome=${FOUNDRY_ACTION_OUTCOME}"
+            forge --version
+            forge_rc=$?
+          } > collected/foundry-version.log 2>&1
+
+          git clone --no-checkout https://github.com/HorizenOfficial/staker.git "$ROOT" \
+            > collected/clone.log 2>&1
+          clone_rc=$?
+          if [ "$clone_rc" = 0 ]; then
+            git -C "$ROOT" checkout --detach ab92502e9da98784dfe3bd3ef933d4e9345ff628 \
+              >> collected/clone.log 2>&1
+            checkout_rc=$?
+            git -C "$ROOT" rev-parse HEAD > collected/target-head.txt 2>&1
+          fi
+
+          if [ "$checkout_rc" = 0 ]; then
+            git -C "$ROOT" submodule update --init --recursive \
+              > collected/dependencies.log 2>&1
+            deps_rc=$?
+            sha256sum \
+              "$ROOT/src/Staker.sol" \
+              "$ROOT/src/ZenStaker.sol" \
+              "$ROOT/src/RewardAccumulator.sol" \
+              > collected/scoped-source-sha256.txt 2>&1
+          fi
+
+          if [ "$deps_rc" = 0 ]; then
+            cp tmp-horizen-r2/HorizenHandlerOnlyInvariants.t.sol \
+              "$ROOT/test/HorizenHandlerOnlyInvariants.t.sol"
+            copy_rc=$?
+          fi
+
+          if [ "$forge_rc" = 0 ] && [ "$copy_rc" = 0 ]; then
+            (cd "$ROOT" && forge build --sizes) > collected/build.log 2>&1
+            build_rc=$?
+
+            (cd "$ROOT" && \
+              FOUNDRY_PROFILE=ci \
+              FOUNDRY_FUZZ_SEED=2026072802 \
+              FOUNDRY_INVARIANT_RUNS=2000 \
+              FOUNDRY_INVARIANT_DEPTH=100 \
+              FOUNDRY_INVARIANT_FAIL_ON_REVERT=false \
+              forge test --match-contract HorizenHandlerOnlyInvariants -vvv) \
+              > collected/handler-only-invariant.log 2>&1
+            invariant_rc=$?
+          fi
+
+          if command -v pdftotext >/dev/null 2>&1; then
+            audit_extract_rc=0
+          else
+            sudo apt-get update > collected/poppler-install.log 2>&1
+            sudo apt-get install -y poppler-utils >> collected/poppler-install.log 2>&1
+            audit_extract_rc=$?
+          fi
+
+          if [ "$audit_extract_rc" = 0 ] && [ "$checkout_rc" = 0 ]; then
+            mkdir -p collected/audit-text
+            audit_fail=0
+            while IFS= read -r -d '' pdf; do
+              rel=${pdf#"$ROOT/"}
+              safe=${rel//\//__}
+              safe=${safe// /_}
+              pdfinfo "$pdf" > "collected/audit-text/${safe}.pdfinfo.txt" 2>&1 || audit_fail=1
+              pdftotext -layout "$pdf" "collected/audit-text/${safe}.txt" \
+                2>> collected/audit-text/extraction-errors.log || audit_fail=1
+            done < <(find "$ROOT/audits" -type f -name '*.pdf' -print0 | sort -z)
+            cp "$ROOT/audits/unistaker/2024_03_UniStaker_Code4rena_Contest.md" \
+              collected/audit-text/2024_03_UniStaker_Code4rena_Contest.md 2>/dev/null || true
+            audit_extract_rc=$audit_fail
+          fi
+
+          if [ "$build_rc" = 0 ]; then
+            ANVIL_PORT=18548
+            anvil --silent --host 127.0.0.1 --port "$ANVIL_PORT" \
+              > collected/anvil.log 2>&1 &
+            ANVIL_PID=$!
+            sleep 2
+            PK='0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80'
+            LIVE_TOKEN='0x57da2D504bf8b83Ef304759d9f2648522D7a9280'
+            LIVE_CALC='0xf518b3c7Cd5cc1595D10E7268677Da0Fe364E191'
+            LIVE_ADMIN='0x1Afb144aaD0aE02f3Bb04C1eae4AC6020a727A21'
+            LIVE_STAKER='0x6BF7CF29a8bcE11Aa62Cf593d165C244fA4d3E31'
+
+            (cd "$ROOT" && forge create src/ZenStaker.sol:ZenStaker \
+              --rpc-url "http://127.0.0.1:${ANVIL_PORT}" \
+              --private-key "$PK" --broadcast \
+              --constructor-args "$LIVE_TOKEN" "$LIVE_CALC" 0 "$LIVE_ADMIN") \
+              > collected/shadow-staker-create.log 2>&1
+            shadow_staker_rc=$?
+            SHADOW_STAKER=$(grep -E 'Deployed to:' collected/shadow-staker-create.log \
+              | tail -1 | awk '{print $3}')
+
+            (cd "$ROOT" && forge create src/RewardAccumulator.sol:RewardAccumulator \
+              --rpc-url "http://127.0.0.1:${ANVIL_PORT}" \
+              --private-key "$PK" --broadcast \
+              --constructor-args "$LIVE_STAKER" "$LIVE_TOKEN" 431700 false) \
+              > collected/shadow-acc-create.log 2>&1
+            shadow_acc_rc=$?
+            SHADOW_ACC=$(grep -E 'Deployed to:' collected/shadow-acc-create.log \
+              | tail -1 | awk '{print $3}')
+
+            if [ -n "$SHADOW_STAKER" ]; then
+              cast code "$SHADOW_STAKER" --rpc-url "http://127.0.0.1:${ANVIL_PORT}" \
+                > collected/local-staker-code.hex 2>&1
+            fi
+            if [ -n "$SHADOW_ACC" ]; then
+              cast code "$SHADOW_ACC" --rpc-url "http://127.0.0.1:${ANVIL_PORT}" \
+                > collected/local-acc-code.hex 2>&1
+            fi
+            kill "$ANVIL_PID" 2>/dev/null || true
+            wait "$ANVIL_PID" 2>/dev/null || true
+
+            if [ "$shadow_staker_rc" = 0 ] && [ "$shadow_acc_rc" = 0 ]; then
+              shadow_rc=0
+            else
+              shadow_rc=1
+            fi
+          fi
+
+          MAIN_OFFICIAL='https://horizen.calderachain.xyz/http'
+          MAIN_THIRDWEB='https://26514.rpc.thirdweb.com'
+          LIVE_STAKER='0x6BF7CF29a8bcE11Aa62Cf593d165C244fA4d3E31'
+          LIVE_ACC='0x06f5555fee73EDdc385b6d76FE00DB2D96ccDaE8'
+
+          if [ "$forge_rc" = 0 ]; then
+            cast code "$LIVE_STAKER" --rpc-url "$MAIN_OFFICIAL" > collected/live-official-staker-code.hex 2>&1
+            rc1=$?
+            cast code "$LIVE_ACC" --rpc-url "$MAIN_OFFICIAL" > collected/live-official-acc-code.hex 2>&1
+            rc2=$?
+            cast code "$LIVE_STAKER" --rpc-url "$MAIN_THIRDWEB" > collected/live-independent-staker-code.hex 2>&1
+            rc3=$?
+            cast code "$LIVE_ACC" --rpc-url "$MAIN_THIRDWEB" > collected/live-independent-acc-code.hex 2>&1
+            rc4=$?
+            if [ "$rc1" = 0 ] && [ "$rc2" = 0 ] && [ "$rc3" = 0 ] && [ "$rc4" = 0 ]; then
+              rpc_rc=0
+            else
+              rpc_rc=1
+            fi
+          fi
+
+          if [ "$shadow_rc" = 0 ] && [ "$rpc_rc" = 0 ]; then
+            python3 - <<'PY' > collected/normalized-runtime-binding.txt 2>&1
+          import hashlib
+          import re
+          from pathlib import Path
+
+          root = Path('collected')
+          metadata = re.compile(
+              bytes.fromhex('a2646970667358221220') + b'.{32}' + bytes.fromhex('64736f6c634300081c0033'),
+              re.DOTALL,
+          )
+
+          def read_hex(path: Path) -> bytes:
+              text = ''.join(path.read_text().split()).lower()
+              if text.startswith('0x'):
+                  text = text[2:]
+              return bytes.fromhex(text)
+
+          def normalized(raw: bytes) -> bytes:
+              return metadata.sub(
+                  bytes.fromhex('a2646970667358221220') + b'\x00' * 32 + bytes.fromhex('64736f6c634300081c0033'),
+                  raw,
+              )
+
+          pairs = [
+              ('staker', root/'local-staker-code.hex', root/'live-official-staker-code.hex', root/'live-independent-staker-code.hex'),
+              ('accumulator', root/'local-acc-code.hex', root/'live-official-acc-code.hex', root/'live-independent-acc-code.hex'),
+          ]
+          all_ok = True
+          for name, local_path, official_path, independent_path in pairs:
+              raws = [read_hex(p) for p in (local_path, official_path, independent_path)]
+              norms = [normalized(x) for x in raws]
+              raw_hashes = [hashlib.sha256(x).hexdigest() for x in raws]
+              norm_hashes = [hashlib.sha256(x).hexdigest() for x in norms]
+              ok = norms[0] == norms[1] == norms[2]
+              all_ok &= ok
+              print(f'{name}_lengths={[len(x) for x in raws]}')
+              print(f'{name}_raw_hashes={raw_hashes}')
+              print(f'{name}_normalized_hashes={norm_hashes}')
+              print(f'{name}_metadata_sequences={[len(metadata.findall(x)) for x in raws]}')
+              print(f'{name}_normalized_equal={str(ok).lower()}')
+          raise SystemExit(0 if all_ok else 1)
+          PY
+            normalized_binding_rc=$?
+          fi
+
+          printf '%s\n' \
+            "foundry_action_outcome=${FOUNDRY_ACTION_OUTCOME}" \
+            "forge_rc=${forge_rc}" \
+            "clone_rc=${clone_rc}" \
+            "checkout_rc=${checkout_rc}" \
+            "deps_rc=${deps_rc}" \
+            "copy_rc=${copy_rc}" \
+            "build_rc=${build_rc}" \
+            "invariant_rc=${invariant_rc}" \
+            "audit_extract_rc=${audit_extract_rc}" \
+            "shadow_rc=${shadow_rc}" \
+            "rpc_rc=${rpc_rc}" \
+            "normalized_binding_rc=${normalized_binding_rc}" \
+            > collected/status.txt
+
+          printf '%s\n' \
+            'All contract execution was local. Public endpoints were used only for eth_getCode reads.' \
+            > collected/network-safety.txt
+          exit 0
+
+      - name: Encrypt complete evidence before upload
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted-output collected
+          test -s tmp-horizen-r2/output-public.pem
+          if [ ! -s collected/status.txt ]; then
+            printf '%s\n' 'bootstrap_status=missing' > collected/status.txt
+          fi
+
+          tar --sort=name --mtime='UTC 2026-07-28' --owner=0 --group=0 --numeric-owner \
+            -czf /tmp/horizen-r2-evidence.tar.gz collected
+          sha256sum /tmp/horizen-r2-evidence.tar.gz | awk '{print $1}' \
+            > encrypted-output/evidence-plaintext.sha256
+
+          openssl rand 32 > /tmp/key.bin
+          openssl rand 16 > /tmp/iv.bin
+          cat /tmp/key.bin /tmp/iv.bin > /tmp/keyinfo.bin
+          KEY=$(od -An -tx1 -v /tmp/key.bin | tr -d ' \n')
+          IV=$(od -An -tx1 -v /tmp/iv.bin | tr -d ' \n')
+
+          openssl enc -aes-256-cbc -K "$KEY" -iv "$IV" \
+            -in /tmp/horizen-r2-evidence.tar.gz \
+            -out encrypted-output/evidence.tar.gz.enc
+          openssl pkeyutl -encrypt \
+            -pubin -inkey tmp-horizen-r2/output-public.pem \
+            -in /tmp/keyinfo.bin \
+            -out encrypted-output/evidence-keyinfo.enc \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+
+          sha256sum encrypted-output/* > encrypted-output/SHA256SUMS
+          rm -rf collected /tmp/horizen-staker-r2 2>/dev/null || true
+          rm -f /tmp/key.bin /tmp/iv.bin /tmp/keyinfo.bin /tmp/horizen-r2-evidence.tar.gz
+
+      - name: Upload encrypted evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizen-handler-only-r2-${{ github.run_id }}
+          path: encrypted-output/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Verify encrypted-only output
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s encrypted-output/evidence.tar.gz.enc
+          test -s encrypted-output/evidence-keyinfo.enc
+          test -s encrypted-output/evidence-plaintext.sha256
+          test -s encrypted-output/SHA256SUMS
+          test ! -e collected
