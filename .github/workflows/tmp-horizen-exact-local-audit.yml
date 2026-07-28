@@ -1,0 +1,181 @@
+name: Temporary encrypted Horizen exact local audit
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/tmp-horizen-exact-local-audit.yml"
+      - "tmp-research/horizen-20260728/**"
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout sanitized harness
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install Foundry v1.7.1
+        id: foundry
+        continue-on-error: true
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Execute exact local test matrix without public log disclosure
+        if: always()
+        shell: bash
+        env:
+          FOUNDRY_ACTION_OUTCOME: ${{ steps.foundry.outcome }}
+        run: |
+          set +e
+          ROOT=/tmp/horizen-staker
+          rm -rf "$ROOT" collected encrypted-output
+          mkdir -p collected
+
+          forge_rc=127
+          clone_rc=99
+          checkout_rc=99
+          deps_rc=99
+          copy_rc=99
+          build_rc=99
+          targeted_rc=99
+          full_rc=99
+
+          {
+            echo "foundry_action_outcome=${FOUNDRY_ACTION_OUTCOME}"
+            forge --version
+            forge_rc=$?
+          } > collected/foundry-version.log 2>&1
+
+          git clone --no-checkout https://github.com/HorizenOfficial/staker.git "$ROOT" \
+            > collected/clone.log 2>&1
+          clone_rc=$?
+
+          if [ "$clone_rc" = 0 ]; then
+            git -C "$ROOT" checkout --detach ab92502e9da98784dfe3bd3ef933d4e9345ff628 \
+              >> collected/clone.log 2>&1
+            checkout_rc=$?
+            git -C "$ROOT" rev-parse HEAD > collected/target-head.txt 2>&1
+          fi
+
+          if [ "$checkout_rc" = 0 ]; then
+            git -C "$ROOT" submodule update --init --recursive \
+              > collected/dependencies.log 2>&1
+            deps_rc=$?
+            sha256sum \
+              "$ROOT/src/Staker.sol" \
+              "$ROOT/src/ZenStaker.sol" \
+              "$ROOT/src/RewardAccumulator.sol" \
+              > collected/scoped-source-sha256.txt 2>&1
+          fi
+
+          if [ "$deps_rc" = 0 ]; then
+            cp tmp-research/horizen-20260728/HorizenDeepAudit.t.sol \
+              "$ROOT/test/HorizenDeepAudit.t.sol"
+            copy_rc=$?
+          fi
+
+          if [ "$forge_rc" = 0 ] && [ "$copy_rc" = 0 ]; then
+            (cd "$ROOT" && forge build --sizes) > collected/build.log 2>&1
+            build_rc=$?
+
+            (cd "$ROOT" && forge test \
+              --match-path test/HorizenDeepAudit.t.sol \
+              --fuzz-runs 10000 -vvv) > collected/targeted.log 2>&1
+            targeted_rc=$?
+
+            (cd "$ROOT" && \
+              FOUNDRY_PROFILE=ci FOUNDRY_FUZZ_SEED=20260728 forge test -vv) \
+              > collected/full-suite.log 2>&1
+            full_rc=$?
+          fi
+
+          printf '%s\n' \
+            "foundry_action_outcome=${FOUNDRY_ACTION_OUTCOME}" \
+            "forge_rc=${forge_rc}" \
+            "clone_rc=${clone_rc}" \
+            "checkout_rc=${checkout_rc}" \
+            "deps_rc=${deps_rc}" \
+            "copy_rc=${copy_rc}" \
+            "build_rc=${build_rc}" \
+            "targeted_rc=${targeted_rc}" \
+            "full_rc=${full_rc}" \
+            > collected/status.txt
+
+          printf '%s\n' "No transaction was broadcast to mainnet or public testnet." \
+            > collected/network-safety.txt
+          exit 0
+
+      - name: Encrypt complete evidence before upload
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted-output collected
+          test -s tmp-research/horizen-20260728/output-public.pem
+
+          if [ ! -s collected/status.txt ]; then
+            printf '%s\n' 'bootstrap_status=missing' > collected/status.txt
+          fi
+
+          tar --sort=name --mtime='UTC 2026-07-28' --owner=0 --group=0 --numeric-owner \
+            -czf /tmp/horizen-evidence.tar.gz collected
+          sha256sum /tmp/horizen-evidence.tar.gz | awk '{print $1}' \
+            > encrypted-output/evidence-plaintext.sha256
+
+          openssl rand 32 > /tmp/output-key.bin
+          openssl rand 16 > /tmp/output-iv.bin
+          cat /tmp/output-key.bin /tmp/output-iv.bin > /tmp/output-keyinfo.bin
+          KEY=$(od -An -tx1 -v /tmp/output-key.bin | tr -d ' \n')
+          IV=$(od -An -tx1 -v /tmp/output-iv.bin | tr -d ' \n')
+
+          openssl enc -aes-256-cbc \
+            -K "$KEY" -iv "$IV" \
+            -in /tmp/horizen-evidence.tar.gz \
+            -out encrypted-output/evidence.tar.gz.enc
+
+          openssl pkeyutl -encrypt \
+            -pubin \
+            -inkey tmp-research/horizen-20260728/output-public.pem \
+            -in /tmp/output-keyinfo.bin \
+            -out encrypted-output/evidence-keyinfo.enc \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+
+          sha256sum \
+            encrypted-output/evidence.tar.gz.enc \
+            encrypted-output/evidence-keyinfo.enc \
+            encrypted-output/evidence-plaintext.sha256 \
+            > encrypted-output/SHA256SUMS
+
+          rm -rf collected "$ROOT" 2>/dev/null || true
+          rm -f /tmp/output-key.bin /tmp/output-iv.bin /tmp/output-keyinfo.bin \
+            /tmp/horizen-evidence.tar.gz
+
+      - name: Upload encrypted evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizen-exact-local-audit-${{ github.run_id }}
+          path: encrypted-output/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Verify encrypted-only output
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s encrypted-output/evidence.tar.gz.enc
+          test -s encrypted-output/evidence-keyinfo.enc
+          test -s encrypted-output/evidence-plaintext.sha256
+          test -s encrypted-output/SHA256SUMS
+          test ! -e collected
