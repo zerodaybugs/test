@@ -1,0 +1,183 @@
+name: Katana Vault Bridge deployment-state inventory
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-vaultbridge-state-inventory.yml'
+      - 'katana-vb-state/**'
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install authenticated Foundry toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/foundry evidence
+          curl --fail --location --retry 4 --retry-all-errors \
+            https://github.com/foundry-rs/foundry/releases/download/v1.7.1/foundry_v1.7.1_linux_amd64.tar.gz \
+            --output /tmp/foundry.tar.gz
+          echo 'cf7e688ed0c4c48adffca788b496076e31060b67ac5afe1e43dbb5499c20c88b  /tmp/foundry.tar.gz' \
+            | sha256sum --check --strict
+          tar -xzf /tmp/foundry.tar.gz -C /tmp/foundry
+          echo /tmp/foundry >> "$GITHUB_PATH"
+          /tmp/foundry/cast --version | tee evidence/CAST_VERSION.txt
+
+      - name: Fetch pinned public deployment broadcasts
+        shell: bash
+        run: |
+          set -euo pipefail
+          COMMIT=c2ece8a5a4618ba3b06412b58e2a063fb014aadb
+          BASE="https://raw.githubusercontent.com/agglayer/vault-bridge/$COMMIT"
+          curl --fail --location --retry 4 --retry-all-errors \
+            "$BASE/broadcast/archive/DeployLayerY.s.sol/747474/run-latest.json" \
+            --output evidence/DeployLayerY-747474.json
+          curl --fail --location --retry 4 --retry-all-errors \
+            "$BASE/broadcast/archive/DeployLayerY_WETH.s.sol/747474/run-latest.json" \
+            --output evidence/DeployLayerY_WETH-747474.json
+          sha256sum evidence/DeployLayerY*.json > evidence/BROADCAST_SHA256SUMS
+
+      - name: Parse deployments and read current proxy state
+        shell: bash
+        env:
+          RPC_URL: https://rpc.katana.network/
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          root = Path('evidence')
+          rpc = os.environ['RPC_URL']
+          files = [root/'DeployLayerY-747474.json', root/'DeployLayerY_WETH-747474.json']
+          tx_rows = []
+          addresses = set()
+
+          for p in files:
+              data = json.loads(p.read_text())
+              for index, tx in enumerate(data.get('transactions', [])):
+                  row = {
+                      'broadcast': p.name,
+                      'index': index,
+                      'hash': tx.get('hash'),
+                      'transactionType': tx.get('transactionType'),
+                      'contractName': tx.get('contractName'),
+                      'contractAddress': tx.get('contractAddress'),
+                      'function': tx.get('function'),
+                      'arguments': tx.get('arguments'),
+                      'from': (tx.get('transaction') or {}).get('from'),
+                      'to': (tx.get('transaction') or {}).get('to'),
+                  }
+                  tx_rows.append(row)
+                  for key in ('contractAddress',):
+                      value = row.get(key)
+                      if isinstance(value, str) and value.startswith('0x') and len(value) == 42:
+                          addresses.add(value.lower())
+                  for key in ('to',):
+                      value = row.get(key)
+                      if isinstance(value, str) and value.startswith('0x') and len(value) == 42:
+                          addresses.add(value.lower())
+
+          def run(*args):
+              proc = subprocess.run(args, text=True, capture_output=True, timeout=45)
+              return {
+                  'ok': proc.returncode == 0,
+                  'stdout': proc.stdout.strip(),
+                  'stderr': proc.stderr.strip(),
+                  'exit': proc.returncode,
+              }
+
+          latest = run('cast', 'block-number', '--rpc-url', rpc)
+          impl_slot = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
+          admin_slot = '0xb53127684a568b3173ae13b9f8a6016e0190a4f791a76d2f0a3b5c9f3b1e8a9c'
+          beacon_slot = '0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50'
+
+          states = []
+          for addr in sorted(addresses):
+              code = run('cast', 'code', addr, '--rpc-url', rpc)
+              if not code['ok'] or code['stdout'] in ('', '0x'):
+                  continue
+              code_hex = code['stdout']
+              row = {
+                  'address': addr,
+                  'code_bytes': max(0, (len(code_hex)-2)//2),
+                  'codehash': run('cast', 'keccak', code_hex),
+                  'implementation_slot': run('cast', 'storage', addr, impl_slot, '--rpc-url', rpc),
+                  'admin_slot': run('cast', 'storage', addr, admin_slot, '--rpc-url', rpc),
+                  'beacon_slot': run('cast', 'storage', addr, beacon_slot, '--rpc-url', rpc),
+                  'globalInitializationCounter': run(
+                      'cast', 'call', addr, 'globalInitializationCounter()(uint64)', '--rpc-url', rpc
+                  ),
+                  'version': run('cast', 'call', addr, 'version()(string)', '--rpc-url', rpc),
+                  'vaultBridgeProtocol': run(
+                      'cast', 'call', addr, 'VAULT_BRIDGE_PROTOCOL()(string)', '--rpc-url', rpc
+                  ),
+                  'customToken': run('cast', 'call', addr, 'customToken()(address)', '--rpc-url', rpc),
+                  'underlyingToken': run('cast', 'call', addr, 'underlyingToken()(address)', '--rpc-url', rpc),
+                  'nativeConverter': run('cast', 'call', addr, 'nativeConverter()(address)', '--rpc-url', rpc),
+                  'migrationManager': run('cast', 'call', addr, 'migrationManager()(address)', '--rpc-url', rpc),
+                  'bridge': run('cast', 'call', addr, 'bridge()(address)', '--rpc-url', rpc),
+                  'agglayerBridge': run('cast', 'call', addr, 'agglayerBridge()(address)', '--rpc-url', rpc),
+                  'totalSupply': run('cast', 'call', addr, 'totalSupply()(uint256)', '--rpc-url', rpc),
+                  'backingOnSecondaryChain': run(
+                      'cast', 'call', addr, 'backingOnSecondaryChain()(uint256)', '--rpc-url', rpc
+                  ),
+              }
+              states.append(row)
+
+          report = {
+              'chain_id': 747474,
+              'latest_block': latest,
+              'broadcast_commit': 'c2ece8a5a4618ba3b06412b58e2a063fb014aadb',
+              'transaction_count': len(tx_rows),
+              'unique_address_count': len(addresses),
+              'transactions': tx_rows,
+              'states': states,
+          }
+          (root/'katana_vaultbridge_state.json').write_text(json.dumps(report, indent=2, sort_keys=True)+'\n')
+
+          compact = []
+          for row in states:
+              counter = row['globalInitializationCounter']
+              impl = row['implementation_slot']['stdout']
+              if counter['ok'] or (impl and int(impl, 16) != 0):
+                  compact.append({
+                      'address': row['address'],
+                      'code_bytes': row['code_bytes'],
+                      'implementation_slot': impl,
+                      'globalInitializationCounter': counter['stdout'] if counter['ok'] else None,
+                      'customToken': row['customToken']['stdout'] if row['customToken']['ok'] else None,
+                      'underlyingToken': row['underlyingToken']['stdout'] if row['underlyingToken']['ok'] else None,
+                      'nativeConverter': row['nativeConverter']['stdout'] if row['nativeConverter']['ok'] else None,
+                      'migrationManager': row['migrationManager']['stdout'] if row['migrationManager']['ok'] else None,
+                      'bridge': row['bridge']['stdout'] if row['bridge']['ok'] else None,
+                      'agglayerBridge': row['agglayerBridge']['stdout'] if row['agglayerBridge']['ok'] else None,
+                      'totalSupply': row['totalSupply']['stdout'] if row['totalSupply']['ok'] else None,
+                      'backingOnSecondaryChain': row['backingOnSecondaryChain']['stdout'] if row['backingOnSecondaryChain']['ok'] else None,
+                  })
+          (root/'katana_vaultbridge_state_compact.json').write_text(json.dumps(compact, indent=2, sort_keys=True)+'\n')
+          print(json.dumps(compact, indent=2, sort_keys=True))
+          PY
+          sha256sum evidence/* > evidence/SHA256SUMS
+
+      - name: Upload read-only state inventory
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-vaultbridge-state-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
