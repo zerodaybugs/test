@@ -1,0 +1,251 @@
+name: OP Mainnet L1 fault-proof live-state inventory
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/op-l1-live-fault-proof-state.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Query read-only OP Mainnet L1 state at one pinned block
+        shell: bash
+        env:
+          RPC_URLS: "https://ethereum-rpc.publicnode.com https://eth.llamarpc.com"
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          RPC_URLS = os.environ['RPC_URLS'].split()
+          ADDRESSES = {
+              'OptimismPortalProxy': '0xbEb5Fc579115071764c7423A4f12eDde41f106Ed',
+              'ProxyAdmin': '0x543bA4AADBAb8f9025686Bd03993043599c6fB04',
+              'DisputeGameFactoryProxy': '0xe5965Ab5962eDc7477C8520243A95517CD252fA9',
+              'SystemConfigProxy': '0x229047fed2591dbec1eF1118d64F7aF3dB9EB290',
+              'PermissionedDisputeGame': '0xE9daD167EF4DE8812C1abD013Ac9570C616599A0',
+              'DelayedWETH': '0xE497B094d6DbB3D5E4CaAc9a14696D7572588d14',
+              'AnchorStateRegistryProxy': '0x18DAc71c228D1C32c99489B7323d441E1175e443',
+              'FaultDisputeGame': '0x4146DF64D83acB0DcB0c1a4884a16f090165e122',
+              'OptimismPortalImplementationListed': '0xe2F826324b2faf99E513D16D266c3F80aE87832B',
+          }
+          IMPLEMENTATION_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
+          ADMIN_SLOT = '0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103'
+
+          SELECTORS = {
+              'version': '0x54fd4d50',
+              'owner': '0x8da5cb5b',
+              'paused': '0x5c975abb',
+              'portal.systemConfig': '0x33d7e2bd',
+              'portal.anchorStateRegistry': '0x5c0cba33',
+              'portal.ethLockbox': '0xb682c444',
+              'asr.disputeGameFactory': '0xf2b4e617',
+              'asr.anchorGame': '0xe0a840eb',
+              'asr.respectedGameType': '0x3c9f397c',
+              'asr.retirementTimestamp': '0x4086d183',
+              'asr.getAnchorRoot': '0xd83ef267',
+              'asr.disputeGameFinalityDelaySeconds': '0x952b2797',
+              'dgf.gameCount': '0x4d1975b4',
+              'dgf.gameImpls': '0x1b685b9e',
+              'dgf.gameArgs': '0x74cc86ac',
+          }
+
+          request_log: list[dict[str, object]] = []
+          response_log: list[dict[str, object]] = []
+          request_id = 0
+          selected_rpc: str | None = None
+
+          def rpc(method: str, params: list[object], label: str) -> object:
+              global request_id, selected_rpc
+              request_id += 1
+              body_obj = {'jsonrpc': '2.0', 'id': request_id, 'method': method, 'params': params}
+              body = json.dumps(body_obj, separators=(',', ':')).encode()
+              errors = []
+              candidates = [selected_rpc] if selected_rpc else []
+              candidates += [url for url in RPC_URLS if url != selected_rpc]
+              for url in candidates:
+                  if not url:
+                      continue
+                  req = urllib.request.Request(
+                      url,
+                      data=body,
+                      headers={'Content-Type': 'application/json', 'User-Agent': 'op-read-only-fault-proof-inventory/1.0'},
+                      method='POST',
+                  )
+                  try:
+                      with urllib.request.urlopen(req, timeout=35) as resp:
+                          parsed = json.loads(resp.read().decode())
+                      if 'error' in parsed:
+                          errors.append({'rpc': url, 'error': parsed['error']})
+                          continue
+                      selected_rpc = url
+                      request_log.append({'label': label, 'method': method, 'params': params})
+                      response_log.append({'label': label, 'result': parsed.get('result')})
+                      time.sleep(0.04)
+                      return parsed.get('result')
+                  except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+                      errors.append({'rpc': url, 'error': repr(exc)})
+              raise SystemExit(f'{label}: all RPC endpoints failed: {errors!r}')
+
+          def word_arg(value: int) -> str:
+              return value.to_bytes(32, 'big').hex()
+
+          def eth_call(to: str, data: str, block: str, label: str) -> str:
+              return str(rpc('eth_call', [{'to': to, 'data': data}, block], label))
+
+          def decode_uint(raw: str) -> int | None:
+              try:
+                  return int(raw, 16)
+              except Exception:
+                  return None
+
+          def decode_address(raw: str) -> str | None:
+              if not isinstance(raw, str) or not raw.startswith('0x') or len(raw) < 42:
+                  return None
+              return '0x' + raw[-40:]
+
+          def decode_bool(raw: str) -> bool | None:
+              value = decode_uint(raw)
+              return None if value is None else bool(value)
+
+          def decode_string(raw: str) -> str | None:
+              try:
+                  data = bytes.fromhex(raw[2:])
+                  if len(data) < 64:
+                      return None
+                  offset = int.from_bytes(data[:32], 'big')
+                  length = int.from_bytes(data[offset:offset + 32], 'big')
+                  return data[offset + 32:offset + 32 + length].decode()
+              except Exception:
+                  return None
+
+          def decode_dynamic_bytes(raw: str) -> str | None:
+              try:
+                  data = bytes.fromhex(raw[2:])
+                  if len(data) < 64:
+                      return None
+                  offset = int.from_bytes(data[:32], 'big')
+                  length = int.from_bytes(data[offset:offset + 32], 'big')
+                  return '0x' + data[offset + 32:offset + 32 + length].hex()
+              except Exception:
+                  return None
+
+          block_number_hex = str(rpc('eth_blockNumber', [], 'eth_blockNumber'))
+          block_number = int(block_number_hex, 16)
+          block = hex(block_number)
+          block_obj = rpc('eth_getBlockByNumber', [block, False], 'pinnedBlock')
+
+          report: dict[str, object] = {
+              'rpc': selected_rpc,
+              'block_number': block_number,
+              'block_hash': block_obj.get('hash') if isinstance(block_obj, dict) else None,
+              'contracts': {},
+              'fault_proof': {},
+          }
+
+          for name, address in ADDRESSES.items():
+              code = str(rpc('eth_getCode', [address, block], f'{name}.code'))
+              impl_raw = str(rpc('eth_getStorageAt', [address, IMPLEMENTATION_SLOT, block], f'{name}.implementationSlot'))
+              admin_raw = str(rpc('eth_getStorageAt', [address, ADMIN_SLOT, block], f'{name}.adminSlot'))
+              version_raw = eth_call(address, SELECTORS['version'], block, f'{name}.version')
+              report['contracts'][name] = {
+                  'address': address,
+                  'code_bytes': max(0, (len(code) - 2) // 2),
+                  'code_hash': hashlib.sha256(bytes.fromhex(code[2:])).hexdigest() if len(code) > 2 else None,
+                  'implementation_slot': decode_address(impl_raw),
+                  'admin_slot': decode_address(admin_raw),
+                  'version': decode_string(version_raw),
+                  'version_raw': version_raw,
+              }
+
+          portal = ADDRESSES['OptimismPortalProxy']
+          portal_values = {}
+          for key in ('portal.systemConfig', 'portal.anchorStateRegistry', 'portal.ethLockbox'):
+              raw = eth_call(portal, SELECTORS[key], block, key)
+              portal_values[key.split('.', 1)[1]] = decode_address(raw)
+          portal_values['paused'] = decode_bool(eth_call(portal, SELECTORS['paused'], block, 'portal.paused'))
+          report['fault_proof']['portal'] = portal_values
+
+          asr = ADDRESSES['AnchorStateRegistryProxy']
+          asr_values = {
+              'disputeGameFactory': decode_address(eth_call(asr, SELECTORS['asr.disputeGameFactory'], block, 'asr.disputeGameFactory')),
+              'anchorGame': decode_address(eth_call(asr, SELECTORS['asr.anchorGame'], block, 'asr.anchorGame')),
+              'respectedGameType': decode_uint(eth_call(asr, SELECTORS['asr.respectedGameType'], block, 'asr.respectedGameType')),
+              'retirementTimestamp': decode_uint(eth_call(asr, SELECTORS['asr.retirementTimestamp'], block, 'asr.retirementTimestamp')),
+              'disputeGameFinalityDelaySeconds': decode_uint(eth_call(asr, SELECTORS['asr.disputeGameFinalityDelaySeconds'], block, 'asr.disputeGameFinalityDelaySeconds')),
+              'paused': decode_bool(eth_call(asr, SELECTORS['paused'], block, 'asr.paused')),
+          }
+          anchor_raw = eth_call(asr, SELECTORS['asr.getAnchorRoot'], block, 'asr.getAnchorRoot')
+          try:
+              anchor_bytes = bytes.fromhex(anchor_raw[2:])
+              asr_values['anchorRoot'] = '0x' + anchor_bytes[:32].hex()
+              asr_values['anchorL2SequenceNumber'] = int.from_bytes(anchor_bytes[32:64], 'big')
+          except Exception:
+              asr_values['anchorRoot_raw'] = anchor_raw
+          report['fault_proof']['anchorStateRegistry'] = asr_values
+
+          dgf = ADDRESSES['DisputeGameFactoryProxy']
+          dgf_values: dict[str, object] = {
+              'owner': decode_address(eth_call(dgf, SELECTORS['owner'], block, 'dgf.owner')),
+              'gameCount': decode_uint(eth_call(dgf, SELECTORS['dgf.gameCount'], block, 'dgf.gameCount')),
+              'gameTypes': {},
+          }
+          discovered_impls: set[str] = set()
+          for game_type in range(0, 16):
+              suffix = word_arg(game_type)
+              impl_raw = eth_call(dgf, SELECTORS['dgf.gameImpls'] + suffix, block, f'dgf.gameImpls[{game_type}]')
+              args_raw = eth_call(dgf, SELECTORS['dgf.gameArgs'] + suffix, block, f'dgf.gameArgs[{game_type}]')
+              impl = decode_address(impl_raw)
+              args = decode_dynamic_bytes(args_raw)
+              entry: dict[str, object] = {'implementation': impl, 'gameArgs': args, 'gameArgs_raw': args_raw}
+              if impl and int(impl, 16) != 0:
+                  discovered_impls.add(impl)
+              dgf_values['gameTypes'][str(game_type)] = entry
+          report['fault_proof']['disputeGameFactory'] = dgf_values
+
+          impl_details = {}
+          for impl in sorted(discovered_impls):
+              code = str(rpc('eth_getCode', [impl, block], f'gameImpl[{impl}].code'))
+              version_raw = eth_call(impl, SELECTORS['version'], block, f'gameImpl[{impl}].version')
+              impl_details[impl] = {
+                  'code_bytes': max(0, (len(code) - 2) // 2),
+                  'code_hash': hashlib.sha256(bytes.fromhex(code[2:])).hexdigest() if len(code) > 2 else None,
+                  'version': decode_string(version_raw),
+                  'version_raw': version_raw,
+              }
+          report['fault_proof']['gameImplementations'] = impl_details
+
+          out = Path('out')
+          (out / 'request-log.json').write_text(json.dumps(request_log, indent=2) + '\n')
+          (out / 'response-log.json').write_text(json.dumps(response_log, indent=2) + '\n')
+          (out / 'live-state.json').write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
+          manifest = []
+          for path in sorted(out.glob('*.json')):
+              manifest.append(f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}')
+          (out / 'SHA256SUMS').write_text('\n'.join(manifest) + '\n')
+          print(json.dumps(report, indent=2, sort_keys=True))
+          PY
+
+      - name: Upload read-only evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: op-mainnet-l1-fault-proof-live-state
+          path: out/
+          if-no-files-found: error
+          retention-days: 3
