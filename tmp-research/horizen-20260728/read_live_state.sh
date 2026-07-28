@@ -10,9 +10,11 @@ MAIN_THIRDWEB='https://26514.rpc.thirdweb.com'
 TEST_OFFICIAL='https://horizen-testnet.rpc.caldera.xyz/http'
 
 STAKER='0x6BF7CF29a8bcE11Aa62Cf593d165C244fA4d3E31'
-ACC='0x06f5555fee73EDdc385b6d76FE00DB2D96ccDaE8'
+ACC='0x06f5555fee73EDdc385b6d76fe00DB2D96ccDaE8'
 TOKEN='0x57da2D504bf8b83Ef304759d9f2648522D7a9280'
 DEPLOYER='0x9B264B21ca7659C256aD09171f827976Acd5a1C3'
+SAFE='0x1Afb144aaD0aE02f3Bb04C1eae4AC6020a727A21'
+SENTINEL='0x0000000000000000000000000000000000000001'
 
 MAIN_HASHES=(
   0x2f437f3e0a65a64d80bc5a9f1a3651568be4904a71c7df4c3bfd6fd2961b229c
@@ -67,6 +69,12 @@ collect_calls() {
     echo "staker_token_balance=$(timeout 30 cast call "$TOKEN" 'balanceOf(address)(uint256)' "$STAKER" --rpc-url "$url" 2>&1)"
     echo "acc_token_balance=$(timeout 30 cast call "$TOKEN" 'balanceOf(address)(uint256)' "$ACC" --rpc-url "$url" 2>&1)"
     echo "deployer_nonce=$(timeout 30 cast nonce "$DEPLOYER" --rpc-url "$url" 2>&1)"
+    echo "safe_code_size=$(timeout 30 cast codesize "$SAFE" --rpc-url "$url" 2>&1)"
+    echo "safe_version=$(timeout 30 cast call "$SAFE" 'VERSION()(string)' --rpc-url "$url" 2>&1)"
+    echo "safe_threshold=$(timeout 30 cast call "$SAFE" 'getThreshold()(uint256)' --rpc-url "$url" 2>&1)"
+    echo "safe_owners=$(timeout 30 cast call "$SAFE" 'getOwners()(address[])' --rpc-url "$url" 2>&1)"
+    echo "safe_nonce=$(timeout 30 cast call "$SAFE" 'nonce()(uint256)' --rpc-url "$url" 2>&1)"
+    echo "safe_modules=$(timeout 30 cast call "$SAFE" 'getModulesPaginated(address,uint256)(address[],address)' "$SENTINEL" 20 --rpc-url "$url" 2>&1)"
   } > "$out"
 
   timeout 45 cast logs --rpc-url "$url" --from-block 21317418 --to-block latest \
@@ -77,8 +85,13 @@ collect_calls() {
     --address "$STAKER" 'AdminSet(address,address)' \
     > "$OUT/${name}-admin-events.log" 2>&1
 
+  timeout 45 cast logs --rpc-url "$url" --from-block 21317418 --to-block latest \
+    --address "$STAKER" 'RewardNotifierSet(address,bool)' \
+    > "$OUT/${name}-notifier-events.log" 2>&1
+
   timeout 30 cast code "$STAKER" --rpc-url "$url" > "$OUT/${name}-staker-code.hex" 2>&1
   timeout 30 cast code "$ACC" --rpc-url "$url" > "$OUT/${name}-acc-code.hex" 2>&1
+  timeout 30 cast code "$SAFE" --rpc-url "$url" > "$OUT/${name}-safe-code.hex" 2>&1
 }
 
 collect_transactions() {
