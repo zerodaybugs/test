@@ -1,0 +1,157 @@
+name: Temporary encrypted Horizen compiler-independent RPC census
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/tmp-horizen-rpc-census.yml"
+      - "tmp-horizen-rpc-census/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: horizen-rpc-census-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout sanitized census
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: horizen-live-state-20260728-a
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install Foundry v1.7.1 for selector derivation
+        id: foundry
+        continue-on-error: true
+        uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a
+        with:
+          version: v1.7.1
+
+      - name: Execute compiler-independent read-only census
+        if: always()
+        shell: bash
+        env:
+          FOUNDRY_ACTION_OUTCOME: ${{ steps.foundry.outcome }}
+        run: |
+          set +e
+          rm -rf collected encrypted-output
+          mkdir -p collected
+          {
+            echo "foundry_action_outcome=${FOUNDRY_ACTION_OUTCOME}"
+            forge --version
+            cast --version
+          } > collected/toolchain.log 2>&1
+          toolchain_rc=$?
+
+          if [ "$toolchain_rc" = 0 ]; then
+            timeout 2100 python3 tmp-horizen-rpc-census/census.py \
+              > collected/census.json 2> collected/census-error.log
+            census_rc=$?
+          else
+            census_rc=99
+          fi
+
+          printf '%s\n' \
+            "foundry_action_outcome=${FOUNDRY_ACTION_OUTCOME}" \
+            "toolchain_rc=${toolchain_rc}" \
+            "census_rc=${census_rc}" \
+            "public_network_writes=0" \
+            > collected/status.txt
+
+          if [ "$census_rc" = 0 ]; then
+            python3 - <<'PY' > collected/sanitized-summary.txt
+          import json
+          from pathlib import Path
+          obj = json.loads(Path('collected/census.json').read_text())
+          result = obj['result']
+          keep = [
+              'block', 'timestamp', 'next_deposit_id', 'unique_owners', 'unique_delegatees',
+              'total_staked', 'total_power', 'surrogate_balance_sum', 'surrogate_surplus',
+              'empty_surrogates', 'unclaimed_sum', 'scaled_unclaimed_sum', 'remaining_scaled',
+              'total_scaled_obligations', 'staker_balance', 'reward_surplus_scaled',
+              'accumulator_balance', 'accumulator_accounted', 'zero_balance_residual_count',
+              'zero_balance_residual_reward', 'zero_balance_residual_scaled', 'safe_version',
+              'safe_threshold', 'safe_owner_count', 'safe_nonce', 'staker_code_size',
+              'staker_code_sha256', 'accumulator_code_size', 'accumulator_code_sha256',
+              'safe_code_size', 'safe_code_sha256', 'deposits_digest'
+          ]
+          print('target_commit=' + obj['target_commit'])
+          print('public_network_writes=0')
+          print('rpc_consensus=true')
+          for key in keep:
+              print(f'{key}={result[key]}')
+          PY
+          else
+            printf '%s\n' 'census_failed=1' > collected/sanitized-summary.txt
+          fi
+
+          printf '%s\n' \
+            'Public endpoints supplied eth_call/storage/code data only; no transaction was signed or broadcast.' \
+            > collected/network-safety.txt
+          exit 0
+
+      - name: Encrypt complete evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted-output collected
+          test -s tmp-horizen-rpc-census/output-public.pem
+          if [ ! -s collected/status.txt ]; then
+            printf '%s\n' 'bootstrap_status=missing' > collected/status.txt
+          fi
+
+          tar --sort=name --mtime='UTC 2026-07-28' --owner=0 --group=0 --numeric-owner \
+            -czf /tmp/horizen-rpc-census.tar.gz collected
+          sha256sum /tmp/horizen-rpc-census.tar.gz | awk '{print $1}' \
+            > encrypted-output/evidence-plaintext.sha256
+
+          openssl rand 32 > /tmp/key.bin
+          openssl rand 16 > /tmp/iv.bin
+          cat /tmp/key.bin /tmp/iv.bin > /tmp/keyinfo.bin
+          KEY=$(od -An -tx1 -v /tmp/key.bin | tr -d ' \n')
+          IV=$(od -An -tx1 -v /tmp/iv.bin | tr -d ' \n')
+          openssl enc -aes-256-cbc -K "$KEY" -iv "$IV" \
+            -in /tmp/horizen-rpc-census.tar.gz \
+            -out encrypted-output/evidence.tar.gz.enc
+          openssl pkeyutl -encrypt \
+            -pubin -inkey tmp-horizen-rpc-census/output-public.pem \
+            -in /tmp/keyinfo.bin \
+            -out encrypted-output/evidence-keyinfo.enc \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+
+          cp collected/status.txt encrypted-output/status.txt
+          cp collected/sanitized-summary.txt encrypted-output/sanitized-summary.txt
+          sha256sum encrypted-output/* > encrypted-output/SHA256SUMS
+          rm -rf collected
+          rm -f /tmp/key.bin /tmp/iv.bin /tmp/keyinfo.bin /tmp/horizen-rpc-census.tar.gz
+
+      - name: Upload encrypted evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizen-rpc-census-${{ github.run_id }}
+          path: encrypted-output/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Verify evidence package
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s encrypted-output/evidence.tar.gz.enc
+          test -s encrypted-output/evidence-keyinfo.enc
+          test -s encrypted-output/evidence-plaintext.sha256
+          test -s encrypted-output/status.txt
+          test -s encrypted-output/sanitized-summary.txt
+          test -s encrypted-output/SHA256SUMS
+          test ! -e collected
