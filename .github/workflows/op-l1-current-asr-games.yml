@@ -1,0 +1,339 @@
+name: OP Mainnet current ASR and dispute-game inventory
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/op-l1-current-asr-games.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Query current Portal-linked ASR and recent games read-only
+        shell: bash
+        env:
+          RPC_URLS: "https://ethereum-rpc.publicnode.com https://eth.llamarpc.com"
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          RPC_URLS = os.environ['RPC_URLS'].split()
+          PORTAL = '0xbEb5Fc579115071764c7423A4f12eDde41f106Ed'
+          DGF = '0xe5965Ab5962eDc7477C8520243A95517CD252fA9'
+          SYSTEM_CONFIG = '0x229047fed2591dbec1eF1118d64F7aF3dB9EB290'
+          IMPLEMENTATION_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
+          ADMIN_SLOT = '0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103'
+          S = {
+              'version': '0x54fd4d50',
+              'owner': '0x8da5cb5b',
+              'paused': '0x5c975abb',
+              'portal.anchorStateRegistry': '0x5c0cba33',
+              'portal.ethLockbox': '0xb682c444',
+              'portal.respectedGameType': '0x3c9f397c',
+              'portal.retirementTimestamp': '0x4fd0434c',
+              'portal.finalityDelay': '0x952b2797',
+              'asr.disputeGameFactory': '0xf2b4e617',
+              'asr.anchorGame': '0xe0a840eb',
+              'asr.respectedGameType': '0x3c9f397c',
+              'asr.retirementTimestamp': '0x4086d183',
+              'asr.getAnchorRoot': '0xd83ef267',
+              'asr.getStartingAnchorRoot': '0x664ed830',
+              'asr.finalityDelay': '0x952b2797',
+              'asr.isGameRegistered': '0xee658e45',
+              'asr.isGameProper': '0x496b9c16',
+              'asr.isGameRespected': '0x04e50fed',
+              'asr.isGameRetired': '0x5958a193',
+              'asr.isGameFinalized': '0x0314d2b3',
+              'asr.isGameClaimValid': '0x6c4f4467',
+              'dgf.gameCount': '0x4d1975b4',
+              'dgf.gameAtIndex': '0xbb8aa1fc',
+              'dgf.gameImpls': '0x1b685b9e',
+              'dgf.gameArgs': '0x74cc86ac',
+              'dgf.initBonds': '0x6593dc6e',
+              'game.status': '0x200d2ed2',
+              'game.createdAt': '0xcf09e0d0',
+              'game.resolvedAt': '0x19effeb4',
+              'game.gameType': '0xbbdc02db',
+              'game.rootClaim': '0xbcef3b55',
+              'game.l2SequenceNumber': '0x99735e32',
+              'game.wasRespected': '0x250e69bd',
+              'game.anchorStateRegistry': '0x5c0cba33',
+              'game.gameData': '0xfa24f743',
+              'systemConfig.isFeatureEnabled': '0x47af267b',
+              'systemConfig.l2ChainId': '0xd6ae3cd5',
+          }
+
+          req_id = 0
+          selected_rpc: str | None = None
+          requests: list[dict[str, object]] = []
+          responses: list[dict[str, object]] = []
+          errors: list[dict[str, object]] = []
+
+          def rpc(method: str, params: list[object], label: str, required: bool = True):
+              global req_id, selected_rpc
+              req_id += 1
+              body_obj = {'jsonrpc': '2.0', 'id': req_id, 'method': method, 'params': params}
+              body = json.dumps(body_obj, separators=(',', ':')).encode()
+              requests.append({'label': label, 'method': method, 'params': params})
+              failures = []
+              candidates = [selected_rpc] if selected_rpc else []
+              candidates += [u for u in RPC_URLS if u != selected_rpc]
+              for url in candidates:
+                  if not url:
+                      continue
+                  request = urllib.request.Request(
+                      url, data=body,
+                      headers={'Content-Type': 'application/json', 'User-Agent': 'op-current-asr-inventory/1.0'},
+                      method='POST',
+                  )
+                  try:
+                      with urllib.request.urlopen(request, timeout=35) as response:
+                          parsed = json.loads(response.read().decode())
+                      if 'error' in parsed:
+                          failures.append({'rpc': url, 'error': parsed['error']})
+                          continue
+                      selected_rpc = url
+                      responses.append({'label': label, 'rpc': url, 'result': parsed.get('result')})
+                      time.sleep(0.035)
+                      return parsed.get('result')
+                  except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+                      failures.append({'rpc': url, 'error': repr(exc)})
+              item = {'label': label, 'method': method, 'failures': failures}
+              errors.append(item)
+              responses.append(item)
+              if required:
+                  Path('out/fatal.json').write_text(json.dumps(item, indent=2) + '\n')
+                  raise SystemExit(f'{label}: {failures!r}')
+              return None
+
+          def call(to: str, data: str, block: str, label: str, required: bool = False) -> str | None:
+              value = rpc('eth_call', [{'to': to, 'data': data}, block], label, required)
+              return None if value is None else str(value)
+
+          def word(value: int) -> str:
+              return value.to_bytes(32, 'big').hex()
+
+          def address_arg(address: str) -> str:
+              return address[2:].lower().rjust(64, '0')
+
+          def bytes32_text(text: str) -> str:
+              raw = text.encode()
+              if len(raw) > 32:
+                  raise ValueError(text)
+              return (raw + b'\0' * (32 - len(raw))).hex()
+
+          def uint(raw: str | None) -> int | None:
+              try:
+                  return int(raw, 16) if raw is not None else None
+              except Exception:
+                  return None
+
+          def addr(raw: str | None) -> str | None:
+              if not isinstance(raw, str) or not raw.startswith('0x') or len(raw) < 42:
+                  return None
+              return '0x' + raw[-40:]
+
+          def boolean(raw: str | None) -> bool | None:
+              value = uint(raw)
+              return None if value is None else bool(value)
+
+          def string(raw: str | None) -> str | None:
+              try:
+                  if raw is None:
+                      return None
+                  data = bytes.fromhex(raw[2:])
+                  offset = int.from_bytes(data[:32], 'big')
+                  length = int.from_bytes(data[offset:offset+32], 'big')
+                  return data[offset+32:offset+32+length].decode()
+              except Exception:
+                  return None
+
+          def dynbytes(raw: str | None) -> str | None:
+              try:
+                  if raw is None:
+                      return None
+                  data = bytes.fromhex(raw[2:])
+                  offset = int.from_bytes(data[:32], 'big')
+                  length = int.from_bytes(data[offset:offset+32], 'big')
+                  return '0x' + data[offset+32:offset+32+length].hex()
+              except Exception:
+                  return None
+
+          def contract_meta(address: str, block: str, label: str) -> dict[str, object]:
+              code = str(rpc('eth_getCode', [address, block], f'{label}.code', True))
+              impl_raw = str(rpc('eth_getStorageAt', [address, IMPLEMENTATION_SLOT, block], f'{label}.implementation', True))
+              admin_raw = str(rpc('eth_getStorageAt', [address, ADMIN_SLOT, block], f'{label}.admin', True))
+              version_raw = call(address, S['version'], block, f'{label}.version')
+              return {
+                  'address': address,
+                  'code_bytes': (len(code) - 2) // 2,
+                  'code_sha256': hashlib.sha256(bytes.fromhex(code[2:])).hexdigest() if len(code) > 2 else None,
+                  'implementation': addr(impl_raw),
+                  'admin': addr(admin_raw),
+                  'version': string(version_raw),
+                  'version_raw': version_raw,
+              }
+
+          block_hex = str(rpc('eth_blockNumber', [], 'eth_blockNumber', True))
+          block_num = int(block_hex, 16)
+          block = hex(block_num)
+          block_obj = rpc('eth_getBlockByNumber', [block, False], 'block', True)
+
+          current_asr = addr(call(PORTAL, S['portal.anchorStateRegistry'], block, 'portal.anchorStateRegistry', True))
+          current_lockbox = addr(call(PORTAL, S['portal.ethLockbox'], block, 'portal.ethLockbox', True))
+          if current_asr is None or current_lockbox is None:
+              raise SystemExit('failed to decode Portal-linked contracts')
+
+          report: dict[str, object] = {
+              'rpc': selected_rpc,
+              'block_number': block_num,
+              'block_hash': block_obj.get('hash') if isinstance(block_obj, dict) else None,
+              'contracts': {
+                  'portal': contract_meta(PORTAL, block, 'portal'),
+                  'currentASR': contract_meta(current_asr, block, 'currentASR'),
+                  'currentETHLockbox': contract_meta(current_lockbox, block, 'currentETHLockbox'),
+                  'disputeGameFactory': contract_meta(DGF, block, 'dgf'),
+              },
+              'portal': {},
+              'asr': {},
+              'systemConfig': {},
+              'gameTypes': {},
+              'recentGames': [],
+          }
+
+          report['portal'] = {
+              'currentASR': current_asr,
+              'currentETHLockbox': current_lockbox,
+              'respectedGameType': uint(call(PORTAL, S['portal.respectedGameType'], block, 'portal.respectedGameType')),
+              'retirementTimestamp': uint(call(PORTAL, S['portal.retirementTimestamp'], block, 'portal.retirementTimestamp')),
+              'finalityDelay': uint(call(PORTAL, S['portal.finalityDelay'], block, 'portal.finalityDelay')),
+              'paused': boolean(call(PORTAL, S['paused'], block, 'portal.paused')),
+          }
+
+          anchor_raw = call(current_asr, S['asr.getAnchorRoot'], block, 'asr.getAnchorRoot')
+          starting_raw = call(current_asr, S['asr.getStartingAnchorRoot'], block, 'asr.getStartingAnchorRoot')
+          anchor_game = addr(call(current_asr, S['asr.anchorGame'], block, 'asr.anchorGame'))
+          report['asr'] = {
+              'address': current_asr,
+              'disputeGameFactory': addr(call(current_asr, S['asr.disputeGameFactory'], block, 'asr.disputeGameFactory')),
+              'anchorGame': anchor_game,
+              'respectedGameType': uint(call(current_asr, S['asr.respectedGameType'], block, 'asr.respectedGameType')),
+              'retirementTimestamp': uint(call(current_asr, S['asr.retirementTimestamp'], block, 'asr.retirementTimestamp')),
+              'finalityDelay': uint(call(current_asr, S['asr.finalityDelay'], block, 'asr.finalityDelay')),
+              'paused': boolean(call(current_asr, S['paused'], block, 'asr.paused')),
+              'anchorRoot_raw': anchor_raw,
+              'startingAnchorRoot_raw': starting_raw,
+          }
+          if anchor_raw:
+              data = bytes.fromhex(anchor_raw[2:])
+              if len(data) >= 64:
+                  report['asr']['anchorRoot'] = '0x' + data[:32].hex()
+                  report['asr']['anchorL2SequenceNumber'] = int.from_bytes(data[32:64], 'big')
+          if starting_raw:
+              data = bytes.fromhex(starting_raw[2:])
+              if len(data) >= 64:
+                  report['asr']['startingAnchorRoot'] = '0x' + data[:32].hex()
+                  report['asr']['startingAnchorL2SequenceNumber'] = int.from_bytes(data[32:64], 'big')
+
+          features = {}
+          for feature in ('ETH_LOCKBOX', 'CUSTOM_GAS_TOKEN', 'INTEROP'):
+              raw = call(
+                  SYSTEM_CONFIG,
+                  S['systemConfig.isFeatureEnabled'] + bytes32_text(feature),
+                  block,
+                  f'systemConfig.isFeatureEnabled[{feature}]',
+              )
+              features[feature] = boolean(raw)
+          report['systemConfig'] = {
+              'l2ChainId': uint(call(SYSTEM_CONFIG, S['systemConfig.l2ChainId'], block, 'systemConfig.l2ChainId')),
+              'features': features,
+          }
+
+          game_count = uint(call(DGF, S['dgf.gameCount'], block, 'dgf.gameCount', True))
+          report['gameCount'] = game_count
+          for game_type in (1, 8):
+              suffix = word(game_type)
+              impl_raw = call(DGF, S['dgf.gameImpls'] + suffix, block, f'dgf.gameImpls[{game_type}]', True)
+              args_raw = call(DGF, S['dgf.gameArgs'] + suffix, block, f'dgf.gameArgs[{game_type}]')
+              bond_raw = call(DGF, S['dgf.initBonds'] + suffix, block, f'dgf.initBonds[{game_type}]')
+              implementation = addr(impl_raw)
+              report['gameTypes'][str(game_type)] = {
+                  'implementation': implementation,
+                  'implementationMeta': contract_meta(implementation, block, f'gameType{game_type}.implementation') if implementation and int(implementation, 16) else None,
+                  'gameArgs': dynbytes(args_raw),
+                  'gameArgs_raw': args_raw,
+                  'initBondWei': uint(bond_raw),
+              }
+
+          def game_detail(index: int, game_type: int, created: int, game: str) -> dict[str, object]:
+              game_arg = address_arg(game)
+              predicates = {}
+              for name in ('isGameRegistered', 'isGameProper', 'isGameRespected', 'isGameRetired', 'isGameFinalized', 'isGameClaimValid'):
+                  raw = call(current_asr, S['asr.' + name] + game_arg, block, f'asr.{name}[{index}]')
+                  predicates[name] = boolean(raw)
+              return {
+                  'index': index,
+                  'address': game,
+                  'listedGameType': game_type,
+                  'listedCreatedAt': created,
+                  'status': uint(call(game, S['game.status'], block, f'game[{index}].status')),
+                  'createdAt': uint(call(game, S['game.createdAt'], block, f'game[{index}].createdAt')),
+                  'resolvedAt': uint(call(game, S['game.resolvedAt'], block, f'game[{index}].resolvedAt')),
+                  'gameType': uint(call(game, S['game.gameType'], block, f'game[{index}].gameType')),
+                  'rootClaim': call(game, S['game.rootClaim'], block, f'game[{index}].rootClaim'),
+                  'l2SequenceNumber': uint(call(game, S['game.l2SequenceNumber'], block, f'game[{index}].l2SequenceNumber')),
+                  'wasRespectedGameTypeWhenCreated': boolean(call(game, S['game.wasRespected'], block, f'game[{index}].wasRespected')),
+                  'anchorStateRegistry': addr(call(game, S['game.anchorStateRegistry'], block, f'game[{index}].anchorStateRegistry')),
+                  'predicates': predicates,
+              }
+
+          if game_count is not None:
+              start = max(0, game_count - 24)
+              for index in range(game_count - 1, start - 1, -1):
+                  raw = call(DGF, S['dgf.gameAtIndex'] + word(index), block, f'dgf.gameAtIndex[{index}]', True)
+                  data = bytes.fromhex(raw[2:])
+                  if len(data) < 96:
+                      raise SystemExit(f'short gameAtIndex response at {index}: {raw}')
+                  listed_type = int.from_bytes(data[:32], 'big')
+                  created = int.from_bytes(data[32:64], 'big')
+                  game = '0x' + data[64+12:96].hex()
+                  report['recentGames'].append(game_detail(index, listed_type, created, game))
+
+          if anchor_game and int(anchor_game, 16):
+              report['anchorGameDetail'] = game_detail(-1, -1, -1, anchor_game)
+
+          report['softErrors'] = errors
+          out = Path('out')
+          (out / 'live-current-asr-games.json').write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
+          (out / 'request-log.json').write_text(json.dumps(requests, indent=2) + '\n')
+          (out / 'response-log.json').write_text(json.dumps(responses, indent=2) + '\n')
+          sums = []
+          for path in sorted(out.glob('*.json')):
+              sums.append(f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}')
+          (out / 'SHA256SUMS').write_text('\n'.join(sums) + '\n')
+          print(json.dumps(report, indent=2, sort_keys=True))
+          PY
+
+      - name: Upload read-only evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: op-mainnet-current-asr-games
+          path: out/
+          if-no-files-found: error
+          retention-days: 3
