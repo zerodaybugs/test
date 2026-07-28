@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -13,16 +14,15 @@ CHAIN_ID = "26514"
 
 
 def post(query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
-    payload = json.dumps({"query": query, "variables": variables or {}}).encode()
-    req = urllib.request.Request(
+    request = urllib.request.Request(
         ENDPOINT,
-        data=payload,
+        data=json.dumps({"query": query, "variables": variables or {}}).encode(),
         headers={
             "content-type": "application/json",
-            "user-agent": "Horizen-Snapshot-read-only-attestation/1.0",
+            "user-agent": "Horizen-Snapshot-read-only-attestation/1.1",
         },
     )
-    with urllib.request.urlopen(req, timeout=60) as response:
+    with urllib.request.urlopen(request, timeout=60) as response:
         obj = json.loads(response.read())
     if obj.get("errors"):
         raise RuntimeError(json.dumps(obj["errors"], indent=2))
@@ -30,7 +30,7 @@ def post(query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 def walk(value: Any, path: str = "$") -> list[tuple[str, Any]]:
-    out: list[tuple[str, Any]] = [(path, value)]
+    out = [(path, value)]
     if isinstance(value, dict):
         for key, child in value.items():
             out.extend(walk(child, f"{path}.{key}"))
@@ -40,34 +40,37 @@ def walk(value: Any, path: str = "$") -> list[tuple[str, Any]]:
     return out
 
 
-def strategy_summary(strategies: Any) -> list[dict[str, Any]]:
-    result = []
+def summarize_strategies(strategies: Any) -> list[dict[str, Any]]:
     if not isinstance(strategies, list):
-        return result
+        return []
+    rows = []
     for strategy in strategies:
         if not isinstance(strategy, dict):
             continue
-        result.append(
+        params = strategy.get("params") if isinstance(strategy.get("params"), dict) else {}
+        url = str(params.get("url") or "")
+        parsed = urllib.parse.urlparse(url) if url else None
+        rows.append(
             {
                 "name": strategy.get("name"),
                 "network": str(strategy.get("network")) if strategy.get("network") is not None else None,
-                "params": strategy.get("params"),
+                "params": params,
+                "api_url": url or None,
+                "api_host": parsed.netloc.lower() if parsed else None,
+                "api_type": params.get("type"),
+                "decimals": params.get("decimals"),
+                "symbol": params.get("symbol"),
+                "contract": params.get("address") or params.get("contractAddress"),
             }
         )
-    return result
+    return rows
 
 
 def main() -> int:
-    output = Path("snapshot-output")
-    output.mkdir(exist_ok=True)
-
     space_query = """
     query Space($id: String!) {
       space(id: $id) {
-        id
-        name
-        network
-        symbol
+        id name network symbol
         strategies { name network params }
         validation { name params }
         voting { delay period type quorum }
@@ -78,103 +81,91 @@ def main() -> int:
     """
     proposal_query = """
     query Proposals($spaces: [String!]) {
-      proposals(
-        first: 25,
-        where: { space_in: $spaces },
-        orderBy: "created",
-        orderDirection: desc
-      ) {
-        id
-        title
-        snapshot
-        network
-        state
-        created
+      proposals(first: 25, where: { space_in: $spaces }, orderBy: "created", orderDirection: desc) {
+        id title snapshot network state created
         strategies { name network params }
       }
     }
     """
 
-    space_data = post(space_query, {"id": SPACE})
-    proposal_data = post(proposal_query, {"spaces": [SPACE]})
-    raw = {"space": space_data.get("space"), "proposals": proposal_data.get("proposals", [])}
-    (output / "raw.json").write_text(json.dumps(raw, indent=2) + "\n")
+    space = post(space_query, {"id": SPACE}).get("space") or {}
+    proposals = post(proposal_query, {"spaces": [SPACE]}).get("proposals") or []
+    current = summarize_strategies(space.get("strategies"))
+    historical = [
+        {
+            "id": proposal.get("id"),
+            "title": proposal.get("title"),
+            "snapshot": proposal.get("snapshot"),
+            "network": str(proposal.get("network")),
+            "state": proposal.get("state"),
+            "strategies": summarize_strategies(proposal.get("strategies")),
+        }
+        for proposal in proposals
+    ]
+    raw = {"space": space, "proposals": proposals}
+    Path("snapshot-output").mkdir(exist_ok=True)
+    Path("snapshot-output/raw.json").write_text(json.dumps(raw, indent=2) + "\n")
 
-    space = raw.get("space") or {}
-    proposals = raw.get("proposals") or []
-    current_strategies = strategy_summary(space.get("strategies"))
-    proposal_strategies = []
-    for proposal in proposals:
-        proposal_strategies.append(
-            {
-                "id": proposal.get("id"),
-                "title": proposal.get("title"),
-                "snapshot": proposal.get("snapshot"),
-                "network": str(proposal.get("network")),
-                "state": proposal.get("state"),
-                "strategies": strategy_summary(proposal.get("strategies")),
-            }
-        )
-
-    flattened = walk(raw)
-    staker_hits = []
-    get_votes_hits = []
-    chain_hits = []
-    for path, value in flattened:
+    staker_hits: list[dict[str, Any]] = []
+    get_votes_hits: list[dict[str, Any]] = []
+    chain_hits: list[dict[str, Any]] = []
+    for path, value in walk(raw):
         if not isinstance(value, (str, int)):
             continue
         text = str(value).lower()
         if STAKER in text:
             staker_hits.append({"path": path, "value": value})
-        if "getvotes" in text or "getvotes(address)" in text:
+        if "getvotes" in text:
             get_votes_hits.append({"path": path, "value": value})
         if text == CHAIN_ID:
             chain_hits.append({"path": path, "value": value})
 
-    names = sorted(
-        {
-            str(strategy.get("name"))
-            for strategy in current_strategies
-            + [item for proposal in proposal_strategies for item in proposal["strategies"]]
-            if strategy.get("name")
-        }
-    )
+    all_strategies = current + [strategy for item in historical for strategy in item["strategies"]]
+    names = sorted({str(item["name"]) for item in all_strategies if item.get("name")})
+    api_hosts = sorted({str(item["api_host"]) for item in all_strategies if item.get("api_host")})
+    api_urls = sorted({str(item["api_url"]) for item in all_strategies if item.get("api_url")})
     contract_call_like = [
-        name
-        for name in names
-        if any(token in name.lower() for token in ("contract-call", "call", "multicall", "delegation", "custom"))
+        name for name in names
+        if any(token in name.lower() for token in ("contract-call", "multicall", "delegation", "custom"))
     ]
+    api_v2 = [item for item in all_strategies if item.get("name") == "api-v2"]
+    uses_staker = bool(staker_hits or get_votes_hits)
 
-    current_uses_staker = bool(staker_hits or get_votes_hits)
     result = {
         "space_id": space.get("id"),
         "space_name": space.get("name"),
         "space_network": str(space.get("network")),
         "proposal_count_checked": len(proposals),
-        "current_strategies": current_strategies,
-        "proposal_strategies": proposal_strategies,
+        "current_strategies": current,
+        "proposal_strategies": historical,
         "strategy_names": names,
+        "api_hosts": api_hosts,
+        "api_urls": api_urls,
+        "api_v2_strategies": api_v2,
         "contract_call_like_strategy_names": contract_call_like,
         "staker_address_hits": staker_hits,
         "get_votes_hits": get_votes_hits,
         "horizen_l3_chain_id_hits": chain_hits,
-        "zenstaker_getvotes_consumed": current_uses_staker,
-        "pass": not current_uses_staker,
-        "security_verdict": "KILL_NO_ZENSTAKER_GOVERNANCE_CONSUMER" if not current_uses_staker else "HOLD_ZENSTAKER_GOVERNANCE_CONSUMER",
+        "zenstaker_getvotes_consumed": uses_staker,
+        "pass": not uses_staker,
+        "security_verdict": "KILL_NO_ZENSTAKER_GOVERNANCE_CONSUMER" if not uses_staker else "HOLD_ZENSTAKER_GOVERNANCE_CONSUMER",
         "public_network_writes": 0,
     }
-    (output / "RESULT.json").write_text(json.dumps(result, indent=2) + "\n")
+    Path("snapshot-output/RESULT.json").write_text(json.dumps(result, indent=2) + "\n")
 
     public = {
         "space_id": result["space_id"],
         "space_network": result["space_network"],
         "proposal_count_checked": len(proposals),
+        "current_strategies": current,
         "strategy_names": names,
+        "api_hosts": api_hosts,
+        "api_urls": api_urls,
         "contract_call_like_strategy_names": contract_call_like,
         "staker_address_hit_count": len(staker_hits),
         "get_votes_hit_count": len(get_votes_hits),
         "horizen_l3_chain_id_hit_count": len(chain_hits),
-        "zenstaker_getvotes_consumed": current_uses_staker,
+        "zenstaker_getvotes_consumed": uses_staker,
         "pass": result["pass"],
         "security_verdict": result["security_verdict"],
         "public_network_writes": 0,
@@ -187,6 +178,7 @@ def main() -> int:
         f"- Space network: `{result['space_network']}`\n"
         f"- Proposals checked: `{len(proposals)}`\n"
         f"- Strategy names: `{', '.join(names)}`\n"
+        f"- API hosts: `{', '.join(api_hosts) if api_hosts else 'none'}`\n"
         f"- ZenStaker address hits: `{len(staker_hits)}`\n"
         f"- `getVotes` hits: `{len(get_votes_hits)}`\n"
         f"- Horizen L3 chain-id hits: `{len(chain_hits)}`\n"
