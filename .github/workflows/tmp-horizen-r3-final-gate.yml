@@ -1,0 +1,284 @@
+name: Temporary Horizen R3 final gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/tmp-horizen-r3-final-gate.yml"
+      - "tmp-research/horizen-20260728/r3_gate_v2.py"
+      - "tmp-research/horizen-20260728/HorizenStatefulInvariant.t.sol"
+      - "tmp-research/horizen-20260728/HorizenDeepAudit.t.sol"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: horizen-r3-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  r3:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout sanitized research branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install Foundry v1.7.1
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Install audit extraction utilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils jq
+
+      - name: Execute exact local EVM and production read-only gates
+        id: gate
+        shell: bash
+        run: |
+          set +e
+          ROOT=/tmp/horizen-r3
+          OUT="$GITHUB_WORKSPACE/r3-output"
+          rm -rf "$ROOT" "$OUT"
+          mkdir -p "$OUT/audit-text" "$OUT/sanitized"
+
+          forge_rc=127
+          clone_rc=99
+          checkout_rc=99
+          deps_rc=99
+          patch_rc=99
+          build_rc=99
+          targeted_rc=99
+          invariant_rc=99
+          full_rc=99
+          audit_rc=99
+          shadow_rc=99
+          r3_rc=99
+
+          forge --version > "$OUT/foundry-version.log" 2>&1
+          forge_rc=$?
+
+          git clone --no-checkout https://github.com/HorizenOfficial/staker.git "$ROOT" \
+            > "$OUT/clone.log" 2>&1
+          clone_rc=$?
+          if [ "$clone_rc" = 0 ]; then
+            git -C "$ROOT" checkout --detach ab92502e9da98784dfe3bd3ef933d4e9345ff628 \
+              >> "$OUT/clone.log" 2>&1
+            checkout_rc=$?
+            git -C "$ROOT" rev-parse HEAD > "$OUT/target-head.txt" 2>&1
+          fi
+
+          if [ "$checkout_rc" = 0 ]; then
+            git -C "$ROOT" submodule update --init --recursive \
+              > "$OUT/dependencies.log" 2>&1
+            deps_rc=$?
+            sha256sum \
+              "$ROOT/src/Staker.sol" \
+              "$ROOT/src/ZenStaker.sol" \
+              "$ROOT/src/RewardAccumulator.sol" \
+              > "$OUT/scoped-source-sha256.txt" 2>&1
+          fi
+
+          if [ "$deps_rc" = 0 ]; then
+            cp tmp-research/horizen-20260728/HorizenDeepAudit.t.sol \
+              "$ROOT/test/HorizenDeepAudit.t.sol"
+            cp tmp-research/horizen-20260728/HorizenStatefulInvariant.t.sol \
+              "$ROOT/test/HorizenStatefulInvariant.t.sol"
+
+            python3 - "$ROOT/test/HorizenStatefulInvariant.t.sol" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+          needle = "targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));"
+          if needle not in text:
+              raise SystemExit("targetSelector configuration not found")
+          if "targetContract(address(handler));" not in text:
+              text = text.replace(needle, needle + "\n    targetContract(address(handler));")
+          path.write_text(text)
+          PY
+            patch_rc=$?
+          fi
+
+          if [ "$forge_rc" = 0 ] && [ "$patch_rc" = 0 ]; then
+            (cd "$ROOT" && forge build --sizes) > "$OUT/build.log" 2>&1
+            build_rc=$?
+
+            (cd "$ROOT" && forge test \
+              --match-path test/HorizenDeepAudit.t.sol \
+              --fuzz-runs 10000 -vvv) > "$OUT/targeted.log" 2>&1
+            targeted_rc=$?
+
+            (cd "$ROOT" && \
+              FOUNDRY_PROFILE=ci \
+              FOUNDRY_FUZZ_SEED=2026072803 \
+              FOUNDRY_INVARIANT_RUNS=2000 \
+              FOUNDRY_INVARIANT_DEPTH=100 \
+              FOUNDRY_INVARIANT_FAIL_ON_REVERT=false \
+              forge test --match-contract HorizenStatefulInvariants -vvv) \
+              > "$OUT/handler-only-invariant.log" 2>&1
+            invariant_rc=$?
+
+            if [ "$invariant_rc" = 0 ] \
+              && grep -q 'Suite result: ok' "$OUT/handler-only-invariant.log" \
+              && grep -q 'targetContract(address(handler));' "$ROOT/test/HorizenStatefulInvariant.t.sol"; then
+              printf '%s\n' PASS > "$OUT/handler-gate.txt"
+            else
+              printf '%s\n' HOLD > "$OUT/handler-gate.txt"
+            fi
+
+            rm -f "$ROOT/test/HorizenStatefulInvariant.t.sol"
+            (cd "$ROOT" && FOUNDRY_PROFILE=ci FOUNDRY_FUZZ_SEED=20260728 forge test -vv) \
+              > "$OUT/full-suite.log" 2>&1
+            full_rc=$?
+          fi
+
+          if [ "$checkout_rc" = 0 ]; then
+            audit_fail=0
+            while IFS= read -r -d '' pdf; do
+              rel=${pdf#"$ROOT/"}
+              safe=${rel//\//__}
+              safe=${safe// /_}
+              pdfinfo "$pdf" > "$OUT/audit-text/${safe}.pdfinfo.txt" 2>&1 || audit_fail=1
+              pdftotext -layout "$pdf" "$OUT/audit-text/${safe}.txt" \
+                2>> "$OUT/audit-text/extraction-errors.log" || audit_fail=1
+            done < <(find "$ROOT/audits" -type f -name '*.pdf' -print0 | sort -z)
+            cp "$ROOT/audits/unistaker/2024_03_UniStaker_Code4rena_Contest.md" \
+              "$OUT/audit-text/2024_03_UniStaker_Code4rena_Contest.md" || audit_fail=1
+            audit_rc=$audit_fail
+          fi
+
+          if [ "$build_rc" = 0 ]; then
+            ANVIL_PORT=18593
+            anvil --silent --host 127.0.0.1 --port "$ANVIL_PORT" > "$OUT/anvil.log" 2>&1 &
+            ANVIL_PID=$!
+            sleep 2
+            PK='0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80'
+            LIVE_TOKEN='0x57da2D504bf8b83Ef304759d9f2648522D7a9280'
+            LIVE_CALC='0xf518b3c7Cd5cc1595D10E7268677Da0Fe364E191'
+            LIVE_ADMIN='0x1Afb144aaD0aE02f3Bb04C1eae4AC6020a727A21'
+            LIVE_STAKER='0x6BF7CF29a8bcE11Aa62Cf593d165C244fA4d3E31'
+
+            (cd "$ROOT" && forge create src/ZenStaker.sol:ZenStaker \
+              --rpc-url "http://127.0.0.1:${ANVIL_PORT}" \
+              --private-key "$PK" --broadcast \
+              --constructor-args "$LIVE_TOKEN" "$LIVE_CALC" 0 "$LIVE_ADMIN") \
+              > "$OUT/shadow-staker-create.log" 2>&1
+            shadow_staker_rc=$?
+            SHADOW_STAKER=$(grep -E 'Deployed to:' "$OUT/shadow-staker-create.log" | tail -1 | awk '{print $3}')
+
+            (cd "$ROOT" && forge create src/RewardAccumulator.sol:RewardAccumulator \
+              --rpc-url "http://127.0.0.1:${ANVIL_PORT}" \
+              --private-key "$PK" --broadcast \
+              --constructor-args "$LIVE_STAKER" "$LIVE_TOKEN" 431700 false) \
+              > "$OUT/shadow-acc-create.log" 2>&1
+            shadow_acc_rc=$?
+            SHADOW_ACC=$(grep -E 'Deployed to:' "$OUT/shadow-acc-create.log" | tail -1 | awk '{print $3}')
+
+            if [ -n "$SHADOW_STAKER" ]; then
+              cast code "$SHADOW_STAKER" --rpc-url "http://127.0.0.1:${ANVIL_PORT}" \
+                > "$OUT/local-shadow-staker-code.hex" 2>&1
+            fi
+            if [ -n "$SHADOW_ACC" ]; then
+              cast code "$SHADOW_ACC" --rpc-url "http://127.0.0.1:${ANVIL_PORT}" \
+                > "$OUT/local-shadow-acc-code.hex" 2>&1
+            fi
+            kill "$ANVIL_PID" 2>/dev/null || true
+            wait "$ANVIL_PID" 2>/dev/null || true
+
+            if [ "$shadow_staker_rc" = 0 ] && [ "$shadow_acc_rc" = 0 ] \
+              && [ -s "$OUT/local-shadow-staker-code.hex" ] \
+              && [ -s "$OUT/local-shadow-acc-code.hex" ]; then
+              shadow_rc=0
+            else
+              shadow_rc=1
+            fi
+          fi
+
+          if [ "$invariant_rc" = 0 ] && [ "$audit_rc" = 0 ] && [ "$shadow_rc" = 0 ]; then
+            python3 tmp-research/horizen-20260728/r3_gate_v2.py \
+              --out "$OUT/sanitized" \
+              --local-staker-code "$OUT/local-shadow-staker-code.hex" \
+              --local-acc-code "$OUT/local-shadow-acc-code.hex" \
+              --audit-dir "$OUT/audit-text" \
+              --handler-gate-file "$OUT/handler-gate.txt" \
+              > "$OUT/r3-gate.log" 2>&1
+            r3_rc=$?
+          fi
+
+          printf '%s\n' \
+            "forge_rc=${forge_rc}" \
+            "clone_rc=${clone_rc}" \
+            "checkout_rc=${checkout_rc}" \
+            "deps_rc=${deps_rc}" \
+            "patch_rc=${patch_rc}" \
+            "build_rc=${build_rc}" \
+            "targeted_rc=${targeted_rc}" \
+            "invariant_rc=${invariant_rc}" \
+            "full_rc=${full_rc}" \
+            "audit_rc=${audit_rc}" \
+            "shadow_rc=${shadow_rc}" \
+            "r3_rc=${r3_rc}" \
+            > "$OUT/status.txt"
+          printf '%s\n' 'No transaction was signed or broadcast to mainnet or public testnet.' \
+            > "$OUT/network-safety.txt"
+
+          exit 0
+
+      - name: Upload sanitized R3 result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizen-r3-sanitized-${{ github.run_id }}
+          path: |
+            r3-output/sanitized/
+            r3-output/status.txt
+            r3-output/network-safety.txt
+            r3-output/handler-gate.txt
+            r3-output/scoped-source-sha256.txt
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload private technical logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizen-r3-technical-${{ github.run_id }}
+          path: |
+            r3-output/*.log
+            r3-output/audit-text/*.pdfinfo.txt
+            r3-output/audit-text/extraction-errors.log
+          if-no-files-found: warn
+          retention-days: 2
+
+      - name: Enforce all R3 gates
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s r3-output/status.txt
+          grep -qx 'PASS' r3-output/handler-gate.txt
+          grep -qx 'forge_rc=0' r3-output/status.txt
+          grep -qx 'clone_rc=0' r3-output/status.txt
+          grep -qx 'checkout_rc=0' r3-output/status.txt
+          grep -qx 'deps_rc=0' r3-output/status.txt
+          grep -qx 'patch_rc=0' r3-output/status.txt
+          grep -qx 'build_rc=0' r3-output/status.txt
+          grep -qx 'targeted_rc=0' r3-output/status.txt
+          grep -qx 'invariant_rc=0' r3-output/status.txt
+          grep -qx 'full_rc=0' r3-output/status.txt
+          grep -qx 'audit_rc=0' r3-output/status.txt
+          grep -qx 'shadow_rc=0' r3-output/status.txt
+          grep -qx 'r3_rc=0' r3-output/status.txt
+          test -s r3-output/sanitized/RESULT.json
+          test -s r3-output/sanitized/RESULT.md
+          jq -e '.all_required_gates_pass == true and .valid_critical_candidates == 0 and .valid_high_candidates == 0 and .public_network_writes == 0' \
+            r3-output/sanitized/RESULT.json >/dev/null
