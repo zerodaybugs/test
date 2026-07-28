@@ -19,7 +19,7 @@ def rpc(url: str, method: str, params: list[Any]) -> Any:
     request = urllib.request.Request(
         url,
         data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(),
-        headers={"content-type": "application/json", "user-agent": "Horizen-Safe-attestation/1.0"},
+        headers={"content-type": "application/json", "user-agent": "Horizen-Safe-attestation/1.1"},
     )
     with urllib.request.urlopen(request, timeout=60) as response:
         obj = json.loads(response.read())
@@ -40,10 +40,6 @@ def code(url: str, address: str) -> bytes:
 
 def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
-
-
-def calldata(signature_selector: str) -> str:
-    return signature_selector
 
 
 def decode_uint(raw: str) -> int:
@@ -99,6 +95,23 @@ def main() -> int:
     modules_data = "0xcc2f8452" + (1).to_bytes(32, "big").hex() + (100).to_bytes(32, "big").hex()
     modules = decode_address_array(eth_call(SAFE, modules_data), 0)
 
+    owner_code = []
+    for owner in owners:
+        owner_h = code(HORIZEN_RPC, owner)
+        owner_b = code(BASE_RPC, owner)
+        owner_code.append(
+            {
+                "owner": owner,
+                "horizen_code_bytes": len(owner_h),
+                "horizen_code_sha256": sha(owner_h) if owner_h else None,
+                "base_code_bytes": len(owner_b),
+                "base_code_sha256": sha(owner_b) if owner_b else None,
+                "cross_chain_exact_match": bool(owner_h) and owner_h == owner_b,
+            }
+        )
+    contract_owner_count = sum(1 for item in owner_code if item["horizen_code_bytes"] > 0)
+    owners_all_eoa = contract_owner_count == 0
+
     singleton_canonical = bool(singleton_h) and singleton_h == singleton_b
     fallback_canonical = int(fallback, 16) == 0 or (bool(fallback_h) and fallback_h == fallback_b)
     guard_zero = int(guard, 16) == 0
@@ -112,6 +125,7 @@ def main() -> int:
             singleton_canonical,
             fallback_canonical,
             guard_zero,
+            owners_all_eoa,
         ]
     )
 
@@ -123,6 +137,9 @@ def main() -> int:
         "threshold": threshold,
         "owner_count": len(owners),
         "owners": owners,
+        "owner_code": owner_code,
+        "contract_owner_count": contract_owner_count,
+        "owners_all_eoa": owners_all_eoa,
         "module_count": len(modules),
         "modules": modules,
         "singleton": singleton,
@@ -144,7 +161,7 @@ def main() -> int:
         "guard_base_sha256": sha(guard_b) if guard_b else None,
         "guard_is_zero": guard_zero,
         "pass": passed,
-        "security_verdict": "KILL_CANONICAL_SAFE" if passed else "HOLD_SAFE_EXTENSION_OR_RUNTIME_DELTA",
+        "security_verdict": "KILL_CANONICAL_SAFE" if passed else "HOLD_SAFE_EXTENSION_OWNER_OR_RUNTIME_DELTA",
         "public_network_writes": 0,
     }
     (out / "RESULT.json").write_text(json.dumps(result, indent=2) + "\n")
@@ -161,6 +178,8 @@ def main() -> int:
         "safe_version": version,
         "threshold": threshold,
         "owner_count": len(owners),
+        "contract_owner_count": contract_owner_count,
+        "owners_all_eoa": owners_all_eoa,
         "module_count": len(modules),
         "singleton_canonical_base_match": singleton_canonical,
         "fallback_handler_present": int(fallback, 16) != 0,
@@ -177,6 +196,7 @@ def main() -> int:
         f"- Verdict: **{result['security_verdict']}**",
         f"- Safe version: `{version}`",
         f"- Threshold / owners: `{threshold}/{len(owners)}`",
+        f"- Contract owners: `{contract_owner_count}`",
         f"- Enabled modules: `{len(modules)}`",
         f"- Singleton canonical Base match: **{singleton_canonical}**",
         f"- Fallback handler present: **{int(fallback, 16) != 0}**",
