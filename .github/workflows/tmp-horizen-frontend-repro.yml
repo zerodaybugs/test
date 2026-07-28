@@ -1,0 +1,116 @@
+name: Temporary encrypted Horizen frontend reproducibility gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/tmp-horizen-frontend-repro.yml"
+      - "tmp-research/horizen-frontend-repro/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: horizen-frontend-repro-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  frontend-repro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout sanitized harness
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up exact Node runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.16.0
+          cache: npm
+          cache-dependency-path: tmp-research/horizen-frontend-repro/cache-anchor-package-lock.json
+        continue-on-error: true
+
+      - name: Build exact source and compare deployed static assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT=/tmp/horizen-staker-services
+          rm -rf "$ROOT" private-evidence sanitized-frontend-repro
+          git clone --no-checkout https://github.com/HorizenOfficial/staker-services.git "$ROOT"
+          git -C "$ROOT" checkout --detach e9ab9af5f9e5bb964e690878b6d41942e825991a
+          test "$(git -C "$ROOT" rev-parse HEAD)" = e9ab9af5f9e5bb964e690878b6d41942e825991a
+          cd "$ROOT/frontend"
+          cp .env.mainnet .env
+          export NEXT_TELEMETRY_DISABLED=1
+          export TZ=UTC
+          npm ci --ignore-scripts
+          npm run build
+          test -d out
+          cd "$GITHUB_WORKSPACE"
+          export SOURCE_ROOT="$ROOT"
+          export LOCAL_OUT="$ROOT/frontend/out"
+          python3 tmp-research/horizen-frontend-repro/compare_frontend.py
+          printf '%s\n' \
+            'Only HTTPS GET requests were made to the production static site.' \
+            'No wallet connection, signer, transaction or public-chain write was used.' \
+            > sanitized-frontend-repro/network-safety.txt
+
+      - name: Encrypt complete technical evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted-frontend-repro
+          test -s tmp-research/horizen-frontend-repro/output-public.pem
+          test -s private-evidence/frontend-repro/RESULT.json
+          tar --sort=name --mtime='UTC 2026-07-28' --owner=0 --group=0 --numeric-owner \
+            -czf /tmp/horizen-frontend-repro.tar.gz private-evidence
+          sha256sum /tmp/horizen-frontend-repro.tar.gz | awk '{print $1}' \
+            > encrypted-frontend-repro/evidence-plaintext.sha256
+          openssl rand 32 > /tmp/key.bin
+          openssl rand 16 > /tmp/iv.bin
+          cat /tmp/key.bin /tmp/iv.bin > /tmp/keyinfo.bin
+          KEY=$(od -An -tx1 -v /tmp/key.bin | tr -d ' \n')
+          IV=$(od -An -tx1 -v /tmp/iv.bin | tr -d ' \n')
+          openssl enc -aes-256-cbc -K "$KEY" -iv "$IV" \
+            -in /tmp/horizen-frontend-repro.tar.gz \
+            -out encrypted-frontend-repro/evidence.tar.gz.enc
+          openssl pkeyutl -encrypt -pubin \
+            -inkey tmp-research/horizen-frontend-repro/output-public.pem \
+            -in /tmp/keyinfo.bin -out encrypted-frontend-repro/evidence-keyinfo.enc
+          sha256sum encrypted-frontend-repro/* > encrypted-frontend-repro/SHA256SUMS
+          rm -rf private-evidence /tmp/key.bin /tmp/iv.bin /tmp/keyinfo.bin \
+            /tmp/horizen-frontend-repro.tar.gz
+
+      - name: Upload sanitized verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizen-frontend-repro-sanitized-${{ github.run_id }}
+          path: sanitized-frontend-repro/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload encrypted technical evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizen-frontend-repro-encrypted-${{ github.run_id }}
+          path: encrypted-frontend-repro/
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Verify result materialization
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s sanitized-frontend-repro/RESULT.json
+          test -s sanitized-frontend-repro/RESULT.md
+          test -s sanitized-frontend-repro/network-safety.txt
+          test -s encrypted-frontend-repro/evidence.tar.gz.enc
+          test -s encrypted-frontend-repro/evidence-keyinfo.enc
+          jq -e '.public_network_writes == 0' sanitized-frontend-repro/RESULT.json >/dev/null
