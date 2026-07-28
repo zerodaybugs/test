@@ -1,0 +1,179 @@
+name: Secure encrypted Katana revalidation
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-secure-revalidation-20260728.yml'
+      - 'secure-katana-input/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: secure-katana-revalidation-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out public transport repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Generate ephemeral runner certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p handshake-public
+          umask 077
+          openssl req -x509 -newkey rsa:4096 -sha256 -nodes -days 1 \
+            -subj '/CN=ephemeral-katana-revalidation-runner' \
+            -keyout /tmp/runner-private.pem \
+            -out handshake-public/runner-certificate.pem \
+            >/dev/null 2>&1
+          openssl x509 -in handshake-public/runner-certificate.pem -noout -fingerprint -sha256 \
+            > handshake-public/runner-certificate.sha256-fingerprint.txt
+          chmod 600 /tmp/runner-private.pem
+          chmod 644 handshake-public/*
+
+      - name: Publish ephemeral runner certificate
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-secure-handshake-${{ github.run_id }}
+          path: handshake-public/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Retrieve encrypted payload from transport branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/transport
+          mkdir -p /tmp/transport
+          found=0
+          for attempt in $(seq 1 240); do
+            rm -rf /tmp/transport/repo
+            git clone --quiet --depth 1 --branch katana-secure-revalidation-20260728 \
+              https://github.com/zerodaybugs/test.git /tmp/transport/repo 2>/dev/null || true
+            if test -s /tmp/transport/repo/secure-katana-input/payload.cms.b64 \
+               && test -s /tmp/transport/repo/secure-katana-input/payload.cms.sha256; then
+              base64 --decode /tmp/transport/repo/secure-katana-input/payload.cms.b64 \
+                > /tmp/transport/payload.cms
+              cp /tmp/transport/repo/secure-katana-input/payload.cms.sha256 /tmp/transport/
+              found=1
+              break
+            fi
+            sleep 5
+          done
+          test "$found" -eq 1
+          (cd /tmp/transport && sha256sum --check --strict payload.cms.sha256)
+
+      - name: Decrypt, execute, and encrypt evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p /tmp/secure-work/test /tmp/secure-work/lib /tmp/secure-evidence encrypted-result
+
+          openssl cms -decrypt -binary -inform DER \
+            -in /tmp/transport/payload.cms \
+            -recip handshake-public/runner-certificate.pem \
+            -inkey /tmp/runner-private.pem \
+            -out /tmp/secure-payload.tar.gz \
+            >/dev/null 2>&1
+          tar -xzf /tmp/secure-payload.tar.gz -C /tmp/secure-work
+          (cd /tmp/secure-work && sha256sum --check --strict INPUT_SHA256SUMS)
+
+          curl -fsSL --retry 4 --retry-all-errors \
+            https://github.com/foundry-rs/foundry/releases/download/v1.7.1/foundry_v1.7.1_linux_amd64.tar.gz \
+            -o /tmp/foundry.tar.gz
+          echo 'cf7e688ed0c4c48adffca788b496076e31060b67ac5afe1e43dbb5499c20c88b  /tmp/foundry.tar.gz' \
+            | sha256sum --check --strict >/dev/null
+          tar -xzf /tmp/foundry.tar.gz -C /tmp
+          install -m 0755 /tmp/forge /tmp/secure-work/forge
+
+          curl -fsSL --retry 4 --retry-all-errors \
+            'https://binaries.soliditylang.org/linux-amd64/solc-linux-amd64-v0.8.24+commit.e11b9ed9' \
+            -o /tmp/secure-work/solc-0.8.24
+          echo 'fb03a29a517452b9f12bcf459ef37d0a543765bb3bbc911e70a87d6a37c30d5f  /tmp/secure-work/solc-0.8.24' \
+            | sha256sum --check --strict >/dev/null
+          chmod 0755 /tmp/secure-work/solc-0.8.24
+
+          git clone --quiet --depth 1 --branch v1.9.7 \
+            https://github.com/foundry-rs/forge-std.git /tmp/secure-work/lib/forge-std
+
+          /tmp/secure-work/forge --version > /tmp/secure-evidence/FORGE_VERSION.txt 2>&1
+          /tmp/secure-work/solc-0.8.24 --version > /tmp/secure-evidence/SOLC_VERSION.txt 2>&1
+          cp /tmp/secure-work/INPUT_SHA256SUMS /tmp/secure-evidence/
+          cp /tmp/secure-work/foundry.toml /tmp/secure-evidence/
+          cp /tmp/secure-work/test/*.sol /tmp/secure-evidence/
+
+          set +e
+          (cd /tmp/secure-work && ./forge build --force) > /tmp/secure-evidence/FRESH_BUILD.log 2>&1
+          build_status=$?
+
+          : > /tmp/secure-evidence/EXIT_STATUS.txt
+          echo "build_exit=$build_status" >> /tmp/secure-evidence/EXIT_STATUS.txt
+          for pair in 'AVKAT_THRESHOLD:KatanaAvKATCapitalThresholdPoC' 'VBUSDS_ROUNDING:KatanaVbUSDSRoundingCyclePoC'; do
+            prefix=${pair%%:*}; contract=${pair#*:}
+            for n in 1 2; do
+              rm -rf /tmp/secure-work/out /tmp/secure-work/cache
+              (cd /tmp/secure-work && timeout 1500 ./forge test --jobs 1 --match-contract "$contract" -vvvv) \
+                > "/tmp/secure-evidence/${prefix}_RUN_${n}.log" 2>&1
+              status=$?
+              echo "${prefix,,}_run_${n}_exit=$status" >> /tmp/secure-evidence/EXIT_STATUS.txt
+            done
+          done
+          set -e
+
+          python3 - <<'PY'
+          import hashlib,json,re
+          from pathlib import Path
+          root=Path('/tmp/secure-evidence');summary={};det={}
+          for p in sorted(root.glob('*_RUN_*.log')):
+              text=p.read_text(errors='replace')
+              summary[p.name]={
+                'passes':re.findall(r'^\[PASS\].*$',text,re.M),
+                'failures':re.findall(r'^\[FAIL[^\n]*',text,re.M),
+                'suite_results':re.findall(r'^Suite result:.*$',text,re.M),
+                'threshold_evidence':re.findall(r'emit ThresholdEvidence\([^\n]+',text),
+                'cycle_evidence':re.findall(r'emit (?:CycleEvidence|SignedEvidence)\([^\n]+',text),
+                'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),
+              }
+              normalized=re.sub(r'finished in [^\n]+','finished in <normalized>',text)
+              normalized=re.sub(r'Ran 1 test suite in [^\n]+','Ran 1 test suite in <normalized>',normalized)
+              (root/(p.stem+'.normalized.log')).write_text(normalized)
+          for prefix in ('AVKAT_THRESHOLD','VBUSDS_ROUNDING'):
+              a=root/f'{prefix}_RUN_1.normalized.log';b=root/f'{prefix}_RUN_2.normalized.log'
+              det[prefix]={'both_exist':a.exists() and b.exists(),'byte_identical':a.exists() and b.exists() and a.read_bytes()==b.read_bytes()}
+          (root/'RUN_SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          (root/'DETERMINISM.json').write_text(json.dumps(det,indent=2,sort_keys=True)+'\n')
+          PY
+          (cd /tmp/secure-evidence && sha256sum * > SHA256SUMS)
+          tar -czf /tmp/secure-evidence.tar.gz -C /tmp secure-evidence
+
+          openssl cms -encrypt -binary -aes-256-cbc -outform DER \
+            -in /tmp/secure-evidence.tar.gz \
+            -out encrypted-result/evidence.cms \
+            /tmp/secure-work/researcher-certificate.pem \
+            >/dev/null 2>&1
+          sha256sum encrypted-result/evidence.cms > encrypted-result/evidence.cms.sha256
+          printf 'encrypted-evidence-complete\n' > encrypted-result/STATUS.txt
+
+          shred -u /tmp/runner-private.pem /tmp/secure-payload.tar.gz /tmp/secure-evidence.tar.gz 2>/dev/null || true
+          rm -rf /tmp/secure-work /tmp/secure-evidence /tmp/transport
+
+      - name: Upload encrypted evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-secure-result-${{ github.run_id }}
+          path: encrypted-result/
+          if-no-files-found: warn
+          retention-days: 1
