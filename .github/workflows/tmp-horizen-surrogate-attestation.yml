@@ -1,0 +1,132 @@
+name: Temporary encrypted Horizen surrogate attestation
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/tmp-horizen-surrogate-attestation.yml"
+      - "tmp-research/horizen-surrogate-attestation/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: horizen-surrogate-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  surrogate-attestation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout sanitized harness
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install Foundry v1.7.1
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Compile exact child and run read-only production attestation
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT=/tmp/horizen-surrogate-source
+          rm -rf "$ROOT" private-evidence sanitized-surrogates
+          git clone --no-checkout https://github.com/HorizenOfficial/staker.git "$ROOT"
+          git -C "$ROOT" checkout --detach ab92502e9da98784dfe3bd3ef933d4e9345ff628
+          git -C "$ROOT" submodule update --init --recursive
+          (cd "$ROOT" && forge build)
+
+          forge inspect --root "$ROOT" src/ZenStaker.sol:ZenDelegationSurrogate deployedBytecode \
+            > /tmp/expected-child.hex
+
+          ANVIL_PORT=18641
+          anvil --silent --host 127.0.0.1 --port "$ANVIL_PORT" >/tmp/horizen-surrogate-anvil.log 2>&1 &
+          ANVIL_PID=$!
+          trap 'kill "$ANVIL_PID" 2>/dev/null || true' EXIT
+          sleep 2
+          PK=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+          CREATE_LOG=/tmp/local-parent-create.log
+          (cd "$ROOT" && forge create src/ZenStaker.sol:ZenStaker \
+            --rpc-url "http://127.0.0.1:${ANVIL_PORT}" \
+            --private-key "$PK" --broadcast \
+            --constructor-args \
+              0x57da2D504bf8b83Ef304759d9f2648522D7a9280 \
+              0xf518b3c7Cd5cc1595D10E7268677Da0Fe364E191 \
+              0 \
+              0x1Afb144aaD0aE02f3Bb04C1eae4AC6020a727A21) \
+            >"$CREATE_LOG" 2>&1
+          LOCAL_PARENT=$(grep -E 'Deployed to:' "$CREATE_LOG" | tail -1 | awk '{print $3}')
+          test -n "$LOCAL_PARENT"
+          cast code "$LOCAL_PARENT" --rpc-url "http://127.0.0.1:${ANVIL_PORT}" \
+            > /tmp/local-parent.hex
+
+          export EXPECTED_CHILD_HEX=/tmp/expected-child.hex
+          export LOCAL_PARENT_HEX=/tmp/local-parent.hex
+          python3 tmp-research/horizen-surrogate-attestation/attestation.py
+
+          printf '%s\n' \
+            'Only eth_call, eth_getCode, eth_getLogs and block reads were issued to public RPCs.' \
+            'No mainnet or public-testnet transaction was signed or broadcast.' \
+            > sanitized-surrogates/network-safety.txt
+
+      - name: Encrypt complete technical evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted-surrogates
+          test -s tmp-research/horizen-surrogate-attestation/output-public.pem
+          test -s private-evidence/surrogate-attestation/RESULT.json
+          tar --sort=name --mtime='UTC 2026-07-28' --owner=0 --group=0 --numeric-owner \
+            -czf /tmp/horizen-surrogate-attestation.tar.gz private-evidence
+          sha256sum /tmp/horizen-surrogate-attestation.tar.gz | awk '{print $1}' \
+            > encrypted-surrogates/evidence-plaintext.sha256
+          openssl rand 32 > /tmp/key.bin
+          openssl rand 16 > /tmp/iv.bin
+          cat /tmp/key.bin /tmp/iv.bin > /tmp/keyinfo.bin
+          KEY=$(od -An -tx1 -v /tmp/key.bin | tr -d ' \n')
+          IV=$(od -An -tx1 -v /tmp/iv.bin | tr -d ' \n')
+          openssl enc -aes-256-cbc -K "$KEY" -iv "$IV" \
+            -in /tmp/horizen-surrogate-attestation.tar.gz \
+            -out encrypted-surrogates/evidence.tar.gz.enc
+          openssl pkeyutl -encrypt -pubin \
+            -inkey tmp-research/horizen-surrogate-attestation/output-public.pem \
+            -in /tmp/keyinfo.bin -out encrypted-surrogates/evidence-keyinfo.enc
+          sha256sum encrypted-surrogates/* > encrypted-surrogates/SHA256SUMS
+          rm -rf private-evidence /tmp/key.bin /tmp/iv.bin /tmp/keyinfo.bin \
+            /tmp/horizen-surrogate-attestation.tar.gz
+
+      - name: Upload sanitized verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizen-surrogate-attestation-sanitized-${{ github.run_id }}
+          path: sanitized-surrogates/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload encrypted technical evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizen-surrogate-attestation-encrypted-${{ github.run_id }}
+          path: encrypted-surrogates/
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Verify result materialization
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s sanitized-surrogates/RESULT.json
+          test -s sanitized-surrogates/RESULT.md
+          test -s sanitized-surrogates/network-safety.txt
+          test -s encrypted-surrogates/evidence.tar.gz.enc
+          test -s encrypted-surrogates/evidence-keyinfo.enc
+          jq -e '.public_network_writes == 0' sanitized-surrogates/RESULT.json >/dev/null
