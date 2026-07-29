@@ -1,0 +1,102 @@
+name: OP post-v7 consensus-contract security delta export
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/op-post-v7-security-delta.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout full public Optimism history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ethereum-optimism/optimism
+          ref: develop
+          path: upstream
+          fetch-depth: 0
+          fetch-tags: true
+          submodules: false
+
+      - name: Export consensus-contract delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/patches
+          cd upstream
+          BASE_TAG=op-contracts/v7.0.0
+          git rev-parse "$BASE_TAG" > ../out/base-commit.txt
+          git rev-parse HEAD > ../out/head-commit.txt
+
+          paths=(
+            packages/contracts-bedrock/src/L1/OptimismPortal2.sol
+            packages/contracts-bedrock/src/dispute
+            packages/contracts-bedrock/src/cannon
+            packages/contracts-bedrock/src/libraries/trie
+            packages/contracts-bedrock/src/libraries/rlp
+            packages/contracts-bedrock/src/universal/PreimageOracle.sol
+            cannon/mipsevm
+            rust/kona/bin/client
+            rust/kona/crates/proof
+          )
+
+          git log --date=iso-strict --format='%H%x09%ad%x09%s' "$BASE_TAG"..HEAD -- "${paths[@]}" \
+            > ../out/commits.tsv
+          git diff --stat "$BASE_TAG"..HEAD -- "${paths[@]}" > ../out/diff-stat.txt
+          git diff --binary "$BASE_TAG"..HEAD -- "${paths[@]}" > ../out/full-delta.patch
+
+          while IFS=$'\t' read -r sha date subject; do
+            [ -n "$sha" ] || continue
+            safe="$(printf '%s' "$subject" | tr -cs 'A-Za-z0-9._-' '_' | cut -c1-80)"
+            git show --format=fuller --binary "$sha" -- "${paths[@]}" \
+              > "../out/patches/${sha}_${safe}.patch"
+          done < ../out/commits.tsv
+
+          cd ..
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json, re
+
+          out = Path('out')
+          rows = []
+          for line in (out / 'commits.tsv').read_text(errors='replace').splitlines():
+              parts = line.split('\t', 2)
+              if len(parts) != 3:
+                  continue
+              sha, date, subject = parts
+              score = 0
+              s = subject.lower()
+              weights = {
+                  'fix': 5, 'security': 10, 'audit': 8, 'proof': 4,
+                  'withdraw': 5, 'portal': 4, 'mips': 6, 'cannon': 5,
+                  'dispute': 4, 'root': 4, 'overflow': 7, 'underflow': 7,
+                  'reentr': 8, 'invalid': 5, 'verify': 5, 'validation': 4,
+                  'panic': 3, 'gas': 3, 'memory': 3, 'preimage': 5,
+              }
+              for term, weight in weights.items():
+                  if term in s:
+                      score += weight
+              rows.append({'sha': sha, 'date': date, 'subject': subject, 'score': score})
+          rows.sort(key=lambda x: (-x['score'], x['date'], x['sha']))
+          (out / 'ranked-commits.json').write_text(json.dumps(rows, indent=2) + '\n')
+          sums = []
+          for p in sorted(out.rglob('*')):
+              if p.is_file() and p.name != 'SHA256SUMS':
+                  sums.append(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(out)}')
+          (out / 'SHA256SUMS').write_text('\n'.join(sums) + '\n')
+          PY
+
+      - name: Upload public delta corpus
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: op-post-v7-security-delta
+          path: out/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
