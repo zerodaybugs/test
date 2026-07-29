@@ -1,0 +1,282 @@
+name: Katana MetaMorpho hidden-loss gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-morpho-hidden-loss-gate-20260729.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Select Ethereum RPC and pin block
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import json, urllib.request
+          endpoints = [
+              'https://ethereum-rpc.publicnode.com',
+              'https://eth.llamarpc.com',
+              'https://1rpc.io/eth',
+              'https://cloudflare-eth.com',
+          ]
+          rid = 0
+          def call(url, method, params):
+              global rid
+              rid += 1
+              req = urllib.request.Request(
+                  url,
+                  data=json.dumps({'jsonrpc':'2.0','id':rid,'method':method,'params':params}).encode(),
+                  headers={'content-type':'application/json','user-agent':'katana-morpho-hidden-loss-gate/1.0'},
+              )
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  out = json.loads(r.read())
+              if 'error' in out:
+                  raise RuntimeError(out['error'])
+              return out['result']
+          errors = {}
+          for url in endpoints:
+              try:
+                  if int(call(url, 'eth_chainId', []), 16) != 1:
+                      raise RuntimeError('wrong chain')
+                  block = int(call(url, 'eth_blockNumber', []), 16)
+                  header = call(url, 'eth_getBlockByNumber', [hex(block), False])
+                  print(f'ETH_RPC={url}')
+                  print(f'ETH_BLOCK={block}')
+                  print(f'ETH_BLOCK_HASH={header["hash"]}')
+                  print(f'ETH_BLOCK_TIMESTAMP={int(header["timestamp"],16)}')
+                  break
+              except Exception as exc:
+                  errors[url] = repr(exc)
+          else:
+              raise SystemExit('no usable Ethereum RPC: ' + json.dumps(errors, sort_keys=True))
+          PY
+
+      - name: Fork block and crystallize pending MetaMorpho losses locally
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          anvil --fork-url "$ETH_RPC" --fork-block-number "$ETH_BLOCK" --host 127.0.0.1 --port 8545 --silent > evidence/anvil.log 2>&1 &
+          ANVIL_PID=$!
+          trap 'kill "$ANVIL_PID" 2>/dev/null || true' EXIT
+          for i in $(seq 1 60); do
+            if cast block-number --rpc-url http://127.0.0.1:8545 >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          cast block-number --rpc-url http://127.0.0.1:8545
+
+          cat > /tmp/gate.py <<'PY'
+          import hashlib
+          import json
+          import subprocess
+          from pathlib import Path
+
+          RPC = 'http://127.0.0.1:8545'
+          PRIVATE_KEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478c4b54b2b4f2a5b4c4c4b4b3a'
+          # Standard Anvil account #0 private key, used only on the disposable local fork.
+          # Use the canonical key below if the runner's Anvil version rejects the compatibility key.
+          PRIVATE_KEYS = [
+              PRIVATE_KEY,
+              '0xac0974bec39a17e36ba4a6b4d238ff944bacb478c4b54b2b4f2a5b4c4c4b4b3a',
+              '0xac0974bec39a17e36ba4a6b4d238ff944bacb478c4b54b2b4f2a5b4c4c4b4b3a',
+          ]
+          VAULTS = [
+              ('vbUSDC','0xbeefb9f61cc44895d8aec381373555a64191a9c4'),
+              ('vbETH','0x31a5684983eee865d943a696aac155363ba024f9'),
+              ('vbWBTC','0x812b2c6ab3f4471c0e43d4bb61098a9211017427'),
+              ('vbUSDT','0xc54b4e08c1dcc199fdd35c6b5ab589ffd3428a8d'),
+          ]
+
+          def run(args, check=True):
+              proc = subprocess.run(args, text=True, capture_output=True)
+              if check and proc.returncode != 0:
+                  raise RuntimeError(f"command failed {args}: {proc.stderr.strip()}")
+              return proc
+
+          def call(address, signature, *args):
+              proc = run(['cast','call','--rpc-url',RPC,address,signature,*map(str,args)])
+              return proc.stdout.strip()
+
+          def uint(address, signature, *args):
+              raw = call(address, signature, *args)
+              first = raw.split()[0]
+              return int(first, 0)
+
+          def address(address_, signature, *args):
+              return call(address_, signature, *args).split()[0].lower()
+
+          def boolean(address_, signature, *args):
+              return call(address_, signature, *args).split()[0].lower() == 'true'
+
+          def bytes32(address_, signature, *args):
+              return call(address_, signature, *args).split()[0].lower()
+
+          def safe(fn):
+              try:
+                  return fn()
+              except Exception as exc:
+                  return {'error': repr(exc)}
+
+          def send_accrue(vault):
+              # `accrueInterest()` is permissionless. Execute only on the disposable Anvil fork.
+              candidates = [
+                  '0xac0974bec39a17e36ba4a6b4d238ff944bacb478c4b54b2b4f2a5b4c4c4b4b3a',
+                  '0xac0974bec39a17e36ba4a6b4d238ff944bacb478c4b54b2b4f2a5b4c4c4b4b3a',
+              ]
+              # Prefer `--unlocked` because Anvil account 0 is unlocked and avoids any key-version ambiguity.
+              proc = run([
+                  'cast','send','--rpc-url',RPC,'--unlocked','--from','0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266',
+                  vault,'accrueInterest()'
+              ], check=False)
+              if proc.returncode == 0:
+                  return {'ok': True, 'stdout': proc.stdout.strip()}
+              return {'ok': False, 'stderr': proc.stderr.strip()}
+
+          rows = []
+          for name, vault in VAULTS:
+              row = {'name':name,'vault':vault}
+              row['asset'] = safe(lambda v=vault: address(v,'asset()(address)'))
+              row['morpho'] = safe(lambda v=vault: address(v,'MORPHO()(address)'))
+              row['owner'] = safe(lambda v=vault: address(v,'owner()(address)'))
+              row['curator'] = safe(lambda v=vault: address(v,'curator()(address)'))
+              row['guardian'] = safe(lambda v=vault: address(v,'guardian()(address)'))
+              row['skim_recipient'] = safe(lambda v=vault: address(v,'skimRecipient()(address)'))
+              row['timelock'] = safe(lambda v=vault: uint(v,'timelock()(uint256)'))
+              row['fee'] = safe(lambda v=vault: uint(v,'fee()(uint96)'))
+              row['fee_recipient'] = safe(lambda v=vault: address(v,'feeRecipient()(address)'))
+              row['before'] = {
+                  'stored_lost_assets': safe(lambda v=vault: uint(v,'lostAssets()(uint256)')),
+                  'last_total_assets': safe(lambda v=vault: uint(v,'lastTotalAssets()(uint256)')),
+                  'reported_total_assets': safe(lambda v=vault: uint(v,'totalAssets()(uint256)')),
+                  'total_supply': safe(lambda v=vault: uint(v,'totalSupply()(uint256)')),
+                  'idle_asset_balance': None,
+              }
+              if isinstance(row['asset'], str):
+                  row['before']['idle_asset_balance'] = safe(
+                      lambda a=row['asset'],v=vault: uint(a,'balanceOf(address)(uint256)',v)
+                  )
+              row['accrue_tx'] = send_accrue(vault)
+              row['after'] = {
+                  'stored_lost_assets': safe(lambda v=vault: uint(v,'lostAssets()(uint256)')),
+                  'last_total_assets': safe(lambda v=vault: uint(v,'lastTotalAssets()(uint256)')),
+                  'reported_total_assets': safe(lambda v=vault: uint(v,'totalAssets()(uint256)')),
+                  'total_supply': safe(lambda v=vault: uint(v,'totalSupply()(uint256)')),
+                  'idle_asset_balance': None,
+              }
+              if isinstance(row['asset'], str):
+                  row['after']['idle_asset_balance'] = safe(
+                      lambda a=row['asset'],v=vault: uint(a,'balanceOf(address)(uint256)',v)
+                  )
+              before_lost = row['before']['stored_lost_assets']
+              after_lost = row['after']['stored_lost_assets']
+              row['new_loss_crystallized'] = (
+                  after_lost - before_lost if isinstance(before_lost,int) and isinstance(after_lost,int) else None
+              )
+              row['effective_real_assets_after'] = (
+                  row['after']['reported_total_assets'] - after_lost
+                  if isinstance(row['after']['reported_total_assets'],int) and isinstance(after_lost,int)
+                  else None
+              )
+
+              supply_len = safe(lambda v=vault: uint(v,'supplyQueueLength()(uint256)'))
+              withdraw_len = safe(lambda v=vault: uint(v,'withdrawQueueLength()(uint256)'))
+              row['supply_queue_length'] = supply_len
+              row['withdraw_queue_length'] = withdraw_len
+              market_ids = []
+              if isinstance(supply_len,int):
+                  for i in range(supply_len):
+                      market_ids.append(bytes32(vault,'supplyQueue(uint256)(bytes32)',i))
+              if isinstance(withdraw_len,int):
+                  for i in range(withdraw_len):
+                      market_id = bytes32(vault,'withdrawQueue(uint256)(bytes32)',i)
+                      if market_id not in market_ids:
+                          market_ids.append(market_id)
+              row['markets'] = []
+              morpho = row['morpho']
+              for market_id in market_ids:
+                  market = {'id':market_id}
+                  # MetaMorpho market configuration: cap, enabled, removableAt.
+                  raw_config = safe(lambda v=vault,m=market_id: call(v,'config(bytes32)((uint184,bool,uint64))',m))
+                  market['config_raw'] = raw_config
+                  if isinstance(morpho,str):
+                      market['position_raw'] = safe(
+                          lambda maddr=morpho,m=market_id,v=vault: call(
+                              maddr,'position(bytes32,address)((uint256,uint128,uint128))',m,v
+                          )
+                      )
+                      market['market_raw'] = safe(
+                          lambda maddr=morpho,m=market_id: call(
+                              maddr,'market(bytes32)((uint128,uint128,uint128,uint128,uint128,uint128))',m
+                          )
+                      )
+                      market['params_raw'] = safe(
+                          lambda maddr=morpho,m=market_id: call(
+                              maddr,'idToMarketParams(bytes32)((address,address,address,address,uint256))',m
+                          )
+                      )
+                  row['markets'].append(market)
+
+              known_role_accounts = []
+              for key in ('owner','curator','guardian','skim_recipient'):
+                  value = row.get(key)
+                  if isinstance(value,str) and value not in known_role_accounts:
+                      known_role_accounts.append(value)
+              row['known_allocator_flags'] = {
+                  account: safe(lambda v=vault,a=account: boolean(v,'isAllocator(address)(bool)',a))
+                  for account in known_role_accounts
+              }
+              rows.append(row)
+
+          out = {
+              'schema':'katana-metamorpho-hidden-loss-gate/v1',
+              'fork_rpc':RPC,
+              'rows':rows,
+          }
+          Path('evidence/LOSS_STATE.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          lines = [
+              '# Katana MetaMorpho hidden-loss gate','',
+              '| token | lost before | lost after local accrue | newly crystallized | reported assets after | effective real assets | queue markets |',
+              '|---|---:|---:|---:|---:|---:|---:|',
+          ]
+          for row in rows:
+              lines.append(
+                  f"| {row['name']} | {row['before']['stored_lost_assets']} | {row['after']['stored_lost_assets']} | "
+                  f"{row['new_loss_crystallized']} | {row['after']['reported_total_assets']} | "
+                  f"{row['effective_real_assets_after']} | {len(row['markets'])} |"
+              )
+          lines += ['', '## Administrative surface', '']
+          for row in rows:
+              lines.append(
+                  f"- **{row['name']}** owner=`{row['owner']}`, curator=`{row['curator']}`, guardian=`{row['guardian']}`, "
+                  f"skimRecipient=`{row['skim_recipient']}`, allocatorFlags=`{row['known_allocator_flags']}`"
+              )
+          Path('evidence/SUMMARY.md').write_text('\n'.join(lines)+'\n')
+          PY
+          python3 /tmp/gate.py
+          (cd evidence && sha256sum LOSS_STATE.json SUMMARY.md anvil.log > SHA256SUMS)
+          cat evidence/SUMMARY.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: katana-morpho-hidden-loss-gate-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
