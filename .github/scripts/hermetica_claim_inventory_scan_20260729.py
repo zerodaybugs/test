@@ -88,10 +88,29 @@ def ft(j,p):
  return 0,None
 
 def main():
- O.mkdir(parents=True,exist_ok=True);info=get(H+"/v2/info");height=int(info["stacks_tip_height"]);tip=info["stacks_tip"]
- block=get(f"{H}/extended/v2/blocks/{height}");bt=int(block.get("block_time",0))
- fns=["get-claim-id","get-total-assets","get-net-assets","get-pending-fees","get-pending-rf","get-share-price","get-fees","get-cooldown","get-express-cooldown","get-deposit-cap","get-max-reward","get-update-window","get-reserve-rate","get-last-log-ts","get-vault-enabled","get-deposit-enabled","get-redeem-enabled","get-request-redeem-enabled","get-express-enabled","get-reward-enabled"]
- sc={f:call(D,S,f,tip) for f in fns}; supply=call(D,T,"get-total-supply",tip); timelock=call(D,"hq-v1","get-timelock",tip); req=call(D,S,"get-update-request-var",tip,[buff(b"\x01")])
+ O.mkdir(parents=True,exist_ok=True);info=get(H+"/v2/info");height=int(info["stacks_tip_height"]);block=get(f"{H}/extended/v2/blocks/{height}")
+ def ox(x):return x if not x or x.startswith("0x") else "0x"+x
+ candidates=[]
+ for x in (info.get("stacks_tip"),block.get("index_block_hash"),block.get("hash"),block.get("block_hash")):
+  x=ox(x)
+  if x and x not in candidates:candidates.append(x)
+ probe=None;tip=None
+ for x in candidates:
+  try:probe=call(D,S,"get-claim-id",x);tip=x;break
+  except urllib.error.HTTPError as e:
+   if e.code!=404:raise
+ if tip is None:
+  height-=1;block=get(f"{H}/extended/v2/blocks/{height}")
+  for x in (block.get("index_block_hash"),block.get("hash"),block.get("block_hash")):
+   x=ox(x)
+   if not x:continue
+   try:probe=call(D,S,"get-claim-id",x);tip=x;break
+   except urllib.error.HTTPError as e:
+    if e.code!=404:raise
+ if tip is None:raise RuntimeError("no usable pinned tip")
+ bt=int(block.get("block_time",0))
+ fns=["get-total-assets","get-net-assets","get-pending-fees","get-pending-rf","get-share-price","get-fees","get-cooldown","get-express-cooldown","get-deposit-cap","get-max-reward","get-update-window","get-reserve-rate","get-last-log-ts","get-vault-enabled","get-deposit-enabled","get-redeem-enabled","get-request-redeem-enabled","get-express-enabled","get-reward-enabled"]
+ sc={"get-claim-id":probe,**{f:call(D,S,f,tip) for f in fns}}; supply=call(D,T,"get-total-supply",tip); timelock=call(D,"hq-v1","get-timelock",tip); req=call(D,S,"get-update-request-var",tip,[buff(b"\x01")])
  n=int(sc["get-claim-id"]["decoded"])
  if n>10000:raise RuntimeError(f"claim-id {n}")
  def one(i):
