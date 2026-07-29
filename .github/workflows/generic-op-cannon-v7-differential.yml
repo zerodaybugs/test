@@ -1,0 +1,164 @@
+name: Generic OP Cannon v7 differential baseline
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/generic-op-cannon-v7-differential.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: generic-op-cannon-v7-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  differential:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      GOFLAGS: "-trimpath"
+    steps:
+      - name: Checkout exact public source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ethereum-optimism/optimism
+          ref: op-contracts/v7.0.0
+          path: upstream
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Verify immutable source lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="a7c88c8d636ceb9944ea0edaf7d033da258778ab"
+          actual="$(git -C upstream rev-parse HEAD)"
+          printf 'expected=%s\nactual=%s\n' "$expected" "$actual"
+          test "$actual" = "$expected"
+
+      - name: Set up repository Go toolchain
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: upstream/go.mod
+          cache: false
+
+      - name: Prepare generated Superchain data
+        shell: bash
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq zip zstd
+          if command -v just >/dev/null 2>&1; then
+            ./op-core/superchain/sync-superchain.sh
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to "$HOME/.local/bin"
+            export PATH="$HOME/.local/bin:$PATH"
+            ./op-core/superchain/sync-superchain.sh
+          fi
+
+      - name: Download locked Go module graph
+        shell: bash
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          go mod download
+          go version
+          go env GOMODCACHE
+
+      - name: Enumerate Cannon test and fuzz surfaces
+        shell: bash
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          mkdir -p ../out
+          set -o pipefail
+          go test ./cannon/mipsevm/... -list '^(Test|Fuzz)' 2>&1 | tee ../out/test-list.log
+
+      - name: Run exact Go to Solidity MIPS64 differential tests
+        shell: bash
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          go test ./cannon/mipsevm/tests/... \
+            -run '^(TestEVM|Test.*EVM|FuzzStateConsistency)' \
+            -count=1 -timeout=120m -v 2>&1 | tee ../out/evm-differential.log
+
+      - name: Run MIPS state machine, memory, syscall, and concurrency tests
+        shell: bash
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          go test ./cannon/mipsevm/... \
+            -run '^(Test|FuzzStateConsistency).*(Memory|Mem|Syscall|Preimage|Instruction|Thread|LL|SC|Atomic|Branch|Jump|Shift|Div|Mul|Sign|Proof|Witness|Step)' \
+            -count=1 -timeout=120m -v 2>&1 | tee ../out/state-machine.log
+
+      - name: Build reusable package test binaries
+        if: always()
+        shell: bash
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          mkdir -p ../out/test-bins
+          go test -c ./cannon/mipsevm/tests -o ../out/test-bins/mipsevm-tests || true
+          go test -c ./cannon/mipsevm/multithreaded -o ../out/test-bins/multithreaded-tests || true
+          go test -c ./cannon/mipsevm/memory -o ../out/test-bins/memory-tests || true
+          chmod +x ../out/test-bins/* 2>/dev/null || true
+
+      - name: Export exact source and module cache
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/export
+          tar --zstd -cf out/export/op-cannon-v7-source.tar.zst -C upstream \
+            cannon op-preimage op-service op-core go.mod go.sum
+          modcache="$(cd upstream && go env GOMODCACHE)"
+          tar --zstd -cf out/export/op-cannon-v7-go-mod-cache.tar.zst -C "$(dirname "$modcache")" "$(basename "$modcache")"
+          {
+            echo "source_tag=op-contracts/v7.0.0"
+            echo "source_commit=$(git -C upstream rev-parse HEAD)"
+            echo "source_tree=$(git -C upstream rev-parse HEAD^{tree})"
+            echo "go=$(go version)"
+            echo "runner=$(uname -a)"
+          } | tee out/MANIFEST.txt
+          find out -type f -maxdepth 3 -print0 | sort -z | xargs -0 sha256sum > out/SHA256SUMS
+          ls -lh out out/export out/test-bins || true
+
+      - name: Upload logs and test binaries
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: op-cannon-v7-differential-baseline
+          path: |
+            out/*.log
+            out/test-bins/
+            out/MANIFEST.txt
+            out/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload exact Cannon source
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: op-cannon-v7-source
+          path: out/export/op-cannon-v7-source.tar.zst
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload Go module cache
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: op-cannon-v7-go-mod-cache
+          path: out/export/op-cannon-v7-go-mod-cache.tar.zst
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
