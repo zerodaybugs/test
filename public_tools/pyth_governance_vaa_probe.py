@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -31,6 +30,10 @@ def main() -> int:
         f'{BASE}/api/v1/vaas/1/{EMITTER_BASE58}',
         f'{BASE}/api/v1/vaas/1/{EMITTER_BASE58}?pageSize=5&sortOrder=DESC',
         f'{BASE}/api/v1/vaas/1/{EMITTER_HEX}?pageSize=5&sortOrder=DESC',
+        f'{BASE}/api/v1/vaas/1/{EMITTER_BASE58}?page=1&pageSize=5&sortOrder=DESC',
+        f'{BASE}/api/v1/vaas/1/{EMITTER_BASE58}?page=2&pageSize=5&sortOrder=DESC',
+        f'{BASE}/api/v1/vaas/1/{EMITTER_BASE58}?page=10&pageSize=50&sortOrder=DESC',
+        f'{BASE}/api/v1/vaas/1/{EMITTER_BASE58}?page=14&pageSize=50&sortOrder=DESC',
     ]
     responses: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
@@ -51,9 +54,18 @@ def main() -> int:
             {
                 'url': item['url'],
                 'top_level_keys': sorted(item['payload'].keys()),
+                'pagination': item['payload'].get('pagination'),
                 'data_type': type(item['payload'].get('data')).__name__,
                 'data_length': len(item['payload'].get('data', []))
                 if isinstance(item['payload'].get('data'), list)
+                else None,
+                'first_sequence': item['payload']['data'][0].get('sequence')
+                if isinstance(item['payload'].get('data'), list)
+                and item['payload'].get('data')
+                else None,
+                'last_sequence': item['payload']['data'][-1].get('sequence')
+                if isinstance(item['payload'].get('data'), list)
+                and item['payload'].get('data')
                 else None,
                 'first_item_keys': sorted(item['payload']['data'][0].keys())
                 if isinstance(item['payload'].get('data'), list)
