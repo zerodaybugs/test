@@ -1,0 +1,174 @@
+name: Katana yield-vault real-loss and rounding profile
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-yield-vault-loss-profile-20260729.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Read MetaMorpho lost assets and Yearn rounding state
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > /tmp/profile.py <<'PY'
+          import json
+          import urllib.request
+          from pathlib import Path
+
+          ENDPOINTS = [
+              'https://ethereum-rpc.publicnode.com',
+              'https://eth.llamarpc.com',
+              'https://1rpc.io/eth',
+              'https://cloudflare-eth.com',
+          ]
+          ITEMS = [
+              ('vbUSDC','0x53E82ABbb12638F09d9e624578ccB666217a765e','0xbeefb9f61cc44895d8aec381373555a64191a9c4','metamorpho'),
+              ('vbETH','0x2DC70fb75b88d2eB4715bc06E1595E6D97c34DFF','0x31a5684983eee865d943a696aac155363ba024f9','metamorpho'),
+              ('vbWBTC','0x2C24B57e2CCd1f273045Af6A5f632504C432374F','0x812b2c6ab3f4471c0e43d4bb61098a9211017427','metamorpho'),
+              ('vbUSDT','0x6d4f9f9f8f0155509ecd6Ac6c544fF27999845CC','0xc54b4e08c1dcc199fdd35c6b5ab589ffd3428a8d','metamorpho'),
+              ('vbUSDS','0x3DD459dE96F9C28e3a343b831cbDC2B93c8C4855','0x0868076663bbc6638cedd27704cc8f0fa53d5b81','yearn'),
+          ]
+          rid=0
+          selected=None
+          errors={}
+
+          def raw(url,method,params,timeout=35):
+              global rid
+              rid+=1
+              body=json.dumps({'jsonrpc':'2.0','id':rid,'method':method,'params':params}).encode()
+              req=urllib.request.Request(url,data=body,headers={'content-type':'application/json','user-agent':'katana-yield-loss-read-only/1.0'})
+              with urllib.request.urlopen(req,timeout=timeout) as response:
+                  payload=json.loads(response.read())
+              if 'error' in payload:
+                  raise RuntimeError(f"{method}: {payload['error']}")
+              return payload['result']
+
+          for endpoint in ENDPOINTS:
+              try:
+                  if int(raw(endpoint,'eth_chainId',[]),16)!=1: raise RuntimeError('wrong chain')
+                  raw(endpoint,'eth_blockNumber',[])
+                  selected=endpoint
+                  break
+              except Exception as exc:
+                  errors[endpoint]=repr(exc)
+          if selected is None: raise SystemExit(json.dumps(errors,sort_keys=True))
+
+          def rpc(method,params,timeout=35):
+              global selected
+              last=None
+              for endpoint in [selected]+[x for x in ENDPOINTS if x!=selected]:
+                  try:
+                      result=raw(endpoint,method,params,timeout)
+                      selected=endpoint
+                      return result
+                  except Exception as exc:
+                      errors[endpoint]=repr(exc); last=exc
+              raise RuntimeError(f'{method} failed: {last!r}')
+
+          selectors={}
+          def selector(signature):
+              if signature not in selectors:
+                  selectors[signature]=rpc('web3_sha3',['0x'+signature.encode().hex()])[:10]
+              return selectors[signature]
+          def pa(address): return address.lower().replace('0x','').rjust(64,'0')
+          def pu(value): return hex(value)[2:].rjust(64,'0')
+          def call(address,signature,args=''):
+              return rpc('eth_call',[{'to':address,'data':selector(signature)+args},'latest'])
+          def uint(address,signature,args=''):
+              value=call(address,signature,args)
+              return int(value,16) if value and value!='0x' else None
+          def addr(address,signature,args=''):
+              value=call(address,signature,args)
+              return ('0x'+value[-40:]).lower() if value and value!='0x' and len(value)>=42 else None
+          def safe(fn):
+              try:return fn()
+              except Exception as exc:return {'error':repr(exc)}
+
+          block=int(rpc('eth_blockNumber',[]),16)
+          header=rpc('eth_getBlockByNumber',[hex(block),False])
+          rows=[]
+          for name,vb,vault,kind in ITEMS:
+              row={'name':name,'vbtoken':vb.lower(),'vault':vault.lower(),'kind':kind}
+              asset=safe(lambda v=vault:addr(v,'asset()'))
+              row['asset']=asset
+              row['vault_total_assets']=safe(lambda v=vault:uint(v,'totalAssets()'))
+              row['vault_total_supply']=safe(lambda v=vault:uint(v,'totalSupply()'))
+              row['vault_decimals']=safe(lambda v=vault:uint(v,'decimals()'))
+              row['asset_decimals']=safe(lambda a=asset:uint(a,'decimals()')) if isinstance(asset,str) else None
+              shares=safe(lambda v=vault,b=vb:uint(v,'balanceOf(address)',pa(b)))
+              row['vbtoken_vault_shares']=shares
+              row['reported_assets_for_vbtoken']=safe(lambda v=vault,s=shares:uint(v,'convertToAssets(uint256)',pu(s))) if isinstance(shares,int) else None
+              row['preview_redeem_for_vbtoken']=safe(lambda v=vault,s=shares:uint(v,'previewRedeem(uint256)',pu(s))) if isinstance(shares,int) else None
+              row['max_withdraw_for_vbtoken']=safe(lambda v=vault,b=vb:uint(v,'maxWithdraw(address)',pa(b)))
+              row['max_redeem_for_vbtoken']=safe(lambda v=vault,b=vb:uint(v,'maxRedeem(address)',pa(b)))
+              row['vbtoken_total_supply']=safe(lambda b=vb:uint(b,'totalSupply()'))
+              row['vbtoken_total_assets']=safe(lambda b=vb:uint(b,'totalAssets()'))
+              if kind=='metamorpho':
+                  row['last_total_assets']=safe(lambda v=vault:uint(v,'lastTotalAssets()'))
+                  row['lost_assets']=safe(lambda v=vault:uint(v,'lostAssets()'))
+                  row['fee']=safe(lambda v=vault:uint(v,'fee()'))
+                  row['morpho']=safe(lambda v=vault:addr(v,'MORPHO()'))
+                  row['supply_queue_length']=safe(lambda v=vault:uint(v,'supplyQueueLength()'))
+                  row['withdraw_queue_length']=safe(lambda v=vault:uint(v,'withdrawQueueLength()'))
+                  ta=row['vault_total_assets']; lost=row['lost_assets']
+                  row['real_total_assets_excluding_lost']=ta-lost if isinstance(ta,int) and isinstance(lost,int) else None
+                  if all(isinstance(row.get(k),int) for k in ['vault_total_supply','vault_decimals','asset_decimals','vbtoken_vault_shares','real_total_assets_excluding_lost']):
+                      offset=row['vault_decimals']-row['asset_decimals']
+                      virtual_shares=10**offset
+                      real=row['real_total_assets_excluding_lost']
+                      # MetaMorpho SharesMathLib: shares * (assets + 1) / (supply + 10**offset), rounded down.
+                      row['decimals_offset']=offset
+                      row['real_assets_for_vbtoken_exact_formula']=(shares*(real+1))//(row['vault_total_supply']+virtual_shares)
+                      row['virtual_lost_backing_for_vbtoken']=row['reported_assets_for_vbtoken']-row['real_assets_for_vbtoken_exact_formula'] if isinstance(row['reported_assets_for_vbtoken'],int) else None
+              else:
+                  for key,signature in [
+                      ('price_per_share','pricePerShare()'),
+                      ('total_idle','totalIdle()'),
+                      ('total_debt','totalDebt()'),
+                      ('last_report','lastReport()'),
+                      ('profit_unlocking_rate','profitUnlockingRate()'),
+                      ('full_profit_unlock_date','fullProfitUnlockDate()'),
+                      ('profit_max_unlock_time','profitMaxUnlockTime()'),
+                  ]:
+                      row[key]=safe(lambda v=vault,s=signature:uint(v,s))
+                  row['locked_strategy_shares']=safe(lambda v=vault:uint(v,'balanceOf(address)',pa(v)))
+              rows.append(row)
+
+          result={'schema':'katana-yield-vault-loss-profile/v1','rpc':selected,'endpoint_errors':errors,'block_number':block,'block_hash':header['hash'],'timestamp':int(header['timestamp'],16),'rows':rows}
+          Path('evidence/PROFILE.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          lines=['# Katana yield-vault real-loss and rounding profile','',f'- Ethereum block: `{block}`','', '| token | vault kind | reported vb backing | lostAssets | real vb backing | virtual loss in vb backing | vb supply | difference real backing - supply |','|---|---|---:|---:|---:|---:|---:|---:|']
+          for r in rows:
+              reported=r.get('reported_assets_for_vbtoken')
+              real=r.get('real_assets_for_vbtoken_exact_formula',reported)
+              supply=r.get('vbtoken_total_supply')
+              lines.append(f"| {r['name']} | {r['kind']} | {reported} | {r.get('lost_assets')} | {real} | {r.get('virtual_lost_backing_for_vbtoken')} | {supply} | {real-supply if isinstance(real,int) and isinstance(supply,int) else None} |")
+          lines+=['','## Full fields','']
+          for r in rows: lines.append(f"- **{r['name']}**: `{json.dumps(r,sort_keys=True)}`")
+          Path('evidence/SUMMARY.md').write_text('\n'.join(lines)+'\n')
+          PY
+          python3 /tmp/profile.py
+          (cd evidence && sha256sum PROFILE.json SUMMARY.md > SHA256SUMS)
+          cat evidence/SUMMARY.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: katana-yield-vault-loss-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
