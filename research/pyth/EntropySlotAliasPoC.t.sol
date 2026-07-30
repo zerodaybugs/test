@@ -218,7 +218,7 @@ contract EntropySlotAliasPoC is Test {
         );
         assertEq(corrupted.sequenceNumber, victimSequence);
         assertEq(corrupted.requester, address(victim));
-        assertEq(corrupted.gasLimit10k, 0);
+        assertEq(corrupted.gasLimit10k, 10);
 
         // This request was created through request(), so its correct status was
         // CALLBACK_NOT_NECESSARY. The outer call's stale storage reference wrote
@@ -237,9 +237,28 @@ contract EntropySlotAliasPoC is Test {
         vm.expectRevert(EntropyErrors.InvalidRevealCall.selector);
         victim.revealNormally(proofs[victimSequence]);
 
-        // The callback path cannot recover a contract that never implemented
-        // IEntropyConsumer. The transaction reverts and the corrupted request
-        // remains active but unusable.
+        // The newly forced callback path calls a contract which never implemented
+        // IEntropyConsumer. The bounded callback fails and commits CALLBACK_FAILED.
+        entropy.revealWithCallback(
+            PROVIDER,
+            victimSequence,
+            victimSecret,
+            proofs[victimSequence]
+        );
+
+        EntropyStructsV2.Request memory afterFailedCallback = entropy.getRequestV2(
+            PROVIDER,
+            victimSequence
+        );
+        assertEq(afterFailedCallback.sequenceNumber, victimSequence);
+        assertEq(
+            afterFailedCallback.callbackStatus,
+            EntropyStatusConstants.CALLBACK_FAILED
+        );
+
+        // Retrying a CALLBACK_FAILED request uses the direct callback branch.
+        // That call reverts, restoring the request and leaving it permanently
+        // active but unusable through either reveal method.
         vm.expectRevert();
         entropy.revealWithCallback(
             PROVIDER,
@@ -255,7 +274,7 @@ contract EntropySlotAliasPoC is Test {
         assertEq(stillStuck.sequenceNumber, victimSequence);
         assertEq(
             stillStuck.callbackStatus,
-            EntropyStatusConstants.CALLBACK_NOT_STARTED
+            EntropyStatusConstants.CALLBACK_FAILED
         );
     }
 }
