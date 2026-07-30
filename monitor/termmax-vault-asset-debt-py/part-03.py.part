@@ -1,0 +1,75 @@
+    topics = row.get("topics", []) if isinstance(row, dict) else row["topics"]
+    return [x.hex() if hasattr(x, "hex") else str(x) for x in topics]
+
+
+def event_block(row: Any) -> int:
+    v = row.get("blockNumber", 0) if isinstance(row, dict) else row["blockNumber"]
+    if isinstance(v, int): return v
+    return int(str(v), 16) if str(v).startswith("0x") else int(v)
+
+
+def discover_vaults(w3: Web3, latest: int) -> tuple[list[str], dict[str, Any]]:
+    vaults = {Web3.to_checksum_address(v) for v in CFG.get("knownVaults", [])}
+    diag: dict[str, Any] = {"known":len(vaults),"factories":[]}
+    for factory in CFG["factories"]:
+        factory = Web3.to_checksum_address(factory)
+        rows = []
+        source = None
+        try:
+            rows = routescan_logs(factory, VAULT_CREATED_TOPIC, latest); source = "routescan"
+        except Exception as exc:
+            try:
+                rows = rpc_logs(w3, factory, VAULT_CREATED_TOPIC, latest); source = "rpc"
+            except Exception as rpc_exc:
+                diag["factories"].append({"factory":factory,"error":f"{exc}; rpc={rpc_exc}"}); continue
+        found = 0
+        for row in rows:
+            ts = event_topics(row)
+            if len(ts) >= 2:
+                try: vaults.add(topic_address(ts[1])); found += 1
+                except Exception: pass
+        diag["factories"].append({"factory":factory,"source":source,"rowCount":len(rows),"decoded":found})
+    try:
+        r = requests.get("https://yields.llama.fi/pools", timeout=60, headers={"User-Agent":"ZeroDayBugs-TermMax-Readonly/1"})
+        r.raise_for_status(); pools = r.json().get("data", [])
+        n = 0
+        for row in pools:
+            if str(row.get("project","")).lower() != "termmax" or str(row.get("chain","")).lower() != str(CFG["llama"]).lower():
+                continue
+            addr = str(row.get("pool","")).split("-",1)[0]
+            if len(addr) == 42 and addr.startswith("0x"):
+                try: vaults.add(Web3.to_checksum_address(addr)); n += 1
+                except Exception: pass
+        diag["defillamaCandidates"] = n
+    except Exception as exc:
+        diag["defillamaError"] = f"{type(exc).__name__}: {exc}"
+    return sorted(vaults), diag
+
+
+def token_meta(w3: Web3, addr: str, block: int) -> dict[str, Any]:
+    c = w3.eth.contract(address=Web3.to_checksum_address(addr), abi=ERC20_ABI)
+    return {"address":Web3.to_checksum_address(addr),"symbol":safe(c.functions.symbol().call,block_identifier=block),"decimals":safe(c.functions.decimals().call,block_identifier=block)}
+
+
+def inspect_order(w3: Web3, vault_c: Any, vault_asset: str, order: str, market_hint: str | None, block: int, timestamp: int) -> dict[str, Any]:
+    order = Web3.to_checksum_address(order)
+    oc = w3.eth.contract(address=order, abi=ORDER_ABI)
+    market_r = safe(oc.functions.market().call, block_identifier=block)
+    market = value(market_r, market_hint)
+    row: dict[str, Any] = {"order":order,"market":market_r,"marketHint":market_hint,"orderMaturity":safe(vault_c.functions.orderMaturity(order).call,block_identifier=block),"tokenReserves":safe(oc.functions.tokenReserves().call,block_identifier=block)}
+    if not market:
+        return row
+    market = Web3.to_checksum_address(market)
+    mc = w3.eth.contract(address=market, abi=MARKET_ABI)
+    tokens_r = safe(mc.functions.tokens().call, block_identifier=block)
+    config_r = safe(mc.functions.config().call, block_identifier=block)
+    paused_r = safe(mc.functions.paused().call, block_identifier=block)
+    row.update({"marketAddress":market,"marketTokens":tokens_r,"marketConfig":config_r,"marketPaused":paused_r})
+    tokens = value(tokens_r)
+    if not tokens or len(tokens) != 5:
+        return row
+    ft,xt,gt,collateral,debt = [Web3.to_checksum_address(x) for x in tokens]
+    ftc = w3.eth.contract(address=ft, abi=ERC20_ABI)
+    maturity = int(value(config_r,[None,0])[1] or 0) if value(config_r) else 0
+    row.update({
+        "ft":token_meta(w3,ft,block),"xt":xt,"gt":gt,"collateral":token_meta(w3,collateral,block),"debtToken":token_meta(w3,debt,block),
