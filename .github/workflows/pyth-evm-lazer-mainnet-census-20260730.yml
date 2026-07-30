@@ -1,0 +1,314 @@
+name: Pyth EVM Lazer mainnet read-only census 20260730
+
+on:
+  push:
+    branches:
+      - research/pyth-source-mirror-20260730-b
+    paths:
+      - '.github/workflows/pyth-evm-lazer-mainnet-census-20260730.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/pyth-evm-lazer-mainnet-census-20260730.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout current public pyth-crosschain store
+        uses: actions/checkout@v4
+        with:
+          repository: pyth-network/pyth-crosschain
+          ref: main
+          path: pyth-crosschain
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install deterministic keccak dependency
+        shell: bash
+        run: python3 -m pip install --disable-pip-version-check --no-input pycryptodome==3.23.0
+
+      - name: Query mainnet deployments without sending transactions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/raw evidence/decoded
+          cat > /tmp/census.py <<'PY'
+          import json
+          import time
+          import urllib.request
+          from pathlib import Path
+          from Crypto.Hash import keccak
+
+          STORE = Path('pyth-crosschain/contract_manager/src/store')
+          OUT = Path('evidence')
+          RAW = OUT / 'raw'
+          RAW.mkdir(parents=True, exist_ok=True)
+          DECODED = OUT / 'decoded'
+          DECODED.mkdir(parents=True, exist_ok=True)
+
+          RANDOM = '0x1111111111111111111111111111111111111111'
+          IMPL_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
+          ADMIN_SLOT = '0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103'
+
+          def selector(sig: str) -> str:
+              h = keccak.new(digest_bits=256)
+              h.update(sig.encode())
+              return '0x' + h.hexdigest()[:8]
+
+          def enc_address(addr: str) -> str:
+              return addr.lower().removeprefix('0x').rjust(64, '0')
+
+          def enc_uint(v: int) -> str:
+              return f'{v:064x}'
+
+          def rpc(url: str, method: str, params, timeout=25):
+              req = urllib.request.Request(
+                  url,
+                  data=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode(),
+                  headers={'content-type':'application/json','user-agent':'Pyth-authorized-read-only-census/1.0'},
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as r:
+                      obj = json.loads(r.read())
+              except Exception as exc:
+                  return {'transport_error': type(exc).__name__, 'message': str(exc)}
+              return obj
+
+          def result(obj):
+              return obj.get('result') if isinstance(obj, dict) else None
+
+          def eth_call(url: str, to: str, sig: str, args='', from_addr=None):
+              tx = {'to': to, 'data': selector(sig) + args}
+              if from_addr:
+                  tx['from'] = from_addr
+              return rpc(url, 'eth_call', [tx, 'latest'])
+
+          def code_len(raw):
+              return max(0, (len(raw)-2)//2) if isinstance(raw, str) and raw.startswith('0x') else 0
+
+          def word(raw, idx=0):
+              if not isinstance(raw, str) or not raw.startswith('0x') or len(raw) < 66:
+                  return None
+              body = raw[2:]
+              start = idx * 64
+              if len(body) < start + 64:
+                  return None
+              return int(body[start:start+64], 16)
+
+          def address_word(raw, idx=0):
+              w = word(raw, idx)
+              return None if w is None else f'0x{w & ((1<<160)-1):040x}'
+
+          def decode_string(raw):
+              try:
+                  body = raw.removeprefix('0x')
+                  off = int(body[:64], 16) * 2
+                  n = int(body[off:off+64], 16)
+                  return bytes.fromhex(body[off+64:off+64+n*2]).decode(errors='replace')
+              except Exception:
+                  return None
+
+          def decode_signers(raw):
+              try:
+                  body = raw.removeprefix('0x')
+                  off = int(body[:64], 16) * 2
+                  n = int(body[off:off+64], 16)
+                  base = off + 64
+                  out = []
+                  for i in range(n):
+                      pos = base + i*128
+                      addr = '0x' + body[pos+24:pos+64]
+                      expiry = int(body[pos+64:pos+128], 16)
+                      out.append({'address':addr.lower(), 'expires_at':expiry})
+                  return out
+              except Exception:
+                  return None
+
+          def decode_impl(storage_raw):
+              return address_word(storage_raw)
+
+          def decode_executor_slot0(raw):
+              if not isinstance(raw, str) or not raw.startswith('0x'):
+                  return None
+              try:
+                  x = int(raw, 16)
+                  return {
+                      'wormhole': f'0x{x & ((1<<160)-1):040x}',
+                      'last_executed_sequence': (x >> 160) & ((1<<64)-1),
+                      'target_chain_id': (x >> 224) & 0xffff,
+                      'owner_emitter_chain_id': (x >> 240) & 0xffff,
+                  }
+              except Exception:
+                  return None
+
+          chains = {x['id']: x for x in json.load(open(STORE/'chains/EvmChains.json'))}
+          lazers = json.load(open(STORE/'contracts/EvmLazerContracts.json'))
+          executors = {x['chain']: x['address'] for x in json.load(open(STORE/'contracts/EvmExecutorContracts.json'))}
+          revision = __import__('subprocess').check_output(['git','-C','pyth-crosschain','rev-parse','HEAD'], text=True).strip()
+
+          targets = []
+          for rec in lazers:
+              chain = chains.get(rec['chain'])
+              if chain and chain.get('mainnet'):
+                  targets.append({
+                      'chain': rec['chain'],
+                      'network_id': chain.get('networkId'),
+                      'rpc': chain.get('rpcUrl'),
+                      'lazer': rec['address'],
+                      'expected_executor': executors.get(rec['chain']),
+                  })
+
+          all_results = []
+          for idx, t in enumerate(targets):
+              url = t['rpc']
+              lazer = t['lazer']
+              executor = t['expected_executor']
+              r = {'target': t, 'source_revision': revision, 'observed_at_unix': int(time.time()), 'raw': {}, 'decoded': {}, 'gates': {}}
+              if not url:
+                  r['gates']['rpc_available'] = False
+                  all_results.append(r)
+                  continue
+
+              r['raw']['chain_id'] = rpc(url, 'eth_chainId', [])
+              r['raw']['block_number'] = rpc(url, 'eth_blockNumber', [])
+              r['raw']['lazer_code'] = rpc(url, 'eth_getCode', [lazer, 'latest'])
+              r['raw']['lazer_impl'] = rpc(url, 'eth_getStorageAt', [lazer, IMPL_SLOT, 'latest'])
+              r['raw']['lazer_admin'] = rpc(url, 'eth_getStorageAt', [lazer, ADMIN_SLOT, 'latest'])
+              for name, sig in {
+                  'lazer_owner':'owner()',
+                  'lazer_version':'version()',
+                  'lazer_fee':'verification_fee()',
+                  'lazer_signers':'getTrustedSigners()',
+              }.items():
+                  r['raw'][name] = eth_call(url, lazer, sig)
+              r['raw']['lazer_initialize_simulation'] = eth_call(url, lazer, 'initialize(address)', enc_address(RANDOM), RANDOM)
+
+              if executor:
+                  r['raw']['executor_code'] = rpc(url, 'eth_getCode', [executor, 'latest'])
+                  r['raw']['executor_impl'] = rpc(url, 'eth_getStorageAt', [executor, IMPL_SLOT, 'latest'])
+                  r['raw']['executor_admin'] = rpc(url, 'eth_getStorageAt', [executor, ADMIN_SLOT, 'latest'])
+                  r['raw']['executor_slot0'] = rpc(url, 'eth_getStorageAt', [executor, '0x0', 'latest'])
+                  r['raw']['executor_slot1'] = rpc(url, 'eth_getStorageAt', [executor, '0x1', 'latest'])
+                  for name, sig in {
+                      'executor_owner':'owner()',
+                      'executor_version':'version()',
+                      'executor_owner_chain':'getOwnerChainId()',
+                      'executor_owner_emitter':'getOwnerEmitterAddress()',
+                      'executor_last_sequence':'getLastExecutedSequence()',
+                  }.items():
+                      r['raw'][name] = eth_call(url, executor, sig)
+                  init_args = (
+                      enc_address(RANDOM)
+                      + enc_uint(0)
+                      + enc_uint(1)
+                      + enc_uint(1)
+                      + ('11'*32)
+                  )
+                  r['raw']['executor_initialize_simulation'] = eth_call(
+                      url,
+                      executor,
+                      'initialize(address,uint64,uint16,uint16,bytes32)',
+                      init_args,
+                      RANDOM,
+                  )
+
+              chain_hex = result(r['raw']['chain_id'])
+              owner_raw = result(r['raw']['lazer_owner'])
+              version_raw = result(r['raw']['lazer_version'])
+              fee_raw = result(r['raw']['lazer_fee'])
+              signers_raw = result(r['raw']['lazer_signers'])
+              lazer_code = result(r['raw']['lazer_code'])
+              impl_raw = result(r['raw']['lazer_impl'])
+              admin_raw = result(r['raw']['lazer_admin'])
+
+              r['decoded'].update({
+                  'chain_id': int(chain_hex,16) if isinstance(chain_hex,str) else None,
+                  'lazer_code_length': code_len(lazer_code),
+                  'lazer_owner': address_word(owner_raw),
+                  'lazer_version': decode_string(version_raw),
+                  'verification_fee': word(fee_raw),
+                  'trusted_signers': decode_signers(signers_raw),
+                  'lazer_implementation': decode_impl(impl_raw),
+                  'lazer_admin': decode_impl(admin_raw),
+              })
+
+              if executor:
+                  exec_code = result(r['raw']['executor_code'])
+                  exec_owner_raw = result(r['raw']['executor_owner'])
+                  exec_version_raw = result(r['raw']['executor_version'])
+                  exec_slot0_raw = result(r['raw']['executor_slot0'])
+                  r['decoded'].update({
+                      'executor_code_length': code_len(exec_code),
+                      'executor_owner': address_word(exec_owner_raw),
+                      'executor_version': decode_string(exec_version_raw),
+                      'executor_implementation': decode_impl(result(r['raw']['executor_impl'])),
+                      'executor_admin': decode_impl(result(r['raw']['executor_admin'])),
+                      'executor_slot0': decode_executor_slot0(exec_slot0_raw),
+                      'executor_owner_emitter': result(r['raw']['executor_owner_emitter']),
+                      'executor_last_sequence_call': word(result(r['raw']['executor_last_sequence'])),
+                      'executor_owner_chain_call': word(result(r['raw']['executor_owner_chain'])),
+                  })
+
+              expected_exec = executor.lower() if executor else None
+              observed_owner = (r['decoded'].get('lazer_owner') or '').lower()
+              executor_owner = (r['decoded'].get('executor_owner') or '').lower()
+              r['gates'] = {
+                  'rpc_available': isinstance(chain_hex, str),
+                  'network_id_match': isinstance(chain_hex,str) and int(chain_hex,16) == t['network_id'],
+                  'lazer_has_code': r['decoded']['lazer_code_length'] > 0,
+                  'lazer_impl_nonzero': r['decoded']['lazer_implementation'] not in (None, '0x0000000000000000000000000000000000000000'),
+                  'lazer_admin_zero': r['decoded']['lazer_admin'] == '0x0000000000000000000000000000000000000000',
+                  'lazer_initialized': result(r['raw']['lazer_initialize_simulation']) is None,
+                  'lazer_owner_matches_executor': bool(expected_exec) and observed_owner == expected_exec,
+                  'lazer_owner_has_code': bool(executor) and r['decoded'].get('executor_code_length',0) > 0,
+                  'trusted_signers_decoded': isinstance(r['decoded']['trusted_signers'], list) and len(r['decoded']['trusted_signers']) > 0,
+                  'executor_initialized': bool(executor) and result(r['raw'].get('executor_initialize_simulation',{})) is None,
+                  'executor_self_owned': bool(executor) and executor_owner == expected_exec,
+                  'executor_impl_nonzero': bool(executor) and r['decoded'].get('executor_implementation') not in (None, '0x0000000000000000000000000000000000000000'),
+                  'executor_admin_zero': bool(executor) and r['decoded'].get('executor_admin') == '0x0000000000000000000000000000000000000000',
+              }
+
+              (RAW/f"{idx:02d}_{t['chain']}.json").write_text(json.dumps(r, indent=2, sort_keys=True))
+              all_results.append(r)
+              time.sleep(0.15)
+
+          summary = {
+              'source_revision': revision,
+              'target_count': len(targets),
+              'results': all_results,
+          }
+          (OUT/'census.json').write_text(json.dumps(summary, indent=2, sort_keys=True))
+
+          gate_names = sorted({g for r in all_results for g in r.get('gates',{})})
+          lines = ['chain\t' + '\t'.join(gate_names)]
+          for r in all_results:
+              lines.append(r['target']['chain'] + '\t' + '\t'.join(str(r.get('gates',{}).get(g,'')) for g in gate_names))
+          (OUT/'gate_matrix.tsv').write_text('\n'.join(lines)+'\n')
+
+          failures = []
+          for r in all_results:
+              for gate, ok in r.get('gates',{}).items():
+                  if ok is False:
+                      failures.append({'chain':r['target']['chain'],'gate':gate,'decoded':r.get('decoded',{})})
+          (OUT/'gate_failures.json').write_text(json.dumps(failures, indent=2, sort_keys=True))
+          print(f"targets={len(targets)} failures={len(failures)}")
+          for item in failures:
+              print(item['chain'], item['gate'])
+          PY
+          python3 /tmp/census.py | tee evidence/run.log
+          find evidence -type f -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS.txt
+
+      - name: Upload read-only evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyth-evm-lazer-mainnet-census-${{ github.run_id }}
+          path: evidence/
+          retention-days: 1
+          compression-level: 6
+          if-no-files-found: error
