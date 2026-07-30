@@ -1,0 +1,211 @@
+name: Private Pyth Entropy live initialization census
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/pyth-entropy-live-init-census-20260730.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout current public deployment store
+        uses: actions/checkout@v4
+        with:
+          repository: pyth-network/pyth-crosschain
+          ref: 56edfe66a3369a1e367c13cae627011a0abda839
+          path: pyth-crosschain
+          persist-credentials: false
+          fetch-depth: 1
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /contract_manager/src/store/chains/EvmChains.json
+            /contract_manager/src/store/contracts/EvmEntropyContracts.json
+
+      - name: Run bounded read-only proxy and initializer census
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/raw
+          cat > /tmp/census.py <<'PY'
+          import json
+          import time
+          import urllib.request
+          import urllib.error
+          from pathlib import Path
+
+          ROOT = Path('pyth-crosschain/contract_manager/src/store')
+          OUT = Path('evidence')
+          CHAINS = json.loads((ROOT / 'chains/EvmChains.json').read_text())
+          CONTRACTS = json.loads((ROOT / 'contracts/EvmEntropyContracts.json').read_text())
+          chain_by_id = {c['id']: c for c in CHAINS}
+
+          IMPL_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
+          ADMIN_SLOT = '0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103'
+          RANDOM = '0x1111111111111111111111111111111111111111'
+
+          SELECTORS = {
+              'owner': '0x8da5cb5b',
+              'admin': '0x6e9960c3',
+              'default_provider': '0x82ee990c',
+              'version': '0x54fd4d50',
+              'pyth_fee': '0x7e0020af',
+              'proposed_admin': '0x32f751ec',
+              'pending_owner': '0xe30c3978',
+              'accrued_pyth': '0xc970835c',
+              'upgrade_magic': '0xcd3474d7',
+          }
+          INIT_SELECTOR = '092c1c99'
+
+          def word_address(raw):
+              if not isinstance(raw, str) or not raw.startswith('0x') or len(raw) < 42:
+                  return None
+              body = raw[2:].rjust(64, '0')
+              return '0x' + body[-40:]
+
+          def word_uint(raw):
+              if not isinstance(raw, str) or not raw.startswith('0x') or raw == '0x':
+                  return None
+              return int(raw, 16)
+
+          def decode_string(raw):
+              try:
+                  body = raw[2:]
+                  offset = int(body[:64], 16) * 2
+                  length = int(body[offset:offset+64], 16)
+                  return bytes.fromhex(body[offset+64:offset+64+length*2]).decode('utf-8', 'replace')
+              except Exception:
+                  return None
+
+          def enc_addr(addr):
+              return addr.lower().removeprefix('0x').rjust(64, '0')
+
+          def enc_uint(value):
+              return f'{value:064x}'
+
+          init_data = (
+              '0x' + INIT_SELECTOR
+              + enc_addr(RANDOM)
+              + enc_addr(RANDOM)
+              + enc_uint(1)
+              + enc_addr(RANDOM)
+              + enc_uint(0)
+          )
+
+          def rpc(url, method, params, timeout=25):
+              body = json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
+              req = urllib.request.Request(url, data=body, headers={
+                  'content-type': 'application/json',
+                  'user-agent': 'Pyth-authorized-readonly-census/1.0',
+              })
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as response:
+                      return json.loads(response.read())
+              except Exception as exc:
+                  return {'transport_error': f'{type(exc).__name__}: {exc}'}
+
+          def result(obj):
+              return obj.get('result') if isinstance(obj, dict) else None
+
+          rows = []
+          for item in CONTRACTS:
+              chain = chain_by_id.get(item['chain'])
+              if not chain or not chain.get('mainnet'):
+                  continue
+              url = chain.get('rpcUrl', '')
+              if not url.startswith('http') or '${' in url or '<' in url:
+                  rows.append({'chain': item['chain'], 'address': item['address'], 'skipped': 'unsupported RPC URL'})
+                  continue
+
+              address = item['address']
+              row = {'chain': item['chain'], 'address': address, 'rpc': url, 'raw': {}}
+              row['raw']['chain_id'] = rpc(url, 'eth_chainId', [])
+              row['raw']['code'] = rpc(url, 'eth_getCode', [address, 'latest'])
+              row['raw']['balance'] = rpc(url, 'eth_getBalance', [address, 'latest'])
+              row['raw']['implementation'] = rpc(url, 'eth_getStorageAt', [address, IMPL_SLOT, 'latest'])
+              row['raw']['proxy_admin_slot'] = rpc(url, 'eth_getStorageAt', [address, ADMIN_SLOT, 'latest'])
+              for name, selector in SELECTORS.items():
+                  row['raw'][name] = rpc(url, 'eth_call', [{'to': address, 'data': selector}, 'latest'])
+
+              # eth_call only: no transaction is broadcast or signed. Success would
+              # mean the public initializer is still callable at latest state.
+              row['raw']['initialize_simulation'] = rpc(url, 'eth_call', [{
+                  'from': RANDOM,
+                  'to': address,
+                  'data': init_data,
+                  'gas': hex(30_000_000),
+              }, 'latest'])
+
+              code = result(row['raw']['code'])
+              init_obj = row['raw']['initialize_simulation']
+              row['decoded'] = {
+                  'chain_id': word_uint(result(row['raw']['chain_id'])),
+                  'code_bytes': max(0, (len(code)-2)//2) if isinstance(code, str) else None,
+                  'balance': word_uint(result(row['raw']['balance'])),
+                  'implementation': word_address(result(row['raw']['implementation'])),
+                  'proxy_admin_slot': word_address(result(row['raw']['proxy_admin_slot'])),
+                  'owner': word_address(result(row['raw']['owner'])),
+                  'admin': word_address(result(row['raw']['admin'])),
+                  'default_provider': word_address(result(row['raw']['default_provider'])),
+                  'proposed_admin': word_address(result(row['raw']['proposed_admin'])),
+                  'pending_owner': word_address(result(row['raw']['pending_owner'])),
+                  'version': decode_string(result(row['raw']['version'])),
+                  'pyth_fee': word_uint(result(row['raw']['pyth_fee'])),
+                  'accrued_pyth': word_uint(result(row['raw']['accrued_pyth'])),
+                  'upgrade_magic': result(row['raw']['upgrade_magic']),
+                  'initializer_callable': isinstance(init_obj, dict) and init_obj.get('result') is not None,
+                  'initializer_result': result(init_obj),
+                  'initializer_error': init_obj.get('error') if isinstance(init_obj, dict) else None,
+                  'initializer_transport_error': init_obj.get('transport_error') if isinstance(init_obj, dict) else None,
+              }
+              decoded = row['decoded']
+              zero = '0x0000000000000000000000000000000000000000'
+              row['flags'] = {
+                  'missing_code': decoded['code_bytes'] in (None, 0),
+                  'zero_or_missing_owner': decoded['owner'] in (None, zero),
+                  'zero_or_missing_admin': decoded['admin'] in (None, zero),
+                  'zero_or_missing_default_provider': decoded['default_provider'] in (None, zero),
+                  'initializer_callable': decoded['initializer_callable'],
+              }
+              (OUT / 'raw' / f"{item['chain']}.json").write_text(json.dumps(row, indent=2, sort_keys=True))
+              rows.append(row)
+              time.sleep(0.15)
+
+          (OUT / 'census.json').write_text(json.dumps(rows, indent=2, sort_keys=True))
+          summary = []
+          summary.append(f'mainnet_entries={len(rows)}')
+          for row in rows:
+              if 'decoded' not in row:
+                  summary.append(f"SKIP {row['chain']} {row.get('skipped')}")
+                  continue
+              d, f = row['decoded'], row['flags']
+              summary.append(
+                  f"{row['chain']} address={row['address']} code={d['code_bytes']} "
+                  f"owner={d['owner']} admin={d['admin']} default={d['default_provider']} "
+                  f"version={d['version']} impl={d['implementation']} init_callable={d['initializer_callable']} "
+                  f"flags={','.join(k for k,v in f.items() if v) or 'none'}"
+              )
+          (OUT / 'SUMMARY.txt').write_text('\n'.join(summary) + '\n')
+          print('\n'.join(summary))
+
+          dangerous = [r for r in rows if r.get('flags', {}).get('initializer_callable')]
+          (OUT / 'DANGEROUS_INITIALIZERS.json').write_text(json.dumps(dangerous, indent=2, sort_keys=True))
+          PY
+          python3 /tmp/census.py | tee evidence/stdout.log
+          sha256sum evidence/census.json evidence/SUMMARY.txt evidence/DANGEROUS_INITIALIZERS.json \
+            > evidence/SHA256SUMS.txt
+
+      - name: Upload read-only census evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyth-entropy-live-init-census-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
