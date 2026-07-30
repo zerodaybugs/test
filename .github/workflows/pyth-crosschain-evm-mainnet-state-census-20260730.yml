@@ -1,0 +1,239 @@
+name: Pyth Crosschain EVM mainnet state census 20260730
+
+on:
+  push:
+    branches:
+      - research/pyth-source-mirror-20260730-b
+    paths:
+      - '.github/workflows/pyth-crosschain-evm-mainnet-state-census-20260730.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - name: Checkout current public Pyth store
+        uses: actions/checkout@v4
+        with:
+          repository: pyth-network/pyth-crosschain
+          ref: main
+          path: pyth-crosschain
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install deterministic keccak dependency
+        shell: bash
+        run: python3 -m pip install --disable-pip-version-check --no-input pycryptodome==3.23.0
+
+      - name: Run low-rate read-only state census
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/raw
+          cat > /tmp/census.py <<'PY'
+          import json
+          import subprocess
+          import time
+          import urllib.request
+          from collections import Counter
+          from pathlib import Path
+          from Crypto.Hash import keccak
+
+          STORE = Path('pyth-crosschain/contract_manager/src/store')
+          OUT = Path('evidence')
+          RAW = OUT / 'raw'
+          RAW.mkdir(parents=True, exist_ok=True)
+          IMPL_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
+          ADMIN_SLOT = '0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103'
+          EXPECTED_MAGIC = 0x97A6F304
+
+          EXTRA_RPCS = {
+              'base':['https://mainnet.base.org','https://base-rpc.publicnode.com'],
+              'ethereum':['https://ethereum-rpc.publicnode.com','https://eth.llamarpc.com'],
+              'polygon':['https://polygon-bor-rpc.publicnode.com'],
+              'optimism':['https://optimism-rpc.publicnode.com'],
+              'arbitrum':['https://arbitrum-one-rpc.publicnode.com'],
+              'bsc':['https://bsc-rpc.publicnode.com'],
+              'avalanche':['https://avalanche-c-chain-rpc.publicnode.com'],
+              'gnosis':['https://gnosis-rpc.publicnode.com'],
+              'linea':['https://linea-rpc.publicnode.com'],
+              'scroll':['https://scroll-rpc.publicnode.com'],
+              'mantle':['https://mantle-rpc.publicnode.com'],
+              'soneium':['https://rpc.soneium.org','https://soneium-rpc.publicnode.com'],
+          }
+
+          def selector(sig):
+              h=keccak.new(digest_bits=256); h.update(sig.encode()); return '0x'+h.hexdigest()[:8]
+
+          def request(url,payload,timeout=28):
+              req=urllib.request.Request(url,data=json.dumps(payload).encode(),headers={
+                  'content-type':'application/json',
+                  'user-agent':'Pyth-authorized-read-only-state-census/1.0',
+              })
+              try:
+                  with urllib.request.urlopen(req,timeout=timeout) as r:
+                      return json.loads(r.read())
+              except Exception as exc:
+                  return {'transport_error':type(exc).__name__,'message':str(exc)}
+
+          def rpc(url,method,params,rpc_id=1):
+              return request(url,{'jsonrpc':'2.0','id':rpc_id,'method':method,'params':params})
+
+          def result(obj): return obj.get('result') if isinstance(obj,dict) else None
+
+          def eth_call(url,to,sig):
+              return rpc(url,'eth_call',[{'to':to,'data':selector(sig)},'latest'])
+
+          def word(raw,idx=0):
+              if not isinstance(raw,str) or not raw.startswith('0x'): return None
+              b=raw[2:]; s=idx*64
+              if len(b)<s+64:return None
+              return int(b[s:s+64],16)
+
+          def addr(raw,idx=0):
+              v=word(raw,idx); return None if v is None else f'0x{v & ((1<<160)-1):040x}'
+
+          def code_len(raw):
+              return max(0,(len(raw)-2)//2) if isinstance(raw,str) and raw.startswith('0x') else 0
+
+          def decode_string(raw):
+              try:
+                  b=raw.removeprefix('0x'); off=int(b[:64],16)*2; n=int(b[off:off+64],16)
+                  return bytes.fromhex(b[off+64:off+64+n*2]).decode(errors='replace')
+              except Exception:return None
+
+          def dynamic_array_len(raw):
+              try:
+                  b=raw.removeprefix('0x'); off=int(b[:64],16)*2
+                  return int(b[off:off+64],16)
+              except Exception:return None
+
+          def probe(url,network_id):
+              c=rpc(url,'eth_chainId',[]); b=rpc(url,'eth_blockNumber',[])
+              ch=result(c); bl=result(b)
+              return {'url':url,'chain_id':c,'block':b,'ok':isinstance(ch,str) and isinstance(bl,str) and int(ch,16)==network_id}
+
+          def choose(chain_id,store_url,network_id):
+              urls=[]
+              for u in [store_url,*EXTRA_RPCS.get(chain_id,[])]:
+                  if u and u not in urls:urls.append(u)
+              probes=[probe(u,network_id) for u in urls]
+              return next((p['url'] for p in probes if p['ok']),None),probes
+
+          chains={x['id']:x for x in json.load(open(STORE/'chains/EvmChains.json'))}
+          recs=json.load(open(STORE/'contracts/EvmPriceFeedContracts.json'))
+          targets=[]
+          seen=set()
+          for rec in recs:
+              chain=chains.get(rec['chain'])
+              if not chain or not chain.get('mainnet'):continue
+              key=(rec['chain'],rec['address'].lower())
+              if key in seen:continue
+              seen.add(key)
+              targets.append({'chain':rec['chain'],'address':rec['address'],'network_id':chain['networkId'],'store_rpc':chain.get('rpcUrl')})
+
+          revision=subprocess.check_output(['git','-C','pyth-crosschain','rev-parse','HEAD'],text=True).strip()
+          rows=[]
+          for i,t in enumerate(targets):
+              url,probes=choose(t['chain'],t['store_rpc'],t['network_id'])
+              row={'target':t,'source_revision':revision,'rpc':url,'rpc_probes':probes,'raw':{},'decoded':{},'gates':{}}
+              if not url:
+                  row['status']='RPC_UNAVAILABLE'; rows.append(row)
+                  (RAW/f'{i:03d}_{t["chain"]}_{t["address"][-6:]}.json').write_text(json.dumps(row,indent=2,sort_keys=True)); continue
+
+              a=t['address']
+              raw=row['raw']
+              raw['code']=rpc(url,'eth_getCode',[a,'latest'])
+              raw['impl']=rpc(url,'eth_getStorageAt',[a,IMPL_SLOT,'latest'])
+              raw['admin']=rpc(url,'eth_getStorageAt',[a,ADMIN_SLOT,'latest'])
+              calls={
+                  'wormhole':'wormhole()',
+                  'chain_id':'chainId()',
+                  'governance':'governanceDataSource()',
+                  'governance_index':'governanceDataSourceIndex()',
+                  'last_sequence':'lastExecutedGovernanceSequence()',
+                  'data_sources':'validDataSources()',
+                  'valid_period':'validTimePeriodSeconds()',
+                  'update_fee':'singleUpdateFeeInWei()',
+                  'transaction_fee':'transactionFeeInWei()',
+                  'owner':'owner()',
+                  'magic':'pythUpgradableMagic()',
+                  'version':'version()',
+              }
+              for name,sig in calls.items():raw[name]=eth_call(url,a,sig)
+
+              d=row['decoded']
+              d['proxy_code_length']=code_len(result(raw['code']))
+              d['implementation']=addr(result(raw['impl']))
+              d['admin']=addr(result(raw['admin']))
+              d['wormhole']=addr(result(raw['wormhole']))
+              d['chain_id']=word(result(raw['chain_id']))
+              d['governance_chain']=word(result(raw['governance']),0)
+              graw=result(raw['governance'])
+              d['governance_emitter']=('0x'+graw.removeprefix('0x')[64:128]) if isinstance(graw,str) and len(graw.removeprefix('0x'))>=128 else None
+              d['governance_index']=word(result(raw['governance_index']))
+              d['last_sequence']=word(result(raw['last_sequence']))
+              d['data_source_count']=dynamic_array_len(result(raw['data_sources']))
+              d['valid_period']=word(result(raw['valid_period']))
+              d['update_fee']=word(result(raw['update_fee']))
+              d['transaction_fee']=word(result(raw['transaction_fee']))
+              d['owner']=addr(result(raw['owner']))
+              d['magic']=word(result(raw['magic']))
+              d['version']=decode_string(result(raw['version']))
+
+              if d['implementation'] and d['implementation']!='0x0000000000000000000000000000000000000000':
+                  raw['implementation_code']=rpc(url,'eth_getCode',[d['implementation'],'latest'])
+                  d['implementation_code_length']=code_len(result(raw['implementation_code']))
+              else:d['implementation_code_length']=0
+              if d['wormhole'] and d['wormhole']!='0x0000000000000000000000000000000000000000':
+                  raw['wormhole_code']=rpc(url,'eth_getCode',[d['wormhole'],'latest'])
+                  d['wormhole_code_length']=code_len(result(raw['wormhole_code']))
+              else:d['wormhole_code_length']=0
+
+              zero='0x0000000000000000000000000000000000000000'
+              row['status']='OK'
+              row['gates']={
+                  'proxy_has_code':d['proxy_code_length']>0,
+                  'implementation_nonzero':d['implementation'] not in (None,zero),
+                  'implementation_has_code':d['implementation_code_length']>0,
+                  'admin_zero_for_uups':d['admin']==zero,
+                  'wormhole_nonzero':d['wormhole'] not in (None,zero),
+                  'wormhole_has_code':d['wormhole_code_length']>0,
+                  'chain_id_matches_contract':d['chain_id'] is not None and d['chain_id']>0,
+                  'governance_chain_nonzero':d['governance_chain'] is not None and d['governance_chain']>0,
+                  'governance_emitter_nonzero':d['governance_emitter'] not in (None,'0x'+'00'*32),
+                  'data_source_count_positive':d['data_source_count'] is not None and d['data_source_count']>0,
+                  'valid_period_positive':d['valid_period'] is not None and d['valid_period']>0,
+                  'owner_renounced':d['owner']==zero,
+                  'pyth_magic_matches':d['magic']==EXPECTED_MAGIC,
+              }
+              rows.append(row)
+              (RAW/f'{i:03d}_{t["chain"]}_{t["address"][-6:]}.json').write_text(json.dumps(row,indent=2,sort_keys=True))
+              time.sleep(0.10)
+
+          failures=[]; compact=[]
+          for r in rows:
+              compact.append({'chain':r['target']['chain'],'address':r['target']['address'],'rpc':r.get('rpc'),'status':r.get('status'),'decoded':r.get('decoded'),'gates':r.get('gates')})
+              for gate,ok in (r.get('gates') or {}).items():
+                  if ok is False:failures.append({'chain':r['target']['chain'],'address':r['target']['address'],'gate':gate,'decoded':r.get('decoded')})
+          summary={'source_revision':revision,'target_count':len(targets),'status_counts':dict(Counter(r.get('status') for r in rows)),'results':rows}
+          (OUT/'census.json').write_text(json.dumps(summary,indent=2,sort_keys=True))
+          (OUT/'compact.json').write_text(json.dumps(compact,indent=2,sort_keys=True))
+          (OUT/'gate_failures.json').write_text(json.dumps(failures,indent=2,sort_keys=True))
+          print(f'targets={len(targets)} reachable={sum(r.get("status")=="OK" for r in rows)} failures={len(failures)}')
+          for f in failures:print(f['chain'],f['address'],f['gate'])
+          PY
+          python3 /tmp/census.py | tee evidence/run.log
+          find evidence -type f -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS.txt
+
+      - name: Upload read-only evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyth-crosschain-evm-mainnet-state-census-${{ github.run_id }}
+          path: evidence/
+          retention-days: 1
+          compression-level: 6
+          if-no-files-found: error
