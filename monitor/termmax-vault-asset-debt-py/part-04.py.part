@@ -1,0 +1,75 @@
+        "debtTokenMatchesVaultAsset": debt.lower() == vault_asset.lower(),
+        "ftBalanceAtOrder":safe(ftc.functions.balanceOf(order).call,block_identifier=block),
+        "marketMaturity":maturity,"marketMatured":bool(maturity and timestamp >= maturity),
+        "activeInVault":int(value(row["orderMaturity"],0) or 0)>0,
+    })
+    return row
+
+
+def inspect_vault(w3: Web3, vault: str, block: int, timestamp: int) -> dict[str, Any]:
+    vault = Web3.to_checksum_address(vault)
+    if len(w3.eth.get_code(vault, block_identifier=block)) == 0:
+        return {"vault":vault,"validVault":False,"reason":"no code"}
+    vc = w3.eth.contract(address=vault, abi=VAULT_ABI)
+    asset_r = safe(vc.functions.asset().call, block_identifier=block)
+    asset = value(asset_r)
+    name_r = safe(vc.functions.name().call, block_identifier=block)
+    if not asset:
+        return {"vault":vault,"validVault":False,"asset":asset_r,"name":name_r}
+    asset = Web3.to_checksum_address(asset)
+    state = {
+        "vault":vault,"validVault":True,"name":name_r,"symbol":safe(vc.functions.symbol().call,block_identifier=block),
+        "asset":token_meta(w3,asset,block),"totalAssets":safe(vc.functions.totalAssets().call,block_identifier=block),
+        "totalSupply":safe(vc.functions.totalSupply().call,block_identifier=block),"paused":safe(vc.functions.paused().call,block_identifier=block),
+    }
+    rows = []
+    source = None
+    try:
+        rows = routescan_logs(vault, NEW_ORDER_TOPIC, block); source = "routescan"
+    except Exception as exc:
+        try:
+            rows = rpc_logs(w3, vault, NEW_ORDER_TOPIC, block); source = "rpc"
+        except Exception as rpc_exc:
+            state["orderDiscovery"]={"error":f"{exc}; rpc={rpc_exc}"}; state["orders"]=[]; return state
+    orders: dict[str, tuple[str | None,int]] = {}
+    for ev in rows:
+        ts = event_topics(ev)
+        if len(ts) >= 4:
+            try:
+                market = topic_address(ts[2]); order = topic_address(ts[3]); orders[order.lower()] = (market,event_block(ev))
+            except Exception: pass
+    state["orderDiscovery"]={"source":source,"rowCount":len(rows),"decoded":len(orders)}
+    state["orders"]=[inspect_order(w3,vc,asset,Web3.to_checksum_address(k),m,b, timestamp) for k,(m,b) in [(k,v[0],) for k,v in []]]
+    # Avoid clever comprehensions here: preserve event block separately for evidence.
+    inspected=[]
+    for order_lower,(market_hint,created_block) in orders.items():
+        row=inspect_order(w3,vc,asset,Web3.to_checksum_address(order_lower),market_hint,block,timestamp)
+        row["createdBlock"]=created_block
+        inspected.append(row)
+    state["orders"]=inspected
+    return state
+
+
+def main() -> int:
+    w3,rpc,attempts=connect(); latest=w3.eth.block_number; block=w3.eth.get_block(latest); timestamp=int(block.timestamp)
+    vaults,discovery=discover_vaults(w3,latest)
+    inspected=[]
+    for i,v in enumerate(vaults,1):
+        try: inspected.append(inspect_vault(w3,v,latest,timestamp))
+        except Exception as exc: inspected.append({"vault":v,"fatalError":f"{type(exc).__name__}: {exc}"})
+        print(f"[{i}/{len(vaults)}] {v}",flush=True)
+    valid=[v for v in inspected if v.get("validVault")]
+    orders=[{"vault":v["vault"],"vaultName":value(v.get("name")),"vaultAsset":v.get("asset"),**o} for v in valid for o in v.get("orders",[])]
+    mismatches=[o for o in orders if o.get("debtTokenMatchesVaultAsset") is False]
+    active_mismatches=[o for o in mismatches if o.get("activeInVault")]
+    material_active=[o for o in active_mismatches if int(value(o.get("ftBalanceAtOrder"),0) or 0)>0]
+    verdict={
+        "candidateVaultCount":len(vaults),"validVaultCount":len(valid),"orderCount":len(orders),
+        "mismatchCount":len(mismatches),"activeMismatchCount":len(active_mismatches),"materialActiveMismatchCount":len(material_active),
+        "nextStep":"LOCAL_FORK_PERMISSIONLESS_WITHDRAWAL_POC" if material_active else "NO_CURRENT_MATERIAL_MISMATCH",
+    }
+    result={"schema":"termmax-vault-asset-debt-consistency/v1","generatedAtUtc":datetime.now(timezone.utc).isoformat(),"chain":CHAIN,"chainId":CFG["chainId"],"safety":{"privateKeys":0,"signedTransactions":0,"broadcastTransactions":0,"stateChanges":0},"rpc":rpc,"rpcAttempts":attempts,"block":{"number":latest,"hash":block.hash.hex(),"timestamp":timestamp,"timestampUtc":datetime.fromtimestamp(timestamp,tz=timezone.utc).isoformat()},"discovery":discovery,"verdict":verdict,"mismatches":mismatches,"activeMismatches":active_mismatches,"materialActiveMismatches":material_active,"vaults":inspected}
+    compact={k:result[k] for k in ["schema","generatedAtUtc","chain","chainId","safety","block","discovery","verdict","mismatches","activeMismatches","materialActiveMismatches"]}
+    (OUT/"VAULT_ASSET_DEBT_FULL.json").write_text(json.dumps(result,indent=2,default=str),encoding="utf-8")
+    (OUT/"VAULT_ASSET_DEBT_COMPACT.json").write_text(json.dumps(compact,indent=2,default=str),encoding="utf-8")
+    (OUT/"VERDICT.txt").write_text(json.dumps(verdict,indent=2),encoding="utf-8")
