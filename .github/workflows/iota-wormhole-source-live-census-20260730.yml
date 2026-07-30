@@ -1,0 +1,331 @@
+name: IOTA Wormhole source and state census
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/iota-wormhole-source-live-census-20260730.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iota-wormhole-source-live-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTH_COMMIT: 9425f76fb4504b801dde3dee824bb350c5b0cb98
+  WORMHOLE_COMMIT: 49f42956964ae90aab9f8f55ead5bff8d6d531af
+  IOTA_CHAIN_ID: '60085'
+  IOTA_LAZER_STATE: '0xbfaaf85f467dd5d9af0f064afb61ceb8c5f0f27c480d4a68ccd4d85cf1c634fb'
+  IOTA_WORMHOLE_STATE: '0x7fa7eb76e4c840102d2a57589b658c44ac506847f972c6fdacdf824cb8f53cb4'
+
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Checkout pinned Pyth source
+        uses: actions/checkout@v4
+        with:
+          repository: pyth-network/pyth-crosschain
+          ref: ${{ env.PYTH_COMMIT }}
+          path: pyth-crosschain
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Checkout pinned Wormhole source
+        uses: actions/checkout@v4
+        with:
+          repository: wormhole-foundation/wormhole
+          ref: ${{ env.WORMHOLE_COMMIT }}
+          path: wormhole
+          persist-credentials: false
+          fetch-depth: 1
+          sparse-checkout: |
+            sui/wormhole
+            guardianset
+          sparse-checkout-cone-mode: true
+
+      - name: Record public source provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/source evidence/live evidence/static evidence/vendor
+          (cd pyth-crosschain && git rev-parse HEAD && git status --short) \
+            | tee evidence/source/pyth-git.txt
+          (cd wormhole && git rev-parse HEAD && git status --short) \
+            | tee evidence/source/wormhole-git.txt
+          find pyth-crosschain/lazer/contracts/iota -maxdepth 6 -type f -printf '%P\t%s bytes\n' \
+            | sort > evidence/source/iota-tree.txt
+          find pyth-crosschain/lazer/contracts/iota/patches -maxdepth 2 -type f -print0 \
+            | sort -z | xargs -0 -r sha256sum > evidence/source/iota-patches.sha256
+          cp -a pyth-crosschain/lazer/contracts/iota/patches evidence/source/
+          cp pyth-crosschain/lazer/contracts/iota/Move.mainnet.toml evidence/source/ || true
+          cp pyth-crosschain/lazer/contracts/iota/Move.lock evidence/source/iota-Move.lock || true
+          cp pyth-crosschain/lazer/contracts/iota/Published.toml evidence/source/iota-Published.toml || true
+          if test -d pyth-crosschain/lazer/contracts/iota/vendor; then
+            cp -a pyth-crosschain/lazer/contracts/iota/vendor evidence/source/
+          fi
+
+      - name: Reconstruct current public IOTA Wormhole package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/wormhole-iota /tmp/wormhole-rewritten
+          cp -a wormhole/sui/wormhole /tmp/wormhole-iota
+          cp -a wormhole/sui/wormhole /tmp/wormhole-rewritten
+          rm -rf /tmp/wormhole-iota/build /tmp/wormhole-rewritten/build
+          rm -f /tmp/wormhole-iota/Move.lock /tmp/wormhole-iota/Published.toml
+          rm -f /tmp/wormhole-rewritten/Move.lock /tmp/wormhole-rewritten/Published.toml
+          python3 - <<'PY'
+          from pathlib import Path
+          for root in (Path('/tmp/wormhole-iota'), Path('/tmp/wormhole-rewritten')):
+              for path in root.rglob('*.move'):
+                  text = path.read_text(encoding='utf-8')
+                  text = text.replace('SUI', 'IOTA').replace('Sui', 'Iota').replace('sui', 'iota')
+                  path.write_text(text, encoding='utf-8')
+          PY
+          PATCH_DIR="$GITHUB_WORKSPACE/pyth-crosschain/lazer/contracts/iota/patches"
+          mapfile -d '' patches < <(find "$PATCH_DIR" -maxdepth 1 -type f -regextype posix-extended \
+            -regex '.*/[0-9].*\.patch' -print0 | sort -z)
+          printf '%s\n' "${patches[@]}" > evidence/vendor/static-patch-list.txt
+          for patch_file in "${patches[@]}"; do
+            patch -p1 -d /tmp/wormhole-iota -N -s -V none -i "$patch_file"
+          done
+          sed "s/__CHAIN_ID__/${IOTA_CHAIN_ID}/g" "$PATCH_DIR/chain-id.patch.tmpl" \
+            > /tmp/chain-id.patch
+          patch -p1 -d /tmp/wormhole-iota -N -s -V none -i /tmp/chain-id.patch
+          cp /tmp/chain-id.patch evidence/vendor/
+          diff -ruN /tmp/wormhole-rewritten /tmp/wormhole-iota \
+            > evidence/vendor/upstream-rewritten-vs-patched.diff || true
+          cp -a /tmp/wormhole-iota evidence/vendor/current-reconstructed-package
+          find /tmp/wormhole-iota -type f -print0 | sort -z | xargs -0 sha256sum \
+            > evidence/vendor/current-reconstructed.sha256
+          if test -d pyth-crosschain/lazer/contracts/iota/vendor/wormhole_mainnet; then
+            diff -ruN pyth-crosschain/lazer/contracts/iota/vendor/wormhole_mainnet /tmp/wormhole-iota \
+              > evidence/vendor/committed-mainnet-vs-current-reconstructed.diff || true
+            find pyth-crosschain/lazer/contracts/iota/vendor/wormhole_mainnet -type f -print0 \
+              | sort -z | xargs -0 sha256sum \
+              > evidence/vendor/committed-mainnet.sha256
+          fi
+
+      - name: Build static function and authority inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          for root in pyth-crosschain/lazer/contracts/iota/sources /tmp/wormhole-iota/sources; do
+            label=$(echo "$root" | tr '/ ' '__')
+            {
+              echo "===== $root ====="
+              grep -RInE \
+                '(^|[[:space:]])(entry|public|public\(package\)|friend)[[:space:]]+fun|share_object|transfer::|upgrade|authorize|commit|witness|Witness|cap|Cap|sequence|guardian|quorum|clock|timestamp|hash|verify|parse|assert!|abort' \
+                "$root" || true
+            } > "evidence/static/${label}.txt"
+          done
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+          roots = [
+              Path('pyth-crosschain/lazer/contracts/iota/sources'),
+              Path('/tmp/wormhole-iota/sources'),
+          ]
+          rows = []
+          for root in roots:
+              for path in sorted(root.rglob('*.move')):
+                  text = path.read_text(encoding='utf-8')
+                  module = re.search(r'\bmodule\s+([^;{]+)', text)
+                  functions = []
+                  pattern = re.compile(
+                      r'(?m)^\s*((?:public(?:\([^)]*\))?|entry|friend)\s+)*fun\s+([A-Za-z_][A-Za-z0-9_]*)\s*\('
+                  )
+                  for match in pattern.finditer(text):
+                      functions.append({
+                          'name': match.group(2),
+                          'visibility': (match.group(1) or '').strip() or 'private',
+                      })
+                  rows.append({
+                      'root': str(root),
+                      'path': str(path.relative_to(root)),
+                      'module': module.group(1).strip() if module else None,
+                      'functions': functions,
+                      'has_share_object': 'share_object' in text,
+                      'has_upgrade_cap': 'UpgradeCap' in text,
+                      'has_clock': 'Clock' in text,
+                      'has_sequence': 'sequence' in text.lower(),
+                  })
+          Path('evidence/static/function-inventory.json').write_text(
+              json.dumps(rows, indent=2), encoding='utf-8'
+          )
+          PY
+
+      - name: Query public IOTA mainnet state
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/iota_live_census.py <<'PY'
+          import hashlib
+          import json
+          import time
+          import urllib.request
+          from pathlib import Path
+
+          OUT = Path('evidence/live')
+          OUT.mkdir(parents=True, exist_ok=True)
+          LAZER = '0xbfaaf85f467dd5d9af0f064afb61ceb8c5f0f27c480d4a68ccd4d85cf1c634fb'
+          WORMHOLE = '0x7fa7eb76e4c840102d2a57589b658c44ac506847f972c6fdacdf824cb8f53cb4'
+          ENDPOINTS = [
+              ('iota-cafe', 'https://api.mainnet.iota.cafe/'),
+              ('blastapi', 'https://iota-mainnet.public.blastapi.io'),
+              ('allthatnode', 'https://iota-mainnet-rpc.allthatnode.com'),
+          ]
+
+          def rpc(url, method, params):
+              body = json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
+              request = urllib.request.Request(
+                  url,
+                  data=body,
+                  headers={'content-type':'application/json','user-agent':'iota-readonly-census/1'},
+              )
+              with urllib.request.urlopen(request, timeout=35) as response:
+                  return json.loads(response.read())
+
+          def object_call(url, object_id):
+              return rpc(url, 'iota_getObject', [object_id, {
+                  'showType': True,
+                  'showOwner': True,
+                  'showPreviousTransaction': True,
+                  'showDisplay': True,
+                  'showContent': True,
+                  'showBcs': True,
+                  'showStorageRebate': True,
+              }])
+
+          def package_from_object(obj):
+              data = (obj.get('result') or {}).get('data') or {}
+              type_name = data.get('type') or ((data.get('content') or {}).get('type'))
+              return type_name.split('::', 1)[0] if isinstance(type_name, str) and '::' in type_name else None
+
+          def inspect(label, url):
+              row = {'label':label,'url':url,'calls':{}}
+              for method, params in [
+                  ('iota_getLatestCheckpointSequenceNumber', []),
+                  ('iota_getChainIdentifier', []),
+                  ('iota_getProtocolConfig', [None]),
+              ]:
+                  try:
+                      row['calls'][method] = rpc(url, method, params)
+                  except Exception as error:
+                      row['calls'][method] = {'client_error':repr(error)}
+              for name, object_id in [('lazer', LAZER), ('wormhole', WORMHOLE)]:
+                  obj = object_call(url, object_id)
+                  row['calls'][f'{name}_object'] = obj
+                  package = package_from_object(obj)
+                  row[f'{name}_package'] = package
+                  if package:
+                      for method, params, suffix in [
+                          ('iota_getNormalizedMoveModulesByPackage', [package], 'normalized_modules'),
+                          ('iota_getObject', [package, {
+                              'showType': True,
+                              'showOwner': True,
+                              'showPreviousTransaction': True,
+                              'showContent': True,
+                              'showBcs': True,
+                          }], 'package_object'),
+                      ]:
+                          try:
+                              row['calls'][f'{name}_{suffix}'] = rpc(url, method, params)
+                          except Exception as error:
+                              row['calls'][f'{name}_{suffix}'] = {'client_error':repr(error)}
+                  for method, params, suffix in [
+                      ('iotax_getDynamicFields', [object_id, None, 100], 'dynamic_fields'),
+                      ('iotax_queryTransactionBlocks', [{
+                          'filter': {'ChangedObject': object_id},
+                          'options': {
+                              'showInput': True,
+                              'showEffects': True,
+                              'showEvents': True,
+                              'showObjectChanges': True,
+                              'showBalanceChanges': True,
+                          },
+                      }, None, 100, True], 'transactions'),
+                  ]:
+                      try:
+                          row['calls'][f'{name}_{suffix}'] = rpc(url, method, params)
+                      except Exception as error:
+                          row['calls'][f'{name}_{suffix}'] = {'client_error':repr(error)}
+              return row
+
+          successes=[]
+          failures=[]
+          for label,url in ENDPOINTS:
+              try:
+                  row=inspect(label,url)
+                  successes.append(row)
+                  (OUT/f'{label}.json').write_text(json.dumps(row,indent=2),encoding='utf-8')
+              except Exception as error:
+                  failures.append({'label':label,'url':url,'error':repr(error)})
+
+          def stable(row):
+              keys = [
+                  'lazer_object','wormhole_object','lazer_normalized_modules',
+                  'wormhole_normalized_modules','lazer_package_object','wormhole_package_object',
+                  'lazer_dynamic_fields','wormhole_dynamic_fields',
+              ]
+              return {key:row['calls'].get(key) for key in keys}
+
+          fingerprints=[]
+          for row in successes:
+              raw=json.dumps(stable(row),sort_keys=True,separators=(',',':')).encode()
+              fingerprints.append({
+                  'label':row['label'],
+                  'lazer_package':row.get('lazer_package'),
+                  'wormhole_package':row.get('wormhole_package'),
+                  'sha256':hashlib.sha256(raw).hexdigest(),
+              })
+          exact=len(fingerprints)>=2 and len({x['sha256'] for x in fingerprints})==1
+          summary={
+              'schema':'iota-live-census/v1',
+              'generated_at_unix':int(time.time()),
+              'success_count':len(successes),
+              'failure_count':len(failures),
+              'failures':failures,
+              'exact_agreement':exact,
+              'providers':fingerprints,
+          }
+          (OUT/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
+          print(json.dumps(summary,indent=2))
+          if not successes:
+              raise SystemExit(2)
+          PY
+          python3 /tmp/iota_live_census.py
+
+      - name: Package public evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find evidence -type f -printf '%P\t%s bytes\n' | sort > evidence/FILE_INDEX.txt
+          (
+            cd evidence
+            find . -type f ! -name SHA256SUMS.txt -print0 | sort -z \
+              | xargs -0 sha256sum > SHA256SUMS.txt
+          )
+
+      - name: Upload public census artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iota-wormhole-source-live-census-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
