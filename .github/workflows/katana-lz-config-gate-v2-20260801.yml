@@ -1,0 +1,286 @@
+name: Corrected encrypted Katana LayerZero config gate
+
+on:
+  pull_request:
+    branches:
+      - tmp/katana-lz-config-gate-20260801
+    paths:
+      - '.katana-lz-config-v2-trigger/**'
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Install ABI decoder
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-input 'eth-abi==5.2.0'
+
+      - name: Collect and decode effective LayerZero configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > /tmp/lz_config.py <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+          from eth_abi import decode
+
+          ETH_RPCS = [
+              'https://ethereum-rpc.publicnode.com',
+              'https://eth.llamarpc.com',
+              'https://cloudflare-eth.com',
+          ]
+          KATANA_RPCS = [
+              'https://rpc.katana.network/',
+              'https://katana.gateway.tenderly.co/',
+              'https://rpc.katanarpc.com/',
+          ]
+
+          ENDPOINT_ETH = '0x1a44076050125825900e736c501f859c50fE728c'
+          ENDPOINT_KATANA = '0x6F475642a6e85809B1c36Fa62763669b1b48DD5B'
+          ITEMS = [
+              ('vbETH',  '0x8F45F7ACD4b9FC0B446902790F304d444dfF949b', '0x694d1697F6909361775139357d99fb60b5caB683'),
+              ('vbUSDC', '0xb5bADA33542a05395d504a25885e02503A957Bb3', '0x807275727Dd3E640c5F2b5DE7d1eC72B4Dd293C0'),
+              ('vbUSDT', '0x839dC0cFF5e263F56C9810560adF8Ea40E95Ab82', '0x4690f346337eD8737BeA462ac71Ff16Ef95B985E'),
+              ('vbUSDS', '0x1E283d60537Dae87Bb63CFCae0Be574b50Ed0BBa', '0xB42ab636ac69f073970a94d1ACE13379E7621665'),
+              ('vbWBTC', '0x8d09c41229f07ad098ffb5fad239dd87d2c131d4', '0x8169e532Bc781985e155037db1F96c267a520DFC'),
+          ]
+
+          def run(args):
+              return subprocess.run(args, check=True, text=True, capture_output=True).stdout.strip()
+
+          def choose_rpc(candidates, expected_chain_id):
+              probes = []
+              for rpc in candidates:
+                  try:
+                      chain_id = run(['cast', 'chain-id', '--rpc-url', rpc])
+                      probes.append({'rpc': rpc, 'chain_id': chain_id})
+                      if chain_id == expected_chain_id:
+                          return rpc, probes
+                  except Exception as exc:
+                      probes.append({'rpc': rpc, 'error': type(exc).__name__ + ': ' + str(exc)})
+              raise RuntimeError('no usable RPC for chain ' + expected_chain_id)
+
+          def call(rpc, to, signature, *args):
+              return run(['cast', 'call', to, signature, *map(str, args), '--rpc-url', rpc])
+
+          def first_line(value):
+              return value.splitlines()[0].strip()
+
+          def decode_uln(raw):
+              payload = bytes.fromhex(raw.removeprefix('0x'))
+              values = decode(['(uint64,uint8,uint8,uint8,address[],address[])'], payload)[0]
+              return {
+                  'confirmations': values[0],
+                  'required_dvn_count': values[1],
+                  'optional_dvn_count': values[2],
+                  'optional_dvn_threshold': values[3],
+                  'required_dvns': [str(value).lower() for value in values[4]],
+                  'optional_dvns': [str(value).lower() for value in values[5]],
+              }
+
+          def decode_executor(raw):
+              payload = bytes.fromhex(raw.removeprefix('0x'))
+              values = decode(['(uint32,address)'], payload)[0]
+              return {
+                  'max_message_size': values[0],
+                  'executor': str(values[1]).lower(),
+              }
+
+          def config_checks(uln):
+              has_dvn = uln['required_dvn_count'] > 0 or uln['optional_dvn_threshold'] > 0
+              counts_match = (
+                  uln['required_dvn_count'] == len(uln['required_dvns'])
+                  and uln['optional_dvn_count'] == len(uln['optional_dvns'])
+              )
+              threshold_valid = (
+                  uln['optional_dvn_count'] == 0
+                  or 0 < uln['optional_dvn_threshold'] <= uln['optional_dvn_count']
+              )
+              required_unique = len(set(uln['required_dvns'])) == len(uln['required_dvns'])
+              optional_unique = len(set(uln['optional_dvns'])) == len(uln['optional_dvns'])
+              return {
+                  'has_effective_dvn': has_dvn,
+                  'counts_match_arrays': counts_match,
+                  'optional_threshold_valid': threshold_valid,
+                  'required_dvns_unique': required_unique,
+                  'optional_dvns_unique': optional_unique,
+              }
+
+          eth_rpc, eth_probes = choose_rpc(ETH_RPCS, '1')
+          katana_rpc, katana_probes = choose_rpc(KATANA_RPCS, '747474')
+
+          report = {
+              'ethereum_rpc': eth_rpc,
+              'katana_rpc': katana_rpc,
+              'ethereum_rpc_probes': eth_probes,
+              'katana_rpc_probes': katana_probes,
+              'ethereum_block': int(run(['cast', 'block-number', '--rpc-url', eth_rpc])),
+              'katana_block': int(run(['cast', 'block-number', '--rpc-url', katana_rpc])),
+              'items': [],
+          }
+
+          for asset, ethereum_oapp, katana_oapp in ITEMS:
+              item = {'asset': asset, 'sides': {}}
+              for side, rpc, endpoint, oapp, remote_eid in [
+                  ('ethereum', eth_rpc, ENDPOINT_ETH, ethereum_oapp, 30375),
+                  ('katana', katana_rpc, ENDPOINT_KATANA, katana_oapp, 30101),
+              ]:
+                  send_library = first_line(call(
+                      rpc, endpoint, 'getSendLibrary(address,uint32)(address)', oapp, remote_eid
+                  ))
+                  receive_lines = call(
+                      rpc, endpoint, 'getReceiveLibrary(address,uint32)(address,bool)', oapp, remote_eid
+                  ).splitlines()
+                  receive_library = receive_lines[0].strip()
+                  receive_library_is_default = receive_lines[1].strip().lower() == 'true'
+                  send_library_is_default = call(
+                      rpc, endpoint, 'isDefaultSendLibrary(address,uint32)(bool)', oapp, remote_eid
+                  ).strip().lower() == 'true'
+                  delegate = first_line(call(rpc, endpoint, 'delegates(address)(address)', oapp))
+                  owner = first_line(call(rpc, oapp, 'owner()(address)'))
+                  counter = int(first_line(call(rpc, oapp, 'globalInitializationCounter()(uint64)')))
+                  peer = first_line(call(rpc, oapp, 'peers(uint32)(bytes32)', remote_eid))
+
+                  send_uln_raw = call(
+                      rpc, endpoint, 'getConfig(address,address,uint32,uint32)(bytes)',
+                      oapp, send_library, remote_eid, 2
+                  )
+                  receive_uln_raw = call(
+                      rpc, endpoint, 'getConfig(address,address,uint32,uint32)(bytes)',
+                      oapp, receive_library, remote_eid, 2
+                  )
+                  executor_raw = call(
+                      rpc, endpoint, 'getConfig(address,address,uint32,uint32)(bytes)',
+                      oapp, send_library, remote_eid, 1
+                  )
+
+                  send_uln = decode_uln(send_uln_raw)
+                  receive_uln = decode_uln(receive_uln_raw)
+                  executor = decode_executor(executor_raw)
+                  send_checks = config_checks(send_uln)
+                  receive_checks = config_checks(receive_uln)
+
+                  checks = {
+                      'owner_nonzero': owner.lower() != '0x0000000000000000000000000000000000000000',
+                      'delegate_nonzero': delegate.lower() != '0x0000000000000000000000000000000000000000',
+                      'peer_nonzero': int(peer, 16) != 0,
+                      'initializer_counter_complete': counter == 1,
+                      'send_library_nonzero': send_library.lower() != '0x0000000000000000000000000000000000000000',
+                      'receive_library_nonzero': receive_library.lower() != '0x0000000000000000000000000000000000000000',
+                      'send_config_valid': all(send_checks.values()),
+                      'receive_config_valid': all(receive_checks.values()),
+                      'executor_nonzero': executor['executor'] != '0x0000000000000000000000000000000000000000',
+                      'max_message_size_nonzero': executor['max_message_size'] > 0,
+                  }
+
+                  item['sides'][side] = {
+                      'oapp': oapp.lower(),
+                      'endpoint': endpoint.lower(),
+                      'remote_eid': remote_eid,
+                      'owner': owner.lower(),
+                      'delegate': delegate.lower(),
+                      'delegate_equals_owner': delegate.lower() == owner.lower(),
+                      'initializer_counter': counter,
+                      'peer': peer.lower(),
+                      'send_library': send_library.lower(),
+                      'receive_library': receive_library.lower(),
+                      'send_library_is_default': send_library_is_default,
+                      'receive_library_is_default': receive_library_is_default,
+                      'send_uln': send_uln,
+                      'receive_uln': receive_uln,
+                      'send_uln_checks': send_checks,
+                      'receive_uln_checks': receive_checks,
+                      'executor': executor,
+                      'checks': checks,
+                      'all_checks_pass': all(checks.values()),
+                  }
+              report['items'].append(item)
+
+          report['all_checks_pass'] = all(
+              side['all_checks_pass']
+              for item in report['items']
+              for side in item['sides'].values()
+          )
+
+          Path('evidence/LZ_CONFIG.json').write_text(
+              json.dumps(report, indent=2, sort_keys=True) + '\n'
+          )
+
+          header = (
+              'asset\tside\towner\tdelegate\tdelegate_equals_owner\tpeer\t'
+              'send_library\treceive_library\tsend_confirmations\treceive_confirmations\t'
+              'send_required_dvns\treceive_required_dvns\tsend_optional_threshold\t'
+              'receive_optional_threshold\texecutor\tmax_message_size\tall_checks_pass'
+          )
+          rows = [header]
+          for item in report['items']:
+              for side_name, side in item['sides'].items():
+                  rows.append('\t'.join(map(str, [
+                      item['asset'], side_name, side['owner'], side['delegate'],
+                      side['delegate_equals_owner'], side['peer'], side['send_library'],
+                      side['receive_library'], side['send_uln']['confirmations'],
+                      side['receive_uln']['confirmations'], side['send_uln']['required_dvn_count'],
+                      side['receive_uln']['required_dvn_count'],
+                      side['send_uln']['optional_dvn_threshold'],
+                      side['receive_uln']['optional_dvn_threshold'],
+                      side['executor']['executor'], side['executor']['max_message_size'],
+                      side['all_checks_pass'],
+                  ])))
+          Path('evidence/LZ_CONFIG.tsv').write_text('\n'.join(rows) + '\n')
+          PY
+
+          python3 /tmp/lz_config.py
+          sha256sum evidence/LZ_CONFIG.json evidence/LZ_CONFIG.tsv > evidence/PLAINTEXT_SHA256SUMS.txt
+
+      - name: Encrypt evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/public.pem <<'PEM'
+          -----BEGIN PUBLIC KEY-----
+          MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAzIplzJAsf2Js94WQkaCh
+          VtZbMdH2HtB8RTC/rg5QZn580yg2mUKW4K2W9d0t+txuVozzCH7boqZlVZQTj6kU
+          mKBEvJ6XaYhzxzBxYZeR5W12n2dHmmv0epFBCGAn+yYfjTD+iq9R73xtjtDvzT4n
+          7WNaXUsaHdY5idpAnwOz6pVcLK9SO2OhpxzGBrjRHK6Y8VYBf92ztseaxqnx1PK/
+          TNxyLreXlzilMTolD9Unn44mR9tw7ZMM1iIW/dwSiBcaBD4yjQTLTiGqu5LJ9299
+          Sj/d4Tt5eCXg8a0XSi7WifAUdOiCAdNOvCUIjEg5xv93RcBzUqEWbAcURpMTXcNU
+          eIsL/p+yUExTgawrCTrYdG/pW3HKTjLvIq/nhtE7O2OTMSqedtT/VNmRm7U3eMOJ
+          UpIm8iDcOCQUZyGD3lsw+DTEAf0sySQlpPlsiOe+CH7z6A+stwQfiXldnqbMG12w
+          dD/Th+IVj7qF6I11Wd3KqvWUmtze+nzXOCHdh7RBuzjJAgMBAAE=
+          -----END PUBLIC KEY-----
+          PEM
+          tar -C evidence -czf /tmp/plain.tar.gz LZ_CONFIG.json LZ_CONFIG.tsv PLAINTEXT_SHA256SUMS.txt
+          openssl rand -hex 32 > /tmp/key.hex
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+            -in /tmp/plain.tar.gz -out evidence/lz-config.tar.gz.enc -pass file:/tmp/key.hex
+          openssl pkeyutl -encrypt -pubin -inkey /tmp/public.pem \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+            -in /tmp/key.hex -out evidence/key.enc
+          rm -f evidence/LZ_CONFIG.json evidence/LZ_CONFIG.tsv evidence/PLAINTEXT_SHA256SUMS.txt
+          sha256sum evidence/lz-config.tar.gz.enc evidence/key.enc > evidence/SHA256SUMS.txt
+          rm -f /tmp/plain.tar.gz /tmp/key.hex /tmp/public.pem /tmp/lz_config.py
+
+      - name: Upload encrypted evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-lz-config-gate-v2-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
