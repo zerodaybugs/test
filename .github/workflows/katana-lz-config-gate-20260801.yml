@@ -1,0 +1,213 @@
+name: Temporary encrypted Katana LayerZero config gate
+
+on:
+  pull_request:
+    branches:
+      - tmp/katana-lz-config-gate-20260801
+    paths:
+      - '.katana-lz-config-trigger/**'
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Install decoder
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-input 'eth-abi==5.2.0'
+
+      - name: Collect and decode effective LayerZero configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > /tmp/lz_config.py <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+          from eth_abi import decode
+
+          ETH_RPC_CANDIDATES = [
+              'https://ethereum-rpc.publicnode.com',
+              'https://eth.llamarpc.com',
+              'https://cloudflare-eth.com',
+          ]
+          KAT_RPC_CANDIDATES = [
+              'https://rpc.katana.network/',
+              'https://katana.gateway.tenderly.co/',
+              'https://rpc.katanarpc.com/',
+          ]
+
+          ENDPOINT_ETH = '0x1a44076050125825900e736c501f859c50fE728c'
+          ENDPOINT_KAT = '0x6F475642a6e85809B1c36Fa62763669b1b48DD5B'
+          OWNER = '0x619D553686958A873A62B336b2DD97C3b25134EA'.lower()
+          ITEMS = [
+              ('vbETH', '0x8F45F7ACD4b9FC0B446902790F304d444dfF949b', '0x694d1697F6909361775139357d99fb60b5caB683'),
+              ('vbUSDC','0xb5bADA33542a05395d504a25885e02503A957Bb3', '0x807275727Dd3E640c5F2b5DE7d1eC72B4Dd293C0'),
+              ('vbUSDT','0x839dC0cFF5e263F56C9810560adF8Ea40E95Ab82', '0x4690f346337eD8737BeA462ac71Ff16Ef95B985E'),
+              ('vbUSDS','0x1E283d60537Dae87Bb63CFCae0Be574b50Ed0BBa', '0xB42ab636ac69f073970a94d1ACE13379E7621665'),
+              ('vbWBTC','0x8d09c41229f07ad098ffb5fad239dd87d2c131d4', '0x8169e532Bc781985e155037db1F96c267a520DFC'),
+          ]
+
+          def run(args):
+              return subprocess.run(args, check=True, text=True, capture_output=True).stdout.strip()
+
+          def choose(candidates, expected):
+              probes=[]
+              for rpc in candidates:
+                  try:
+                      cid=run(['cast','chain-id','--rpc-url',rpc])
+                      probes.append({'rpc':rpc,'chain_id':cid})
+                      if cid == expected:
+                          return rpc, probes
+                  except Exception as exc:
+                      probes.append({'rpc':rpc,'error':type(exc).__name__+': '+str(exc)})
+              raise RuntimeError('no rpc')
+
+          def call(rpc,to,sig,*args):
+              return run(['cast','call',to,sig,*map(str,args),'--rpc-url',rpc])
+
+          def decode_uln(raw):
+              b=bytes.fromhex(raw.removeprefix('0x'))
+              vals=decode(['uint64','uint8','uint8','uint8','address[]','address[]'],b)
+              return {
+                  'confirmations':vals[0],
+                  'required_dvn_count':vals[1],
+                  'optional_dvn_count':vals[2],
+                  'optional_dvn_threshold':vals[3],
+                  'required_dvns':[str(x).lower() for x in vals[4]],
+                  'optional_dvns':[str(x).lower() for x in vals[5]],
+              }
+
+          def decode_executor(raw):
+              b=bytes.fromhex(raw.removeprefix('0x'))
+              vals=decode(['uint32','address'],b)
+              return {'max_message_size':vals[0], 'executor':str(vals[1]).lower()}
+
+          eth_rpc,eth_probes=choose(ETH_RPC_CANDIDATES,'1')
+          kat_rpc,kat_probes=choose(KAT_RPC_CANDIDATES,'747474')
+          report={
+              'eth_rpc':eth_rpc,
+              'katana_rpc':kat_rpc,
+              'eth_probes':eth_probes,
+              'katana_probes':kat_probes,
+              'eth_block':int(run(['cast','block-number','--rpc-url',eth_rpc])),
+              'katana_block':int(run(['cast','block-number','--rpc-url',kat_rpc])),
+              'items':[],
+          }
+
+          for asset,eth_oapp,kat_oapp in ITEMS:
+              entry={'asset':asset,'sides':{}}
+              for side,rpc,endpoint,oapp,remote_eid in [
+                  ('ethereum',eth_rpc,ENDPOINT_ETH,eth_oapp,30375),
+                  ('katana',kat_rpc,ENDPOINT_KAT,kat_oapp,30101),
+              ]:
+                  send_lib=call(rpc,endpoint,'getSendLibrary(address,uint32)(address)',oapp,remote_eid).splitlines()[0]
+                  recv_lines=call(rpc,endpoint,'getReceiveLibrary(address,uint32)(address,bool)',oapp,remote_eid).splitlines()
+                  recv_lib=recv_lines[0]
+                  recv_is_default=recv_lines[1].strip().lower()=='true'
+                  delegate=call(rpc,endpoint,'delegates(address)(address)',oapp).splitlines()[0]
+                  default_send=call(rpc,endpoint,'isDefaultSendLibrary(address,uint32)(bool)',oapp,remote_eid).strip().lower()=='true'
+                  send_uln_raw=call(rpc,endpoint,'getConfig(address,address,uint32,uint32)(bytes)',oapp,send_lib,remote_eid,2)
+                  recv_uln_raw=call(rpc,endpoint,'getConfig(address,address,uint32,uint32)(bytes)',oapp,recv_lib,remote_eid,2)
+                  send_exec_raw=call(rpc,endpoint,'getConfig(address,address,uint32,uint32)(bytes)',oapp,send_lib,remote_eid,1)
+                  send_uln=decode_uln(send_uln_raw)
+                  recv_uln=decode_uln(recv_uln_raw)
+                  send_exec=decode_executor(send_exec_raw)
+                  security={
+                      'delegate_matches_owner':delegate.lower()==OWNER,
+                      'send_has_dvn':send_uln['required_dvn_count']>0 or send_uln['optional_dvn_threshold']>0,
+                      'receive_has_dvn':recv_uln['required_dvn_count']>0 or recv_uln['optional_dvn_threshold']>0,
+                      'send_counts_match':send_uln['required_dvn_count']==len(send_uln['required_dvns']) and send_uln['optional_dvn_count']==len(send_uln['optional_dvns']),
+                      'receive_counts_match':recv_uln['required_dvn_count']==len(recv_uln['required_dvns']) and recv_uln['optional_dvn_count']==len(recv_uln['optional_dvns']),
+                      'send_threshold_valid':send_uln['optional_dvn_count']==0 or 0 < send_uln['optional_dvn_threshold'] <= send_uln['optional_dvn_count'],
+                      'receive_threshold_valid':recv_uln['optional_dvn_count']==0 or 0 < recv_uln['optional_dvn_threshold'] <= recv_uln['optional_dvn_count'],
+                      'executor_nonzero':send_exec['executor']!='0x0000000000000000000000000000000000000000',
+                  }
+                  entry['sides'][side]={
+                      'oapp':oapp.lower(),
+                      'endpoint':endpoint.lower(),
+                      'remote_eid':remote_eid,
+                      'delegate':delegate.lower(),
+                      'send_library':send_lib.lower(),
+                      'receive_library':recv_lib.lower(),
+                      'is_default_send_library':default_send,
+                      'is_default_receive_library':recv_is_default,
+                      'send_uln':send_uln,
+                      'receive_uln':recv_uln,
+                      'send_executor':send_exec,
+                      'security':security,
+                  }
+              report['items'].append(entry)
+
+          report['all_security_checks_pass']=all(
+              all(side['security'].values())
+              for item in report['items']
+              for side in item['sides'].values()
+          )
+          Path('evidence/LZ_CONFIG.json').write_text(json.dumps(report,indent=2,sort_keys=True)+'\n')
+
+          lines=['asset\tside\tdelegate\tsend_lib\treceive_lib\tconfirmations_send\tconfirmations_receive\trequired_send\trequired_receive\toptional_threshold_send\toptional_threshold_receive\texecutor\tsecurity_pass']
+          for item in report['items']:
+              for side_name,side in item['sides'].items():
+                  lines.append('\t'.join(map(str,[
+                      item['asset'],side_name,side['delegate'],side['send_library'],side['receive_library'],
+                      side['send_uln']['confirmations'],side['receive_uln']['confirmations'],
+                      side['send_uln']['required_dvn_count'],side['receive_uln']['required_dvn_count'],
+                      side['send_uln']['optional_dvn_threshold'],side['receive_uln']['optional_dvn_threshold'],
+                      side['send_executor']['executor'],all(side['security'].values())
+                  ])))
+          Path('evidence/LZ_CONFIG.tsv').write_text('\n'.join(lines)+'\n')
+          PY
+          python3 /tmp/lz_config.py
+          sha256sum evidence/LZ_CONFIG.json evidence/LZ_CONFIG.tsv > evidence/PLAINTEXT_SHA256SUMS.txt
+
+      - name: Encrypt evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/public.pem <<'PEM'
+          -----BEGIN PUBLIC KEY-----
+          MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAzIplzJAsf2Js94WQkaCh
+          VtZbMdH2HtB8RTC/rg5QZn580yg2mUKW4K2W9d0t+txuVozzCH7boqZlVZQTj6kU
+          mKBEvJ6XaYhzxzBxYZeR5W12n2dHmmv0epFBCGAn+yYfjTD+iq9R73xtjtDvzT4n
+          7WNaXUsaHdY5idpAnwOz6pVcLK9SO2OhpxzGBrjRHK6Y8VYBf92ztseaxqnx1PK/
+          TNxyLreXlzilMTolD9Unn44mR9tw7ZMM1iIW/dwSiBcaBD4yjQTLTiGqu5LJ9299
+          Sj/d4Tt5eCXg8a0XSi7WifAUdOiCAdNOvCUIjEg5xv93RcBzUqEWbAcURpMTXcNU
+          eIsL/p+yUExTgawrCTrYdG/pW3HKTjLvIq/nhtE7O2OTMSqedtT/VNmRm7U3eMOJ
+          UpIm8iDcOCQUZyGD3lsw+DTEAf0sySQlpPlsiOe+CH7z6A+stwQfiXldnqbMG12w
+          dD/Th+IVj7qF6I11Wd3KqvWUmtze+nzXOCHdh7RBuzjJAgMBAAE=
+          -----END PUBLIC KEY-----
+          PEM
+          tar -C evidence -czf /tmp/plain.tar.gz LZ_CONFIG.json LZ_CONFIG.tsv PLAINTEXT_SHA256SUMS.txt
+          openssl rand -hex 32 > /tmp/key.hex
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+            -in /tmp/plain.tar.gz -out evidence/lz-config.tar.gz.enc -pass file:/tmp/key.hex
+          openssl pkeyutl -encrypt -pubin -inkey /tmp/public.pem \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+            -in /tmp/key.hex -out evidence/key.enc
+          rm -f evidence/LZ_CONFIG.json evidence/LZ_CONFIG.tsv evidence/PLAINTEXT_SHA256SUMS.txt
+          sha256sum evidence/lz-config.tar.gz.enc evidence/key.enc > evidence/SHA256SUMS.txt
+          rm -f /tmp/plain.tar.gz /tmp/key.hex /tmp/public.pem /tmp/lz_config.py
+
+      - name: Upload encrypted evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-lz-config-gate-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
