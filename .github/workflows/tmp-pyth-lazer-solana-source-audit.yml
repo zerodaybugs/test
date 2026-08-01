@@ -1,0 +1,157 @@
+name: Temporary Pyth Lazer Solana source snapshot
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-pyth-lazer-solana-source-audit.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: actions/checkout@v4
+        with:
+          repository: pyth-network/pyth-lazer-public
+          ref: c3933a093bf66e761fc3c9a5a0e2d4655ac17780
+          path: upstream
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/checkout@v4
+        with:
+          repository: pyth-network/audit-reports
+          path: audits
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Package exact public source and audit inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/source evidence/audits
+          git -C upstream rev-parse HEAD > evidence/SOURCE_COMMIT.txt
+          git -C upstream log --date=iso-strict --pretty='%H%x09%ad%x09%s' -- \
+            contracts/solana sdk/js-solana sdk/rust/protocol \
+            > evidence/SOLANA_RELEVANT_HISTORY.tsv
+          cp -a upstream/contracts/solana evidence/source/contracts-solana
+          cp -a upstream/sdk/js-solana evidence/source/sdk-js-solana
+          mkdir -p evidence/source/sdk-rust
+          cp -a upstream/sdk/rust/protocol evidence/source/sdk-rust/protocol
+          cp upstream/Cargo.toml upstream/Cargo.lock evidence/source/ 2>/dev/null || true
+          find evidence/source -type f -print0 | sort -z | xargs -0 sha256sum > evidence/SOURCE_SHA256SUMS.txt
+          find audits -type f | sort > evidence/AUDIT_FILE_INVENTORY.txt
+          rg -n -i 'lazer|pyth pro|solana receiver|ed25519|ecdsa|trusted signer' audits > evidence/AUDIT_KEYWORD_HITS.txt || true
+          rg -n --hidden --glob '!target/**' \
+            'unwrap\(|expect\(|panic!|assert!|unsafe|unchecked|TODO|FIXME|has_one|Signer|secp256k1_recover|ed25519|trusted|expires_at|treasury|fee' \
+            upstream/contracts/solana upstream/sdk/js-solana upstream/sdk/rust/protocol \
+            > evidence/STATIC_SECURITY_SCAN.txt || true
+
+      - name: Capture active mainnet program and storage through read-only RPC
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, struct, time, urllib.request
+          from pathlib import Path
+          out=Path('evidence/onchain'); out.mkdir(parents=True, exist_ok=True)
+          program='pytd2yyk641x7ak7mkaasSJVXh6YYZnC7wTmtgAyxPt'
+          storage='3rdJbqfnagQ4yx9HXJViD4zc4xpiSqmFsKpPuSCQVyQL'
+          rpcs=['https://solana-rpc.publicnode.com','https://api.mainnet-beta.solana.com','https://solana.drpc.org','https://mainnet-beta.solflare.network']
+          def call(url,method,params):
+              req=urllib.request.Request(url,data=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode(),headers={'content-type':'application/json','user-agent':'ReadOnly-Pyth-Lazer-Snapshot/1.0'})
+              with urllib.request.urlopen(req,timeout=180) as response: body=json.loads(response.read())
+              if body.get('error') is not None: raise RuntimeError(body['error'])
+              return body['result']
+          selected=None; attempts=[]
+          for url in rpcs:
+              try:
+                  slot=call(url,'getSlot',[{'commitment':'finalized'}])
+                  value=call(url,'getAccountInfo',[program,{'encoding':'base64','commitment':'finalized'}])['value']
+                  if not value or not value.get('executable'): raise RuntimeError('program missing/non-executable')
+                  selected=url; attempts.append({'rpc':url,'ok':True,'slot':slot}); break
+              except Exception as exc: attempts.append({'rpc':url,'ok':False,'error':repr(exc)})
+          if selected is None: raise SystemExit(f'No RPC: {attempts}')
+          def account(address):
+              value=call(selected,'getAccountInfo',[address,{'encoding':'base64','commitment':'finalized'}])['value']
+              if value is None: raise RuntimeError(f'missing {address}')
+              return value,base64.b64decode(value['data'][0])
+          meta,raw=account(program)
+          if len(raw)<36 or struct.unpack_from('<I',raw,0)[0]!=2: raise RuntimeError('unexpected Program layout')
+          alphabet='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+          def b58(data):
+              n=int.from_bytes(data,'big'); s=''
+              while n: n,r=divmod(n,58); s=alphabet[r]+s
+              leading=len(data)-len(data.lstrip(b'\0'))
+              return '1'*leading+(s or '')
+          pdata_address=b58(raw[4:36]); pmeta,praw=account(pdata_address); smeta,sraw=account(storage)
+          if len(praw)<13 or struct.unpack_from('<I',praw,0)[0]!=3: raise RuntimeError('unexpected ProgramData layout')
+          auth_option=praw[12]; elf_off=45 if auth_option==1 else 13; payload=praw[elf_off:]
+          if payload[:4]!=b'\x7fELF': raise RuntimeError(f'ELF missing at {elf_off}')
+          def elf_size(data):
+              phoff=struct.unpack_from('<Q',data,0x20)[0]; shoff=struct.unpack_from('<Q',data,0x28)[0]
+              eh,pe,pn,se,sn=struct.unpack_from('<HHHHH',data,0x34); maximum=max(64,eh)
+              if phoff and pe and pn:
+                  maximum=max(maximum,phoff+pe*pn)
+                  for i in range(pn):
+                      o=phoff+i*pe; maximum=max(maximum,struct.unpack_from('<Q',data,o+8)[0]+struct.unpack_from('<Q',data,o+32)[0])
+              if shoff and se and sn:
+                  maximum=max(maximum,shoff+se*sn)
+                  for i in range(sn):
+                      o=shoff+i*se
+                      if struct.unpack_from('<I',data,o+4)[0]!=8:
+                          maximum=max(maximum,struct.unpack_from('<Q',data,o+24)[0]+struct.unpack_from('<Q',data,o+32)[0])
+              if maximum>len(data): raise RuntimeError('ELF extent')
+              return maximum
+          elf=payload[:elf_size(payload)]
+          (out/'PROGRAM_ACCOUNT.bin').write_bytes(raw); (out/'PROGRAMDATA_ACCOUNT.bin').write_bytes(praw)
+          (out/'PYTH_LAZER_MAINNET_CANONICAL.so').write_bytes(elf); (out/'STORAGE_ACCOUNT.bin').write_bytes(sraw)
+          result={'rpc':selected,'rpcAttempts':attempts,'capturedUnix':int(time.time()),'programId':program,'programOwner':meta['owner'],'programDataAddress':pdata_address,'programDataOwner':pmeta['owner'],'deploySlot':struct.unpack_from('<Q',praw,4)[0],'upgradeAuthorityOption':auth_option,'canonicalElfBytes':len(elf),'canonicalElfSha256':hashlib.sha256(elf).hexdigest(),'storageId':storage,'storageOwner':smeta['owner'],'storageBytes':len(sraw),'storageSha256':hashlib.sha256(sraw).hexdigest(),'safety':{'publicChainWrites':0,'publicTransactionsSigned':0,'publicTransactionsSent':0,'rpcMethods':['getSlot','getAccountInfo']}}
+          (out/'ONCHAIN_SNAPSHOT.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n'); print(json.dumps(result,indent=2,sort_keys=True))
+          PY
+
+      - name: Run contract unit tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --manifest-path upstream/contracts/solana/Cargo.toml -p pyth-lazer-solana-contract --locked --all-features 2>&1 | tee evidence/CARGO_TEST.log
+          code=${PIPESTATUS[0]}; printf '%s\n' "$code" > evidence/CARGO_TEST_EXIT_CODE.txt; exit "$code"
+
+      - name: Build deterministic evidence archive
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          root=Path('evidence'); entries=[]
+          for path in sorted(p for p in root.rglob('*') if p.is_file() and p.name not in {'EVIDENCE_MANIFEST.json','SHA256SUMS.txt'}):
+              data=path.read_bytes(); entries.append({'path':path.relative_to(root).as_posix(),'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest()})
+          (root/'EVIDENCE_MANIFEST.json').write_text(json.dumps(entries,indent=2,sort_keys=True)+'\n')
+          with (root/'SHA256SUMS.txt').open('w') as h:
+              for row in entries: h.write(f"{row['sha256']}  {row['path']}\n")
+          PY
+          tar --sort=name --mtime='UTC 2026-08-01' --owner=0 --group=0 --numeric-owner -czf pyth-lazer-solana-source-audit.tar.gz evidence
+          sha256sum pyth-lazer-solana-source-audit.tar.gz > pyth-lazer-solana-source-audit.tar.gz.sha256
+
+      - name: Upload temporary evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyth-lazer-solana-source-audit-${{ github.run_id }}
+          path: |
+            evidence/
+            pyth-lazer-solana-source-audit.tar.gz
+            pyth-lazer-solana-source-audit.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
