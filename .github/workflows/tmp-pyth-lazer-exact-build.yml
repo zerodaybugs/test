@@ -1,0 +1,118 @@
+name: Temporary Pyth Lazer exact active build binding
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-pyth-lazer-exact-build.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  bind:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          rustflags: ''
+
+      - name: Install Solana Verify CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install solana-verify --locked
+          solana-verify --version | tee SOLANA_VERIFY_VERSION.txt
+          solana-verify build --help > SOLANA_VERIFY_BUILD_HELP.txt
+
+      - name: Checkout deployment-window candidate source
+        uses: actions/checkout@v4
+        with:
+          repository: pyth-network/pyth-crosschain
+          ref: d66907f9a26cb751156123c92a297a5df6590920
+          path: candidate
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Deterministically build candidate
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p evidence
+          git -C candidate rev-parse HEAD | tee evidence/CANDIDATE_COMMIT.txt
+          git -C candidate show -s --format='%H%n%aI%n%cI%n%s' HEAD > evidence/CANDIDATE_COMMIT_METADATA.txt
+          cp SOLANA_VERIFY_VERSION.txt SOLANA_VERIFY_BUILD_HELP.txt evidence/
+          cd candidate/lazer
+          solana-verify build --library-name pyth_lazer_solana_contract 2>&1 | tee ../../evidence/SOLANA_VERIFY_BUILD.log
+          code=${PIPESTATUS[0]}
+          printf '%s\n' "$code" > ../../evidence/SOLANA_VERIFY_BUILD_EXIT_CODE.txt
+          exit "$code"
+
+      - name: Compare candidate executable to active mainnet ELF
+        if: always()
+        shell: bash
+        env:
+          EXPECTED_ACTIVE_ELF_SHA256: 20ab42e7bc37e60f65d24b0df405549dc42649351231ede0bcbcd3b514223677
+        run: |
+          set -euo pipefail
+          so='candidate/lazer/target/deploy/pyth_lazer_solana_contract.so'
+          if [ ! -f "$so" ]; then
+            find candidate -type f -name 'pyth_lazer_solana_contract.so' -print > evidence/SO_SEARCH.txt
+            exit 1
+          fi
+          cp "$so" evidence/CANDIDATE_PYTH_LAZER_SOLANA.so
+          sha256sum "$so" | tee evidence/CANDIDATE_RAW_SHA256.txt
+          solana-verify get-executable-hash "$so" | tee evidence/CANDIDATE_EXECUTABLE_HASH.txt
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          so = Path('candidate/lazer/target/deploy/pyth_lazer_solana_contract.so')
+          data = so.read_bytes()
+          raw = hashlib.sha256(data).hexdigest()
+          expected = os.environ['EXPECTED_ACTIVE_ELF_SHA256']
+          result = {
+              'candidateCommit': Path('evidence/CANDIDATE_COMMIT.txt').read_text().strip(),
+              'candidateBytes': len(data),
+              'candidateRawSha256': raw,
+              'expectedActiveCanonicalElfSha256': expected,
+              'rawShaMatchesActiveCanonical': raw == expected,
+          }
+          Path('evidence/BINDING_RESULT.json').write_text(json.dumps(result, indent=2, sort_keys=True) + '\n')
+          print(json.dumps(result, indent=2, sort_keys=True))
+          PY
+
+      - name: Build immutable evidence archive
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          root=Path('evidence'); root.mkdir(exist_ok=True); entries=[]
+          for path in sorted(p for p in root.rglob('*') if p.is_file() and p.name not in {'EVIDENCE_MANIFEST.json','SHA256SUMS.txt'}):
+              data=path.read_bytes(); entries.append({'path':path.relative_to(root).as_posix(),'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest()})
+          (root/'EVIDENCE_MANIFEST.json').write_text(json.dumps(entries,indent=2,sort_keys=True)+'\n')
+          with (root/'SHA256SUMS.txt').open('w') as h:
+              for row in entries: h.write(f"{row['sha256']}  {row['path']}\n")
+          PY
+          tar --sort=name --mtime='UTC 2026-08-01' --owner=0 --group=0 --numeric-owner -czf pyth-lazer-exact-build-binding.tar.gz evidence
+          sha256sum pyth-lazer-exact-build-binding.tar.gz > pyth-lazer-exact-build-binding.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pyth-lazer-exact-build-binding-${{ github.run_id }}
+          path: |
+            evidence/
+            pyth-lazer-exact-build-binding.tar.gz
+            pyth-lazer-exact-build-binding.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
