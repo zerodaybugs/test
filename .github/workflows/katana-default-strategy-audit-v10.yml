@@ -1,0 +1,301 @@
+name: Internal Katana default strategy takeover and audit gate v10
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.katana-default-v10/**'
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    env:
+      GOVERNANCE_COMMIT: 2fe29c49bfbd6c7c116ddf56a1228de450a62728
+      VAULT: '0x7231dbaCdFc968E07656D12389AB20De82FbfCeB'
+      ACTIVE_STRATEGY: '0x60233D1c150F9C08D886906d597aA79a205b0463'
+      SWAPPER: '0x92D2e00b6D2BB50B87a9BE971a82B1F00ac44768'
+      MERKL: '0x3Ef3D8bA38EBe18DB133cEc108f4D14CE00Dd9Ae'
+      KAT: '0x7f1f4b4b29f5058fa32cc7a97141b8d7e5abdc2d'
+      USDC: '0x203A662b0BD271A6ed5a60EdFbd04bFce608FD36'
+      ATTACKER: '0x1111111111111111111111111111111111111111'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends poppler-utils jq ripgrep
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Select Katana RPC
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/live evidence/audit
+          RPC=''
+          for candidate in \
+            'https://rpc.katana.network/' \
+            'https://katana.gateway.tenderly.co/' \
+            'https://rpc.katanarpc.com/'; do
+            if id="$(cast chain-id --rpc-url "$candidate" 2>/dev/null)" && test "$id" = '747474'; then
+              RPC="$candidate"
+              break
+            fi
+          done
+          test -n "$RPC"
+          printf 'RPC=%s\n' "$RPC" >> "$GITHUB_ENV"
+          printf '%s\n' "$RPC" > evidence/live/RPC.txt
+          cast block latest --json --rpc-url "$RPC" > evidence/live/BLOCK.json
+
+      - name: Probe default strategy takeover and direct principal-loss path
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          from typing import Any
+
+          rpc = os.environ['RPC']
+          vault = os.environ['VAULT']
+          active = os.environ['ACTIVE_STRATEGY']
+          attacker = os.environ['ATTACKER']
+          kat = os.environ['KAT']
+          usdc = os.environ['USDC']
+          swapper = os.environ['SWAPPER']
+          merkl = os.environ['MERKL']
+
+          def run(args: list[str]) -> str:
+              return subprocess.run(args, check=True, text=True, capture_output=True).stdout.strip()
+
+          def call(to: str, sig: str, *args: str, sender: str | None = None) -> dict[str, Any]:
+              cmd = ['cast','call',to,sig,*map(str,args),'--rpc-url',rpc]
+              if sender:
+                  cmd += ['--from',sender]
+              try:
+                  return {'status':'SUCCESS','output':run(cmd)}
+              except subprocess.CalledProcessError as exc:
+                  return {'status':'REVERT','output':(exc.stderr or exc.stdout or str(exc)).strip()}
+
+          def first(result):
+              return result['output'].splitlines()[0].strip() if result['status']=='SUCCESS' else None
+
+          def addr(result):
+              value = first(result)
+              return value.lower() if value else None
+
+          def intval(result):
+              value = first(result)
+              return int(value.split()[0],0) if value else None
+
+          def storage(address: str, slot: int) -> str:
+              return run(['cast','storage',address,hex(slot),'--rpc-url',rpc]).lower()
+
+          default_call = call(vault,'defaultStrategy()(address)')
+          active_call = call(vault,'strategy()(address)')
+          default = addr(default_call)
+          active_live = addr(active_call)
+          if not default:
+              raise RuntimeError('default strategy unavailable')
+
+          default_master = intval(call(default,'masterTokenId()(uint256)'))
+          active_master = intval(call(active_live or active,'masterTokenId()(uint256)'))
+          nft = addr(call(active_live or active,'nft()(address)'))
+          active_nft_owner = (
+              call(nft,'ownerOf(uint256)(address)',str(active_master))
+              if nft and active_master else None
+          )
+          default_nft_owner = (
+              call(nft,'ownerOf(uint256)(address)',str(default_master))
+              if nft and default_master else None
+          )
+
+          probes = [
+              {
+                  'label':'initialize_owner_takeover',
+                  'result':call(default,'initializeOwner(address)',attacker,sender=attacker),
+              },
+              {
+                  'label':'retire_master_token',
+                  'result':call(default,'retireStrategy()',sender=attacker),
+              },
+              {
+                  'label':'withdraw_master_principal',
+                  'result':call(default,'withdraw(address,uint256)(uint256)',attacker,'1',sender=attacker),
+              },
+              {
+                  'label':'overwrite_master_token',
+                  'result':call(default,'receiveMasterToken(uint256)','1',sender=attacker),
+              },
+              {
+                  'label':'uups_upgrade',
+                  'result':call(default,'upgradeTo(address)',attacker,sender=attacker),
+              },
+          ]
+
+          active_probes = [
+              {
+                  'label':'active_retire_master_token',
+                  'result':call(active_live or active,'retireStrategy()',sender=attacker),
+              },
+              {
+                  'label':'active_withdraw_master_principal',
+                  'result':call(active_live or active,'withdraw(address,uint256)(uint256)',attacker,'1',sender=attacker),
+              },
+              {
+                  'label':'active_uups_upgrade',
+                  'result':call(active_live or active,'upgradeTo(address)',attacker,sender=attacker),
+              },
+          ]
+
+          metadata = {
+              'vault': {
+                  'address':vault.lower(),
+                  'default_strategy_call':default_call,
+                  'active_strategy_call':active_call,
+                  'master_token_id':call(vault,'masterTokenId()(uint256)'),
+                  'total_assets':call(vault,'totalAssets()(uint256)'),
+                  'total_supply':call(vault,'totalSupply()(uint256)'),
+                  'paused':call(vault,'paused()(bool)'),
+                  'lock_nft':call(vault,'lockNft()(address)'),
+              },
+              'default_strategy': {
+                  'address':default,
+                  'owner':call(default,'owner()(address)'),
+                  'master_token_id':default_master,
+                  'nft':call(default,'nft()(address)'),
+                  'escrow':call(default,'escrow()(address)'),
+                  'total_assets':call(default,'totalAssets()(uint256)'),
+                  'implementation':call(default,'implementation()(address)'),
+                  'slot0_initializable_word':storage(default,0),
+                  'slot0_initialized_low_byte':int(storage(default,0),16) & 0xff,
+                  'eip1967_implementation':storage(default,int('360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc',16)),
+                  'eip1967_admin':storage(default,int('b53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103',16)),
+                  'master_nft_owner':default_nft_owner,
+                  'attacker_probes':probes,
+              },
+              'active_strategy': {
+                  'address':active_live or active,
+                  'owner':call(active_live or active,'owner()(address)'),
+                  'master_token_id':active_master,
+                  'nft':call(active_live or active,'nft()(address)'),
+                  'escrow':call(active_live or active,'escrow()(address)'),
+                  'total_assets':call(active_live or active,'totalAssets()(uint256)'),
+                  'implementation':call(active_live or active,'implementation()(address)'),
+                  'slot0_initializable_word':storage(active_live or active,0),
+                  'slot0_initialized_low_byte':int(storage(active_live or active,0),16) & 0xff,
+                  'master_nft_owner':active_nft_owner,
+                  'attacker_probes':active_probes,
+              },
+              'swapper': {
+                  'address':swapper.lower(),
+                  'kat_balance':call(kat,'balanceOf(address)(uint256)',swapper),
+                  'usdc_balance':call(usdc,'balanceOf(address)(uint256)',swapper),
+                  'native_balance_wei':int(run(['cast','balance',swapper,'--rpc-url',rpc]).split()[0],0),
+                  'reward_distributor':call(swapper,'rewardDistributor()(address)'),
+                  'escrow':call(swapper,'escrow()(address)'),
+                  'escrow_token':call(swapper,'escrowToken()(address)'),
+              },
+              'merkl': {
+                  'operator_active_to_swapper':call(merkl,'operators(address,address)(uint256)',active_live or active,swapper),
+                  'recipient_active_kat':call(merkl,'claimRecipient(address,address)(address)',active_live or active,kat),
+                  'recipient_active_default':call(merkl,'claimRecipient(address,address)(address)',active_live or active,'0x0000000000000000000000000000000000000000'),
+              },
+          }
+
+          unauthorized_successes = [
+              item['label']
+              for item in probes + active_probes
+              if item['result']['status']=='SUCCESS'
+          ]
+          metadata['verdict'] = {
+              'default_owner_matches_vault':addr(metadata['default_strategy']['owner']) == vault.lower(),
+              'active_owner_matches_vault':addr(metadata['active_strategy']['owner']) == vault.lower(),
+              'default_initialized_version_at_least_two':metadata['default_strategy']['slot0_initialized_low_byte'] >= 2,
+              'unauthorized_successes':unauthorized_successes,
+              'takeover_gate_pass':(
+                  addr(metadata['default_strategy']['owner']) == vault.lower()
+                  and metadata['default_strategy']['slot0_initialized_low_byte'] >= 2
+                  and not unauthorized_successes
+              ),
+          }
+
+          Path('evidence/live/DEFAULT_STRATEGY_GATE.json').write_text(json.dumps(metadata,indent=2,sort_keys=True)+'\n')
+          rows=['component\taddress\towner\tmaster_token_id\ttotal_assets\tinitialized_low_byte']
+          rows.append('\t'.join(map(str,['default',default,addr(metadata['default_strategy']['owner']),default_master,intval(metadata['default_strategy']['total_assets']),metadata['default_strategy']['slot0_initialized_low_byte']])))
+          rows.append('\t'.join(map(str,['active',active_live or active,addr(metadata['active_strategy']['owner']),active_master,intval(metadata['active_strategy']['total_assets']),metadata['active_strategy']['slot0_initialized_low_byte']])))
+          Path('evidence/live/DEFAULT_STRATEGY_GATE.tsv').write_text('\n'.join(rows)+'\n')
+          PY
+
+      - name: Pin source, build, and extract complete public audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/katana-governance"
+          git clone --filter=blob:none https://github.com/aragon/katana-governance.git "$WORK"
+          git -C "$WORK" checkout "$GOVERNANCE_COMMIT"
+          git -C "$WORK" submodule update --init --recursive
+          git -C "$WORK" rev-parse HEAD > evidence/audit/PINNED_COMMIT.txt
+          git -C "$WORK" submodule status --recursive > evidence/audit/SUBMODULE_STATUS.txt
+          git -C "$WORK" status --short > evidence/audit/SOURCE_STATUS.txt
+          (cd "$WORK" && forge build --force) > evidence/audit/FORGE_BUILD.log 2>&1
+          pdfinfo "$WORK/audits/audit-report.pdf" > evidence/audit/AUDIT_PDF_INFO.txt
+          pdftotext -layout "$WORK/audits/audit-report.pdf" evidence/audit/AUDIT_REPORT.txt
+          grep -niE 'critical|high|medium|low|informational|acknowledged|resolved|owner|initializ|reinitializ|swapper|operator|recipient|strategy|vault|claim|reward|reentran' evidence/audit/AUDIT_REPORT.txt > evidence/audit/AUDIT_RELEVANT_LINES.txt || true
+          git -C "$WORK" log --all --oneline --decorate -n 200 > evidence/audit/HISTORY.txt
+          git -C "$WORK" log --all --oneline --grep='audit\|fix\|security\|owner\|initializ\|operator\|recipient\|swapper' -i > evidence/audit/SECURITY_HISTORY.txt || true
+          {
+            printf '%s\n' '=== initializers and ownership ==='
+            rg -n --glob '*.sol' 'initializer|reinitializer|_transferOwnership|onlyOwner|retireStrategy|receiveMasterToken' "$WORK/src" || true
+            printf '%s\n' '=== arbitrary calls, approvals, recipients, operators ==='
+            rg -n --glob '*.sol' 'target\.call|\.call\{|approve\(|setClaimRecipient|toggleOperator|claimAndSwap|_executeActions' "$WORK/src" || true
+          } > evidence/audit/TARGETED_STATIC_SCAN.txt
+
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+          text=Path('evidence/audit/AUDIT_REPORT.txt').read_text(errors='replace')
+          lines=text.splitlines()
+          titles=[]
+          for i,line in enumerate(lines):
+              if re.search(r'\b(Critical|High|Medium|Low|Informational)\b',line,re.I):
+                  clean=' '.join(line.split())
+                  if clean and clean not in titles:
+                      titles.append(clean)
+          report={'line_count':len(lines),'severity_lines':titles[:250]}
+          Path('evidence/audit/AUDIT_INDEX.json').write_text(json.dumps(report,indent=2,sort_keys=True)+'\n')
+          PY
+
+      - name: Package evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find evidence -type f -printf '%P\t%s bytes\n' | sort > evidence/ARTIFACT_INDEX.txt
+          (cd evidence && find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt)
+
+      - name: Upload private evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-default-strategy-audit-v10-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
