@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Indexed-log wrapper with Routescan hex-field normalization.
+"""Indexed-log wrapper with Routescan and topic normalization.
 
 Read-only only: no signer, transaction construction, broadcast, or state change.
 """
@@ -22,6 +22,11 @@ def _parse_int(value: Any) -> int:
         return value
     text = str(value or "0")
     return int(text, 16) if text.lower().startswith("0x") else int(text)
+
+
+def _hex(value: Any) -> str:
+    text = value.hex() if hasattr(value, "hex") else str(value)
+    return text if text.startswith("0x") else "0x" + text
 
 
 def _normalize(rows: list[Any]) -> list[Any]:
@@ -64,5 +69,10 @@ def indexed_first_logs(address: str, start: int, end: int) -> tuple[list[Any], l
     raise RuntimeError(base.json.dumps(attempts))
 
 
+# Web3.py releases differ on whether HexBytes.hex() includes the 0x prefix.
+# Normalize both the expected signatures and incoming explorer/RPC topics.
+base.MARKET_CREATED_TOPIC = _hex(base.MARKET_CREATED_TOPIC)
+base.PRICE_FEED_CREATED_TOPIC = _hex(base.PRICE_FEED_CREATED_TOPIC)
+base.topic_hex = _hex
 base.all_logs = indexed_first_logs
 raise SystemExit(base.main())
