@@ -13,6 +13,13 @@ if SPEC is None or SPEC.loader is None:
 base = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(base)
 
+# web3.py v7 HexBytes.hex() omits the 0x prefix, while explorer logs include it.
+# Normalize once so exact event-topic comparisons remain deterministic.
+if not base.MARKET_CREATED_TOPIC.startswith("0x"):
+    base.MARKET_CREATED_TOPIC = "0x" + base.MARKET_CREATED_TOPIC
+if not base.PRICE_FEED_CREATED_TOPIC.startswith("0x"):
+    base.PRICE_FEED_CREATED_TOPIC = "0x" + base.PRICE_FEED_CREATED_TOPIC
+
 
 def indexed_first_logs(address: str, start: int, end: int) -> tuple[list[Any], list[dict[str, Any]]]:
     attempts: list[dict[str, Any]] = []
