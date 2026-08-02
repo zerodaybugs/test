@@ -1,0 +1,223 @@
+name: Velocity active deployment trigger check
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/velocity-active-trigger-public.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  trigger-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Capture current active Velocity deployment and public source head
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > /tmp/check.py <<'PY'
+          import base64
+          import hashlib
+          import json
+          import struct
+          import subprocess
+          import time
+          import urllib.request
+          from pathlib import Path
+
+          PROGRAM = 'vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P'
+          BASELINE_PROGRAMDATA = 'HkRf36jvUB32dnHjHqpMnPcKJhUP2TUKJTH7RDTifJm7'
+          BASELINE_ELF_SHA256 = '1b7b06d17af813b5a505df8f534bfd0779a1a7457f0d2626b1a45c8741686c80'
+          BASELINE_SOURCE_HEAD = '13e8e9b8d614f3b62e3a65a8c372c819e6529aeb'
+          RPCS = [
+              'https://solana-rpc.publicnode.com',
+              'https://api.mainnet-beta.solana.com',
+              'https://solana.drpc.org',
+              'https://1rpc.io/solana',
+          ]
+          ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+          OUT = Path('evidence')
+
+          def b58encode(data: bytes) -> str:
+              number = int.from_bytes(data, 'big')
+              encoded = ''
+              while number:
+                  number, remainder = divmod(number, 58)
+                  encoded = ALPHABET[remainder] + encoded
+              leading = 0
+              for byte in data:
+                  if byte != 0:
+                      break
+                  leading += 1
+              return '1' * leading + (encoded or '')
+
+          def rpc(endpoint: str, method: str, params):
+              payload = json.dumps({
+                  'jsonrpc': '2.0',
+                  'id': 1,
+                  'method': method,
+                  'params': params,
+              }).encode()
+              request = urllib.request.Request(
+                  endpoint,
+                  data=payload,
+                  headers={
+                      'content-type': 'application/json',
+                      'user-agent': 'ZeroDayBugs-Velocity-Trigger/1.0',
+                  },
+                  method='POST',
+              )
+              with urllib.request.urlopen(request, timeout=25) as response:
+                  body = json.loads(response.read().decode())
+              if body.get('error'):
+                  raise RuntimeError(json.dumps(body['error']))
+              return body['result']
+
+          def canonical_elf_size(data: bytes) -> int:
+              if len(data) < 64 or data[:4] != b'\x7fELF' or data[4] != 2 or data[5] != 1:
+                  raise ValueError('not ELF64 little-endian')
+              u16 = lambda offset: struct.unpack_from('<H', data, offset)[0]
+              u32 = lambda offset: struct.unpack_from('<I', data, offset)[0]
+              u64 = lambda offset: struct.unpack_from('<Q', data, offset)[0]
+              phoff, shoff = u64(0x20), u64(0x28)
+              ehsize, phentsize, phnum = u16(0x34), u16(0x36), u16(0x38)
+              shentsize, shnum = u16(0x3A), u16(0x3C)
+              maximum = max(64, ehsize)
+              if phoff and phentsize and phnum:
+                  maximum = max(maximum, phoff + phentsize * phnum)
+                  for index in range(phnum):
+                      offset = phoff + index * phentsize
+                      maximum = max(maximum, u64(offset + 8) + u64(offset + 32))
+              if shoff and shentsize and shnum:
+                  maximum = max(maximum, shoff + shentsize * shnum)
+                  for index in range(shnum):
+                      offset = shoff + index * shentsize
+                      if u32(offset + 4) != 8:
+                          maximum = max(maximum, u64(offset + 24) + u64(offset + 32))
+              if maximum > len(data):
+                  raise ValueError('ELF extent outside payload')
+              return maximum
+
+          attempts = []
+          selected = None
+          program_result = None
+          for endpoint in RPCS:
+              try:
+                  slot = rpc(endpoint, 'getSlot', [{'commitment': 'finalized'}])
+                  program_result = rpc(endpoint, 'getAccountInfo', [
+                      PROGRAM,
+                      {'encoding': 'base64', 'commitment': 'finalized'},
+                  ])
+                  if not program_result.get('value'):
+                      raise RuntimeError('program account missing')
+                  selected = endpoint
+                  attempts.append({'endpoint': endpoint, 'ok': True, 'slot': slot})
+                  break
+              except Exception as error:
+                  attempts.append({'endpoint': endpoint, 'ok': False, 'error': f'{type(error).__name__}: {error}'})
+                  time.sleep(0.5)
+
+          source_head = None
+          source_error = None
+          try:
+              output = subprocess.check_output([
+                  'git', 'ls-remote', 'https://github.com/velocity-exchange/protocol-v2.git',
+                  'refs/heads/master'
+              ], text=True, timeout=30).strip()
+              source_head = output.split()[0]
+          except Exception as error:
+              source_error = f'{type(error).__name__}: {error}'
+
+          result = {
+              'programId': PROGRAM,
+              'baseline': {
+                  'programData': BASELINE_PROGRAMDATA,
+                  'canonicalElfSha256': BASELINE_ELF_SHA256,
+                  'publicSourceHead': BASELINE_SOURCE_HEAD,
+              },
+              'rpcAttempts': attempts,
+              'selectedEndpoint': selected,
+              'current': {
+                  'programData': None,
+                  'deploymentSlot': None,
+                  'canonicalElfSha256': None,
+                  'publicSourceHead': source_head,
+              },
+              'checks': {},
+              'sourceError': source_error,
+              'publicChainTransactions': 0,
+          }
+
+          if selected and program_result:
+              program_raw = base64.b64decode(program_result['value']['data'][0])
+              if len(program_raw) < 36:
+                  raise RuntimeError('program account too short')
+              program_data = b58encode(program_raw[4:36])
+              pd_result = rpc(selected, 'getAccountInfo', [
+                  program_data,
+                  {'encoding': 'base64', 'commitment': 'finalized'},
+              ])
+              if not pd_result.get('value'):
+                  raise RuntimeError('ProgramData account missing')
+              pd_raw = base64.b64decode(pd_result['value']['data'][0])
+              if len(pd_raw) < 46:
+                  raise RuntimeError('ProgramData account too short')
+              deployment_slot = struct.unpack_from('<Q', pd_raw, 4)[0]
+              payload = pd_raw[45:]
+              canonical = payload[:canonical_elf_size(payload)]
+              canonical_hash = hashlib.sha256(canonical).hexdigest()
+              result['current'].update({
+                  'programData': program_data,
+                  'deploymentSlot': deployment_slot,
+                  'canonicalElfSha256': canonical_hash,
+                  'programDataAccountSha256': hashlib.sha256(pd_raw).hexdigest(),
+                  'canonicalElfBytes': len(canonical),
+              })
+              OUT.joinpath('ACTIVE_CANONICAL.so').write_bytes(canonical)
+
+          current = result['current']
+          result['checks'] = {
+              'rpcExecutionSucceeded': selected is not None and current['canonicalElfSha256'] is not None,
+              'programDataChanged': current['programData'] not in (None, BASELINE_PROGRAMDATA),
+              'activeElfChanged': current['canonicalElfSha256'] not in (None, BASELINE_ELF_SHA256),
+              'publicSourceHeadChanged': source_head not in (None, BASELINE_SOURCE_HEAD),
+          }
+          if not result['checks']['rpcExecutionSucceeded']:
+              result['verdict'] = 'NOT_EXECUTED_RPC_UNAVAILABLE'
+          elif any([
+              result['checks']['programDataChanged'],
+              result['checks']['activeElfChanged'],
+              result['checks']['publicSourceHeadChanged'],
+          ]):
+              result['verdict'] = 'REOPEN_TRIGGER_CHANGED_DEPLOYMENT_OR_SOURCE'
+          else:
+              result['verdict'] = 'NO_REOPEN_TRIGGER_UNCHANGED_DEPLOYMENT_AND_SOURCE'
+
+          OUT.joinpath('TRIGGER_RESULT.json').write_text(json.dumps(result, indent=2, sort_keys=True) + '\n')
+          manifest = []
+          for path in sorted(p for p in OUT.iterdir() if p.is_file()):
+              data = path.read_bytes()
+              manifest.append({'name': path.name, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+          OUT.joinpath('MANIFEST.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
+          print(json.dumps(result, indent=2, sort_keys=True))
+          PY
+          python /tmp/check.py | tee evidence/RUN_STDOUT.log
+
+      - name: Upload trigger-check evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: velocity-active-trigger-public-${{ github.run_id }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 1
