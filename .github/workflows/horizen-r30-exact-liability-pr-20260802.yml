@@ -1,0 +1,96 @@
+name: Horizen R30 exact accrued-plus-future liability census
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/horizen-r30-exact-liability-pr-20260802.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  exact-liability:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Reconstruct all deposit liabilities from public state
+        shell: bash
+        env:
+          RPC: https://horizen-testnet.rpc.caldera.xyz/http
+          STAKER: '0x6BF7CF29a8bcE11Aa62Cf593d165C244fA4d3E31'
+          TOKEN: '0xb06EC4ce262D8dbDc24Fac87479A49A7DC4cFb87'
+          FROM_BLOCK: '21842327'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, time, urllib.request
+
+          RPC=os.environ['RPC']; S=os.environ['STAKER'].lower(); T=os.environ['TOKEN'].lower(); START=int(os.environ['FROM_BLOCK']); SCALE=10**36
+          rid=0
+          def rpc(method, params, tries=4):
+              global rid
+              last=None
+              for n in range(tries):
+                  rid+=1
+                  data=json.dumps({'jsonrpc':'2.0','id':rid,'method':method,'params':params}).encode()
+                  req=urllib.request.Request(RPC,data=data,headers={'content-type':'application/json','user-agent':'Horizen-R30-exact-liability'},method='POST')
+                  try:
+                      with urllib.request.urlopen(req,timeout=40) as r: out=json.loads(r.read())
+                      if 'error' in out: raise RuntimeError(out['error'])
+                      return out['result']
+                  except Exception as e:
+                      last=e; time.sleep(2**n)
+              raise RuntimeError(f'{method}: {last}')
+          def call(to,data): return rpc('eth_call',[{'to':to,'data':data},'latest'])
+          def ui(x): return int(x,16)
+          def pad(v): return hex(v)[2:].rjust(64,'0')
+          def addr_word(w): return '0x'+w[-40:]
+          def words(x):
+              h=x[2:]; assert len(h)%64==0
+              return [h[i:i+64] for i in range(0,len(h),64)]
+          def logs(address,topic,start,end,chunk=20000):
+              out=[]; cur=start
+              while cur<=end:
+                  stop=min(cur+chunk-1,end)
+                  try:
+                      out+=rpc('eth_getLogs',[{'address':address,'fromBlock':hex(cur),'toBlock':hex(stop),'topics':[topic]}],3); cur=stop+1
+                  except Exception:
+                      if chunk<=500: raise
+                      chunk//=2
+              return out
+
+          SEL={
+            'deposits':'0xb02c43d0','unclaimed':'0xcb3056ad','rpt':'0xae0d27b6','total_staked':'0x817b1cd2','total_power':'0x08484dee','reward_end':'0x37e9f64a','scaled_rate':'0xc3c16e4e','balance_of':'0x70a08231'
+          }
+          TOPIC_STAKE='0x1a325385f16807e99fb688b597db78b00faee313dcf02e882dd16daab6fc3e1f'
+          latest=ui(rpc('eth_blockNumber',[])); block=rpc('eth_getBlockByNumber',[hex(latest),False]); now=ui(block['timestamp'])
+          stake_logs=logs(S,TOPIC_STAKE,START,latest)
+          ids=sorted({ui(x['topics'][2]) for x in stake_logs})
+          rpt=ui(call(S,SEL['rpt'])); total_staked=ui(call(S,SEL['total_staked'])); total_power=ui(call(S,SEL['total_power'])); reward_end=ui(call(S,SEL['reward_end'])); scaled_rate=ui(call(S,SEL['scaled_rate']))
+          staker_balance=ui(call(T,SEL['balance_of']+S.removeprefix('0x').rjust(64,'0')))
+          deposits=[]; sum_bal=0; sum_ep=0; sum_scaled=0; sum_floor=0
+          for i in ids:
+              w=words(call(S,SEL['deposits']+pad(i)))
+              assert len(w)>=7, (i,len(w))
+              balance=ui('0x'+w[0]); owner=addr_word(w[1]); ep=ui('0x'+w[2]); delegatee=addr_word(w[3]); claimer=addr_word(w[4]); cp=ui('0x'+w[5]); stored=ui('0x'+w[6])
+              assert rpt>=cp, (i,rpt,cp)
+              exact=stored+ep*(rpt-cp)
+              floor=ui(call(S,SEL['unclaimed']+pad(i)))
+              assert floor==exact//SCALE, (i,floor,exact//SCALE)
+              sum_bal+=balance; sum_ep+=ep; sum_scaled+=exact; sum_floor+=floor
+              deposits.append({'id':i,'balance':balance,'owner':owner,'earning_power':ep,'delegatee':delegatee,'claimer':claimer,'reward_per_token_checkpoint':cp,'stored_scaled_unclaimed':stored,'exact_scaled_unclaimed':exact,'floor_unclaimed_raw':floor})
+          remaining=max(reward_end-now,0); future_scaled=scaled_rate*remaining
+          total_scaled_liability=sum_scaled+future_scaled; backing_scaled=staker_balance*SCALE; surplus_scaled=backing_scaled-total_scaled_liability
+          result={
+            'classification':'PUBLIC_READ_ONLY_EXACT_LIABILITY','public_network_writes':0,'collected_at_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'block_number':latest,'block_timestamp':now,
+            'stake_event_count':len(stake_logs),'unique_deposit_ids':len(ids),'reward_per_token_accumulated':rpt,
+            'aggregates':{'sum_deposit_balances':sum_bal,'contract_total_staked':total_staked,'principal_aggregate_delta':sum_bal-total_staked,'sum_deposit_earning_power':sum_ep,'contract_total_earning_power':total_power,'earning_power_aggregate_delta':sum_ep-total_power},
+            'liability':{'staker_token_balance_raw':staker_balance,'staker_backing_scaled':backing_scaled,'exact_accrued_scaled':sum_scaled,'floor_accrued_raw':sum_floor,'reward_end':reward_end,'remaining_seconds':remaining,'scaled_reward_rate':scaled_rate,'future_stream_scaled':future_scaled,'total_accrued_plus_future_scaled':total_scaled_liability,'exact_surplus_scaled':surplus_scaled,'exact_surplus_raw_floor':surplus_scaled//SCALE,'solvent':surplus_scaled>=0},
+            'deposits':deposits,
+          }
+          result['gates']={'deposit_balance_matches_total':sum_bal==total_staked,'deposit_ep_matches_total':sum_ep==total_power,'all_unclaimed_helpers_match_exact':True,'exact_accrued_plus_future_solvent':surplus_scaled>=0}
+          print('HORIZEN_R30_EXACT_JSON_BEGIN'); print(json.dumps(result,indent=2,sort_keys=True)); print('HORIZEN_R30_EXACT_JSON_END')
+          assert all(result['gates'].values()), result['gates']
+          print('HORIZEN_R30_EXACT_GATE=PASS'); print('PUBLIC_NETWORK_WRITES=0')
+          PY
