@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build a deterministic, evenly sampled index of finalized public Pyth Lazer calls.
 
-Read-only JSON-RPC only. The script deliberately stores only the selected sample,
+Read-only JSON-RPC only.  The script deliberately stores only the selected sample,
 not the complete signature history, to keep the artifact bounded.
 """
 from __future__ import annotations
@@ -12,6 +12,7 @@ import math
 import os
 import random
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -64,14 +65,14 @@ def rpc(method: str, params: list[Any], cursor: int, attempts: int = 18) -> tupl
         try:
             result = request(endpoint, method, params)
             return result, endpoint, (index + 1) % len(RPCS), errors
-        except Exception as exc:
+        except Exception as exc:  # public endpoints can rate-limit transiently
             errors.append(f"{endpoint}: {type(exc).__name__}: {exc}")
             time.sleep(min(8.0, 0.2 * (2 ** min(attempt, 5))) + random.random() * 0.2)
     raise RuntimeError(" | ".join(errors[-12:]))
 
 
 def deterministic_positions(count: int, wanted: int) -> list[int]:
-    """Evenly spread wanted indexes through a page, including both edges."""
+    """Evenly spread `wanted` indexes through a page, including both edges."""
     if count <= wanted:
         return list(range(count))
     if wanted == 1:
@@ -173,6 +174,7 @@ def main() -> int:
             break
         time.sleep(0.04)
 
+    # Preserve chronological order and remove any accidental duplicate signatures.
     dedup: dict[str, dict[str, Any]] = {}
     for row in selected:
         dedup[row["signature"]] = row
@@ -212,9 +214,15 @@ def main() -> int:
     (OUT / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
 
+    # Fail closed if the intended history depth or sample cardinality was not reached.
+    history_exhausted = termination in {"short_page", "empty_page"}
     minimum_pages = max(1, math.floor(MAX_PAGES * 0.99))
-    minimum_rows = max(1, math.floor(MAX_PAGES * SAMPLE_PER_PAGE * 0.98))
-    if summary["pagesFetched"] < minimum_pages or summary["sampleRows"] < minimum_rows:
+    expected_rows_for_fetched_pages = summary["pagesFetched"] * SAMPLE_PER_PAGE
+    minimum_rows = max(1, math.floor(expected_rows_for_fetched_pages * 0.98))
+    if (
+        (not history_exhausted and summary["pagesFetched"] < minimum_pages)
+        or summary["sampleRows"] < minimum_rows
+    ):
         return 2
     return 0
 
