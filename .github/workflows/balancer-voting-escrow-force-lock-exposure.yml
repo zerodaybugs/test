@@ -1,0 +1,229 @@
+name: Balancer VotingEscrow force-lock exposure scan
+
+on:
+  push:
+    branches:
+      - tooling/foundry-download-bootstrap-20260802
+    paths:
+      - '.github/workflows/balancer-voting-escrow-force-lock-exposure.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/balancer-voting-escrow-force-lock-exposure.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install verified Foundry
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl --fail --location --retry 5 --retry-all-errors \
+            -o /tmp/foundry.tar.gz \
+            https://github.com/foundry-rs/foundry/releases/download/v1.7.1/foundry_v1.7.1_linux_amd64.tar.gz
+          echo 'cf7e688ed0c4c48adffca788b496076e31060b67ac5afe1e43dbb5499c20c88b  /tmp/foundry.tar.gz' | sha256sum -c -
+          tar -xzf /tmp/foundry.tar.gz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Scan historical depositors and current force-lockable balances
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          cat > /tmp/scan.py <<'PY'
+          import json, time, urllib.request, sys, os
+
+          RPCS = [
+              'https://ethereum-rpc.publicnode.com',
+              'https://eth.llamarpc.com',
+          ]
+          VE = '0xC128a9954e6c874eA3d62ce62B468bA073093F25'
+          START = 14200000
+          rpc_id = 0
+          active_rpc = None
+
+          def rpc(method, params, retries=5):
+              global rpc_id, active_rpc
+              last = None
+              candidates = ([active_rpc] if active_rpc else []) + [r for r in RPCS if r != active_rpc]
+              for url in candidates:
+                  if not url:
+                      continue
+                  for attempt in range(retries):
+                      rpc_id += 1
+                      body = json.dumps({'jsonrpc':'2.0','id':rpc_id,'method':method,'params':params}).encode()
+                      req = urllib.request.Request(url, data=body, headers={'content-type':'application/json'})
+                      try:
+                          with urllib.request.urlopen(req, timeout=60) as resp:
+                              out = json.load(resp)
+                          if 'error' in out:
+                              raise RuntimeError(out['error'])
+                          active_rpc = url
+                          return out['result']
+                      except Exception as exc:
+                          last = exc
+                          time.sleep(min(2 ** attempt, 8))
+              raise RuntimeError(f'{method} failed: {last}')
+
+          def batch(calls, chunk=100):
+              global rpc_id, active_rpc
+              results = []
+              for pos in range(0, len(calls), chunk):
+                  part = calls[pos:pos+chunk]
+                  reqs = []
+                  ids = []
+                  for method, params in part:
+                      rpc_id += 1
+                      ids.append(rpc_id)
+                      reqs.append({'jsonrpc':'2.0','id':rpc_id,'method':method,'params':params})
+                  last = None
+                  candidates = ([active_rpc] if active_rpc else []) + [r for r in RPCS if r != active_rpc]
+                  for url in candidates:
+                      if not url:
+                          continue
+                      try:
+                          request = urllib.request.Request(
+                              url, data=json.dumps(reqs).encode(), headers={'content-type':'application/json'}
+                          )
+                          with urllib.request.urlopen(request, timeout=90) as resp:
+                              out = json.load(resp)
+                          by_id = {x['id']: x for x in out}
+                          ordered = []
+                          for rid in ids:
+                              item = by_id[rid]
+                              if 'error' in item:
+                                  raise RuntimeError(item['error'])
+                              ordered.append(item['result'])
+                          active_rpc = url
+                          results.extend(ordered)
+                          break
+                      except Exception as exc:
+                          last = exc
+                  else:
+                      raise RuntimeError(f'batch failed: {last}')
+                  time.sleep(0.05)
+              return results
+
+          # Function selectors supplied by cast in the workflow, avoiding any non-primary ABI source.
+          SEL_TOKEN = os.environ['SEL_TOKEN']
+          SEL_LOCKED = os.environ['SEL_LOCKED']
+          SEL_BALANCE = os.environ['SEL_BALANCE']
+          SEL_ALLOWANCE = os.environ['SEL_ALLOWANCE']
+          TOPIC_DEPOSIT = os.environ['TOPIC_DEPOSIT']
+
+          latest_hex = rpc('eth_blockNumber', [])
+          latest = int(latest_hex, 16)
+          latest_block = rpc('eth_getBlockByNumber', [latest_hex, False])
+          now = int(latest_block['timestamp'], 16)
+
+          token_raw = rpc('eth_call', [{'to':VE,'data':SEL_TOKEN}, latest_hex])
+          token = '0x' + token_raw[-40:]
+
+          logs = []
+          step = 100000
+          start = START
+          while start <= latest:
+              end = min(start + step - 1, latest)
+              try:
+                  part = rpc('eth_getLogs', [{
+                      'fromBlock':hex(start), 'toBlock':hex(end),
+                      'address':VE, 'topics':[TOPIC_DEPOSIT]
+                  }], retries=3)
+                  logs.extend(part)
+                  print(f'{start}-{end}: {len(part)} deposits', flush=True)
+                  start = end + 1
+              except Exception as exc:
+                  if step <= 5000:
+                      raise
+                  step //= 2
+                  print(f'reducing block range to {step}: {exc}', flush=True)
+
+          providers = sorted({'0x' + log['topics'][1][-40:] for log in logs})
+          print(f'unique historical deposit providers: {len(providers)}', flush=True)
+
+          def encode_address(selector, address):
+              return selector + address[2:].lower().rjust(64, '0')
+
+          locked_calls = [('eth_call', [{'to':VE,'data':encode_address(SEL_LOCKED,p)}, latest_hex]) for p in providers]
+          locked_raw = batch(locked_calls)
+          active = []
+          for provider, raw in zip(providers, locked_raw):
+              if not raw or raw == '0x':
+                  continue
+              body = raw[2:].ljust(128, '0')
+              amount_word = int(body[:64], 16)
+              # Decode signed int128 from the low 128 bits of the ABI word.
+              amount128 = amount_word & ((1 << 128) - 1)
+              if amount128 >= (1 << 127):
+                  amount128 -= (1 << 128)
+              end = int(body[64:128], 16)
+              if amount128 > 0 and end > now:
+                  active.append((provider, amount128, end))
+
+          balance_calls = [('eth_call', [{'to':token,'data':encode_address(SEL_BALANCE,p)}, latest_hex]) for p,_,_ in active]
+          allowance_calls = [('eth_call', [{'to':token,'data':SEL_ALLOWANCE + p[2:].lower().rjust(64,'0') + VE[2:].lower().rjust(64,'0')}, latest_hex]) for p,_,_ in active]
+          balances = batch(balance_calls) if balance_calls else []
+          allowances = batch(allowance_calls) if allowance_calls else []
+
+          rows = []
+          for (provider, locked_amount, end), bal_raw, allow_raw in zip(active, balances, allowances):
+              balance = int(bal_raw, 16)
+              allowance = int(allow_raw, 16)
+              exposed = min(balance, allowance)
+              rows.append({
+                  'provider':provider, 'locked_amount':locked_amount, 'lock_end':end,
+                  'free_balance':balance, 'allowance':allowance, 'force_lockable':exposed,
+              })
+          rows.sort(key=lambda x:x['force_lockable'], reverse=True)
+          exposed = [r for r in rows if r['force_lockable'] > 0]
+
+          summary = {
+              'rpc':active_rpc, 'block':latest, 'block_timestamp':now,
+              'voting_escrow':VE, 'token':token,
+              'deposit_event_count':len(logs),
+              'historical_provider_count':len(providers),
+              'active_lock_count':len(active),
+              'currently_exposed_wallet_count':len(exposed),
+              'total_force_lockable_raw':sum(r['force_lockable'] for r in exposed),
+              'max_single_wallet_force_lockable_raw':max((r['force_lockable'] for r in exposed), default=0),
+          }
+          with open('summary.json','w') as f: json.dump(summary,f,indent=2)
+          with open('active-locks.json','w') as f: json.dump(rows,f,indent=2)
+          with open('exposed-wallets.json','w') as f: json.dump(exposed,f,indent=2)
+          with open('exposed-wallets.tsv','w') as f:
+              f.write('provider\tlocked_amount\tlock_end\tfree_balance\tallowance\tforce_lockable\n')
+              for r in exposed:
+                  f.write(f"{r['provider']}\t{r['locked_amount']}\t{r['lock_end']}\t{r['free_balance']}\t{r['allowance']}\t{r['force_lockable']}\n")
+          print(json.dumps(summary, indent=2))
+          print(open('exposed-wallets.tsv').read())
+          PY
+          export SEL_TOKEN=$(cast sig 'token()')
+          export SEL_LOCKED=$(cast sig 'locked(address)')
+          export SEL_BALANCE=$(cast sig 'balanceOf(address)')
+          export SEL_ALLOWANCE=$(cast sig 'allowance(address,address)')
+          export TOPIC_DEPOSIT=$(cast keccak 'Deposit(address,uint256,uint256,int128,uint256)')
+          python3 /tmp/scan.py | tee exposure-scan.log
+          sha256sum summary.json active-locks.json exposed-wallets.json exposed-wallets.tsv exposure-scan.log > SHA256SUMS
+
+      - name: Upload read-only evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: balancer-voting-escrow-force-lock-exposure
+          path: |
+            summary.json
+            active-locks.json
+            exposed-wallets.json
+            exposed-wallets.tsv
+            exposure-scan.log
+            SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
