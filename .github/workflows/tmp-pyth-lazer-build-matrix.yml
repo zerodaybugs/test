@@ -1,0 +1,129 @@
+name: Temporary Pyth Lazer deployment-window build matrix
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-pyth-lazer-build-matrix.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: post-ecdsa-governance
+            commit: 7655b9110db0fba0365b886a0878d88085204db5
+          - label: pre-sdk-change
+            commit: 4a90dcb3c463d647af3068ac1641327e8b070d58
+          - label: sdk-change
+            commit: ba09a52afa296ccb867d1db512f0e3f95fc58e53
+          - label: last-main-before-deploy
+            commit: d66907f9a26cb751156123c92a297a5df6590920
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          rustflags: ''
+
+      - name: Install Solana Verify CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install solana-verify --locked
+          mkdir -p evidence
+          solana-verify --version | tee evidence/SOLANA_VERIFY_VERSION.txt
+
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+        with:
+          repository: pyth-network/pyth-crosschain
+          ref: ${{ matrix.commit }}
+          path: candidate
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Build candidate and compare normalized hash
+        shell: bash
+        env:
+          ACTIVE_PROGRAM_HASH: b790774609fcb6ca5d37bb205ab7e1371a5082aa6770d1d143a0dd44f9f314f9
+          CANDIDATE_LABEL: ${{ matrix.label }}
+          CANDIDATE_COMMIT: ${{ matrix.commit }}
+        run: |
+          set -o pipefail
+          git -C candidate show -s --format='%H%n%aI%n%cI%n%s' HEAD | tee evidence/CANDIDATE_COMMIT_METADATA.txt
+          cd candidate/lazer
+          solana-verify build --library-name pyth_lazer_solana_contract 2>&1 | tee ../../evidence/SOLANA_VERIFY_BUILD.log
+          code=${PIPESTATUS[0]}
+          printf '%s\n' "$code" > ../../evidence/SOLANA_VERIFY_BUILD_EXIT_CODE.txt
+          cd ../..
+          if [ "$code" -ne 0 ]; then
+            exit "$code"
+          fi
+          so='candidate/lazer/target/deploy/pyth_lazer_solana_contract.so'
+          cp "$so" evidence/CANDIDATE.so
+          sha256sum "$so" | tee evidence/CANDIDATE_RAW_SHA256.txt
+          solana-verify get-executable-hash "$so" | tee evidence/CANDIDATE_EXECUTABLE_HASH.txt
+          python3 - <<'PY'
+          import hashlib, json, os, re
+          from pathlib import Path
+          so = Path('candidate/lazer/target/deploy/pyth_lazer_solana_contract.so')
+          raw = so.read_bytes()
+          text = Path('evidence/CANDIDATE_EXECUTABLE_HASH.txt').read_text(errors='replace')
+          hashes = re.findall(r'(?i)\b[0-9a-f]{64}\b', text)
+          executable = hashes[-1].lower() if hashes else None
+          active = os.environ['ACTIVE_PROGRAM_HASH'].lower()
+          result = {
+              'label': os.environ['CANDIDATE_LABEL'],
+              'commit': os.environ['CANDIDATE_COMMIT'],
+              'bytes': len(raw),
+              'rawSha256': hashlib.sha256(raw).hexdigest(),
+              'executableHash': executable,
+              'activeProgramHash': active,
+              'exactNormalizedMatch': executable == active,
+          }
+          Path('evidence/RESULT.json').write_text(json.dumps(result, indent=2, sort_keys=True) + '\n')
+          print(json.dumps(result, indent=2, sort_keys=True))
+          PY
+
+      - name: Build deterministic evidence archive
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          root=Path('evidence'); root.mkdir(exist_ok=True)
+          entries=[]
+          for path in sorted(p for p in root.rglob('*') if p.is_file() and p.name not in {'EVIDENCE_MANIFEST.json','SHA256SUMS.txt'}):
+              data=path.read_bytes()
+              entries.append({'path':path.relative_to(root).as_posix(),'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest()})
+          (root/'EVIDENCE_MANIFEST.json').write_text(json.dumps(entries,indent=2,sort_keys=True)+'\n')
+          with (root/'SHA256SUMS.txt').open('w') as h:
+              for row in entries:
+                  h.write(f"{row['sha256']}  {row['path']}\n")
+          PY
+          tar --sort=name --mtime='UTC 2026-08-02' --owner=0 --group=0 --numeric-owner -czf pyth-lazer-build-${{ matrix.label }}.tar.gz evidence
+          sha256sum pyth-lazer-build-${{ matrix.label }}.tar.gz > pyth-lazer-build-${{ matrix.label }}.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pyth-lazer-build-${{ matrix.label }}-${{ github.run_id }}
+          path: |
+            evidence/
+            pyth-lazer-build-${{ matrix.label }}.tar.gz
+            pyth-lazer-build-${{ matrix.label }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
