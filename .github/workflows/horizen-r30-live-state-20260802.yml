@@ -1,0 +1,383 @@
+name: Horizen R30 public read-only live state
+
+on:
+  push:
+    branches:
+      - ci/horizen-r30-live-state-20260802
+    paths:
+      - '.github/workflows/horizen-r30-live-state-20260802.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  live-state:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Collect and verify public state
+        shell: bash
+        env:
+          RPC_URL: https://horizen-testnet.rpc.caldera.xyz/http
+          STAKER: '0x6BF7CF29a8bcE11Aa62Cf593d165C244fA4d3E31'
+          ACCUMULATOR: '0x06f5555fee73EDdc385b6d76FE00DB2D96ccDaE8'
+          TOKEN: '0xb06EC4ce262D8dbDc24Fac87479A49A7DC4cFb87'
+          DEPLOYER: '0x9B264B21ca7659C256aD09171f827976Acd5a1C3'
+          DEPLOYMENT_BLOCK: '21842327'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import math
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+
+          RPC = os.environ['RPC_URL']
+          STAKER = os.environ['STAKER'].lower()
+          ACC = os.environ['ACCUMULATOR'].lower()
+          TOKEN = os.environ['TOKEN'].lower()
+          DEPLOYER = os.environ['DEPLOYER'].lower()
+          DEPLOYMENT_BLOCK = int(os.environ['DEPLOYMENT_BLOCK'])
+
+          request_id = 0
+
+          def rpc(method, params, retries=4):
+              global request_id
+              request_id += 1
+              payload = json.dumps({
+                  'jsonrpc': '2.0',
+                  'id': request_id,
+                  'method': method,
+                  'params': params,
+              }).encode()
+              last = None
+              for attempt in range(retries):
+                  req = urllib.request.Request(
+                      RPC,
+                      data=payload,
+                      headers={'content-type': 'application/json', 'user-agent': 'Horizen-R30-readonly/1'},
+                      method='POST',
+                  )
+                  try:
+                      with urllib.request.urlopen(req, timeout=35) as response:
+                          obj = json.loads(response.read())
+                      if 'error' in obj:
+                          raise RuntimeError(f"RPC {method}: {obj['error']}")
+                      return obj['result']
+                  except Exception as exc:
+                      last = exc
+                      if attempt + 1 < retries:
+                          time.sleep(2 ** attempt)
+              raise RuntimeError(f'RPC failed after retries: {method}: {last}')
+
+          def call(to, data):
+              return rpc('eth_call', [{'to': to, 'data': data}, 'latest'])
+
+          def word_chunks(result):
+              h = result[2:]
+              if len(h) % 64:
+                  raise ValueError(f'non-word ABI result: {result}')
+              return [h[i:i+64] for i in range(0, len(h), 64)]
+
+          def u256(result):
+              return int(result, 16)
+
+          def addr(result):
+              h = result[2:]
+              return '0x' + h[-40:]
+
+          def boolean(result):
+              return bool(u256(result))
+
+          def enc_addr(address):
+              return address.lower().removeprefix('0x').rjust(64, '0')
+
+          def enc_u256(value):
+              return hex(value)[2:].rjust(64, '0')
+
+          def decode_string(result):
+              words = word_chunks(result)
+              if not words:
+                  return ''
+              offset = int(words[0], 16)
+              start = offset * 2
+              raw = result[2:]
+              length = int(raw[start:start+64], 16)
+              data = raw[start+64:start+64+length*2]
+              return bytes.fromhex(data).decode('utf-8', errors='replace')
+
+          def decode_address_array_and_next(result):
+              words = word_chunks(result)
+              offset = int(words[0], 16)
+              next_addr = '0x' + words[1][-40:]
+              base_word = offset // 32
+              length = int(words[base_word], 16)
+              owners = ['0x' + words[base_word + 1 + i][-40:] for i in range(length)]
+              return owners, next_addr
+
+          def code_info(address):
+              code = rpc('eth_getCode', [address, 'latest'])
+              raw = bytes.fromhex(code[2:]) if code != '0x' else b''
+              return {
+                  'bytes': len(raw),
+                  'sha256': hashlib.sha256(raw).hexdigest(),
+                  'present': bool(raw),
+              }
+
+          def get_logs_chunked(address, topic0, start, end, chunk=20_000):
+              logs = []
+              cursor = start
+              while cursor <= end:
+                  stop = min(cursor + chunk - 1, end)
+                  filt = {
+                      'address': address,
+                      'fromBlock': hex(cursor),
+                      'toBlock': hex(stop),
+                      'topics': [topic0],
+                  }
+                  try:
+                      logs.extend(rpc('eth_getLogs', [filt], retries=3))
+                      cursor = stop + 1
+                  except Exception:
+                      if chunk <= 500:
+                          raise
+                      chunk //= 2
+              return logs
+
+          selectors = {
+              'token_total_supply': '0x18160ddd',
+              'token_decimals': '0x313ce567',
+              'token_symbol': '0x95d89b41',
+              'token_owner': '0x8da5cb5b',
+              'balance_of': '0x70a08231',
+              'staker_admin': '0xf851a440',
+              'earning_calculator': '0x72a35df9',
+              'max_bump_tip': '0x7aa23c52',
+              'claim_fee_parameters': '0x774da674',
+              'total_staked': '0x817b1cd2',
+              'total_power': '0x08484dee',
+              'reward_end': '0x37e9f64a',
+              'last_checkpoint': '0x61dc0549',
+              'scaled_rate': '0xc3c16e4e',
+              'is_notifier': '0xe70f9445',
+              'surrogates': '0xe6dec270',
+              'acc_owner': '0x8da5cb5b',
+              'time_window': '0xd2f343c7',
+              'last_reward_time': '0x9231cf74',
+              'next_reward_time': '0x7f68e195',
+              'accumulated_rewards': '0x9c81ff6b',
+              'whitelist_enabled': '0x51fb012d',
+              'safe_threshold': '0xe75235b8',
+              'safe_owners': '0xa0e67e2b',
+              'safe_version': '0xffa1ad74',
+              'safe_modules': '0xcc2f8452',
+          }
+
+          chain_id = u256(rpc('eth_chainId', []))
+          latest = u256(rpc('eth_blockNumber', []))
+          block = rpc('eth_getBlockByNumber', [hex(latest), False])
+          now = int(block['timestamp'], 16)
+
+          admin = addr(call(STAKER, selectors['staker_admin']))
+          calculator = addr(call(STAKER, selectors['earning_calculator']))
+          max_bump_tip = u256(call(STAKER, selectors['max_bump_tip']))
+          claim_words = word_chunks(call(STAKER, selectors['claim_fee_parameters']))
+          claim_fee = int(claim_words[0], 16)
+          fee_collector = '0x' + claim_words[1][-40:]
+          total_staked = u256(call(STAKER, selectors['total_staked']))
+          total_power = u256(call(STAKER, selectors['total_power']))
+          reward_end = u256(call(STAKER, selectors['reward_end']))
+          last_checkpoint = u256(call(STAKER, selectors['last_checkpoint']))
+          scaled_rate = u256(call(STAKER, selectors['scaled_rate']))
+
+          acc_owner = addr(call(ACC, selectors['acc_owner']))
+          time_window = u256(call(ACC, selectors['time_window']))
+          last_reward_time = u256(call(ACC, selectors['last_reward_time']))
+          next_reward_time = u256(call(ACC, selectors['next_reward_time']))
+          accumulated = u256(call(ACC, selectors['accumulated_rewards']))
+          whitelist_enabled = boolean(call(ACC, selectors['whitelist_enabled']))
+
+          total_supply = u256(call(TOKEN, selectors['token_total_supply']))
+          decimals = u256(call(TOKEN, selectors['token_decimals']))
+          symbol = decode_string(call(TOKEN, selectors['token_symbol']))
+          try:
+              token_owner = addr(call(TOKEN, selectors['token_owner']))
+          except Exception:
+              token_owner = None
+
+          token_staker_balance = u256(call(TOKEN, selectors['balance_of'] + enc_addr(STAKER)))
+          token_acc_balance = u256(call(TOKEN, selectors['balance_of'] + enc_addr(ACC)))
+
+          current_notifiers = {}
+          notifier_topic = '0xb33ca1dabfb28a2e1bd06b332c396b1a3d538278691341a5503bbad53f919197'
+          notifier_logs = get_logs_chunked(STAKER, notifier_topic, DEPLOYMENT_BLOCK, latest)
+          for log in notifier_logs:
+              account = '0x' + log['topics'][1][-40:]
+              enabled = bool(int(log['data'], 16))
+              current_notifiers[account.lower()] = enabled
+
+          # Cross-check every address ever observed in RewardNotifierSet.
+          notifier_cross_checks = {
+              account: boolean(call(STAKER, selectors['is_notifier'] + enc_addr(account)))
+              for account in sorted(current_notifiers)
+          }
+          notifier_cross_checks[ACC] = boolean(call(STAKER, selectors['is_notifier'] + enc_addr(ACC)))
+          notifier_cross_checks[DEPLOYER] = boolean(call(STAKER, selectors['is_notifier'] + enc_addr(DEPLOYER)))
+          notifier_cross_checks[admin.lower()] = boolean(call(STAKER, selectors['is_notifier'] + enc_addr(admin)))
+
+          # Enumerate all delegatees from the canonical DelegateeAltered event stream,
+          # resolve unique surrogates, and sum physical principal backing.
+          delegatee_topic = '0xe03d018e6f94071d97d5befc6a430dedbb1792ef805cf2042edbc2bb75b44528'
+          delegatee_logs = get_logs_chunked(STAKER, delegatee_topic, DEPLOYMENT_BLOCK, latest)
+          delegatees = set()
+          for log in delegatee_logs:
+              words = word_chunks(log['data'])
+              if len(words) >= 2:
+                  new_delegatee = '0x' + words[1][-40:]
+                  if int(new_delegatee, 16) != 0:
+                      delegatees.add(new_delegatee.lower())
+
+          surrogates = {}
+          for delegatee in sorted(delegatees):
+              surrogate = addr(call(STAKER, selectors['surrogates'] + enc_addr(delegatee))).lower()
+              if int(surrogate, 16) == 0:
+                  continue
+              if surrogate not in surrogates:
+                  balance = u256(call(TOKEN, selectors['balance_of'] + enc_addr(surrogate)))
+                  surrogates[surrogate] = {
+                      'balance': balance,
+                      'code': code_info(surrogate),
+                  }
+          surrogate_balance_sum = sum(v['balance'] for v in surrogates.values())
+
+          # Safe control-plane census where applicable.
+          def safe_snapshot(address):
+              code = code_info(address)
+              if not code['present']:
+                  return {'code': code, 'is_contract': False}
+              out = {'code': code, 'is_contract': True}
+              try:
+                  out['threshold'] = u256(call(address, selectors['safe_threshold']))
+                  out['owners'], out['owners_next'] = decode_address_array_and_next(call(address, selectors['safe_owners']))
+              except Exception as exc:
+                  out['safe_decode_error'] = str(exc)
+              try:
+                  out['version'] = decode_string(call(address, selectors['safe_version']))
+              except Exception:
+                  out['version'] = None
+              try:
+                  data = selectors['safe_modules'] + enc_addr('0x0000000000000000000000000000000000000001') + enc_u256(100)
+                  out['modules'], out['modules_next'] = decode_address_array_and_next(call(address, data))
+              except Exception:
+                  out['modules'] = None
+              return out
+
+          admin_control = safe_snapshot(admin)
+          accumulator_control = safe_snapshot(acc_owner)
+
+          remaining_seconds = max(reward_end - now, 0)
+          future_stream_liability = (scaled_rate * remaining_seconds) // 10**36
+          accumulator_backing_delta = token_acc_balance - accumulated
+          principal_backing_delta = surrogate_balance_sum - total_staked
+
+          checkpoints_for_one_raw = math.ceil(10**36 / total_power) if total_power else None
+          checkpoints_for_one_token = math.ceil(10**54 / total_power) if total_power else None
+          max_30d_fragmentation_raw = (total_power * 2_592_000) / 10**36
+
+          result = {
+              'classification': 'PUBLIC_READ_ONLY_STATE',
+              'public_network_writes': 0,
+              'collected_at_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+              'rpc': RPC,
+              'chain_id': chain_id,
+              'block_number': latest,
+              'block_timestamp': now,
+              'addresses': {
+                  'staker': STAKER,
+                  'accumulator': ACC,
+                  'token': TOKEN,
+                  'deployer': DEPLOYER,
+              },
+              'code': {
+                  'staker': code_info(STAKER),
+                  'accumulator': code_info(ACC),
+                  'token': code_info(TOKEN),
+              },
+              'token': {
+                  'symbol': symbol,
+                  'decimals': decimals,
+                  'total_supply': total_supply,
+                  'owner': token_owner,
+                  'staker_balance': token_staker_balance,
+                  'accumulator_balance': token_acc_balance,
+              },
+              'staker': {
+                  'admin': admin,
+                  'earning_power_calculator': calculator,
+                  'max_bump_tip': max_bump_tip,
+                  'claim_fee': claim_fee,
+                  'fee_collector': fee_collector,
+                  'total_staked': total_staked,
+                  'total_earning_power': total_power,
+                  'reward_end_time': reward_end,
+                  'last_checkpoint_time': last_checkpoint,
+                  'scaled_reward_rate': scaled_rate,
+                  'future_stream_liability': future_stream_liability,
+                  'notifier_state_from_events': current_notifiers,
+                  'notifier_cross_checks': notifier_cross_checks,
+              },
+              'accumulator': {
+                  'owner': acc_owner,
+                  'time_window': time_window,
+                  'last_reward_time': last_reward_time,
+                  'next_reward_time': next_reward_time,
+                  'accumulated_rewards': accumulated,
+                  'whitelist_enabled': whitelist_enabled,
+                  'backing_delta': accumulator_backing_delta,
+              },
+              'principal_backing': {
+                  'delegatee_event_count': len(delegatee_logs),
+                  'unique_delegatees': len(delegatees),
+                  'unique_surrogates': len(surrogates),
+                  'surrogate_balance_sum': surrogate_balance_sum,
+                  'total_staked': total_staked,
+                  'backing_delta': principal_backing_delta,
+                  'surrogates': surrogates,
+              },
+              'control_plane': {
+                  'staker_admin': admin_control,
+                  'accumulator_owner': accumulator_control,
+              },
+              'rounding_bound': {
+                  'checkpoints_for_one_raw_unit': checkpoints_for_one_raw,
+                  'checkpoints_for_one_full_token': checkpoints_for_one_token,
+                  'max_30d_fragmentation_raw_units_strict_upper_bound': max_30d_fragmentation_raw,
+                  'total_staked_fraction_of_supply': (total_staked / total_supply) if total_supply else None,
+              },
+              'gates': {
+                  'chain_id_expected': chain_id == 2651420,
+                  'identity_configuration': calculator.lower() == '0xf518b3c7cd5cc1595d10e7268677da0fe364e191',
+                  'bumping_disabled': max_bump_tip == 0,
+                  'claim_fee_disabled': claim_fee == 0,
+                  'principal_fully_backed': principal_backing_delta >= 0,
+                  'accumulator_fully_backed': accumulator_backing_delta >= 0,
+                  'accumulator_is_notifier': notifier_cross_checks.get(ACC) is True,
+              },
+          }
+
+          print('HORIZEN_R30_JSON_BEGIN')
+          print(json.dumps(result, indent=2, sort_keys=True))
+          print('HORIZEN_R30_JSON_END')
+
+          assert result['gates']['chain_id_expected']
+          assert result['gates']['principal_fully_backed']
+          assert result['gates']['accumulator_fully_backed']
+          assert result['gates']['accumulator_is_notifier']
+          print('HORIZEN_R30_GATE=PASS')
+          print('PUBLIC_NETWORK_WRITES=0')
+          PY
