@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only TMX OFT configuration and supply gate for Ethereum and BNB Chain.
+"""Read-only TMX cross-chain deployment and OFT-interface gate.
 
 No signer, transaction construction, broadcast, impersonation, or state mutation.
 """
@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 
 TMX = Web3.to_checksum_address("0x9daf7A876366c1f1195FE3072262FDE900000000")
 EXPECTED_ADMIN = Web3.to_checksum_address("0x81f314f70702Bbe89FEd0F2cFe6841950275E0b7")
@@ -62,6 +63,8 @@ def connect(cfg: dict[str, Any]) -> tuple[Web3, str, list[dict[str, Any]]]:
     for url in cfg["rpcs"]:
         try:
             w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 30}))
+            if cfg["chainId"] == 56:
+                w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
             chain_id = w3.eth.chain_id
             block = w3.eth.get_block("latest")
             if chain_id != cfg["chainId"]:
@@ -114,8 +117,22 @@ def main() -> int:
         if endpoint_contract else {"ok": False, "error": "endpoint unavailable"}
     )
 
+    oft_calls = {
+        "owner": owner,
+        "endpoint": endpoint_r,
+        "endpointEid": endpoint_eid,
+        "endpointDelegate": delegate,
+        "msgInspector": safe(token.functions.msgInspector().call, block_identifier=block.number),
+        "sharedDecimals": safe(token.functions.sharedDecimals().call, block_identifier=block.number),
+        "decimalConversionRate": safe(token.functions.decimalConversionRate().call, block_identifier=block.number),
+        "oAppVersion": safe(token.functions.oAppVersion().call, block_identifier=block.number),
+        "ownPeer": own_peer,
+        "remotePeer": remote_peer,
+    }
+    oft_interface_present = any(row.get("ok") for row in oft_calls.values())
+
     result = {
-        "schema": "termmax-tmx-oft-live-gate/v1",
+        "schema": "termmax-tmx-crosschain-live-gate/v2",
         "generatedAtUtc": datetime.now(timezone.utc).isoformat(),
         "safety": {"privateKeys": 0, "signedTransactions": 0, "broadcastTransactions": 0, "stateChanges": 0},
         "chain": chain,
@@ -135,31 +152,22 @@ def main() -> int:
         "symbol": safe(token.functions.symbol().call, block_identifier=block.number),
         "decimals": decimals,
         "totalSupply": total_supply,
-        "owner": owner,
         "expectedAdmin": EXPECTED_ADMIN,
-        "endpoint": endpoint_r,
-        "endpointCodeBytes": len(w3.eth.get_code(endpoint, block_identifier=block.number)) if endpoint else 0,
-        "endpointEid": endpoint_eid,
-        "endpointDelegate": delegate,
-        "msgInspector": safe(token.functions.msgInspector().call, block_identifier=block.number),
-        "sharedDecimals": safe(token.functions.sharedDecimals().call, block_identifier=block.number),
-        "decimalConversionRate": safe(token.functions.decimalConversionRate().call, block_identifier=block.number),
-        "oAppVersion": safe(token.functions.oAppVersion().call, block_identifier=block.number),
+        "oftInterfaceCalls": oft_calls,
         "ownEid": cfg["ownEid"],
         "remoteEid": cfg["remoteEid"],
-        "ownPeer": own_peer,
-        "remotePeer": remote_peer,
         "expectedRemotePeer": expected_peer,
     }
     result["verdict"] = {
         "contractDeployed": len(code) > 0,
+        "oftInterfacePresent": oft_interface_present,
         "ownerMatchesExpectedAdmin": bool(owner.get("ok") and owner.get("value", "").lower() == EXPECTED_ADMIN.lower()),
         "endpointEidMatchesChain": bool(endpoint_eid.get("ok") and endpoint_eid.get("value") == cfg["ownEid"]),
         "remotePeerMatchesTMX": bool(remote_peer.get("ok") and str(remote_peer.get("value")).lower() == expected_peer.lower()),
         "ownPeerIsZero": bool(own_peer.get("ok") and int(str(own_peer.get("value")), 16) == 0),
         "delegateMatchesExpectedAdmin": bool(delegate.get("ok") and delegate.get("value", "").lower() == EXPECTED_ADMIN.lower()),
     }
-    (out / "TMX_OFT_LIVE_GATE.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    (out / "TMX_CROSSCHAIN_LIVE_GATE.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     (out / "VERDICT.json").write_text(json.dumps(result["verdict"], indent=2), encoding="utf-8")
     print(json.dumps(result, indent=2))
     return 0
