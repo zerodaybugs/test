@@ -1,0 +1,120 @@
+name: Balancer FeeDistributor read-only production probe
+
+on:
+  push:
+    branches:
+      - tooling/foundry-download-bootstrap-20260802
+    paths:
+      - '.github/workflows/balancer-fee-distributor-production-probe.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/balancer-fee-distributor-production-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install verified Foundry
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 5 --retry-all-errors \
+            -o /tmp/foundry.tar.gz \
+            https://github.com/foundry-rs/foundry/releases/download/v1.7.1/foundry_v1.7.1_linux_amd64.tar.gz
+          echo 'cf7e688ed0c4c48adffca788b496076e31060b67ac5afe1e43dbb5499c20c88b  /tmp/foundry.tar.gz' | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf /tmp/foundry.tar.gz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Probe current mainnet state
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          FD=0xD3cf852898b21fc233251427c2DC93d3d604F3BB
+
+          RPC=''
+          for candidate in \
+            https://ethereum-rpc.publicnode.com \
+            https://eth.llamarpc.com \
+            https://cloudflare-eth.com; do
+            if timeout 20 cast block-number --rpc-url "$candidate" >/dev/null 2>&1; then
+              RPC="$candidate"
+              break
+            fi
+          done
+          test -n "$RPC"
+
+          BLOCK=$(cast block-number --rpc-url "$RPC")
+          NOW=$(cast block latest --field timestamp --rpc-url "$RPC")
+          NOW_DEC=$(cast to-dec "$NOW")
+          printf 'block\t%s\nblock_timestamp\t%s\nblock_timestamp_iso\t%s\n' \
+            "$BLOCK" "$NOW_DEC" "$(date -u -d "@$NOW_DEC" +%Y-%m-%dT%H:%M:%SZ)" > production-probe.tsv
+          printf 'token\tsymbol\tdecimals\tbalance_raw\tcached_raw\tuncached_raw\tcursor\tcursor_iso\tgap_seconds\tgap_weeks\n' \
+            > token-state.tsv
+
+          # Enumerate all current ERC-20 holdings from Blockscout's public read-only API.
+          curl --fail --location --retry 5 --retry-all-errors \
+            "https://eth.blockscout.com/api/v2/addresses/${FD}/token-balances" \
+            -o token-balances.json
+
+          jq -r '.[] | select(.token.type == "ERC-20") | select((.value | tonumber) > 0) | .token.address' \
+            token-balances.json | sort -fu > token-addresses.txt
+
+          # Ensure the economically material known tokens are probed even if an indexer omits them.
+          printf '%s\n' \
+            0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48 \
+            0xba100000625a3754423978a60c9317c58a424e3D \
+            >> token-addresses.txt
+          sort -fu token-addresses.txt -o token-addresses.txt
+
+          while read -r TOKEN; do
+            test -n "$TOKEN" || continue
+            BALANCE=$(cast call "$TOKEN" 'balanceOf(address)(uint256)' "$FD" --rpc-url "$RPC" 2>/dev/null || echo 0)
+            BALANCE=$(cast to-dec "$BALANCE" 2>/dev/null || echo 0)
+            CACHED=$(cast call "$FD" 'getTokenLastBalance(address)(uint256)' "$TOKEN" --rpc-url "$RPC")
+            CACHED=$(cast to-dec "$CACHED")
+            CURSOR=$(cast call "$FD" 'getTokenTimeCursor(address)(uint256)' "$TOKEN" --rpc-url "$RPC")
+            CURSOR=$(cast to-dec "$CURSOR")
+            DECIMALS=$(cast call "$TOKEN" 'decimals()(uint8)' --rpc-url "$RPC" 2>/dev/null || echo 0)
+            DECIMALS=$(cast to-dec "$DECIMALS" 2>/dev/null || echo 0)
+            SYMBOL=$(cast call "$TOKEN" 'symbol()(string)' --rpc-url "$RPC" 2>/dev/null | tr '\t\r\n' ' ' || true)
+            SYMBOL=${SYMBOL:-UNKNOWN}
+            if (( BALANCE >= CACHED )); then UNCACHED=$((BALANCE-CACHED)); else UNCACHED=-1; fi
+            if (( CURSOR > 0 && NOW_DEC >= CURSOR )); then
+              GAP=$((NOW_DEC-CURSOR))
+              CURSOR_ISO=$(date -u -d "@$CURSOR" +%Y-%m-%dT%H:%M:%SZ)
+            else
+              GAP=-1
+              CURSOR_ISO=never
+            fi
+            if (( GAP >= 0 )); then GAP_WEEKS=$(awk -v g="$GAP" 'BEGIN { printf "%.6f", g/604800 }'); else GAP_WEEKS=-1; fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$TOKEN" "$SYMBOL" "$DECIMALS" "$BALANCE" "$CACHED" "$UNCACHED" \
+              "$CURSOR" "$CURSOR_ISO" "$GAP" "$GAP_WEEKS" >> token-state.tsv
+          done < token-addresses.txt
+
+          sort -t $'\t' -k10,10nr token-state.tsv -o token-state.sorted.tsv
+          mv token-state.sorted.tsv token-state.tsv
+          cat production-probe.tsv
+          cat token-state.tsv
+
+      - name: Upload read-only evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: balancer-fee-distributor-production-probe
+          path: |
+            production-probe.tsv
+            token-state.tsv
+            token-addresses.txt
+            token-balances.json
+          if-no-files-found: error
+          retention-days: 1
