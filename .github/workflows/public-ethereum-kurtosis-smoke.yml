@@ -13,7 +13,7 @@ permissions:
 jobs:
   exact-geth-lodestar-smoke:
     runs-on: ubuntu-24.04
-    timeout-minutes: 70
+    timeout-minutes: 90
 
     steps:
       - name: Check out smoke configuration
@@ -70,14 +70,14 @@ jobs:
             | jq '[.[] | {RepoDigests, Id, Created, Architecture, Os}]' \
             | tee evidence/CLIENT_IMAGES.json
 
-      - name: Run the stock Fulu devnet to finalization
+      - name: Start the stock Fulu devnet
         id: smoke
         continue-on-error: true
         shell: bash
         run: |
           set +e
           set -o pipefail
-          timeout 58m kurtosis run \
+          timeout 30m kurtosis run \
             --enclave exact-ethereum-smoke \
             github.com/ethpandaops/ethereum-package@27a33b90d159de24eb05f8ff27b8ddf0beb813d5 \
             --args-file .tooling/ethereum-kurtosis-smoke/network_params.yaml \
@@ -85,6 +85,68 @@ jobs:
           status=${PIPESTATUS[0]}
           printf '%s\n' "$status" | tee evidence/RUN_STATUS.txt
           exit "$status"
+
+      - name: Wait for canonical head progression and finalized epoch
+        id: finality
+        if: steps.smoke.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cl_url="$(kurtosis port print exact-ethereum-smoke cl-1-lodestar-geth http | tail -n 1 | tr -d '\r')"
+          el_url="$(kurtosis port print exact-ethereum-smoke el-1-geth-lodestar rpc | tail -n 1 | tr -d '\r')"
+          printf '%s\n' "$cl_url" | tee evidence/CL_HTTP_URL.txt
+          printf '%s\n' "$el_url" | tee evidence/EL_RPC_URL.txt
+
+          deadline=$((SECONDS + 1500))
+          status='FAIL'
+          : > evidence/FINALITY_POLL.log
+          while (( SECONDS < deadline )); do
+            now="$(date -u +%FT%TZ)"
+            finality_tmp="$(mktemp)"
+            header_tmp="$(mktemp)"
+            sync_tmp="$(mktemp)"
+            if curl --max-time 5 -fsS "$cl_url/eth/v1/beacon/states/head/finality_checkpoints" > "$finality_tmp" \
+              && curl --max-time 5 -fsS "$cl_url/eth/v1/beacon/headers/head" > "$header_tmp" \
+              && curl --max-time 5 -fsS "$cl_url/eth/v1/node/syncing" > "$sync_tmp"; then
+              justified="$(jq -r '.data.current_justified.epoch // "0"' "$finality_tmp")"
+              finalized="$(jq -r '.data.finalized.epoch // "0"' "$finality_tmp")"
+              head_slot="$(jq -r '.data.header.message.slot // "0"' "$header_tmp")"
+              syncing="$(jq -r '.data.is_syncing // true' "$sync_tmp")"
+              printf '%s head_slot=%s justified_epoch=%s finalized_epoch=%s syncing=%s\n' \
+                "$now" "$head_slot" "$justified" "$finalized" "$syncing" \
+                | tee -a evidence/FINALITY_POLL.log
+              cp "$finality_tmp" evidence/FINALITY_CHECKPOINTS.json
+              cp "$header_tmp" evidence/HEAD_HEADER.json
+              cp "$sync_tmp" evidence/SYNCING.json
+              if [[ "$head_slot" =~ ^[0-9]+$ ]] \
+                && [[ "$justified" =~ ^[0-9]+$ ]] \
+                && [[ "$finalized" =~ ^[0-9]+$ ]] \
+                && (( head_slot >= 64 )) \
+                && (( justified >= 2 )) \
+                && (( finalized >= 1 )) \
+                && [[ "$syncing" == 'false' ]]; then
+                status='PASS'
+                rm -f "$finality_tmp" "$header_tmp" "$sync_tmp"
+                break
+              fi
+            else
+              printf '%s beacon_api_not_ready\n' "$now" | tee -a evidence/FINALITY_POLL.log
+            fi
+            rm -f "$finality_tmp" "$header_tmp" "$sync_tmp"
+            sleep 12
+          done
+          printf '%s\n' "$status" | tee evidence/FINALITY_STATUS.txt
+
+          curl --max-time 5 -fsS \
+            -H 'content-type: application/json' \
+            --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
+            "$el_url" | tee evidence/EL_BLOCK_NUMBER.json
+          curl --max-time 5 -fsS \
+            -H 'content-type: application/json' \
+            --data '{"jsonrpc":"2.0","id":1,"method":"web3_clientVersion","params":[]}' \
+            "$el_url" | tee evidence/EL_CLIENT_VERSION.json
+
+          test "$status" = 'PASS'
 
       - name: Collect complete smoke evidence
         if: always()
@@ -123,6 +185,12 @@ jobs:
           set -euo pipefail
           test -f evidence/RUN_STATUS.txt
           test "$(cat evidence/RUN_STATUS.txt)" = '0'
+          test -f evidence/FINALITY_STATUS.txt
+          test "$(cat evidence/FINALITY_STATUS.txt)" = 'PASS'
           grep -Fq 'Starlark code successfully run' evidence/KURTOSIS_RUN.log
-          grep -Fq 'ethereum/client-go:v1.17.5' evidence/DOCKER_IMAGES.txt
-          grep -Fq 'chainsafe/lodestar:v1.45.0' evidence/DOCKER_IMAGES.txt
+          jq -e '.[] | .RepoDigests[] | select(. == "ethereum/client-go@sha256:523d3ba26623a619e912019068dc2784f02934070ac46bdae4d5b9df0d917814")' \
+            evidence/CLIENT_IMAGES.json >/dev/null
+          jq -e '.[] | .RepoDigests[] | select(. == "chainsafe/lodestar@sha256:9560dedafce15d1b165114672258f30c2f6f66c1dec93d273bc43d00fdbb16f3")' \
+            evidence/CLIENT_IMAGES.json >/dev/null
+          jq -e '.result | test("Geth/v1.17.5-stable-9621c6ad")' evidence/EL_CLIENT_VERSION.json >/dev/null
+          jq -e '(.data.finalized.epoch | tonumber) >= 1' evidence/FINALITY_CHECKPOINTS.json >/dev/null
