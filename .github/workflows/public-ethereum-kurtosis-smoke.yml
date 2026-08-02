@@ -1,0 +1,123 @@
+name: Public exact Ethereum Kurtosis smoke
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/public-ethereum-kurtosis-smoke.yml'
+      - '.tooling/ethereum-kurtosis-smoke/**'
+
+permissions:
+  contents: read
+
+jobs:
+  exact-geth-lodestar-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+
+    steps:
+      - name: Check out smoke configuration
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Record runner and Docker baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          uname -a | tee evidence/UNAME.txt
+          docker version | tee evidence/DOCKER_VERSION.txt
+          docker info | tee evidence/DOCKER_INFO.txt
+          sha256sum .tooling/ethereum-kurtosis-smoke/network_params.yaml > evidence/INPUT_SHA256.txt
+
+      - name: Install and start current Kurtosis CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'deb [trusted=yes] https://sdk.kurtosis.com/kurtosis-cli-release-artifacts/ /' \
+            | sudo tee /etc/apt/sources.list.d/kurtosis.list
+          sudo apt-get update
+          sudo apt-get install -y kurtosis-cli jq curl
+          kurtosis version | tee evidence/KURTOSIS_VERSION_BEFORE_ENGINE.txt
+          kurtosis engine start
+          kurtosis version | tee evidence/KURTOSIS_VERSION.txt
+
+      - name: Pin the official ethereum-package source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/ethpandaops/ethereum-package.git ethereum-package
+          cd ethereum-package
+          git checkout --detach 27a33b90d159de24eb05f8ff27b8ddf0beb813d5
+          actual="$(git rev-parse HEAD)"
+          expected='27a33b90d159de24eb05f8ff27b8ddf0beb813d5'
+          test "$actual" = "$expected"
+          printf '%s\n' "$actual" | tee ../evidence/ETHEREUM_PACKAGE_COMMIT.txt
+          git show -s --format='%cI%n%s' HEAD | tee ../evidence/ETHEREUM_PACKAGE_META.txt
+
+      - name: Verify exact client images are pullable
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull ethereum/client-go:v1.17.5
+          docker pull chainsafe/lodestar:v1.45.0
+          docker image inspect ethereum/client-go:v1.17.5 chainsafe/lodestar:v1.45.0 \
+            | jq '[.[] | {RepoDigests, Id, Created, Architecture, Os}]' \
+            | tee evidence/CLIENT_IMAGES.json
+
+      - name: Run the stock Fulu devnet to finalization
+        id: smoke
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          timeout 58m kurtosis run \
+            --enclave exact-ethereum-smoke \
+            ./ethereum-package \
+            --args-file .tooling/ethereum-kurtosis-smoke/network_params.yaml \
+            2>&1 | tee evidence/KURTOSIS_RUN.log
+          status=${PIPESTATUS[0]}
+          printf '%s\n' "$status" | tee evidence/RUN_STATUS.txt
+          exit "$status"
+
+      - name: Collect complete smoke evidence
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p evidence
+          cp .tooling/ethereum-kurtosis-smoke/network_params.yaml evidence/NETWORK_PARAMS.yaml
+          kurtosis enclave ls --full-uuids > evidence/ENCLAVE_LIST.txt 2>&1
+          kurtosis enclave inspect exact-ethereum-smoke --full-uuids > evidence/ENCLAVE_INSPECT.txt 2>&1
+          kurtosis service logs exact-ethereum-smoke -x -a > evidence/ALL_SERVICE_LOGS.txt 2>&1
+          docker ps -a --no-trunc > evidence/DOCKER_PS.txt 2>&1
+          docker stats --no-stream > evidence/DOCKER_STATS.txt 2>&1
+          docker images --digests --no-trunc > evidence/DOCKER_IMAGES.txt 2>&1
+          grep -Eina 'fatal|panic|error|finaliz|genesis|head|peer|fulu|peerdas' \
+            evidence/ALL_SERVICE_LOGS.txt > evidence/KEY_LOG_LINES.txt 2>/dev/null || true
+          (
+            cd evidence
+            find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0 \
+              | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+          )
+
+      - name: Upload reproducible public smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-ethereum-kurtosis-smoke-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Enforce the smoke gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f evidence/RUN_STATUS.txt
+          test "$(cat evidence/RUN_STATUS.txt)" = '0'
+          grep -Eiq 'finaliz' evidence/KURTOSIS_RUN.log
