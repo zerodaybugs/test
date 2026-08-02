@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   live-scan:
@@ -44,22 +44,39 @@ jobs:
       - name: Install scanner dependencies
         run: python -m pip install --disable-pip-version-check requests 'eth-hash[pycryptodome]'
       - name: Decode and execute read-only live gate
+        id: scan
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           mkdir -p /tmp/0x_ah "results/${{ matrix.chain }}"
+          {
+            echo "chain=${{ matrix.chain }}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "head_sha=${GITHUB_SHA}"
+            echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "results/${{ matrix.chain }}/workflow-context.txt"
           base64 -d research/0x_ah/live_gate.py.gz.b64 | gzip -d > /tmp/0x_ah/live_gate.py
           python -m py_compile /tmp/0x_ah/live_gate.py
+          set +e
           python /tmp/0x_ah/live_gate.py \
             --chain '${{ matrix.chain }}' \
-            --output "results/${{ matrix.chain }}"
+            --output "results/${{ matrix.chain }}" \
+            > "results/${{ matrix.chain }}/workflow-stdout.log" \
+            2> "results/${{ matrix.chain }}/workflow-stderr.log"
+          status=$?
+          set -e
+          echo "$status" > "results/${{ matrix.chain }}/EXIT_CODE"
+          echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "results/${{ matrix.chain }}/workflow-context.txt"
+          cat "results/${{ matrix.chain }}/workflow-stdout.log" || true
+          cat "results/${{ matrix.chain }}/workflow-stderr.log" >&2 || true
+          exit "$status"
       - name: Upload live-gate evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: 0x-ah-live-${{ matrix.chain }}
           path: results/${{ matrix.chain }}
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
 
   exact-code-poc:
@@ -72,25 +89,85 @@ jobs:
         with:
           version: stable
       - name: Run PoC against exact official source
+        id: poc
         shell: bash
         run: |
-          set -euo pipefail
-          git clone --recursive https://github.com/0xProject/0x-settler.git /tmp/0x-settler
-          cd /tmp/0x-settler
-          git checkout e6bb6fe99ede56d5bd14d33d37cb0910ac737723
-          git submodule update --init --recursive
-          base64 -d "$GITHUB_WORKSPACE/research/0x_ah/AllowanceHolderClassifierBypassPoC.t.sol.b64" \
-            > test/unit/AllowanceHolderClassifierBypassPoC.t.sol
+          set -uo pipefail
           mkdir -p "$GITHUB_WORKSPACE/results/poc"
-          sha256sum test/unit/AllowanceHolderClassifierBypassPoC.t.sol \
-            | tee "$GITHUB_WORKSPACE/results/poc/POC.sha256"
-          forge test --match-contract AllowanceHolderClassifierBypassPoC -vvv \
-            2>&1 | tee "$GITHUB_WORKSPACE/results/poc/forge-test.log"
+          {
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "head_sha=${GITHUB_SHA}"
+            echo "official_source_commit=e6bb6fe99ede56d5bd14d33d37cb0910ac737723"
+            echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "$GITHUB_WORKSPACE/results/poc/workflow-context.txt"
+          set +e
+          {
+            git clone --recursive https://github.com/0xProject/0x-settler.git /tmp/0x-settler
+            cd /tmp/0x-settler
+            git checkout e6bb6fe99ede56d5bd14d33d37cb0910ac737723
+            git submodule update --init --recursive
+            base64 -d "$GITHUB_WORKSPACE/research/0x_ah/AllowanceHolderClassifierBypassPoC.t.sol.b64" \
+              > test/unit/AllowanceHolderClassifierBypassPoC.t.sol
+            sha256sum test/unit/AllowanceHolderClassifierBypassPoC.t.sol \
+              | tee "$GITHUB_WORKSPACE/results/poc/POC.sha256"
+            forge test --match-contract AllowanceHolderClassifierBypassPoC -vvv
+          } > "$GITHUB_WORKSPACE/results/poc/forge-test.log" 2>&1
+          status=$?
+          set -e
+          echo "$status" > "$GITHUB_WORKSPACE/results/poc/EXIT_CODE"
+          echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_WORKSPACE/results/poc/workflow-context.txt"
+          cat "$GITHUB_WORKSPACE/results/poc/forge-test.log"
+          exit "$status"
       - name: Upload PoC evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: 0x-ah-exact-code-poc
           path: results/poc
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
+
+  preserve-evidence:
+    name: preserve-evidence-on-results-branch
+    if: always()
+    needs:
+      - live-scan
+      - exact-code-poc
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download every evidence artifact
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: 0x-ah-*
+          path: /tmp/evidence
+          merge-multiple: false
+      - name: Checkout isolated results branch
+        uses: actions/checkout@v4
+        with:
+          ref: research/0x-settler-ah-results-20260802
+          path: results-repo
+          fetch-depth: 0
+      - name: Commit immutable run evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          dst="results-repo/ci-results/${GITHUB_RUN_ID}"
+          mkdir -p "$dst"
+          if [ -d /tmp/evidence ]; then
+            cp -a /tmp/evidence/. "$dst/"
+          fi
+          {
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "event=${GITHUB_EVENT_NAME}"
+            echo "source_sha=${GITHUB_SHA}"
+            echo "source_ref=${GITHUB_REF}"
+            echo "preserved_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "public_transactions=0"
+          } > "$dst/RUN_MANIFEST.txt"
+          cd results-repo
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add "ci-results/${GITHUB_RUN_ID}"
+          git commit -m "Preserve 0x AH gate evidence run ${GITHUB_RUN_ID}"
+          git push origin HEAD:research/0x-settler-ah-results-20260802
