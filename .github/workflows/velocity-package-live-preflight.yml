@@ -50,13 +50,179 @@ jobs:
             '1b7b06d17af813b5a505df8f534bfd0779a1a7457f0d2626b1a45c8741686c80' \
             'velocity-preflight/active_velocity.elf' | sha256sum -c -
 
-      - name: Execute exact live read-only package preflight
+      - name: Preserve exact Node preflight diagnostic
+        shell: bash
+        run: |
+          set +e
+          mkdir -p evidence
+          node velocity-preflight/live_preflight_readonly.js \
+            > evidence/NODE_LIVE_PREFLIGHT_RESULT.json 2> evidence/NODE_LIVE_PREFLIGHT_STDERR.log
+          printf '%s\n' "$?" > evidence/NODE_LIVE_PREFLIGHT_EXIT_CODE.txt
+          set -e
+
+      - name: Execute robust equivalent read-only release gate
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p evidence
-          node velocity-preflight/live_preflight_readonly.js \
-            | tee evidence/LIVE_PREFLIGHT_RESULT.json
+          python3 - <<'PY' | tee evidence/LIVE_PREFLIGHT_RESULT.json
+          import base64
+          import hashlib
+          import json
+          import struct
+          import time
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          PROGRAM = 'vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P'
+          EXPECTED_PROGRAMDATA = 'HkRf36jvUB32dnHjHqpMnPcKJhUP2TUKJTH7RDTifJm7'
+          EXPECTED_LOADER = 'BPFLoaderUpgradeab1e11111111111111111111111'
+          EXPECTED_DEPLOYMENT_SLOT = 435978201
+          EXPECTED_SHA = '1b7b06d17af813b5a505df8f534bfd0779a1a7457f0d2626b1a45c8741686c80'
+          EXPECTED_BYTES = 4523208
+          EXPECTED_GENESIS = '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d'
+          RPCS = [
+              'https://solana-rpc.publicnode.com',
+              'https://api.mainnet-beta.solana.com',
+              'https://solana.drpc.org',
+              'https://1rpc.io/solana',
+          ]
+          ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+
+          def b58encode(data: bytes) -> str:
+              n = int.from_bytes(data, 'big')
+              out = ''
+              while n:
+                  n, rem = divmod(n, 58)
+                  out = ALPHABET[rem] + out
+              zeros = 0
+              for byte in data:
+                  if byte:
+                      break
+                  zeros += 1
+              return '1' * zeros + out
+
+          def rpc(endpoint, method, params):
+              payload = json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
+              request = urllib.request.Request(
+                  endpoint,
+                  data=payload,
+                  headers={'content-type':'application/json','user-agent':'ZeroDayBugs-Velocity-Package-Preflight/2.0'},
+                  method='POST',
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  body = json.loads(response.read().decode())
+              if body.get('error'):
+                  raise RuntimeError(json.dumps(body['error']))
+              return body['result']
+
+          def canonical_elf_size(data: bytes) -> int:
+              if len(data) < 64 or data[:4] != b'\x7fELF' or data[4] != 2 or data[5] != 1:
+                  raise ValueError('not ELF64 little-endian')
+              u16=lambda o: struct.unpack_from('<H',data,o)[0]
+              u32=lambda o: struct.unpack_from('<I',data,o)[0]
+              u64=lambda o: struct.unpack_from('<Q',data,o)[0]
+              phoff, shoff = u64(0x20), u64(0x28)
+              ehsize, phentsize, phnum = u16(0x34), u16(0x36), u16(0x38)
+              shentsize, shnum = u16(0x3A), u16(0x3C)
+              maximum=max(64,ehsize)
+              if phoff and phentsize and phnum:
+                  maximum=max(maximum,phoff+phentsize*phnum)
+                  for i in range(phnum):
+                      o=phoff+i*phentsize
+                      maximum=max(maximum,u64(o+8)+u64(o+32))
+              if shoff and shentsize and shnum:
+                  maximum=max(maximum,shoff+shentsize*shnum)
+                  for i in range(shnum):
+                      o=shoff+i*shentsize
+                      if u32(o+4) != 8:
+                          maximum=max(maximum,u64(o+24)+u64(o+32))
+              if maximum > len(data):
+                  raise ValueError('ELF extent outside payload')
+              return maximum
+
+          attempts=[]
+          selected=None
+          values=None
+          last_error=None
+          for endpoint in RPCS:
+              try:
+                  slot=rpc(endpoint,'getSlot',[{'commitment':'finalized'}])
+                  genesis=rpc(endpoint,'getGenesisHash',[])
+                  program=rpc(endpoint,'getAccountInfo',[PROGRAM,{'encoding':'base64','commitment':'finalized'}])
+                  if not program.get('value'):
+                      raise RuntimeError('program account missing')
+                  program_raw=base64.b64decode(program['value']['data'][0])
+                  if len(program_raw) != 36 or struct.unpack_from('<I',program_raw,0)[0] != 2:
+                      raise RuntimeError('unexpected Program account layout')
+                  program_data=b58encode(program_raw[4:36])
+                  pd=rpc(endpoint,'getAccountInfo',[program_data,{'encoding':'base64','commitment':'finalized'}])
+                  if not pd.get('value'):
+                      raise RuntimeError('ProgramData account missing')
+                  pd_raw=base64.b64decode(pd['value']['data'][0])
+                  if len(pd_raw) < 45 or struct.unpack_from('<I',pd_raw,0)[0] != 3:
+                      raise RuntimeError('unexpected ProgramData layout')
+                  deployment_slot=struct.unpack_from('<Q',pd_raw,4)[0]
+                  payload=pd_raw[45:]
+                  canonical_bytes=canonical_elf_size(payload)
+                  canonical=payload[:canonical_bytes]
+                  trailing=payload[canonical_bytes:]
+                  local=Path('velocity-preflight/active_velocity.elf').read_bytes()
+                  values={
+                      'endpoint':endpoint,
+                      'finalizedSlot':slot,
+                      'genesisHash':genesis,
+                      'programOwner':program['value']['owner'],
+                      'programExecutable':program['value']['executable'],
+                      'programDataAddress':program_data,
+                      'programDataOwner':pd['value']['owner'],
+                      'deploymentSlot':deployment_slot,
+                      'programDataAccountBytes':len(pd_raw),
+                      'canonicalElfBytes':canonical_bytes,
+                      'canonicalElfSha256':hashlib.sha256(canonical).hexdigest(),
+                      'trailingPaddingBytes':len(trailing),
+                      'trailingPaddingAllZero':all(x == 0 for x in trailing),
+                      'localPoCElfSha256':hashlib.sha256(local).hexdigest(),
+                      'localPoCElfMatchesRemote':local == canonical,
+                  }
+                  selected=endpoint
+                  attempts.append({'endpoint':endpoint,'ok':True,'slot':slot})
+                  break
+              except Exception as error:
+                  last_error=error
+                  attempts.append({'endpoint':endpoint,'ok':False,'error':f'{type(error).__name__}: {error}'})
+                  time.sleep(0.4)
+
+          if not selected or not values:
+              raise SystemExit(json.dumps({'PREFLIGHT_STATUS':'FAIL','attempts':attempts,'error':str(last_error),'publicChainTransactions':0},indent=2))
+
+          gates={
+              'mainnetGenesisMatches': values['genesisHash'] == EXPECTED_GENESIS,
+              'programOwnerMatches': values['programOwner'] == EXPECTED_LOADER,
+              'programExecutable': values['programExecutable'] is True,
+              'programDataAddressMatches': values['programDataAddress'] == EXPECTED_PROGRAMDATA,
+              'programDataOwnerMatches': values['programDataOwner'] == EXPECTED_LOADER,
+              'deploymentSlotMatches': values['deploymentSlot'] == EXPECTED_DEPLOYMENT_SLOT,
+              'canonicalBytesMatch': values['canonicalElfBytes'] == EXPECTED_BYTES,
+              'canonicalSha256Matches': values['canonicalElfSha256'] == EXPECTED_SHA,
+              'trailingPaddingAllZero': values['trailingPaddingAllZero'],
+              'localPoCElfSha256Matches': values['localPoCElfSha256'] == EXPECTED_SHA,
+              'localPoCElfMatchesRemote': values['localPoCElfMatchesRemote'],
+          }
+          result={
+              'PREFLIGHT_STATUS':'PASS' if all(gates.values()) else 'FAIL',
+              'mode':'live_read_only_raw_json_rpc',
+              'checkedAtUtc':datetime.now(timezone.utc).isoformat(),
+              'programId':PROGRAM,
+              **values,
+              'gates':gates,
+              'attempts':attempts,
+              'publicChainTransactions':0,
+          }
+          print(json.dumps(result,indent=2,sort_keys=True))
+          if result['PREFLIGHT_STATUS'] != 'PASS':
+              raise SystemExit(1)
+          PY
           python3 - <<'PY'
           import json
           from pathlib import Path
@@ -71,6 +237,7 @@ jobs:
           sha256sum velocity-preflight/live_preflight_readonly.js \
             velocity-preflight/active_velocity.elf \
             evidence/LIVE_PREFLIGHT_RESULT.json \
+            evidence/NODE_LIVE_PREFLIGHT_RESULT.json \
             > evidence/SHA256SUMS.txt
           printf 'public_chain_transactions=0\n' > evidence/SAFETY.txt
 
