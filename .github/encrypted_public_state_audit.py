@@ -19,7 +19,7 @@ CHAINS={
  "Mainnet":(1,["https://ethereum-rpc.publicnode.com","https://eth.llamarpc.com","https://rpc.flashbots.net"]),
  "Arbitrum":(42161,["https://arbitrum-one-rpc.publicnode.com","https://arb1.arbitrum.io/rpc","https://arbitrum.drpc.org"]),
  "BeraChain":(80094,["https://rpc.berachain.com","https://berachain-rpc.publicnode.com","https://berachain.drpc.org"]),
- "Corn":(21000000,["https://mainnet.corn-rpc.com","https://maizenet-rpc.usecorn.com","https://rpc.ankr.com/corn_maizenet"]),
+ "Corn":(21000000,["routescan://21000000","https://mainnet.corn-rpc.com","https://maizenet-rpc.usecorn.com","https://rpc.ankr.com/corn_maizenet","https://rpc.21000000.corn.chain.cookinghubblevoyager"]),
  "Optimism":(10,["https://optimism-rpc.publicnode.com","https://mainnet.optimism.io","https://optimism.drpc.org"]),
  "Scroll":(534352,["https://rpc.scroll.io","https://scroll-rpc.publicnode.com","https://scroll.drpc.org"]),
  "TAC":(239,["https://rpc.tac.build","https://tac-mainnet.rpc.thirdweb.com"]),
@@ -41,6 +41,7 @@ def boolean(x): return bool(uint(x))
 def address(x): return "0x"+x[-40:].lower()
 def bytes32(x): return "0x"+x[-64:].lower()
 def short(e): return str(e).replace("\n"," ")[:800]
+def endpoint_host(u): return "api.routescan.io" if u.startswith("routescan://") else urllib.parse.urlparse(u).netloc
 
 def get_json(url):
  q=urllib.request.Request(url,headers={"Accept":"application/vnd.github+json","User-Agent":"PublicStateAudit/1.0"})
@@ -70,10 +71,23 @@ class RPC:
  def __init__(self,cid,urls): self.cid=cid; self.urls=urls; self.good=None; self.ok=set(); self.i=random.randint(1,99999); self.block=None; self.hash=None
  def raw(self,u,m,p):
   if m not in ALLOWED or m in FORBIDDEN: raise RuntimeError("blocked method "+m)
-  self.i+=1; body=json.dumps({"jsonrpc":"2.0","id":self.i,"method":m,"params":p}).encode(); q=urllib.request.Request(u,data=body,headers={"Content-Type":"application/json","User-Agent":"PublicStateAudit/1.0"},method="POST")
+  self.i+=1
+  if u.startswith("routescan://"):
+   base=f"https://api.routescan.io/v2/network/mainnet/evm/{self.cid}/etherscan/api"
+   if m=="eth_chainId": return hex(self.cid)
+   qv={"module":"proxy","action":m}
+   if m=="eth_getBlockByNumber": qv.update({"tag":p[0],"boolean":str(bool(p[1])).lower()})
+   elif m=="eth_getCode": qv.update({"address":p[0],"tag":p[1]})
+   elif m=="eth_call": qv.update({"to":p[0]["to"],"data":p[0]["data"],"tag":p[1]})
+   url=base+"?"+urllib.parse.urlencode(qv)
+   q=urllib.request.Request(url,headers={"Accept":"application/json","User-Agent":"PublicStateAudit/1.0"},method="GET")
+  else:
+   body=json.dumps({"jsonrpc":"2.0","id":self.i,"method":m,"params":p}).encode(); q=urllib.request.Request(u,data=body,headers={"Content-Type":"application/json","User-Agent":"PublicStateAudit/1.0"},method="POST")
   with urllib.request.urlopen(q,timeout=25) as r: z=json.loads(r.read().decode())
-  if "error" in z: raise RuntimeError(z["error"])
-  return z.get("result")
+  if "error" in z and z["error"]: raise RuntimeError(z["error"])
+  result=z.get("result")
+  if isinstance(result,str) and result.startswith("Error!"): raise RuntimeError(result)
+  return result
  def req(self,m,p):
   errors=[]; order=([self.good] if self.good else [])+[u for u in self.urls if u!=self.good]
   for _ in range(2):
@@ -83,7 +97,7 @@ class RPC:
       if int(self.raw(u,"eth_chainId",[]),16)!=self.cid: raise RuntimeError("wrong chain")
       self.ok.add(u)
      v=self.raw(u,m,p); self.good=u; return v
-    except Exception as e: errors.append(urllib.parse.urlparse(u).netloc+":"+short(e))
+    except Exception as e: errors.append(endpoint_host(u)+":"+short(e))
    time.sleep(1)
   raise RuntimeError(" | ".join(errors[-6:]))
  def pin(self): self.block=self.req("eth_blockNumber",[]); self.hash=self.req("eth_getBlockByNumber",[self.block,False])["hash"]
@@ -129,10 +143,43 @@ def find_deployments(chain_deps,vault):
   except Exception: pass
  return out
 
+
+def find_current_references(chain_deps,current):
+ out=[]
+ for d in chain_deps:
+  ca=d["data"].get("contractAddresses",{})
+  for k,v in ca.items():
+   try:
+    if isinstance(v,str) and norm(v)==norm(current):
+     vault=ca.get("BoringVault")
+     if vault: out.append((d,norm(vault),"registry-address:"+k))
+   except Exception: pass
+ return out
+
+def find_live_hook_references(r,chain_deps,current):
+ out=[]; seen=set()
+ for d in chain_deps:
+  vault=d["data"].get("contractAddresses",{}).get("BoringVault")
+  try:
+   if not vault: continue
+   vault=norm(vault)
+   if vault in seen: continue
+   seen.add(vault)
+   h=val(view(r,vault,S["hook"],address))
+   if h and norm(h)==norm(current): out.append((d,vault,"live-hook"))
+  except Exception: pass
+ return out
+
+def inspect_unmatched_current(r,current):
+ z=contract(r,current)
+ for n in ["hook","authority"]:
+  z[n]=view(r,current,S[n],address)
+ return z
+
 def probe_pair(r,chain,current,old,vault,dep_path,old_key):
  auth=val(view(r,vault,S["authority"],address)); cur=contract(r,current); prev=contract(r,old); row={"chain":chain,"deploymentPath":dep_path,"recordedTellerKey":old_key,"vault":norm(vault),"currentTeller":cur,"recordedTeller":prev,"authority":{"address":auth,"code":code(r,auth) if auth else None}}
  if auth:
-  row["authority"].update({"oldRoles":viewa(r,auth,S["getUserRoles"],old,bytes32),"currentRoles":viewa(r,auth,S["getUserRoles"],current,bytes32),"randomCanCall":{"old":{},"current":{}},"tellerCanCallVault":{"old":{},"current":{}},"public":{}})
+  row["authority"].update({"oldRoles":viewa(r,auth,S["getUserRoles"],old,bytes32),"currentRoles":viewa(r,auth,S["getUserRoles"],current,bytes32),"randomCanCall":{"old":{},"current":{}} ,"tellerCanCallVault":{"old":{},"current":{}} ,"public":{}})
   for lab,t in [("old",old),("current",current)]:
    for n in ["deposit3","deposit4","deposit5","withdraw","bulkDeposit","bulkWithdraw"]:
     row["authority"]["randomCanCall"][lab][n]=can(r,auth,EOA,t,S[n]); row["authority"]["public"][lab+"."+n]=public(r,auth,t,S[n])
@@ -154,19 +201,28 @@ def main():
   r=RPC(cid,urls)
   try: r.pin()
   except Exception as e: chains.append({"chain":chain,"status":"RPC_PIN_FAILED","error":short(e)}); continue
-  chains.append({"chain":chain,"chainId":cid,"block":int(r.block,16),"blockHex":r.block,"blockHash":r.hash,"endpointHost":urllib.parse.urlparse(r.good).netloc,"status":"PINNED"})
+  chains.append({"chain":chain,"chainId":cid,"block":int(r.block,16),"blockHex":r.block,"blockHash":r.hash,"endpointHost":endpoint_host(r.good),"status":"PINNED"})
   for reg_key,current in addrs.items():
    try:
-    current=norm(current); vault=val(view(r,current,S["vault"],address))
-    if not vault: unmatched.append({"chain":chain,"registryKey":reg_key,"currentTeller":current,"reason":"current vault() unreadable"}); continue
-    matches=find_deployments(deps.get(chain,[]),vault)
-    if not matches: unmatched.append({"chain":chain,"registryKey":reg_key,"currentTeller":current,"vault":vault,"reason":"no deployment JSON with same vault"}); continue
+    current=norm(current); direct_vault=val(view(r,current,S["vault"],address)); refs=[]
+    if direct_vault:
+     for d in find_deployments(deps.get(chain,[]),direct_vault): refs.append((d,norm(direct_vault),"direct-vault"))
+    refs.extend(find_current_references(deps.get(chain,[]),current))
+    refs.extend(find_live_hook_references(r,deps.get(chain,[]),current))
+    uniq=[]; keys=set()
+    for d,vault,why in refs:
+     k=(d["path"],vault)
+     if k not in keys: keys.add(k); uniq.append((d,vault,why))
+    if not uniq:
+     unmatched.append({"chain":chain,"registryKey":reg_key,"currentTeller":current,"inspection":inspect_unmatched_current(r,current),"reason":"no direct vault(), deployment reference, or live hook match"}); continue
     seen=set()
-    for d in matches:
-     for old_key,old in recorded_tellers(d["data"]):
-      if old==current or old in seen: continue
-      seen.add(old); pairs.append(probe_pair(r,chain,current,old,vault,d["path"],old_key))
-    if not seen: unmatched.append({"chain":chain,"registryKey":reg_key,"currentTeller":current,"vault":vault,"reason":"no distinct recorded Teller"})
+    for d0,vault,why in uniq:
+     for d in find_deployments(deps.get(chain,[]),vault):
+      for old_key,old in recorded_tellers(d["data"]):
+       key=(vault,old)
+       if old==current or key in seen: continue
+       seen.add(key); row=probe_pair(r,chain,current,old,vault,d["path"],old_key); row["currentResolution"]=why; pairs.append(row)
+    if not seen: unmatched.append({"chain":chain,"registryKey":reg_key,"currentTeller":current,"references":[{"path":d["path"],"vault":v,"resolution":w} for d,v,w in uniq],"inspection":inspect_unmatched_current(r,current),"reason":"resolved current deployment but no distinct recorded Teller"})
    except Exception as e: unmatched.append({"chain":chain,"registryKey":reg_key,"currentTeller":str(current),"reason":short(e)})
  result={"schemaVersion":1,"source":{"repository":REPO,"commit":COMMIT},"safety":{"readOnly":True,"allowedMethods":sorted(ALLOWED),"forbiddenMethods":sorted(FORBIDDEN),"transactionsSigned":0,"transactionsBroadcast":0},"chains":chains,"pairs":pairs,"unmatched":unmatched}
  (outdir/"results.json").write_text(json.dumps(result,indent=2,sort_keys=True)+"\n")
