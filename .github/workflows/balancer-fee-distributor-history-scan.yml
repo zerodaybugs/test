@@ -1,0 +1,154 @@
+name: Balancer FeeDistributor historical truncation scan
+
+on:
+  push:
+    branches:
+      - tooling/foundry-download-bootstrap-20260802
+    paths:
+      - '.github/workflows/balancer-fee-distributor-history-scan.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/balancer-fee-distributor-history-scan.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan all TokenCheckpointed events read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/scan.py <<'PY'
+          import json, time, urllib.request, sys
+          from collections import defaultdict
+
+          RPCS = [
+              'https://ethereum-rpc.publicnode.com',
+              'https://eth.llamarpc.com',
+          ]
+          FD = '0xD3cf852898b21fc233251427c2DC93d3d604F3BB'
+          TOPIC0 = '0x9b7f1a85a4c9b4e59e1b6527d9969c50cdfb3a1a467d0c4a51fb0ed8bf07f130'
+          START = 15100000
+          WEEK = 604800
+          rpc_id = 0
+          active_rpc = None
+
+          def rpc(method, params, retries=6):
+              global rpc_id, active_rpc
+              last = None
+              candidates = [active_rpc] if active_rpc else []
+              candidates += [x for x in RPCS if x != active_rpc]
+              for url in candidates:
+                  if not url:
+                      continue
+                  for attempt in range(retries):
+                      rpc_id += 1
+                      body = json.dumps({'jsonrpc':'2.0','id':rpc_id,'method':method,'params':params}).encode()
+                      req = urllib.request.Request(url, data=body, headers={'content-type':'application/json'})
+                      try:
+                          with urllib.request.urlopen(req, timeout=60) as r:
+                              obj = json.load(r)
+                          if 'error' in obj:
+                              raise RuntimeError(obj['error'])
+                          active_rpc = url
+                          return obj['result']
+                      except Exception as e:
+                          last = e
+                          time.sleep(min(2 ** attempt, 10))
+              raise RuntimeError(f'{method} failed: {last}')
+
+          latest = int(rpc('eth_blockNumber', []), 16)
+          logs = []
+          step = 100000
+          start = START
+          while start <= latest:
+              end = min(start + step - 1, latest)
+              try:
+                  part = rpc('eth_getLogs', [{
+                      'fromBlock': hex(start), 'toBlock': hex(end),
+                      'address': FD, 'topics': [TOPIC0]
+                  }], retries=3)
+                  logs.extend(part)
+                  print(f'{start}-{end}: {len(part)} events', flush=True)
+                  start = end + 1
+              except Exception as e:
+                  if step <= 5000:
+                      raise
+                  step //= 2
+                  print(f'reducing range to {step}: {e}', flush=True)
+
+          blocks = {}
+          def block_ts(number):
+              if number not in blocks:
+                  b = rpc('eth_getBlockByNumber', [hex(number), False])
+                  blocks[number] = int(b['timestamp'], 16)
+              return blocks[number]
+
+          def word(data, i):
+              raw = data[2 + i*64: 2 + (i+1)*64]
+              return int(raw, 16)
+
+          rows = []
+          truncated = []
+          for log in logs:
+              bn = int(log['blockNumber'], 16)
+              txi = int(log['transactionIndex'], 16)
+              li = int(log['logIndex'], 16)
+              ts = block_ts(bn)
+              token = '0x' + log['data'][2+24:2+64]
+              amount = word(log['data'], 1)
+              processed_to = word(log['data'], 2)
+              row = {
+                  'block': bn, 'tx_index': txi, 'log_index': li,
+                  'block_timestamp': ts, 'token': token,
+                  'amount': amount, 'processed_to': processed_to,
+                  'lag_seconds': ts - processed_to,
+                  'truncated': processed_to < ts,
+                  'tx_hash': log['transactionHash'],
+              }
+              rows.append(row)
+              if row['truncated'] and amount > 0:
+                  truncated.append(row)
+
+          rows.sort(key=lambda x:(x['block'],x['tx_index'],x['log_index']))
+          with open('token-checkpoint-events.json','w') as f:
+              json.dump(rows,f,indent=2)
+          with open('truncated-events.json','w') as f:
+              json.dump(truncated,f,indent=2)
+          with open('summary.json','w') as f:
+              json.dump({
+                  'rpc': active_rpc, 'start_block': START, 'latest_block': latest,
+                  'event_count': len(rows), 'unique_tokens': len(set(r['token'] for r in rows)),
+                  'truncated_event_count': len(truncated),
+                  'max_emitted_lag_seconds': max((r['lag_seconds'] for r in rows), default=0),
+              },f,indent=2)
+          with open('truncated-events.tsv','w') as f:
+              f.write('block\tblock_timestamp\ttoken\tamount\tprocessed_to\tlag_seconds\ttx_hash\n')
+              for r in truncated:
+                  f.write(f"{r['block']}\t{r['block_timestamp']}\t{r['token']}\t{r['amount']}\t{r['processed_to']}\t{r['lag_seconds']}\t{r['tx_hash']}\n")
+          print(json.dumps(json.load(open('summary.json')), indent=2))
+          print(open('truncated-events.tsv').read())
+          PY
+          cd "$GITHUB_WORKSPACE"
+          python3 /tmp/scan.py | tee history-scan.log
+          sha256sum summary.json token-checkpoint-events.json truncated-events.json truncated-events.tsv history-scan.log > SHA256SUMS
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: balancer-fee-distributor-history-scan
+          path: |
+            summary.json
+            token-checkpoint-events.json
+            truncated-events.json
+            truncated-events.tsv
+            history-scan.log
+            SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
