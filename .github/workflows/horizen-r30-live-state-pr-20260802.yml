@@ -1,0 +1,117 @@
+name: Horizen R30 PR read-only live-state census
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/horizen-r30-live-state-pr-20260802.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Read public Horizen testnet state
+        shell: bash
+        env:
+          RPC: https://horizen-testnet.rpc.caldera.xyz/http
+          STAKER: '0x6BF7CF29a8bcE11Aa62Cf593d165C244fA4d3E31'
+          ACC: '0x06f5555fee73EDdc385b6d76FE00DB2D96ccDaE8'
+          TOKEN: '0xb06EC4ce262D8dbDc24Fac87479A49A7DC4cFb87'
+          DEPLOYER: '0x9B264B21ca7659C256aD09171f827976Acd5a1C3'
+          FROM_BLOCK: '21842327'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, math, os, time, urllib.request
+
+          RPC=os.environ['RPC']; S=os.environ['STAKER'].lower(); A=os.environ['ACC'].lower(); T=os.environ['TOKEN'].lower(); D=os.environ['DEPLOYER'].lower(); START=int(os.environ['FROM_BLOCK'])
+          rid=0
+          def rpc(method, params, tries=4):
+              global rid
+              last=None
+              for n in range(tries):
+                  rid+=1
+                  payload=json.dumps({'jsonrpc':'2.0','id':rid,'method':method,'params':params}).encode()
+                  req=urllib.request.Request(RPC,data=payload,headers={'content-type':'application/json','user-agent':'Horizen-R30-readonly'},method='POST')
+                  try:
+                      with urllib.request.urlopen(req,timeout=40) as r: obj=json.loads(r.read())
+                      if 'error' in obj: raise RuntimeError(obj['error'])
+                      return obj['result']
+                  except Exception as e:
+                      last=e; time.sleep(2**n)
+              raise RuntimeError(f'{method}: {last}')
+          def call(to,data): return rpc('eth_call',[{'to':to,'data':data},'latest'])
+          def ui(x): return int(x,16)
+          def ad(x): return '0x'+x[-40:]
+          def pad_addr(x): return x.removeprefix('0x').lower().rjust(64,'0')
+          def words(x):
+              h=x[2:]; assert len(h)%64==0
+              return [h[i:i+64] for i in range(0,len(h),64)]
+          def code(address):
+              x=rpc('eth_getCode',[address,'latest']); b=bytes.fromhex(x[2:]) if x!='0x' else b''
+              return {'present':bool(b),'bytes':len(b),'sha256':hashlib.sha256(b).hexdigest()}
+          def logs(address,topic,start,end,chunk=20000):
+              out=[]; cur=start
+              while cur<=end:
+                  stop=min(cur+chunk-1,end)
+                  try:
+                      out += rpc('eth_getLogs',[{'address':address,'fromBlock':hex(cur),'toBlock':hex(stop),'topics':[topic]}],3)
+                      cur=stop+1
+                  except Exception:
+                      if chunk<=500: raise
+                      chunk//=2
+              return out
+          sel={
+            'supply':'0x18160ddd','balance':'0x70a08231','admin':'0xf851a440','calc':'0x72a35df9','tip':'0x7aa23c52','fee':'0x774da674','staked':'0x817b1cd2','power':'0x08484dee','end':'0x37e9f64a','checkpoint':'0x61dc0549','rate':'0xc3c16e4e','notifier':'0xe70f9445','surrogate':'0xe6dec270','owner':'0x8da5cb5b','window':'0xd2f343c7','last':'0x9231cf74','next':'0x7f68e195','accum':'0x9c81ff6b','wl':'0x51fb012d','threshold':'0xe75235b8','owners':'0xa0e67e2b'
+          }
+          chain=ui(rpc('eth_chainId',[])); latest=ui(rpc('eth_blockNumber',[])); block=rpc('eth_getBlockByNumber',[hex(latest),False]); now=ui(block['timestamp'])
+          admin=ad(call(S,sel['admin'])); calc=ad(call(S,sel['calc'])); tip=ui(call(S,sel['tip'])); fee_w=words(call(S,sel['fee'])); fee=ui('0x'+fee_w[0]); fee_col='0x'+fee_w[1][-40:]
+          staked=ui(call(S,sel['staked'])); power=ui(call(S,sel['power'])); end=ui(call(S,sel['end'])); checkpoint=ui(call(S,sel['checkpoint'])); rate=ui(call(S,sel['rate']))
+          owner=ad(call(A,sel['owner'])); window=ui(call(A,sel['window'])); last=ui(call(A,sel['last'])); nxt=ui(call(A,sel['next'])); accum=ui(call(A,sel['accum'])); wl=bool(ui(call(A,sel['wl'])))
+          supply=ui(call(T,sel['supply'])); s_bal=ui(call(T,sel['balance']+pad_addr(S))); a_bal=ui(call(T,sel['balance']+pad_addr(A)))
+          notifier_topic='0xb33ca1dabfb28a2e1bd06b332c396b1a3d538278691341a5503bbad53f919197'
+          nlogs=logs(S,notifier_topic,START,latest); observed={}
+          for x in nlogs: observed[('0x'+x['topics'][1][-40:]).lower()]=bool(ui(x['data']))
+          candidates=set(observed)|{A,D,admin.lower()}
+          current={x:bool(ui(call(S,sel['notifier']+pad_addr(x)))) for x in sorted(candidates)}
+          delegatee_topic='0xe03d018e6f94071d97d5befc6a430dedbb1792ef805cf2042edbc2bb75b44528'
+          dlogs=logs(S,delegatee_topic,START,latest); delegatees=set()
+          for x in dlogs:
+              w=words(x['data'])
+              if len(w)>=2:
+                  q='0x'+w[1][-40:]
+                  if ui(q): delegatees.add(q.lower())
+          surrogates={}
+          for d in sorted(delegatees):
+              q=ad(call(S,sel['surrogate']+pad_addr(d))).lower()
+              if ui(q) and q not in surrogates: surrogates[q]=ui(call(T,sel['balance']+pad_addr(q)))
+          backing=sum(surrogates.values())
+          def safe_snapshot(x):
+              out={'code':code(x)}
+              if not out['code']['present']: return out
+              try: out['threshold']=ui(call(x,sel['threshold']))
+              except Exception: out['threshold']=None
+              try:
+                  w=words(call(x,sel['owners'])); off=ui('0x'+w[0])//32; count=ui('0x'+w[off]); out['owners']=['0x'+w[off+1+i][-40:] for i in range(count)]
+              except Exception: out['owners']=None
+              return out
+          remain=max(end-now,0); future=(rate*remain)//10**36
+          result={
+            'classification':'PUBLIC_READ_ONLY_STATE','public_network_writes':0,'collected_at_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'chain_id':chain,'block_number':latest,'block_timestamp':now,
+            'code':{'staker':code(S),'accumulator':code(A),'token':code(T)},
+            'token':{'total_supply':supply,'staker_balance':s_bal,'accumulator_balance':a_bal},
+            'staker':{'admin':admin,'calculator':calc,'max_bump_tip':tip,'claim_fee':fee,'fee_collector':fee_col,'total_staked':staked,'total_earning_power':power,'reward_end':end,'last_checkpoint':checkpoint,'scaled_reward_rate':rate,'future_stream_liability':future,'notifier_events':observed,'current_notifiers':current},
+            'accumulator':{'owner':owner,'time_window':window,'last_reward_time':last,'next_reward_time':nxt,'accumulated_rewards':accum,'whitelist_enabled':wl,'backing_delta':a_bal-accum},
+            'principal':{'delegatee_events':len(dlogs),'unique_delegatees':len(delegatees),'unique_surrogates':len(surrogates),'surrogate_balance_sum':backing,'total_staked':staked,'backing_delta':backing-staked,'surrogates':surrogates},
+            'control':{'admin':safe_snapshot(admin),'accumulator_owner':safe_snapshot(owner)},
+            'rounding':{'checkpoints_for_one_raw':math.ceil(10**36/power) if power else None,'checkpoints_for_one_token':math.ceil(10**54/power) if power else None,'max_30d_fragmentation_raw_upper_bound':(power*2592000)/10**36,'staked_fraction_of_supply':staked/supply if supply else None},
+          }
+          result['gates']={'chain':chain==2651420,'identity':calc.lower()=='0xf518b3c7cd5cc1595d10e7268677da0fe364e191','bumping_disabled':tip==0,'claim_fee_disabled':fee==0,'principal_backed':backing>=staked,'accumulator_backed':a_bal>=accum,'accumulator_notifier':current.get(A) is True}
+          print('HORIZEN_R30_JSON_BEGIN'); print(json.dumps(result,indent=2,sort_keys=True)); print('HORIZEN_R30_JSON_END')
+          assert all(result['gates'].values()), result['gates']
+          print('HORIZEN_R30_GATE=PASS'); print('PUBLIC_NETWORK_WRITES=0')
+          PY
