@@ -1,0 +1,248 @@
+name: Temporary Velocity devnet-mainnet SWIFT overlap gate 20260802
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-velocity-cross-cluster-overlap-20260802.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  overlap:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install pinned official Velocity SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work evidence
+          cd work
+          npm init -y >/dev/null
+          npm install --ignore-scripts --legacy-peer-deps --no-audit --no-fund \
+            @velocity-exchange/sdk@0.10.0 \
+            @solana/web3.js@1.98.0 > ../evidence/NPM_INSTALL.log 2>&1
+          npm ls --all --json > ../evidence/NPM_DEPENDENCY_TREE.json \
+            2> ../evidence/NPM_LS_STDERR.log || true
+
+      - name: Fetch finalized cross-cluster populations and compute overlap
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work
+          cat > overlap.mjs <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import crypto from 'node:crypto';
+          import {Connection,Keypair,PublicKey} from '@solana/web3.js';
+          import * as velocity from '@velocity-exchange/sdk';
+
+          const OUT=path.resolve('../evidence');
+          const PROGRAM=new PublicKey('vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P');
+          const RPCS={
+            'mainnet-beta':[
+              'https://solana-rpc.publicnode.com',
+              'https://api.mainnet-beta.solana.com',
+              'https://solana.drpc.org',
+              'https://1rpc.io/solana',
+              'https://mainnet-beta.solflare.network',
+            ],
+            devnet:[
+              'https://api.devnet.solana.com',
+              'https://solana-devnet.g.alchemy.com/v2/demo',
+            ],
+          };
+          const sha256=(x)=>crypto.createHash('sha256').update(x).digest('hex');
+          const sleep=(ms)=>new Promise((r)=>setTimeout(r,ms));
+          const normalize=(v)=>JSON.parse(JSON.stringify(v,(_k,x)=>{
+            if(typeof x==='bigint')return x.toString();
+            if(x&&x.constructor?.name==='BN')return x.toString(10);
+            if(x&&typeof x.toBase58==='function')return x.toBase58();
+            if(Buffer.isBuffer(x)||x instanceof Uint8Array)return {hex:Buffer.from(x).toString('hex'),bytes:x.length};
+            return x;
+          }));
+          const write=(name,value)=>fs.writeFileSync(path.join(OUT,name),JSON.stringify(normalize(value),null,2)+'\n');
+          const to58=(v)=>v?.toBase58?.()??(v?String(v):null);
+          const authorityOf=(a)=>to58(a.authorityPubkey??a.authority_pubkey??a.authority??a.userAuthority??a.user_authority??a.owner);
+          const subOf=(a)=>Number(a.subAccountId??a.sub_account_id??a.subaccountId??a.subAccount??0);
+
+          async function raw(endpoint,method,params,timeoutMs=90000){
+            const controller=new AbortController();
+            const timer=setTimeout(()=>controller.abort(),timeoutMs);
+            try{
+              const response=await fetch(endpoint,{method:'POST',headers:{'content-type':'application/json','user-agent':'Velocity-Cross-Cluster-Overlap/1.0'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params}),signal:controller.signal});
+              const text=await response.text();
+              if(!response.ok)throw new Error(`HTTP ${response.status}: ${text.slice(0,300)}`);
+              const body=JSON.parse(text); if(body.error)throw new Error(JSON.stringify(body.error)); return body.result;
+            }finally{clearTimeout(timer);}
+          }
+
+          async function connect(env){
+            const attempts=[];
+            for(const endpoint of RPCS[env]){
+              let client;
+              try{
+                const slot=await raw(endpoint,'getSlot',[{commitment:'finalized'}]);
+                const genesisHash=await raw(endpoint,'getGenesisHash',[]);
+                const program=await raw(endpoint,'getAccountInfo',[PROGRAM.toBase58(),{encoding:'base64',commitment:'finalized'}]);
+                if(!program?.value?.executable)throw new Error('program missing/non-executable');
+                velocity.initialize({env});
+                const connection=new Connection(endpoint,'finalized');
+                const loader=new velocity.BulkAccountLoader(connection,'finalized',10000);
+                client=new velocity.VelocityClient({
+                  connection,
+                  wallet:new velocity.Wallet(Keypair.generate()),
+                  env,
+                  programID:PROGRAM,
+                  opts:{commitment:'finalized',preflightCommitment:'finalized'},
+                  accountSubscription:{type:'polling',accountLoader:loader},
+                  userStats:false,
+                  activeSubAccountId:0,
+                  subAccountIds:[],
+                });
+                const subscribed=await client.subscribe();
+                if(!subscribed)throw new Error('Velocity subscribe returned false');
+                attempts.push({endpoint,ok:true,slot,genesisHash});
+                return {endpoint,slot,genesisHash,client,attempts};
+              }catch(error){
+                attempts.push({endpoint,ok:false,error:`${error.name}: ${error.message}`});
+                if(client)try{await client.unsubscribe();}catch{}
+                await sleep(500);
+              }
+            }
+            throw new Error(`${env} connection failed: ${JSON.stringify(attempts)}`);
+          }
+
+          async function fetchPopulation(env){
+            const ctx=await connect(env);
+            try{
+              const accountNamespaces=Object.keys(ctx.client.program.account).sort();
+              const signedNamespaces=accountNamespaces.filter((name)=>/signed.*msg/i.test(name));
+              const users=await ctx.client.program.account.user.all();
+              const signed=[];
+              const signedErrors=[];
+              for(const namespace of signedNamespaces){
+                try{
+                  const rows=await ctx.client.program.account[namespace].all();
+                  for(const row of rows)signed.push({namespace,publicKey:row.publicKey,account:row.account});
+                }catch(error){signedErrors.push({namespace,error:`${error.name}: ${error.message}`});}
+              }
+              const userRows=users.map((row)=>({
+                publicKey:to58(row.publicKey),
+                authority:authorityOf(row.account),
+                subAccountId:subOf(row.account),
+                poolId:Number(row.account.poolId??row.account.pool_id??0),
+                status:Number(row.account.status??0),
+                idle:Boolean(row.account.idle??false),
+              }));
+              const signedRows=signed.map((row)=>({
+                namespace:row.namespace,
+                publicKey:to58(row.publicKey),
+                authority:authorityOf(row.account),
+                orderCount:Number(row.account.signedMsgOrderData?.length??row.account.signed_msg_order_data?.length??0),
+              }));
+              return {
+                env,
+                endpoint:ctx.endpoint,
+                finalizedSlot:ctx.slot,
+                genesisHash:ctx.genesisHash,
+                connectionAttempts:ctx.attempts,
+                accountNamespaces,
+                signedNamespaces,
+                signedNamespaceErrors:signedErrors,
+                users:userRows,
+                signedAccounts:signedRows,
+              };
+            }finally{await ctx.client.unsubscribe();}
+          }
+
+          function key(row){return `${row.authority}:${row.subAccountId}`;}
+          function hashKey(value){return sha256(Buffer.from(value)).slice(0,24);}
+
+          async function main(){
+            const mainnet=await fetchPopulation('mainnet-beta');
+            const devnet=await fetchPopulation('devnet');
+            write('MAINNET_POPULATION.json',mainnet);
+            write('DEVNET_POPULATION.json',devnet);
+
+            const mainUsersByKey=new Map();
+            const mainUsersByAuthority=new Map();
+            for(const row of mainnet.users){
+              if(!row.authority)continue;
+              const k=key(row); if(!mainUsersByKey.has(k))mainUsersByKey.set(k,[]); mainUsersByKey.get(k).push(row);
+              if(!mainUsersByAuthority.has(row.authority))mainUsersByAuthority.set(row.authority,[]); mainUsersByAuthority.get(row.authority).push(row);
+            }
+            const devUsersByKey=new Map();
+            for(const row of devnet.users){if(row.authority){const k=key(row);if(!devUsersByKey.has(k))devUsersByKey.set(k,[]);devUsersByKey.get(k).push(row);}}
+
+            const exactUserOverlap=[];
+            for(const [k,dRows] of devUsersByKey){
+              const mRows=mainUsersByKey.get(k)??[];
+              if(mRows.length)exactUserOverlap.push({keyHash:hashKey(k),authority:dRows[0].authority,subAccountId:dRows[0].subAccountId,devnet:dRows,mainnet:mRows});
+            }
+            const devSignedToMainUsers=[];
+            for(const signed of devnet.signedAccounts){
+              if(!signed.authority)continue;
+              const mainRows=mainUsersByAuthority.get(signed.authority)??[];
+              if(mainRows.length)devSignedToMainUsers.push({authorityHash:hashKey(signed.authority),authority:signed.authority,devnetSignedAccount:signed,mainnetUsers:mainRows});
+            }
+            const mainSignedAuthorities=new Set(mainnet.signedAccounts.map((r)=>r.authority).filter(Boolean));
+            const signedAuthorityOverlap=devnet.signedAccounts
+              .filter((r)=>r.authority&&mainSignedAuthorities.has(r.authority))
+              .map((r)=>({authorityHash:hashKey(r.authority),authority:r.authority,devnet:r,mainnet:mainnet.signedAccounts.filter((m)=>m.authority===r.authority)}));
+
+            const gate={
+              status:'PASS_READ_ONLY_VELOCITY_CROSS_CLUSTER_OVERLAP_SCAN',
+              programId:PROGRAM,
+              mainnetFinalizedSlot:mainnet.finalizedSlot,
+              devnetFinalizedSlot:devnet.finalizedSlot,
+              mainnetGenesisHash:mainnet.genesisHash,
+              devnetGenesisHash:devnet.genesisHash,
+              genesisHashesDiffer:mainnet.genesisHash!==devnet.genesisHash,
+              devnetMinusMainnetSlot:Number(devnet.finalizedSlot)-Number(mainnet.finalizedSlot),
+              mainnetUsers:mainnet.users.length,
+              devnetUsers:devnet.users.length,
+              mainnetSignedAccounts:mainnet.signedAccounts.length,
+              devnetSignedAccounts:devnet.signedAccounts.length,
+              exactCrossClusterUserOverlapCount:exactUserOverlap.length,
+              devnetSignedAuthorityWithMainnetUserCount:devSignedToMainUsers.length,
+              signedAuthorityBothClustersCount:signedAuthorityOverlap.length,
+              liveOverlappingVictimSurface:devSignedToMainUsers.length>0,
+              exactUserOverlap,
+              devnetSignedToMainUsers,
+              signedAuthorityOverlap,
+              safety:{
+                rpcMethods:['getSlot','getGenesisHash','getAccountInfo','getProgramAccounts'],
+                privateKeysLoaded:0,
+                publicChainTransactionsConstructed:0,
+                publicChainTransactionsSigned:0,
+                publicChainTransactionsSent:0,
+                publicChainWrites:0,
+              },
+            };
+            write('FINAL_GATE.json',gate);
+            const manifest=fs.readdirSync(OUT).sort().map((name)=>{const b=fs.readFileSync(path.join(OUT,name));return {name,bytes:b.length,sha256:sha256(b)};});
+            write('MANIFEST.json',manifest);
+            console.log(JSON.stringify(gate,null,2));
+          }
+
+          main().catch((error)=>{write('FAILURE.json',{status:'FAILED',error:`${error.stack||error}`,safety:{publicChainWrites:0}});console.error(error.stack||error);process.exit(1);});
+          NODE
+          node overlap.mjs | tee ../evidence/RUN_STDOUT.log
+          sha256sum overlap.mjs > ../evidence/SCANNER_SHA256.txt
+
+      - name: Upload immutable read-only evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: velocity-cross-cluster-overlap-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
