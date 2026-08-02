@@ -1,0 +1,164 @@
+name: Balancer FeeDistributor mainnet-fork PoC
+
+on:
+  push:
+    branches:
+      - tooling/foundry-download-bootstrap-20260802
+    paths:
+      - '.github/workflows/balancer-fee-distributor-mainnet-fork-poc.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/balancer-fee-distributor-mainnet-fork-poc.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  poc:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install verified toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin" /tmp/poc/lib
+          curl --fail --location --retry 5 --retry-all-errors \
+            -o /tmp/foundry.tar.gz \
+            https://github.com/foundry-rs/foundry/releases/download/v1.7.1/foundry_v1.7.1_linux_amd64.tar.gz
+          echo 'cf7e688ed0c4c48adffca788b496076e31060b67ac5afe1e43dbb5499c20c88b  /tmp/foundry.tar.gz' | sha256sum -c -
+          tar -xzf /tmp/foundry.tar.gz -C "$HOME/.local/bin"
+          curl --fail --location --retry 5 --retry-all-errors \
+            -o /tmp/solc-0.8.27 \
+            https://github.com/ethereum/solidity/releases/download/v0.8.27/solc-static-linux
+          chmod +x /tmp/solc-0.8.27
+          curl --fail --location --retry 5 --retry-all-errors \
+            -o /tmp/forge-std.tar.gz \
+            https://codeload.github.com/foundry-rs/forge-std/tar.gz/77041d2ce690e692d6e03cc812b57d1ddaa4d505
+          tar -xzf /tmp/forge-std.tar.gz -C /tmp/poc/lib
+          mv /tmp/poc/lib/forge-std-* /tmp/poc/lib/forge-std
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Create pinned deployed-bytecode test
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/poc/src /tmp/poc/test
+          cat > /tmp/poc/foundry.toml <<'EOF'
+          [profile.default]
+          src = 'src'
+          test = 'test'
+          out = 'out'
+          libs = ['lib']
+          solc = '/tmp/solc-0.8.27'
+          auto_detect_solc = false
+          optimizer = true
+          optimizer_runs = 200
+          evm_version = 'cancun'
+          EOF
+          cat > /tmp/poc/test/FeeDistributorMainnetFork.t.sol <<'EOF'
+          // SPDX-License-Identifier: MIT
+          pragma solidity 0.8.27;
+          import "forge-std/Test.sol";
+
+          interface IFeeDistributor {
+              function checkpointToken(address token) external;
+              function getTokenTimeCursor(address token) external view returns (uint256);
+              function getTokenLastBalance(address token) external view returns (uint256);
+              function getTokensDistributedInWeek(address token, uint256 timestamp) external view returns (uint256);
+          }
+          interface IERC20Minimal {
+              function balanceOf(address account) external view returns (uint256);
+          }
+
+          contract FeeDistributorMainnetForkTest is Test {
+              address private constant FEE_DISTRIBUTOR = 0xD3cf852898b21fc233251427c2DC93d3d604F3BB;
+              address private constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+              uint256 private constant WEEK = 1 weeks;
+              IFeeDistributor private constant distributor = IFeeDistributor(FEE_DISTRIBUTOR);
+              IERC20Minimal private constant usdc = IERC20Minimal(USDC);
+
+              function test_DeployedBytecodeOrphansDirectUSDCDepositAfterTwentyWeeklyBoundaries() public {
+                  uint256 cursorBefore = distributor.getTokenTimeCursor(USDC);
+                  uint256 cachedBefore = distributor.getTokenLastBalance(USDC);
+                  uint256 actualBefore = usdc.balanceOf(FEE_DISTRIBUTOR);
+                  assertEq(cachedBefore, actualBefore, "pinned production state must begin fully cached");
+                  assertGt(cursorBefore, 0, "USDC token state must already be initialized");
+
+                  uint256 firstWeek = (cursorBefore / WEEK) * WEEK;
+                  uint256 baselineAllocated = _sumAllocations(firstWeek, 40);
+                  uint256 directDeposit = 2_100_000e6;
+                  deal(USDC, FEE_DISTRIBUTOR, actualBefore + directDeposit, true);
+
+                  vm.warp(firstWeek + 21 weeks + 1);
+                  distributor.checkpointToken(USDC);
+
+                  uint256 newlyAllocated = _sumAllocations(firstWeek, 40) - baselineAllocated;
+                  uint256 cachedAfter = distributor.getTokenLastBalance(USDC);
+                  uint256 actualAfter = usdc.balanceOf(FEE_DISTRIBUTOR);
+                  uint256 orphaned = directDeposit - newlyAllocated;
+
+                  emit log_named_uint("cursor before", cursorBefore);
+                  emit log_named_uint("direct deposit", directDeposit);
+                  emit log_named_uint("newly allocated", newlyAllocated);
+                  emit log_named_uint("permanently orphaned", orphaned);
+
+                  assertGt(orphaned, 0, "twenty-iteration horizon must truncate the deposit");
+                  assertEq(cachedAfter, actualAfter, "entire post-deposit balance is cached");
+
+                  uint256 totalAllocatedBeforeRetry = _sumAllocations(firstWeek, 40);
+                  distributor.checkpointToken(USDC);
+                  vm.warp(block.timestamp + 2 weeks);
+                  distributor.checkpointToken(USDC);
+                  assertEq(
+                      _sumAllocations(firstWeek, 40),
+                      totalAllocatedBeforeRetry,
+                      "later checkpoints cannot recover the orphan"
+                  );
+              }
+
+              function _sumAllocations(uint256 firstWeek, uint256 count) private view returns (uint256 sum) {
+                  for (uint256 i; i < count; ++i) {
+                      sum += distributor.getTokensDistributedInWeek(USDC, firstWeek + i * WEEK);
+                  }
+              }
+          }
+          EOF
+
+      - name: Run pinned local mainnet fork only
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          RPC=''
+          for candidate in \
+            https://ethereum-rpc.publicnode.com \
+            https://eth.llamarpc.com; do
+            if timeout 20 cast block 25667582 --rpc-url "$candidate" >/dev/null 2>&1; then
+              RPC="$candidate"
+              break
+            fi
+          done
+          test -n "$RPC"
+          cd /tmp/poc
+          forge test \
+            --fork-url "$RPC" \
+            --fork-block-number 25667582 \
+            --match-test test_DeployedBytecodeOrphansDirectUSDCDepositAfterTwentyWeeklyBoundaries \
+            -vvv | tee mainnet-fork-poc.log
+          sha256sum test/FeeDistributorMainnetFork.t.sol mainnet-fork-poc.log > SHA256SUMS
+
+      - name: Upload PoC evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: balancer-fee-distributor-mainnet-fork-poc
+          path: |
+            /tmp/poc/test/FeeDistributorMainnetFork.t.sol
+            /tmp/poc/mainnet-fork-poc.log
+            /tmp/poc/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
