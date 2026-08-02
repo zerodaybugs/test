@@ -1,0 +1,216 @@
+name: Velocity encrypted cross-cluster SWIFT overlap inventory
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/velocity-cross-cluster-overlap-encrypted.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+
+      - name: Install pinned public decoder
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work encrypted
+          cd work
+          npm init -y >/dev/null
+          npm config set registry https://registry.npmjs.org/
+          npm install --ignore-scripts --legacy-peer-deps --no-audit --no-fund \
+            @velocity-exchange/sdk@0.10.0 \
+            @solana/web3.js@1.98.0 >/dev/null
+
+      - name: Read current mainnet/devnet overlap and encrypt detailed rows
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work
+          cat > inventory.mjs <<'NODE'
+          import fs from 'node:fs';
+          import crypto from 'node:crypto';
+          import {Connection,PublicKey} from '@solana/web3.js';
+          import * as sdk from '@velocity-exchange/sdk';
+
+          const PROGRAM = new PublicKey('vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P');
+          const MAINNET_GENESIS='5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d';
+          const DEVNET_GENESIS='EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG';
+          const PUBLIC_EXAMPLE_SIGNER_SHA256='8a9374b499af7105aa6c7b364ed9fc95035b77d7364c657daedbc2dd8d9e6429';
+          const MAINNET_RPCS=['https://solana-rpc.publicnode.com','https://api.mainnet-beta.solana.com','https://solana.drpc.org','https://1rpc.io/solana'];
+          const DEVNET_RPCS=['https://api.devnet.solana.com','https://solana-devnet.api.syndica.io/api-key/public','https://devnet.helius-rpc.com/?api-key='];
+          const sha256=(data)=>crypto.createHash('sha256').update(data).digest('hex');
+          const sleep=(ms)=>new Promise((resolve)=>setTimeout(resolve,ms));
+          const keyOf=(authority,subAccountId)=>`${authority}:${subAccountId}`;
+          const signedPda=(authority)=>PublicKey.findProgramAddressSync([Buffer.from('SIGNED_MSG'),new PublicKey(authority).toBuffer()],PROGRAM)[0];
+
+          async function getMany(connection,keys) {
+            const out=[];
+            for (let i=0;i<keys.length;i+=80) {
+              const chunk=keys.slice(i,i+80);
+              let last;
+              for (let attempt=0;attempt<6;attempt++) {
+                try { out.push(...await connection.getMultipleAccountsInfo(chunk,'confirmed')); last=null; break; }
+                catch (error) { last=error; await sleep(500*(attempt+1)); }
+              }
+              if (last) throw last;
+            }
+            return out;
+          }
+
+          async function connectAndFetch(label,endpoints,expectedGenesis) {
+            const attempts=[];
+            let lastError;
+            for (const endpoint of endpoints) {
+              try {
+                const connection=new Connection(endpoint,'confirmed');
+                const [genesis,slot,rows]=await Promise.all([
+                  connection.getGenesisHash(),
+                  connection.getSlot('confirmed'),
+                  connection.getProgramAccounts(PROGRAM,{commitment:'confirmed',filters:[sdk.getUserFilter()]})
+                ]);
+                if (genesis!==expectedGenesis) throw new Error(`unexpected genesis ${genesis}`);
+                attempts.push({endpoint,ok:true,slot,users:rows.length,genesis});
+                return {label,endpoint,connection,slot,genesis,rows,attempts};
+              } catch (error) {
+                attempts.push({endpoint,ok:false,error:`${error.name}: ${error.message}`});
+                lastError=error;
+              }
+            }
+            throw new Error(`${label} unavailable: ${lastError}`);
+          }
+
+          function decodeRows(rows) {
+            return rows.map((row)=>{
+              const account=sdk.decodeUser(Buffer.from(row.account.data));
+              const authority=account.authority.toBase58();
+              const subAccountId=Number(account.subAccountId);
+              return {
+                key:keyOf(authority,subAccountId),
+                userAccount:row.pubkey.toBase58(),
+                authority,
+                authoritySha256:sha256(authority),
+                subAccountId,
+                poolId:Number(account.poolId),
+                idle:Boolean(account.idle),
+                status:Number(account.status),
+                totalDeposits:account.totalDeposits.toString(),
+                totalWithdraws:account.totalWithdraws.toString(),
+                accountDataSha256:sha256(row.account.data),
+              };
+            });
+          }
+
+          async function main() {
+            sdk.initialize({env:'mainnet-beta'});
+            const [mainnet,devnet]=await Promise.all([
+              connectAndFetch('mainnet',MAINNET_RPCS,MAINNET_GENESIS),
+              connectAndFetch('devnet',DEVNET_RPCS,DEVNET_GENESIS),
+            ]);
+            const mainRows=decodeRows(mainnet.rows);
+            const devRows=decodeRows(devnet.rows);
+            const mainMap=new Map(mainRows.map((row)=>[row.key,row]));
+            const devMap=new Map(devRows.map((row)=>[row.key,row]));
+            const overlapKeys=[...mainMap.keys()].filter((key)=>devMap.has(key)).sort();
+            const overlapAuthorities=[...new Set(overlapKeys.map((key)=>mainMap.get(key).authority))].sort();
+            const signedKeys=overlapAuthorities.map(signedPda);
+            const [mainSigned,devSigned]=await Promise.all([
+              getMany(mainnet.connection,signedKeys),
+              getMany(devnet.connection,signedKeys),
+            ]);
+            const signedByAuthority=new Map(overlapAuthorities.map((authority,index)=>[authority,{
+              pda:signedKeys[index].toBase58(),
+              mainnetExists:mainSigned[index]!==null,
+              devnetExists:devSigned[index]!==null,
+              mainnetDataSha256:mainSigned[index]?sha256(mainSigned[index].data):null,
+              devnetDataSha256:devSigned[index]?sha256(devSigned[index].data):null,
+            }]));
+            const detailed=overlapKeys.map((key)=>{
+              const mainnetUser=mainMap.get(key);
+              const devnetUser=devMap.get(key);
+              return {mainnetUser,devnetUser,signed:signedByAuthority.get(mainnetUser.authority)};
+            });
+            const bothSigned=detailed.filter((row)=>row.signed.mainnetExists&&row.signed.devnetExists);
+            const publicExampleMatches=detailed.filter((row)=>row.mainnetUser.authoritySha256===PUBLIC_EXAMPLE_SIGNER_SHA256);
+            const summary={
+              status:'PASS_ENCRYPTED_VELOCITY_CROSS_CLUSTER_OVERLAP_INVENTORY',
+              programId:PROGRAM.toBase58(),
+              programIdSameAcrossClusters:true,
+              mainnet:{endpoint:mainnet.endpoint,slot:mainnet.slot,genesis:mainnet.genesis,users:mainRows.length,uniqueAuthorities:new Set(mainRows.map((x)=>x.authority)).size},
+              devnet:{endpoint:devnet.endpoint,slot:devnet.slot,genesis:devnet.genesis,users:devRows.length,uniqueAuthorities:new Set(devRows.map((x)=>x.authority)).size},
+              devnetMinusMainnetSlot:devnet.slot-mainnet.slot,
+              genesisHashesDiffer:mainnet.genesis!==devnet.genesis,
+              exactAuthoritySubaccountOverlapRows:detailed.length,
+              exactOverlapUniqueAuthorities:overlapAuthorities.length,
+              overlapRowsWithMainnetSignedState:detailed.filter((row)=>row.signed.mainnetExists).length,
+              overlapRowsWithDevnetSignedState:detailed.filter((row)=>row.signed.devnetExists).length,
+              overlapRowsWithBothSignedStates:bothSigned.length,
+              subAccountZeroRowsWithBothSignedStates:bothSigned.filter((row)=>row.mainnetUser.subAccountId===0).length,
+              publicAuthenticExampleSignerOverlapRows:publicExampleMatches.length,
+              publicAuthenticExampleSignerHasBothSignedStates:publicExampleMatches.some((row)=>row.signed.mainnetExists&&row.signed.devnetExists),
+              attempts:{mainnet:mainnet.attempts,devnet:devnet.attempts},
+              publicChainTransactions:0,
+            };
+            fs.writeFileSync('DETAILS.json',JSON.stringify({summary,detailed},null,2)+'\n');
+            fs.writeFileSync('SUMMARY.json',JSON.stringify(summary,null,2)+'\n');
+            console.log(JSON.stringify(summary,null,2));
+          }
+          main().catch((error)=>{console.error(error.stack||error);process.exit(1);});
+          NODE
+          node inventory.mjs
+          cat > research-cert.pem <<'CERT'
+          -----BEGIN CERTIFICATE-----
+          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
+          -----END CERTIFICATE-----
+          CERT
+          tar -czf DETAILS.tar.gz DETAILS.json SUMMARY.json
+          openssl cms -encrypt -binary -aes256 -in DETAILS.tar.gz -outform DER -out DETAILS.cms research-cert.pem
+          openssl x509 -in research-cert.pem -noout -fingerprint -sha256 > CERT_FINGERPRINT.txt
+          cp SUMMARY.json ../encrypted/SUMMARY.json
+          cp DETAILS.cms CERT_FINGERPRINT.txt ../encrypted/
+          rm -f DETAILS.json DETAILS.tar.gz
+
+      - name: Upload encrypted detail and aggregate summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: velocity-cross-cluster-overlap-encrypted
+          path: encrypted
+          if-no-files-found: error
+          retention-days: 1
