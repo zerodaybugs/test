@@ -1,0 +1,141 @@
+name: Balancer FeeDistributor read-only state probe
+
+on:
+  push:
+    branches:
+      - tooling/foundry-download-bootstrap-20260802
+    paths:
+      - '.github/workflows/balancer-fee-distributor-readonly.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/balancer-fee-distributor-readonly.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Query public read-only state
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p probe
+          cat > probe/probe.py <<'PY'
+          import json, time, urllib.request
+
+          FD = '0xD3cf852898b21fc233251427c2DC93d3d604F3BB'
+          RPCS = [
+              'https://ethereum-rpc.publicnode.com',
+              'https://eth.llamarpc.com',
+              'https://1rpc.io/eth',
+          ]
+          BLOCKSCOUT = f'https://eth.blockscout.com/api/v2/addresses/{FD}/token-balances'
+
+          def request_json(url, payload=None):
+              data = None if payload is None else json.dumps(payload).encode()
+              req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.loads(r.read().decode())
+
+          rpc_url = None
+          def rpc(method, params):
+              global rpc_url
+              payload = {'jsonrpc':'2.0','id':1,'method':method,'params':params}
+              candidates = [rpc_url] if rpc_url else []
+              candidates += [x for x in RPCS if x != rpc_url]
+              last = None
+              for url in candidates:
+                  if not url: continue
+                  try:
+                      out = request_json(url, payload)
+                      if 'error' in out: raise RuntimeError(out['error'])
+                      rpc_url = url
+                      return out['result']
+                  except Exception as e:
+                      last = e
+              raise RuntimeError(f'All RPCs failed: {last}')
+
+          def calldata(selector, address):
+              return selector + address.lower().replace('0x','').rjust(64,'0')
+
+          def eth_call(to, data):
+              return int(rpc('eth_call', [{'to':to, 'data':data}, 'latest']), 16)
+
+          latest_num_hex = rpc('eth_blockNumber', [])
+          block = rpc('eth_getBlockByNumber', [latest_num_hex, False])
+          chain_ts = int(block['timestamp'], 16)
+
+          tokens = []
+          try:
+              payload = request_json(BLOCKSCOUT)
+              items = payload if isinstance(payload, list) else payload.get('items', [])
+              for item in items:
+                  token = item.get('token') or {}
+                  addr = token.get('address_hash') or token.get('address')
+                  if not addr: continue
+                  tokens.append({
+                      'address': addr,
+                      'symbol': token.get('symbol') or '',
+                      'name': token.get('name') or '',
+                      'decimals': int(token.get('decimals') or 0),
+                      'explorer_value': item.get('value'),
+                  })
+          except Exception as e:
+              tokens = []
+              blockscout_error = repr(e)
+          else:
+              blockscout_error = None
+
+          fallback = [
+              {'address':'0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48','symbol':'USDC','name':'USD Coin','decimals':6},
+              {'address':'0xba100000625a3754423978a60c9317c58a424e3D','symbol':'BAL','name':'Balancer','decimals':18},
+          ]
+          seen = {t['address'].lower() for t in tokens}
+          tokens += [t for t in fallback if t['address'].lower() not in seen]
+
+          rows = []
+          for t in tokens:
+              a = t['address']
+              try:
+                  cursor = eth_call(FD, calldata('0xacbc1428', a))
+                  cached = eth_call(FD, calldata('0x2308805b', a))
+                  actual = eth_call(a, calldata('0x70a08231', FD))
+                  gap = None if cursor == 0 else chain_ts - cursor
+                  rows.append({**t, 'cursor':cursor, 'gap_seconds':gap, 'gap_days':None if gap is None else gap/86400,
+                               'cached_balance':cached, 'actual_balance':actual,
+                               'uncached_balance':actual-cached if actual >= cached else None,
+                               'over_20_weeks':bool(gap is not None and gap > 20*7*86400),
+                               'rpc_error':None})
+              except Exception as e:
+                  rows.append({**t, 'rpc_error':repr(e)})
+
+          result = {
+              'fee_distributor': FD,
+              'latest_block': int(latest_num_hex,16),
+              'chain_timestamp': chain_ts,
+              'wall_timestamp': int(time.time()),
+              'rpc_url': rpc_url,
+              'blockscout_error': blockscout_error,
+              'tokens': rows,
+          }
+          with open('probe/results.json','w') as f: json.dump(result,f,indent=2)
+          with open('probe/results.tsv','w') as f:
+              f.write('symbol\taddress\tdecimals\tactual\tcached\tuncached\tcursor\tgap_days\tover_20_weeks\terror\n')
+              for r in rows:
+                  f.write('\t'.join(str(r.get(k,'')) for k in ['symbol','address','decimals','actual_balance','cached_balance','uncached_balance','cursor','gap_days','over_20_weeks','rpc_error'])+'\n')
+          print(json.dumps(result, indent=2))
+          PY
+          python3 probe/probe.py | tee probe/stdout.txt
+      - name: Upload probe evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: balancer-fee-distributor-readonly
+          path: probe/
+          if-no-files-found: error
+          retention-days: 1
