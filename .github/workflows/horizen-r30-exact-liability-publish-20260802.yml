@@ -1,0 +1,78 @@
+name: Temporary Horizen R30 exact-liability evidence publisher
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/horizen-r30-exact-liability-publish-20260802.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Reconstruct and publish exact public-state liability
+        shell: bash
+        env:
+          RPC: https://horizen-testnet.rpc.caldera.xyz/http
+          STAKER: '0x6BF7CF29a8bcE11Aa62Cf593d165C244fA4d3E31'
+          TOKEN: '0xb06EC4ce262D8dbDc24Fac87479A49A7DC4cFb87'
+          FROM_BLOCK: '21842327'
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, json, os, time, urllib.request
+          RPC=os.environ['RPC']; S=os.environ['STAKER'].lower(); T=os.environ['TOKEN'].lower(); START=int(os.environ['FROM_BLOCK']); SCALE=10**36
+          rid=0
+          def rpc(method,params,tries=4):
+              global rid
+              last=None
+              for n in range(tries):
+                  rid+=1; body=json.dumps({'jsonrpc':'2.0','id':rid,'method':method,'params':params}).encode(); req=urllib.request.Request(RPC,data=body,headers={'content-type':'application/json','user-agent':'Horizen-R30-exact-liability'},method='POST')
+                  try:
+                      with urllib.request.urlopen(req,timeout=40) as r: out=json.loads(r.read())
+                      if 'error' in out: raise RuntimeError(out['error'])
+                      return out['result']
+                  except Exception as e: last=e; time.sleep(2**n)
+              raise RuntimeError(f'{method}: {last}')
+          def call(to,data): return rpc('eth_call',[{'to':to,'data':data},'latest'])
+          def ui(x): return int(x,16)
+          def pad(v): return hex(v)[2:].rjust(64,'0')
+          def words(x):
+              h=x[2:]; assert len(h)%64==0
+              return [h[i:i+64] for i in range(0,len(h),64)]
+          def logs(address,topic,start,end,chunk=20000):
+              out=[]; cur=start
+              while cur<=end:
+                  stop=min(cur+chunk-1,end)
+                  try: out+=rpc('eth_getLogs',[{'address':address,'fromBlock':hex(cur),'toBlock':hex(stop),'topics':[topic]}],3); cur=stop+1
+                  except Exception:
+                      if chunk<=500: raise
+                      chunk//=2
+              return out
+          SEL={'deposits':'0xb02c43d0','unclaimed':'0xcb3056ad','rpt':'0xae0d27b6','staked':'0x817b1cd2','power':'0x08484dee','end':'0x37e9f64a','rate':'0xc3c16e4e','balance':'0x70a08231'}
+          TOPIC='0x1a325385f16807e99fb688b597db78b00faee313dcf02e882dd16daab6fc3e1f'
+          latest=ui(rpc('eth_blockNumber',[])); now=ui(rpc('eth_getBlockByNumber',[hex(latest),False])['timestamp']); ev=logs(S,TOPIC,START,latest); ids=sorted({ui(x['topics'][2]) for x in ev})
+          rpt=ui(call(S,SEL['rpt'])); total_staked=ui(call(S,SEL['staked'])); total_power=ui(call(S,SEL['power'])); end=ui(call(S,SEL['end'])); rate=ui(call(S,SEL['rate'])); balance=ui(call(T,SEL['balance']+S[2:].rjust(64,'0')))
+          rows=[]; sum_bal=sum_ep=sum_scaled=sum_floor=0
+          for i in ids:
+              w=words(call(S,SEL['deposits']+pad(i))); assert len(w)>=7
+              bal=ui('0x'+w[0]); owner='0x'+w[1][-40:]; ep=ui('0x'+w[2]); delegatee='0x'+w[3][-40:]; claimer='0x'+w[4][-40:]; cp=ui('0x'+w[5]); stored=ui('0x'+w[6]); assert rpt>=cp
+              exact=stored+ep*(rpt-cp); floor=ui(call(S,SEL['unclaimed']+pad(i))); assert floor==exact//SCALE
+              sum_bal+=bal; sum_ep+=ep; sum_scaled+=exact; sum_floor+=floor; rows.append({'id':i,'balance':str(bal),'owner':owner,'earning_power':str(ep),'delegatee':delegatee,'claimer':claimer,'reward_per_token_checkpoint':str(cp),'stored_scaled_unclaimed':str(stored),'exact_scaled_unclaimed':str(exact),'floor_unclaimed_raw':str(floor)})
+          remain=max(end-now,0); future=rate*remain; backing=balance*SCALE; total=sum_scaled+future; surplus=backing-total
+          result={'classification':'PUBLIC_READ_ONLY_EXACT_LIABILITY','public_network_writes':0,'collected_at_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'block_number':latest,'block_timestamp':now,'stake_event_count':len(ev),'unique_deposit_ids':len(ids),'reward_per_token_accumulated':str(rpt),'aggregates':{'sum_deposit_balances':str(sum_bal),'contract_total_staked':str(total_staked),'principal_aggregate_delta':str(sum_bal-total_staked),'sum_deposit_earning_power':str(sum_ep),'contract_total_earning_power':str(total_power),'earning_power_aggregate_delta':str(sum_ep-total_power)},'liability':{'staker_token_balance_raw':str(balance),'staker_backing_scaled':str(backing),'exact_accrued_scaled':str(sum_scaled),'floor_accrued_raw':str(sum_floor),'reward_end':end,'remaining_seconds':remain,'scaled_reward_rate':str(rate),'future_stream_scaled':str(future),'total_accrued_plus_future_scaled':str(total),'exact_surplus_scaled':str(surplus),'exact_surplus_raw_floor':str(surplus//SCALE),'solvent':surplus>=0},'deposits':rows}
+          result['gates']={'deposit_balance_matches_total':sum_bal==total_staked,'deposit_ep_matches_total':sum_ep==total_power,'all_unclaimed_helpers_match_exact':True,'exact_accrued_plus_future_solvent':surplus>=0}
+          assert all(result['gates'].values()),result['gates']
+          data=(json.dumps(result,indent=2,sort_keys=True)+'\n').encode()
+          repo=os.environ['REPOSITORY']; url=f'https://api.github.com/repos/{repo}/contents/research/horizen-r30-exact-liability-20260802.json'
+          payload=json.dumps({'message':'research: publish Horizen R30 exact liability evidence','content':base64.b64encode(data).decode(),'branch':'main'}).encode()
+          req=urllib.request.Request(url,data=payload,headers={'authorization':'Bearer '+os.environ['GH_TOKEN'],'accept':'application/vnd.github+json','x-github-api-version':'2022-11-28','content-type':'application/json','user-agent':'Horizen-R30-publisher'},method='PUT')
+          with urllib.request.urlopen(req,timeout=40) as r: published=json.loads(r.read())
+          print('HORIZEN_R30_EXACT_GATE=PASS'); print('PUBLISHED_COMMIT='+published['commit']['sha']); print('PUBLIC_NETWORK_WRITES=0')
+          PY
