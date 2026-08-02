@@ -1,0 +1,298 @@
+name: Temporary Velocity feed-age sharded census 20260802
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-velocity-feed-age-sharded-20260802.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Bind active program and build finalized signature index
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p index
+          cat > /tmp/index.mjs <<'NODE'
+          import fs from 'node:fs';
+          import crypto from 'node:crypto';
+
+          const PROGRAM='vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P';
+          const ORACLE='2k3UHX6ehRFzx5fTVvbL6FwXhMjkucjJDL9MuVKLo8TV';
+          const EXPECTED_PD='HkRf36jvUB32dnHjHqpMnPcKJhUP2TUKJTH7RDTifJm7';
+          const EXPECTED_ELF='1b7b06d17af813b5a505df8f534bfd0779a1a7457f0d2626b1a45c8741686c80';
+          const DEPLOYMENT=435978201;
+          const ALPHABET='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+          const RPCS=['https://solana-rpc.publicnode.com','https://api.mainnet-beta.solana.com','https://solana.drpc.org','https://1rpc.io/solana','https://mainnet-beta.solflare.network'];
+          const sleep=(ms)=>new Promise((resolve)=>setTimeout(resolve,ms));
+          let cursor=0;
+
+          function b58e(data){
+            let number=BigInt('0x'+Buffer.from(data).toString('hex')),encoded='';
+            while(number>0n){const remainder=Number(number%58n);number/=58n;encoded=ALPHABET[remainder]+encoded}
+            let zeros=0;for(const byte of data){if(byte!==0)break;zeros++}
+            return '1'.repeat(zeros)+encoded;
+          }
+          async function raw(endpoint,method,params,timeoutMs=90000){
+            const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeoutMs);
+            try{
+              const response=await fetch(endpoint,{method:'POST',headers:{'content-type':'application/json','user-agent':'ZDB-sharded-index/1'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params}),signal:controller.signal});
+              const text=await response.text();
+              if(!response.ok)throw new Error(`${response.status}:${text.slice(0,160)}`);
+              const body=JSON.parse(text);if(body.error)throw new Error(JSON.stringify(body.error));return body.result;
+            }finally{clearTimeout(timer)}
+          }
+          async function rpc(method,params,attempts=15){
+            let last;
+            for(let attempt=0;attempt<attempts;attempt++){
+              const endpoint=RPCS[(cursor+attempt)%RPCS.length];
+              try{const result=await raw(endpoint,method,params);cursor=(RPCS.indexOf(endpoint)+1)%RPCS.length;return{endpoint,result}}
+              catch(error){last=error;await sleep(Math.min(5000,150*(2**Math.min(attempt,5)))+Math.floor(Math.random()*100))}
+            }
+            throw last;
+          }
+          function elfLen(data){
+            if(data.length<64||data.subarray(0,4).toString('hex')!=='7f454c46'||data[4]!==2||data[5]!==1)throw new Error('elf');
+            const phoff=Number(data.readBigUInt64LE(0x20)),shoff=Number(data.readBigUInt64LE(0x28)),eh=data.readUInt16LE(0x34),pe=data.readUInt16LE(0x36),pn=data.readUInt16LE(0x38),se=data.readUInt16LE(0x3a),sn=data.readUInt16LE(0x3c);
+            let maximum=Math.max(64,eh);
+            if(phoff&&pe&&pn){maximum=Math.max(maximum,phoff+pe*pn);for(let i=0;i<pn;i++){const offset=phoff+i*pe;maximum=Math.max(maximum,Number(data.readBigUInt64LE(offset+8)+data.readBigUInt64LE(offset+32)))}}
+            if(shoff&&se&&sn){maximum=Math.max(maximum,shoff+se*sn);for(let i=0;i<sn;i++){const offset=shoff+i*se;if(data.readUInt32LE(offset+4)!==8)maximum=Math.max(maximum,Number(data.readBigUInt64LE(offset+24)+data.readBigUInt64LE(offset+32)))}}
+            if(maximum>data.length)throw new Error('extent');return maximum;
+          }
+
+          const program=await rpc('getAccountInfo',[PROGRAM,{encoding:'base64',commitment:'finalized'}]);
+          const programRaw=Buffer.from(program.result.value.data[0],'base64');
+          const programData=b58e(programRaw.subarray(4,36));
+          const pd=await rpc('getAccountInfo',[programData,{encoding:'base64',commitment:'finalized'}]);
+          const pdRaw=Buffer.from(pd.result.value.data[0],'base64');
+          const deploymentSlot=Number(pdRaw.readBigUInt64LE(4));
+          const payload=pdRaw.subarray(45);
+          const canonical=payload.subarray(0,elfLen(payload));
+          const activeElfSha256=crypto.createHash('sha256').update(canonical).digest('hex');
+          const binding={programId:PROGRAM,programData,deploymentSlot,activeElfSha256,exactProgramData:programData===EXPECTED_PD,exactElf:activeElfSha256===EXPECTED_ELF,publicChainTransactions:0};
+          fs.writeFileSync('index/BINDING.json',JSON.stringify(binding,null,2)+'\n');
+          if(!binding.exactProgramData||!binding.exactElf)throw new Error(`deployment changed: ${JSON.stringify(binding)}`);
+
+          const rows=[],pages=[];
+          let before,reached=false;
+          for(let page=0;page<320;page++){
+            const options={limit:1000,commitment:'finalized'};if(before)options.before=before;
+            const response=await rpc('getSignaturesForAddress',[ORACLE,options]);
+            const pageRows=response.result??[];
+            pages.push({page,endpoint:response.endpoint,count:pageRows.length,firstSlot:pageRows[0]?.slot,lastSlot:pageRows.at(-1)?.slot});
+            for(const row of pageRows){if(Number(row.slot)<DEPLOYMENT){reached=true;break}rows.push(row)}
+            console.log(`PAGE=${page} ROWS=${rows.length} LAST=${pageRows.at(-1)?.slot}`);
+            if(reached||pageRows.length<1000)break;
+            before=pageRows.at(-1).signature;
+            await sleep(60);
+          }
+          rows.reverse();
+          const summary={verdict:rows.length>=10000?'PASS_INDEX':'FAIL_INDEX',rows:rows.length,reachedDeployment:reached,oldest:rows[0]??null,newest:rows.at(-1)??null,publicChainTransactions:0};
+          fs.writeFileSync('index/signatures.json',JSON.stringify(rows));
+          fs.writeFileSync('index/PAGES.json',JSON.stringify(pages,null,2)+'\n');
+          fs.writeFileSync('index/INDEX_SUMMARY.json',JSON.stringify(summary,null,2)+'\n');
+          if(summary.verdict!=='PASS_INDEX')throw new Error(JSON.stringify(summary));
+          NODE
+          node /tmp/index.mjs | tee index/RUN_STDOUT.log
+          sha256sum index/* > index/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: velocity-sequence-index
+          path: index
+          if-no-files-found: error
+          retention-days: 1
+
+  scan:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 24
+      matrix:
+        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: velocity-sequence-index
+          path: index
+
+      - name: Decode pinned sharded probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          printf '%s' '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' > /tmp/shard.mjs.gz.b64
+          base64 -d /tmp/shard.mjs.gz.b64 | gzip -d > /tmp/shard.mjs
+          printf '%s  %s\n' '3170647de2bcfa28d44cc5bd19d6db284f5e4cfe703e552f78ee03cbafcfad89' '/tmp/shard.mjs' | sha256sum -c -
+          node --check /tmp/shard.mjs
+          sha256sum /tmp/shard.mjs > out/PROBE_SHA256.txt
+
+      - name: Scan assigned chronological sample shard
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+          SHARDS: '24'
+          SAMPLE_LIMIT: '120000'
+          BATCH: '20'
+          INDEX_PATH: index/signatures.json
+          OUT_DIR: out
+        run: |
+          set -o pipefail
+          node /tmp/shard.mjs 2>&1 | tee out/RUN_STDOUT.log
+          code=${PIPESTATUS[0]}
+          printf '%s\n' "$code" > out/EXIT_CODE.txt
+          exit "$code"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: velocity-sequence-shard-${{ matrix.shard }}
+          path: out
+          if-no-files-found: error
+          retention-days: 1
+
+  aggregate:
+    needs: [prepare,scan]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: velocity-sequence-index
+          path: index
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: velocity-sequence-shard-*
+          path: shards
+          merge-multiple: false
+
+      - name: Build fail-closed global verdict
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p final
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+
+          binding=json.loads(Path('index/BINDING.json').read_text())
+          files=sorted(Path('shards').rglob('shard-*.json'))
+          shards=[]
+          for path in files:
+              try:
+                  shards.append(json.loads(path.read_text()))
+              except Exception:
+                  pass
+          expected=24
+          feed_map={}
+          positive=None
+          for shard in shards:
+              if shard.get('positiveSol48') and positive is None:
+                  positive=shard['positiveSol48']
+              for feed in shard.get('feedStats',[]):
+                  key=str(feed['feedId'])
+                  target=feed_map.setdefault(key,{
+                      'feedId':feed['feedId'],'observations':0,'positiveAgeCount':0,
+                      'maxAgeSeconds':-1,'maxAgeWitness':None,'thresholdCounts':{},'topAgeWitnesses':[]
+                  })
+                  target['observations']+=feed.get('observations',0)
+                  target['positiveAgeCount']+=feed.get('positiveAgeCount',0)
+                  for threshold,count in feed.get('thresholdCounts',{}).items():
+                      target['thresholdCounts'][threshold]=target['thresholdCounts'].get(threshold,0)+count
+                  if feed.get('maxAgeSeconds',-1)>target['maxAgeSeconds']:
+                      target['maxAgeSeconds']=feed['maxAgeSeconds']
+                      target['maxAgeWitness']=feed.get('maxAgeWitness')
+                  target['topAgeWitnesses'].extend(feed.get('topAgeWitnesses',[]))
+          for feed in feed_map.values():
+              dedup={}
+              for row in feed['topAgeWitnesses']:
+                  dedup[(row.get('signature'),row.get('messageSha256'),row.get('feedId'))]=row
+              feed['topAgeWitnesses']=sorted(dedup.values(),key=lambda row:row.get('ageSeconds',-1),reverse=True)[:100]
+          feed_stats=sorted(feed_map.values(),key=lambda row:row['feedId'])
+          sol=next((row for row in feed_stats if row['feedId']==6),None)
+          core=sum(max(0,row.get('coreEnd',0)-row.get('coreStart',0)) for row in shards)
+          sampled=max([row.get('sampledRows',0) for row in shards] or [0])
+          responses=sum(row.get('transactionResponses',0) for row in shards)
+          failures=sum(row.get('failures',0) for row in shards)
+          decoded=sum(row.get('decodedMessages',0) for row in shards)
+          coverage=core/sampled if sampled else 0
+          failure_rate=failures/responses if responses else 1
+          execution=(
+              binding.get('exactProgramData') is True
+              and binding.get('exactElf') is True
+              and len(shards)==expected
+              and coverage>=0.99
+              and failure_rate<=0.15
+              and decoded>=sampled*0.30
+          )
+          if not execution:
+              verdict='INCOMPLETE_FAIL_CLOSED'
+          elif positive or (sol and sol.get('maxAgeSeconds',-1)>=48):
+              verdict='POSITIVE_SOL_48S_WITNESS'
+          elif sol and sol.get('maxAgeSeconds',-1)>=4:
+              verdict='POSITIVE_SOL_4S_WITNESS'
+          elif any(row.get('maxAgeSeconds',-1)>=4 for row in feed_stats):
+              verdict='POSITIVE_OTHER_4S_WITNESS'
+          else:
+              verdict='NO_MATERIAL_AGE_IN_120K_SAMPLE'
+          result={
+              'verdict':verdict,'executionPassed':execution,'binding':binding,
+              'expectedShards':expected,'receivedShards':len(shards),
+              'sampledRows':sampled,'coreRowsCovered':core,'coverageRatio':coverage,
+              'transactionResponses':responses,'decodedMessages':decoded,
+              'failures':failures,'failureRate':failure_rate,
+              'solMaxAgeSeconds':sol.get('maxAgeSeconds') if sol else None,
+              'solMaxAgeWitness':sol.get('maxAgeWitness') if sol else None,
+              'positiveSol48':positive,'feedStats':feed_stats,
+              'safety':{'publicChainWrites':0,'publicTransactionsSigned':0,'publicTransactionsSent':0},
+          }
+          Path('final/RESULT.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          Path('final/SHARDS.json').write_text(json.dumps(shards,indent=2,sort_keys=True)+'\n')
+          entries=[]
+          for path in sorted(p for p in Path('final').iterdir() if p.is_file() and p.name not in {'MANIFEST.json','SHA256SUMS.txt'}):
+              data=path.read_bytes()
+              entries.append({'name':path.name,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest()})
+          Path('final/MANIFEST.json').write_text(json.dumps(entries,indent=2,sort_keys=True)+'\n')
+          with Path('final/SHA256SUMS.txt').open('w') as handle:
+              for row in entries:
+                  handle.write(f"{row['sha256']}  {row['name']}\n")
+          print(json.dumps({k:result[k] for k in ['verdict','executionPassed','receivedShards','sampledRows','coverageRatio','decodedMessages','failureRate','solMaxAgeSeconds']},indent=2))
+          if not execution:
+              raise SystemExit(1)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: velocity-sequence-final-${{ github.run_id }}
+          path: final
+          if-no-files-found: error
+          retention-days: 1
