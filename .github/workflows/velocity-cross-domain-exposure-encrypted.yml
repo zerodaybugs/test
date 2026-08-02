@@ -1,0 +1,184 @@
+name: Encrypted Solana cross-program account exposure inventory
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/velocity-cross-domain-exposure-encrypted.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+
+      - name: Install pinned public decoder
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work encrypted
+          cd work
+          npm init -y >/dev/null
+          npm config set registry https://registry.npmjs.org/
+          npm install --ignore-scripts --legacy-peer-deps --no-audit --no-fund \
+            @velocity-exchange/sdk@0.10.0 \
+            @solana/web3.js@1.98.0 >/dev/null
+
+      - name: Read current account overlap and encrypt detailed output
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work
+          cat > inventory.mjs <<'NODE'
+          import fs from 'node:fs';
+          import crypto from 'node:crypto';
+          import {Connection,PublicKey} from '@solana/web3.js';
+          import * as sdk from '@velocity-exchange/sdk';
+
+          const VELOCITY = new PublicKey('vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P');
+          const DRIFT = new PublicKey('dRiftyHA39MWEi3m9aunc5MzRF1JYuBsbn6VPcn33UH');
+          const RPCS = [
+            'https://solana-rpc.publicnode.com',
+            'https://api.mainnet-beta.solana.com',
+            'https://solana.drpc.org',
+            'https://1rpc.io/solana',
+          ];
+          const sha256 = (data) => crypto.createHash('sha256').update(data).digest('hex');
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          const u16le = (value) => { const b=Buffer.alloc(2); b.writeUInt16LE(value); return b; };
+          const velocitySigned = (authority) => PublicKey.findProgramAddressSync([Buffer.from('SIGNED_MSG'), authority.toBuffer()], VELOCITY)[0];
+          const driftSigned = (authority) => PublicKey.findProgramAddressSync([Buffer.from('SIGNED_MSG'), authority.toBuffer()], DRIFT)[0];
+          const driftUser = (authority, subAccountId) => PublicKey.findProgramAddressSync([Buffer.from('user'), authority.toBuffer(), u16le(subAccountId)], DRIFT)[0];
+
+          async function getMany(connection, keys) {
+            const results=[];
+            for (let i=0;i<keys.length;i+=80) {
+              const chunk=keys.slice(i,i+80);
+              let last;
+              for (let attempt=0;attempt<5;attempt++) {
+                try { results.push(...await connection.getMultipleAccountsInfo(chunk,'confirmed')); last=null; break; }
+                catch (error) { last=error; await sleep(500*(attempt+1)); }
+              }
+              if (last) throw last;
+            }
+            return results;
+          }
+
+          async function main() {
+            sdk.initialize({env:'mainnet-beta'});
+            let connection, endpoint, userRows, lastError;
+            const attempts=[];
+            for (const candidate of RPCS) {
+              try {
+                const c=new Connection(candidate,'confirmed');
+                const accounts=await c.getProgramAccounts(VELOCITY,{commitment:'confirmed',filters:[sdk.getUserFilter()]});
+                attempts.push({endpoint:candidate,ok:true,users:accounts.length,slot:await c.getSlot('confirmed')});
+                connection=c; endpoint=candidate; userRows=accounts; break;
+              } catch (error) {
+                attempts.push({endpoint:candidate,ok:false,error:`${error.name}: ${error.message}`});
+                lastError=error;
+              }
+            }
+            if (!connection) throw lastError;
+
+            const users=userRows.map((row)=>{
+              const account=sdk.decodeUser(Buffer.from(row.account.data));
+              return {
+                userAccount:row.pubkey.toBase58(),
+                accountDataSha256:sha256(row.account.data),
+                authority:account.authority.toBase58(),
+                subAccountId:Number(account.subAccountId),
+                poolId:Number(account.poolId),
+                idle:Boolean(account.idle),
+                totalDeposits:account.totalDeposits.toString(),
+                totalWithdraws:account.totalWithdraws.toString(),
+              };
+            });
+
+            const authorities=[...new Set(users.map((row)=>row.authority))].sort();
+            const velocitySignedKeys=authorities.map((a)=>velocitySigned(new PublicKey(a)));
+            const driftSignedKeys=authorities.map((a)=>driftSigned(new PublicKey(a)));
+            const driftUserKeys=users.map((row)=>driftUser(new PublicKey(row.authority),row.subAccountId));
+            const [velocitySignedInfos,driftSignedInfos,driftUserInfos]=await Promise.all([
+              getMany(connection,velocitySignedKeys),getMany(connection,driftSignedKeys),getMany(connection,driftUserKeys)
+            ]);
+            const velocitySignedMap=new Map(authorities.map((a,i)=>[a,{pubkey:velocitySignedKeys[i].toBase58(),exists:velocitySignedInfos[i]!==null,lamports:velocitySignedInfos[i]?.lamports??null,dataSha256:velocitySignedInfos[i]?sha256(velocitySignedInfos[i].data):null}]));
+            const driftSignedMap=new Map(authorities.map((a,i)=>[a,{pubkey:driftSignedKeys[i].toBase58(),exists:driftSignedInfos[i]!==null,lamports:driftSignedInfos[i]?.lamports??null,dataSha256:driftSignedInfos[i]?sha256(driftSignedInfos[i].data):null}]));
+
+            const detailed=users.map((row,i)=>({
+              ...row,
+              velocitySigned:velocitySignedMap.get(row.authority),
+              driftSigned:driftSignedMap.get(row.authority),
+              driftUser:{pubkey:driftUserKeys[i].toBase58(),exists:driftUserInfos[i]!==null,lamports:driftUserInfos[i]?.lamports??null,dataSha256:driftUserInfos[i]?sha256(driftUserInfos[i].data):null},
+            }));
+            const summary={
+              status:'PASS_ENCRYPTED_CROSS_PROGRAM_ACCOUNT_INVENTORY',endpoint,slot:attempts.find((x)=>x.ok)?.slot,
+              velocityUsers:detailed.length,uniqueAuthorities:authorities.length,
+              velocitySignedAuthorities:[...velocitySignedMap.values()].filter((x)=>x.exists).length,
+              driftSignedAuthorities:[...driftSignedMap.values()].filter((x)=>x.exists).length,
+              velocityUsersWithDriftUser:detailed.filter((x)=>x.driftUser.exists).length,
+              fullCrossProgramRows:detailed.filter((x)=>x.velocitySigned.exists&&x.driftSigned.exists&&x.driftUser.exists).length,
+              subAccountZeroFullCrossProgramRows:detailed.filter((x)=>x.subAccountId===0&&x.velocitySigned.exists&&x.driftSigned.exists&&x.driftUser.exists).length,
+              publicChainTransactions:0,
+            };
+            fs.writeFileSync('INVENTORY.json',JSON.stringify({summary,attempts,detailed},null,2)+'\n');
+            fs.writeFileSync('SUMMARY.json',JSON.stringify(summary,null,2)+'\n');
+            console.log(JSON.stringify(summary,null,2));
+          }
+          main().catch((error)=>{console.error(error.stack||error);process.exit(1);});
+          NODE
+          node inventory.mjs
+          cat > research-cert.pem <<'CERT'
+          -----BEGIN CERTIFICATE-----
+          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
+          olPaH1I711WYe7U=
+          -----END CERTIFICATE-----
+          CERT
+          tar -czf INVENTORY.tar.gz INVENTORY.json SUMMARY.json
+          openssl cms -encrypt -binary -aes256 -in INVENTORY.tar.gz -outform DER -out INVENTORY.cms research-cert.pem
+          openssl x509 -in research-cert.pem -noout -fingerprint -sha256 > CERT_FINGERPRINT.txt
+          cp SUMMARY.json ../encrypted/SUMMARY.json
+          cp INVENTORY.cms CERT_FINGERPRINT.txt ../encrypted/
+          rm -f INVENTORY.json INVENTORY.tar.gz
+
+      - name: Upload encrypted detailed evidence and aggregate summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-cross-program-account-inventory
+          path: encrypted
+          if-no-files-found: error
+          retention-days: 1
