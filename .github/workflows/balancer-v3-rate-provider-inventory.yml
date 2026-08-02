@@ -1,0 +1,88 @@
+name: Balancer V3 rate-provider inventory
+
+on:
+  push:
+    branches:
+      - tooling/foundry-download-bootstrap-20260802
+    paths:
+      - '.github/workflows/balancer-v3-rate-provider-inventory.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Query Balancer public GraphQL API
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          endpoint='https://api-v3.balancer.fi/graphql'
+          page_size=100
+          skip=0
+          echo '[]' > evidence/pools.json
+
+          while true; do
+            query='query Pools($first:Int!,$skip:Int!){poolGetPools(first:$first,skip:$skip,where:{chainIn:[MAINNET],protocolVersionIn:[3]}){id address name symbol protocolVersion type version factory createTime poolTokens{address symbol balance priceRate priceRateProvider nestedPool{id address name protocolVersion type version}} dynamicData{totalLiquidity swapEnabled isPaused isInRecoveryMode}}}'
+            payload=$(jq -cn --arg q "$query" --argjson first "$page_size" --argjson skip "$skip" '{query:$q,variables:{first:$first,skip:$skip}}')
+            curl --fail --silent --show-error --retry 5 --retry-all-errors \
+              -H 'content-type: application/json' -H 'user-agent: ZeroDayBugs-readonly-inventory/1.0' \
+              --data "$payload" "$endpoint" > evidence/page.json
+            jq -e '.errors == null' evidence/page.json >/dev/null
+            count=$(jq '.data.poolGetPools | length' evidence/page.json)
+            jq -s '.[0] + .[1].data.poolGetPools' evidence/pools.json evidence/page.json > evidence/pools.next.json
+            mv evidence/pools.next.json evidence/pools.json
+            echo "page skip=$skip count=$count"
+            if [ "$count" -lt "$page_size" ]; then break; fi
+            skip=$((skip + page_size))
+          done
+
+          jq '[.[] | . as $p | .poolTokens[] | select(.priceRateProvider != null and (.priceRateProvider|ascii_downcase) != "0x0000000000000000000000000000000000000000") | {
+              poolId:$p.id,
+              poolAddress:$p.address,
+              poolName:$p.name,
+              poolType:$p.type,
+              poolVersion:$p.version,
+              factory:$p.factory,
+              tvl:$p.dynamicData.totalLiquidity,
+              swapEnabled:$p.dynamicData.swapEnabled,
+              paused:$p.dynamicData.isPaused,
+              recovery:$p.dynamicData.isInRecoveryMode,
+              tokenAddress:.address,
+              tokenSymbol:.symbol,
+              tokenBalance:.balance,
+              priceRate:.priceRate,
+              priceRateProvider:.priceRateProvider,
+              nestedPool:.nestedPool
+          }]' evidence/pools.json > evidence/rate-provider-tokens.json
+
+          jq '[.[] | select(.nestedPool != null and .nestedPool.protocolVersion == 2)]' \
+            evidence/rate-provider-tokens.json > evidence/v3-pools-consuming-v2-bpt-rate.json
+
+          jq '[.[] | select((.tokenAddress|ascii_downcase) == (.priceRateProvider|ascii_downcase))]' \
+            evidence/rate-provider-tokens.json > evidence/self-rate-provider-tokens.json
+
+          jq -r '[length, ([.[] | select(.swapEnabled == true and .paused == false and .recovery == false)] | length), ([.[].tvl|tonumber] | add // 0)] | @tsv' \
+            evidence/v3-pools-consuming-v2-bpt-rate.json > evidence/v2-bpt-consumer-summary.tsv
+
+          jq -r '.[] | [.poolAddress,.poolName,.poolType,.tvl,.tokenAddress,.tokenSymbol,.priceRateProvider,.nestedPool.address,.nestedPool.name,.swapEnabled,.paused,.recovery] | @tsv' \
+            evidence/v3-pools-consuming-v2-bpt-rate.json > evidence/v3-pools-consuming-v2-bpt-rate.tsv
+
+          jq -r '.[] | [.poolAddress,.poolName,.poolType,.tvl,.tokenAddress,.tokenSymbol,.priceRateProvider,.nestedPool.protocolVersion,.nestedPool.address] | @tsv' \
+            evidence/rate-provider-tokens.json > evidence/all-rate-provider-tokens.tsv
+
+          sha256sum evidence/* > evidence/SHA256SUMS
+          cat evidence/v2-bpt-consumer-summary.tsv
+          cat evidence/v3-pools-consuming-v2-bpt-rate.tsv
+
+      - name: Upload inventory
+        uses: actions/upload-artifact@v4
+        with:
+          name: balancer-v3-rate-provider-inventory
+          path: evidence
+          if-no-files-found: error
+          retention-days: 1
