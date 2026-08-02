@@ -31,6 +31,7 @@ jobs:
           cargo install solana-verify --locked
           solana-verify --version | tee SOLANA_VERIFY_VERSION.txt
           solana-verify build --help > SOLANA_VERIFY_BUILD_HELP.txt
+          solana-verify get-program-hash --help > SOLANA_VERIFY_PROGRAM_HASH_HELP.txt
 
       - name: Checkout deployment-window candidate source
         uses: actions/checkout@v4
@@ -48,17 +49,18 @@ jobs:
           mkdir -p evidence
           git -C candidate rev-parse HEAD | tee evidence/CANDIDATE_COMMIT.txt
           git -C candidate show -s --format='%H%n%aI%n%cI%n%s' HEAD > evidence/CANDIDATE_COMMIT_METADATA.txt
-          cp SOLANA_VERIFY_VERSION.txt SOLANA_VERIFY_BUILD_HELP.txt evidence/
+          cp SOLANA_VERIFY_VERSION.txt SOLANA_VERIFY_BUILD_HELP.txt SOLANA_VERIFY_PROGRAM_HASH_HELP.txt evidence/
           cd candidate/lazer
           solana-verify build --library-name pyth_lazer_solana_contract 2>&1 | tee ../../evidence/SOLANA_VERIFY_BUILD.log
           code=${PIPESTATUS[0]}
           printf '%s\n' "$code" > ../../evidence/SOLANA_VERIFY_BUILD_EXIT_CODE.txt
           exit "$code"
 
-      - name: Compare candidate executable to active mainnet ELF
+      - name: Compare candidate executable to active mainnet program
         if: always()
         shell: bash
         env:
+          PROGRAM_ID: pytd2yyk641x7ak7mkaasSJVXh6YYZnC7wTmtgAyxPt
           EXPECTED_ACTIVE_ELF_SHA256: 20ab42e7bc37e60f65d24b0df405549dc42649351231ede0bcbcd3b514223677
         run: |
           set -euo pipefail
@@ -70,19 +72,72 @@ jobs:
           cp "$so" evidence/CANDIDATE_PYTH_LAZER_SOLANA.so
           sha256sum "$so" | tee evidence/CANDIDATE_RAW_SHA256.txt
           solana-verify get-executable-hash "$so" | tee evidence/CANDIDATE_EXECUTABLE_HASH.txt
+
+          : > evidence/ACTIVE_PROGRAM_HASH_ATTEMPTS.log
+          active_ok=0
+          for rpc in \
+            https://api.mainnet-beta.solana.com \
+            https://solana-rpc.publicnode.com \
+            https://solana.drpc.org \
+            https://mainnet-beta.solflare.network
+          do
+            printf 'RPC=%s\n' "$rpc" | tee -a evidence/ACTIVE_PROGRAM_HASH_ATTEMPTS.log
+            set +e
+            output=$(solana-verify -u "$rpc" get-program-hash "$PROGRAM_ID" 2>&1)
+            code=$?
+            set -e
+            printf '%s\nEXIT_CODE=%s\n' "$output" "$code" | tee -a evidence/ACTIVE_PROGRAM_HASH_ATTEMPTS.log
+            if [ "$code" -eq 0 ]; then
+              printf '%s\n' "$rpc" > evidence/ACTIVE_PROGRAM_HASH_RPC.txt
+              printf '%s\n' "$output" > evidence/ACTIVE_PROGRAM_HASH.txt
+              active_ok=1
+              break
+            fi
+          done
+          if [ "$active_ok" -ne 1 ]; then
+            printf 'ACTIVE_PROGRAM_HASH_QUERY_FAILED\n' > evidence/ACTIVE_PROGRAM_HASH_STATUS.txt
+          else
+            printf 'ACTIVE_PROGRAM_HASH_QUERY_PASS\n' > evidence/ACTIVE_PROGRAM_HASH_STATUS.txt
+          fi
+
           python3 - <<'PY'
-          import hashlib, json, os
+          import hashlib, json, os, re
           from pathlib import Path
+
           so = Path('candidate/lazer/target/deploy/pyth_lazer_solana_contract.so')
           data = so.read_bytes()
           raw = hashlib.sha256(data).hexdigest()
           expected = os.environ['EXPECTED_ACTIVE_ELF_SHA256']
+
+          def hash_from(path: str):
+              p = Path(path)
+              if not p.exists():
+                  return None
+              matches = re.findall(r'(?i)\b[0-9a-f]{64}\b', p.read_text(errors='replace'))
+              return matches[-1].lower() if matches else None
+
+          candidate_executable = hash_from('evidence/CANDIDATE_EXECUTABLE_HASH.txt')
+          active_program = hash_from('evidence/ACTIVE_PROGRAM_HASH.txt')
           result = {
               'candidateCommit': Path('evidence/CANDIDATE_COMMIT.txt').read_text().strip(),
               'candidateBytes': len(data),
               'candidateRawSha256': raw,
               'expectedActiveCanonicalElfSha256': expected,
               'rawShaMatchesActiveCanonical': raw == expected,
+              'candidateExecutableHash': candidate_executable,
+              'activeProgramHash': active_program,
+              'executableHashMatchesActiveProgram': (
+                  candidate_executable is not None
+                  and active_program is not None
+                  and candidate_executable == active_program
+              ),
+              'bindingVerdict': (
+                  'EXACT_EXECUTABLE_HASH_MATCH'
+                  if candidate_executable is not None
+                  and active_program is not None
+                  and candidate_executable == active_program
+                  else 'NO_EXECUTABLE_HASH_MATCH'
+              ),
           }
           Path('evidence/BINDING_RESULT.json').write_text(json.dumps(result, indent=2, sort_keys=True) + '\n')
           print(json.dumps(result, indent=2, sort_keys=True))
