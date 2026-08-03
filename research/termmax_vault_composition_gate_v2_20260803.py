@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Resilient wrapper for the TermMax vault composition gate.
 
-Adds RPC rotation and Routescan indexed-log fallback for historical ERC-20
-Transfer discovery. The core order, vault, and settlement reads remain exactly
+Adds indexed-log-first holder discovery from a conservative pre-deployment block,
+then RPC rotation as fallback. The core order, vault, and settlement reads remain
 those of termmax_vault_composition_gate_20260803.py. Read-only only.
 """
 from __future__ import annotations
@@ -23,18 +23,30 @@ if SPEC is None or SPEC.loader is None:
 base = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(base)
 
+# The archive-node binary search in the base scanner can fail closed on public
+# RPCs that do not serve old state. This block predates the vault deployment and
+# therefore safely covers the complete share Transfer history.
+HOLDER_SCAN_START_BLOCK = 24_000_000
+
 
 def topic_hex(value: Any) -> str:
     text = value.hex() if hasattr(value, "hex") else str(value)
     return text if text.startswith("0x") else "0x" + text
 
 
+def parse_int(value: Any) -> int:
+    if isinstance(value, int):
+        return value
+    text = str(value or "0")
+    return int(text, 16) if text.lower().startswith("0x") else int(text)
+
+
 def normalize_log(row: Any) -> Any:
     if not isinstance(row, dict):
         return row
     item = dict(row)
-    if "blockNumber" in item and isinstance(item["blockNumber"], str):
-        item["blockNumber"] = int(item["blockNumber"], 16) if item["blockNumber"].startswith("0x") else int(item["blockNumber"])
+    if "blockNumber" in item:
+        item["blockNumber"] = parse_int(item["blockNumber"])
     return item
 
 
@@ -83,13 +95,13 @@ def routescan_logs(start: int, end: int) -> tuple[list[dict[str, Any]], dict[str
         }
         payload: Any = None
         last_error: Exception | None = None
-        for attempt in range(7):
+        for attempt in range(8):
             try:
                 response = requests.get(
                     endpoint,
                     params=params,
                     timeout=60,
-                    headers={"User-Agent": "ZeroDayBugs-TermMax-Readonly/4"},
+                    headers={"User-Agent": "ZeroDayBugs-TermMax-Readonly/5"},
                 )
                 if response.status_code == 429:
                     time.sleep(1.5 * (attempt + 1))
@@ -104,7 +116,8 @@ def routescan_logs(start: int, end: int) -> tuple[list[dict[str, Any]], dict[str
             raise RuntimeError(f"Routescan failed: {last_error}")
         rows = payload.get("result", []) if isinstance(payload, dict) else []
         if isinstance(rows, str):
-            if "No" in rows or "not found" in rows.lower():
+            lowered = rows.lower()
+            if "no" in lowered or "not found" in lowered:
                 break
             raise RuntimeError(f"unexpected Routescan response: {payload}")
         if not rows:
@@ -114,25 +127,40 @@ def routescan_logs(start: int, end: int) -> tuple[list[dict[str, Any]], dict[str
             break
         page += 1
         time.sleep(0.25)
-    return all_rows, {"transport": "routescan", "endpoint": endpoint, "pageCount": page, "rowCount": len(all_rows)}
+    return all_rows, {
+        "transport": "routescan",
+        "endpoint": endpoint,
+        "fromBlock": start,
+        "toBlock": end,
+        "pageCount": page,
+        "rowCount": len(all_rows),
+    }
 
 
-def resilient_transfer_logs(_w3: Web3, start: int, end: int) -> tuple[list[Any], list[dict[str, Any]]]:
+def resilient_transfer_logs(_w3: Web3, _start: int, end: int) -> tuple[list[Any], list[dict[str, Any]]]:
+    start = HOLDER_SCAN_START_BLOCK
     attempts: list[dict[str, Any]] = []
+
+    # Indexed explorer first: avoids archive-node and wide eth_getLogs limits.
+    try:
+        rows, diag = routescan_logs(start, end)
+        attempts.append({"ok": True, **diag})
+        if rows:
+            return rows, attempts
+    except Exception as exc:  # noqa: BLE001
+        attempts.append({"ok": False, "transport": "routescan", "error": f"{type(exc).__name__}: {exc}"})
+
     for url in base.RPCS:
         try:
             rows, diag = direct_logs(url, start, end)
             attempts.append({"ok": True, **diag})
-            return rows, attempts
+            if rows:
+                return rows, attempts
         except Exception as exc:  # noqa: BLE001
             attempts.append({"ok": False, "transport": "rpc", "url": url, "error": f"{type(exc).__name__}: {exc}"})
-    try:
-        rows, diag = routescan_logs(start, end)
-        attempts.append({"ok": True, **diag})
-        return rows, attempts
-    except Exception as exc:  # noqa: BLE001
-        attempts.append({"ok": False, "transport": "routescan", "error": f"{type(exc).__name__}: {exc}"})
-    # Preserve all higher-value order/vault state even if holder enumeration is unavailable.
+
+    # Preserve the higher-value order and settlement state if all holder
+    # transports fail. The verdict exposes zero holders rather than guessing.
     return [], attempts
 
 
