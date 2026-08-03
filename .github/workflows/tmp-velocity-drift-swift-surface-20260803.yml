@@ -1,0 +1,225 @@
+name: Temporary Velocity-Drift SWIFT surface census 20260803
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-velocity-drift-swift-surface-20260803.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: velocity-drift-swift-surface-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install official published SDKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work evidence
+          cd work
+          npm init -y >/dev/null
+          npm install --ignore-scripts --legacy-peer-deps --no-audit --no-fund \
+            @velocity-exchange/sdk@0.10.0 \
+            @drift-labs/sdk@latest \
+            @solana/web3.js@1.98.0 > ../evidence/NPM_INSTALL.log 2>&1
+          npm ls --depth=0 --json > ../evidence/PACKAGE_TREE.json
+          npm view @velocity-exchange/sdk@0.10.0 dist --json > ../evidence/VELOCITY_DIST.json
+          npm view @drift-labs/sdk@latest dist --json > ../evidence/DRIFT_DIST.json
+
+      - name: Execute finalized read-only cross-protocol population census
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work
+          cat > census.mjs <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import crypto from 'node:crypto';
+          import {Connection,Keypair,PublicKey} from '@solana/web3.js';
+          import * as velocity from '@velocity-exchange/sdk';
+          import * as drift from '@drift-labs/sdk';
+
+          const OUT=path.resolve('../evidence');
+          const ENDPOINTS=[
+            'https://api.mainnet-beta.solana.com',
+            'https://solana-rpc.publicnode.com',
+            'https://solana.drpc.org',
+            'https://1rpc.io/solana',
+            'https://mainnet-beta.solflare.network',
+          ];
+          const VELOCITY_ID=new PublicKey('vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P');
+          const sha=(x)=>crypto.createHash('sha256').update(x).digest('hex');
+          const delay=(ms)=>new Promise((r)=>setTimeout(r,ms));
+          const to58=(v)=>v?.toBase58?.()??(v?String(v):null);
+          const authority=(a)=>to58(a.authorityPubkey??a.authority_pubkey??a.authority??a.userAuthority??a.user_authority??a.owner);
+          const sub=(a)=>Number(a.subAccountId??a.sub_account_id??a.subaccountId??a.subAccount??0);
+          const nz=(v)=>{try{return BigInt(v?.toString?.()??v??0)!==0n;}catch{return false;}};
+          const variant=(v)=>v&&typeof v==='object'?Object.keys(v)[0]??'unknown':String(v??'unknown');
+          const idHash=(authority,subAccountId)=>sha(Buffer.from(`${authority}:${subAccountId}`)).slice(0,24);
+          const write=(name,value)=>fs.writeFileSync(path.join(OUT,name),JSON.stringify(value,null,2)+'\n');
+
+          async function rpc(endpoint,method,params){
+            const controller=new AbortController();
+            const timer=setTimeout(()=>controller.abort(),120000);
+            try{
+              const response=await fetch(endpoint,{method:'POST',headers:{'content-type':'application/json','accept':'application/json','user-agent':'Velocity-Drift-SWIFT-Surface-Census/1.0'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params}),signal:controller.signal});
+              const text=await response.text();
+              if(!response.ok)throw new Error(`HTTP ${response.status}: ${text.slice(0,200)}`);
+              const body=JSON.parse(text);if(body.error)throw new Error(JSON.stringify(body.error));return body.result;
+            }finally{clearTimeout(timer);}
+          }
+
+          function resolveDriftProgramId(){
+            const candidate=drift.DRIFT_PROGRAM_ID??drift.getDriftProgramId?.('mainnet-beta')??drift.getDriftProgramId?.();
+            if(!candidate)throw new Error('Unable to resolve Drift program ID from official SDK');
+            return new PublicKey(candidate);
+          }
+
+          function valueSummary(account){
+            const spots=(account.spotPositions??account.spot_positions??[]).filter((p)=>nz(p.scaledBalance??p.scaled_balance));
+            const perps=(account.perpPositions??account.perp_positions??[]).filter((p)=>nz(p.baseAssetAmount??p.base_asset_amount)||nz(p.quoteAssetAmount??p.quote_asset_amount)||nz(p.lpShares??p.lp_shares));
+            const orders=(account.orders??[]).filter((o)=>Number(o.orderId??o.order_id??0)>0&&variant(o.status)!=='init');
+            return {hasValueBearingState:spots.length>0||perps.length>0||orders.length>0,spotPositionCount:spots.length,perpPositionCount:perps.length,openOrderCount:orders.length};
+          }
+
+          async function buildClients(endpoint){
+            const connection=new Connection(endpoint,'finalized');
+            velocity.initialize({env:'mainnet-beta'});
+            const vLoader=new velocity.BulkAccountLoader(connection,'finalized',10000);
+            const vClient=new velocity.VelocityClient({
+              connection,
+              wallet:new velocity.Wallet(Keypair.generate()),
+              env:'mainnet-beta',programID:VELOCITY_ID,
+              opts:{commitment:'finalized',preflightCommitment:'finalized'},
+              accountSubscription:{type:'polling',accountLoader:vLoader},
+              activeSubAccountId:0,subAccountIds:[],userStats:false,
+            });
+            const driftId=resolveDriftProgramId();
+            const dLoader=new drift.BulkAccountLoader(connection,'finalized',10000);
+            const dClient=new drift.DriftClient({
+              connection,
+              wallet:new drift.Wallet(Keypair.generate()),
+              env:'mainnet-beta',programID:driftId,
+              opts:{commitment:'finalized',preflightCommitment:'finalized'},
+              accountSubscription:{type:'polling',accountLoader:dLoader},
+              activeSubAccountId:0,subAccountIds:[],userStats:false,
+            });
+            if(!await vClient.subscribe())throw new Error('Velocity subscribe returned false');
+            if(!await dClient.subscribe())throw new Error('Drift subscribe returned false');
+            return {connection,vClient,dClient,driftId};
+          }
+
+          async function fetchSigned(program){
+            const namespaces=Object.keys(program.account).filter((name)=>/signed.*msg|swift/i.test(name)).sort();
+            const rows=[];const errors=[];
+            for(const namespace of namespaces){
+              try{
+                for(const row of await program.account[namespace].all())rows.push({namespace,authority:authority(row.account)});
+              }catch(error){errors.push({namespace,error:`${error.name}: ${error.message}`});}
+            }
+            return {namespaces,rows,errors};
+          }
+
+          async function main(){
+            const attempts=[];let ctx;let lastError;
+            for(const endpoint of ENDPOINTS){
+              let local;
+              try{
+                const finalizedSlot=await rpc(endpoint,'getSlot',[{commitment:'finalized'}]);
+                const genesisHash=await rpc(endpoint,'getGenesisHash',[]);
+                const vProgram=await rpc(endpoint,'getAccountInfo',[VELOCITY_ID.toBase58(),{encoding:'base64',commitment:'finalized'}]);
+                if(!vProgram?.value?.executable)throw new Error('Velocity program unavailable');
+                local=await buildClients(endpoint);
+                attempts.push({endpoint,ok:true,finalizedSlot,genesisHash});
+                ctx={...local,endpoint,finalizedSlot,genesisHash};break;
+              }catch(error){
+                lastError=error;attempts.push({endpoint,ok:false,error:`${error.name}: ${error.message}`});
+                if(local){try{await local.vClient.unsubscribe();}catch{}try{await local.dClient.unsubscribe();}catch{}}
+                await delay(500);
+              }
+            }
+            if(!ctx)throw lastError;
+            try{
+              const vUsersRaw=await ctx.vClient.program.account.user.all();
+              const dUsersRaw=await ctx.dClient.program.account.user.all();
+              const vSigned=await fetchSigned(ctx.vClient.program);
+              const dSigned=await fetchSigned(ctx.dClient.program);
+              const vUsers=vUsersRaw.map(({account})=>{const a=authority(account),s=sub(account);return {authority:a,subAccountId:s,identityHash:a?idHash(a,s):null,...valueSummary(account)};});
+              const dUsers=dUsersRaw.map(({account})=>{const a=authority(account),s=sub(account);return {authority:a,subAccountId:s,identityHash:a?idHash(a,s):null,...valueSummary(account)};});
+
+              const vByKey=new Map(vUsers.filter((u)=>u.authority).map((u)=>[`${u.authority}:${u.subAccountId}`,u]));
+              const vByAuthority=new Map();for(const u of vUsers.filter((u)=>u.authority)){if(!vByAuthority.has(u.authority))vByAuthority.set(u.authority,[]);vByAuthority.get(u.authority).push(u);}
+              const dByKey=new Map(dUsers.filter((u)=>u.authority).map((u)=>[`${u.authority}:${u.subAccountId}`,u]));
+              const exactUserOverlap=[];
+              for(const [key,dUser] of dByKey){const vUser=vByKey.get(key);if(vUser)exactUserOverlap.push({identityHash:vUser.identityHash,subAccountId:vUser.subAccountId,velocityValueBearing:vUser.hasValueBearingState,driftValueBearing:dUser.hasValueBearingState,velocitySpotPositions:vUser.spotPositionCount,velocityPerpPositions:vUser.perpPositionCount,velocityOpenOrders:vUser.openOrderCount,driftSpotPositions:dUser.spotPositionCount,driftPerpPositions:dUser.perpPositionCount,driftOpenOrders:dUser.openOrderCount});}
+
+              const dSignedAuthorities=new Set(dSigned.rows.map((r)=>r.authority).filter(Boolean));
+              const vSignedAuthorities=new Set(vSigned.rows.map((r)=>r.authority).filter(Boolean));
+              const driftSignedToVelocity=[];
+              for(const a of dSignedAuthorities){for(const vUser of vByAuthority.get(a)??[])driftSignedToVelocity.push({identityHash:vUser.identityHash,subAccountId:vUser.subAccountId,velocityValueBearing:vUser.hasValueBearingState,velocitySpotPositions:vUser.spotPositionCount,velocityPerpPositions:vUser.perpPositionCount,velocityOpenOrders:vUser.openOrderCount});}
+              const signedBoth=[...dSignedAuthorities].filter((a)=>vSignedAuthorities.has(a)).map((a)=>({authorityHash:sha(Buffer.from(a)).slice(0,24),velocityUserCount:(vByAuthority.get(a)??[]).length}));
+
+              const result={
+                status:'PASS_READ_ONLY_VELOCITY_DRIFT_SWIFT_SURFACE_CENSUS',
+                endpoint:ctx.endpoint,finalizedSlot:ctx.finalizedSlot,genesisHash:ctx.genesisHash,
+                velocityProgramId:VELOCITY_ID.toBase58(),driftProgramId:ctx.driftId.toBase58(),
+                velocityUsers:vUsers.length,driftUsers:dUsers.length,
+                velocitySignedAccounts:vSigned.rows.length,driftSignedAccounts:dSigned.rows.length,
+                velocitySignedAuthorities:vSignedAuthorities.size,driftSignedAuthorities:dSignedAuthorities.size,
+                exactCrossProtocolUserOverlapCount:exactUserOverlap.length,
+                exactCrossProtocolValueBearingBothCount:exactUserOverlap.filter((x)=>x.velocityValueBearing&&x.driftValueBearing).length,
+                driftSignedAuthorityWithVelocityUserCount:driftSignedToVelocity.length,
+                driftSignedAuthorityWithValueBearingVelocityUserCount:driftSignedToVelocity.filter((x)=>x.velocityValueBearing).length,
+                signedAuthorityBothProtocolsCount:signedBoth.length,
+                liveCrossProtocolVictimSurface:driftSignedToVelocity.some((x)=>x.velocityValueBearing),
+                redactedWitnesses:{exactUsers:exactUserOverlap,driftSignedToVelocity,signedBoth},
+                namespaces:{velocity:vSigned.namespaces,drift:dSigned.namespaces},
+                namespaceErrors:{velocity:vSigned.errors,drift:dSigned.errors},
+                connectionAttempts:attempts,
+                safety:{productionPrivateKeysLoaded:0,ephemeralReadOnlyKeypairsGenerated:2,transactionsConstructed:0,transactionsSigned:0,transactionsSent:0,publicChainWrites:0,rpcMethods:['getSlot','getGenesisHash','getAccountInfo','getProgramAccounts']},
+              };
+              write('FINAL_GATE.json',result);
+              write('POPULATION_DIGESTS.json',{velocityUsers:sha(Buffer.from(JSON.stringify(vUsers))),driftUsers:sha(Buffer.from(JSON.stringify(dUsers))),velocitySigned:sha(Buffer.from(JSON.stringify(vSigned.rows))),driftSigned:sha(Buffer.from(JSON.stringify(dSigned.rows)))});
+              console.log(JSON.stringify(result,null,2));
+            }finally{await ctx.vClient.unsubscribe();await ctx.dClient.unsubscribe();}
+          }
+          main().catch((error)=>{write('FAILURE.json',{status:'FAILED',error:String(error?.stack??error),safety:{publicChainWrites:0}});console.error(error?.stack??error);process.exit(1);});
+          NODE
+          node census.mjs | tee ../evidence/RUN_STDOUT.log
+          sha256sum census.mjs > ../evidence/SCANNER_SHA256.txt
+
+      - name: Build immutable evidence manifest
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          root=Path('evidence');rows=[]
+          for p in sorted(x for x in root.iterdir() if x.is_file() and x.name not in {'MANIFEST.json','SHA256SUMS.txt'}):
+              b=p.read_bytes();rows.append({'name':p.name,'bytes':len(b),'sha256':hashlib.sha256(b).hexdigest()})
+          (root/'MANIFEST.json').write_text(json.dumps(rows,indent=2,sort_keys=True)+'\n')
+          with (root/'SHA256SUMS.txt').open('w') as f:
+              for row in rows:f.write(f"{row['sha256']}  {row['name']}\n")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: velocity-drift-swift-surface-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
