@@ -7,6 +7,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 
 ATTACKER = Web3.to_checksum_address("0x1000000000000000000000000000000000000001")
 TARGET = Web3.to_checksum_address("0x8409a9C1A911CED491892c5694E43994c9d47E8f")
@@ -39,6 +40,8 @@ def main() -> int:
     for url in rpcs:
         try:
             candidate = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout":30}))
+            if chain == "bnb":
+                candidate.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
             if candidate.eth.chain_id != expected_id:
                 raise RuntimeError(f"unexpected chain id {candidate.eth.chain_id}")
             block = candidate.eth.get_block("latest")
@@ -63,7 +66,7 @@ def main() -> int:
     except Exception as exc:
         version = {"ok":False,"error":f"{type(exc).__name__}: {exc}"}
     result = {
-        "schema":"termmax-accessmanager-fast-renounce-probe/v1",
+        "schema":"termmax-accessmanager-fast-renounce-probe/v2",
         "generatedAtUtc":datetime.now(timezone.utc).isoformat(),
         "safety":{"privateKeys":0,"signedTransactions":0,"broadcastTransactions":0,"stateChanges":0},
         "chain":chain,"chainId":expected_id,"rpc":rpc,"rpcAttempts":attempts,
