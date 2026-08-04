@@ -1,0 +1,183 @@
+name: TermMax PSX1 encrypted canonical replay v3
+
+on:
+  push:
+    branches:
+      - runner/termmax-psx1-push-v3-20260804
+    paths:
+      - '.github/workflows/termmax-psx1-encrypted-push-v3.yml'
+      - '.trigger/termmax-psx1-push-v3.txt'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: termmax-psx1-encrypted-push-v3
+  cancel-in-progress: false
+
+jobs:
+  encrypted-replay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout isolated branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Generate run-bound input certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p /tmp/psx1 public_metadata encrypted_output
+          openssl req -x509 -newkey rsa:4096 -nodes -sha256 -days 1 \
+            -subj "/CN=termmax-psx1-${GITHUB_RUN_ID}" \
+            -keyout /tmp/psx1/input.key \
+            -out /tmp/psx1/input.crt >/dev/null 2>&1
+          cp /tmp/psx1/input.crt public_metadata/input_certificate.pem
+          openssl x509 -in /tmp/psx1/input.crt \
+            -noout -fingerprint -sha256 -subject -dates \
+            > public_metadata/INPUT_CERTIFICATE_METADATA.txt
+          uname -a > public_metadata/UNAME.txt
+          python3 --version > public_metadata/PYTHON_VERSION.txt
+          openssl version -a > public_metadata/OPENSSL_VERSION.txt
+
+      - name: Publish one-time certificate
+        uses: actions/upload-artifact@v4
+        with:
+          name: termmax-psx1-input-certificate-${{ github.run_id }}
+          path: public_metadata
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Receive and verify encrypted payload
+        id: inbox
+        shell: bash
+        env:
+          BRANCH: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          inbox=".tooling/ephemeral-private-runner/inbox/termmax-psx1-v3-${GITHUB_RUN_ID}"
+          remote='refs/remotes/termmax-psx1-payload/head'
+          found=false
+          for _ in $(seq 1 1800); do
+            git fetch --quiet --no-tags --depth=1 \
+              "https://github.com/${REPO}.git" \
+              "+refs/heads/${BRANCH}:${remote}" >/dev/null 2>&1 || true
+            if git show "${remote}:${inbox}/READY" > /tmp/psx1/READY 2>/dev/null; then
+              mapfile -t parts < <(
+                git ls-tree -r --name-only "$remote" -- "$inbox" \
+                  | grep -E '/part-[0-9]{4}$' | sort
+              )
+              if test "${#parts[@]}" -gt 0; then
+                : > /tmp/psx1/payload.cms.b64
+                for part in "${parts[@]}"; do
+                  git show "${remote}:${part}" >> /tmp/psx1/payload.cms.b64
+                done
+                base64 --decode /tmp/psx1/payload.cms.b64 > /tmp/psx1/payload.cms
+                expected="$(tr -d '[:space:]' < /tmp/psx1/READY)"
+                actual="$(sha256sum /tmp/psx1/payload.cms | awk '{print $1}')"
+                if test -s /tmp/psx1/payload.cms && test "$actual" = "$expected"; then
+                  printf '%s  payload.cms\n' "$actual" > public_metadata/ENCRYPTED_PAYLOAD_SHA256.txt
+                  printf '%s\n' "${#parts[@]}" > public_metadata/ENCRYPTED_PAYLOAD_PART_COUNT.txt
+                  found=true
+                  break
+                fi
+              fi
+            fi
+            sleep 5
+          done
+          test "$found" = true
+          echo 'payload_received=true' >> "$GITHUB_OUTPUT"
+
+      - name: Decrypt and validate payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p /tmp/psx1/payload /tmp/psx1/results /tmp/psx1/bundle
+          openssl cms -decrypt -binary -inform DER \
+            -in /tmp/psx1/payload.cms \
+            -recip /tmp/psx1/input.crt \
+            -inkey /tmp/psx1/input.key \
+            -out /tmp/psx1/payload.tar >/dev/null 2>&1
+          python3 - <<'PY'
+          import pathlib, tarfile
+          src=pathlib.Path('/tmp/psx1/payload.tar')
+          dst=pathlib.Path('/tmp/psx1/payload')
+          with tarfile.open(src,'r:*') as tf:
+              members=tf.getmembers()
+              if not members:
+                  raise SystemExit('empty payload')
+              for m in members:
+                  p=pathlib.PurePosixPath(m.name)
+                  if p.is_absolute() or '..' in p.parts or m.issym() or m.islnk() or m.isdev():
+                      raise SystemExit(f'unsafe member: {m.name}')
+              tf.extractall(dst,members=members,filter='data')
+          PY
+          test -f /tmp/psx1/payload/run.sh
+          test -f /tmp/psx1/payload/result_cert.pem
+          test -f /tmp/psx1/payload/MANIFEST.sha256
+          (cd /tmp/psx1/payload && sha256sum -c MANIFEST.sha256) \
+            > /tmp/psx1/PAYLOAD_INTEGRITY.log 2>&1
+          chmod 700 /tmp/psx1/payload/run.sh
+
+      - name: Execute read-only local-fork payload
+        id: private_run
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          (cd /tmp/psx1/payload && \
+            PRIVATE_RUNNER_RESULTS=/tmp/psx1/results \
+            bash ./run.sh) > /tmp/psx1/PRIVATE_RUN.log 2>&1
+          status=$?
+          printf '%s\n' "$status" > /tmp/psx1/PRIVATE_RUN_STATUS.txt
+          printf 'status=%s\n' "$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Encrypt all private output
+        if: always() && steps.inbox.outputs.payload_received == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f /tmp/psx1/PRIVATE_RUN_STATUS.txt \
+            || printf '125\n' > /tmp/psx1/PRIVATE_RUN_STATUS.txt
+          cp /tmp/psx1/PRIVATE_RUN_STATUS.txt /tmp/psx1/bundle/
+          cp /tmp/psx1/PRIVATE_RUN.log /tmp/psx1/bundle/ 2>/dev/null || true
+          cp /tmp/psx1/PAYLOAD_INTEGRITY.log /tmp/psx1/bundle/ 2>/dev/null || true
+          cp -a public_metadata /tmp/psx1/bundle/
+          cp -a /tmp/psx1/results/. /tmp/psx1/bundle/ 2>/dev/null || true
+          (cd /tmp/psx1/bundle && \
+            find . -type f ! -name SHA256SUMS.txt -print0 \
+              | sort -z | xargs -0 sha256sum > SHA256SUMS.txt)
+          tar -cf /tmp/psx1/result.tar -C /tmp/psx1/bundle .
+          openssl cms -encrypt -binary -aes256 \
+            -in /tmp/psx1/result.tar -outform DER \
+            -out encrypted_output/encrypted-result.cms \
+            /tmp/psx1/payload/result_cert.pem >/dev/null 2>&1
+          sha256sum encrypted_output/encrypted-result.cms \
+            > encrypted_output/ENCRYPTED_RESULT_SHA256.txt
+          rm -rf /tmp/psx1/payload /tmp/psx1/input.key /tmp/psx1/input.crt \
+            /tmp/psx1/result.tar /tmp/psx1/bundle
+
+      - name: Upload encrypted result only
+        if: always() && steps.inbox.outputs.payload_received == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: termmax-psx1-encrypted-result-${{ github.run_id }}
+          path: encrypted_output
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Enforce payload result after encrypted upload
+        if: always() && steps.inbox.outputs.payload_received == 'true'
+        shell: bash
+        env:
+          STATUS: ${{ steps.private_run.outputs.status }}
+        run: |
+          set -euo pipefail
+          test "$STATUS" = '0'
