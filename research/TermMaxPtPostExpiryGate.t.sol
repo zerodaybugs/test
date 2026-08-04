@@ -54,8 +54,6 @@ interface ITermMaxGt {
 }
 
 contract TermMaxPtPostExpiryGate is Test {
-    uint256 internal constant PINNED_BLOCK = 25_677_087;
-
     address internal constant MARKET = 0xf61d02aE5D19fA11fC825dc565cFaf264720F6C4;
     address internal constant GT = 0xD58Dd7Cd72AeA98FdAafBc4a965F4fCC49C68859;
     address internal constant PT = 0x2D433b943FB8c015AE409444B7F960ED288082b4;
@@ -67,12 +65,16 @@ contract TermMaxPtPostExpiryGate is Test {
     uint256 internal constant TERM_MATURITY = 1_788_055_200;
     uint256 internal constant TARGET_ID = 2;
 
+    uint256 internal forkBlock;
+
     function setUp() public {
-        vm.createSelectFork(vm.envString("ETH_RPC_URL"), PINNED_BLOCK);
-        assertEq(block.number, PINNED_BLOCK, "wrong fork block");
+        vm.createSelectFork(vm.envString("ETH_RPC_URL"));
+        forkBlock = block.number;
+        assertLt(block.timestamp, TERM_MATURITY, "production state already passed TermMax maturity");
     }
 
     function test_PostPtExpiryOracleRepayLiquidationAndRedemptionRemainOperational() public {
+        uint256 initialSnapshot = vm.snapshotState();
         ITermMaxPTFeed feed = ITermMaxPTFeed(FEED);
         ITermMaxGt gt = ITermMaxGt(GT);
 
@@ -81,6 +83,7 @@ contract TermMaxPtPostExpiryGate is Test {
 
         uint256 pendleExpiry = IPendleMarketExpiry(MARKET).expiry();
         assertEq(IPendlePT(PT).expiry(), pendleExpiry, "PT/market expiry mismatch");
+        assertLt(block.timestamp, pendleExpiry, "production state already passed PT expiry");
         assertLt(pendleExpiry, TERM_MATURITY, "no PT/TermMax maturity gap");
 
         address underlyingFeed = feed.PRICE_FEED();
@@ -114,9 +117,12 @@ contract TermMaxPtPostExpiryGate is Test {
         (, uint128 debtAfter,) = gt.loanInfo(TARGET_ID);
         assertEq(debtAfter, debtBefore - repayAmount, "repay failed in PT/TermMax maturity gap");
 
-        // Reset the position, then move into the normal post-TermMax-maturity liquidation window.
-        vm.createSelectFork(vm.envString("ETH_RPC_URL"), PINNED_BLOCK);
-        underlyingFeed = ITermMaxPTFeed(FEED).PRICE_FEED();
+        // Restore the exact current production state, then cross TermMax maturity locally.
+        assertTrue(vm.revertToState(initialSnapshot), "snapshot restore failed");
+        vm.clearMockedCalls();
+        feed = ITermMaxPTFeed(FEED);
+        gt = ITermMaxGt(GT);
+        underlyingFeed = feed.PRICE_FEED();
         (uRound, uAnswer, uStarted,, uAnsweredInRound) = IAggregatorLike(underlyingFeed).latestRoundData();
         (dRound, dAnswer, dStarted,, dAnsweredInRound) = IAggregatorLike(USDC_FEED).latestRoundData();
         vm.warp(TERM_MATURITY + 1);
@@ -145,7 +151,7 @@ contract TermMaxPtPostExpiryGate is Test {
         assertEq(syReceived, syOut, "YT redeem return/balance mismatch");
         assertGt(syReceived, 0, "post-expiry PT redemption failed");
 
-        emit log_named_uint("pinnedBlock", PINNED_BLOCK);
+        emit log_named_uint("currentForkBlock", forkBlock);
         emit log_named_uint("pendleExpiry", pendleExpiry);
         emit log_named_uint("termMaxMaturity", TERM_MATURITY);
         emit log_named_uint("postExpiryOraclePrice", oraclePrice);
