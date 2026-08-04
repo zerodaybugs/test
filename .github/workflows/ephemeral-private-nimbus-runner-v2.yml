@@ -1,0 +1,230 @@
+name: Ephemeral encrypted Nimbus local runner v2
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ephemeral-private-nimbus-runner-v2.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  encrypted-local-run-v2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out public runner definition
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Record public runtime baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p public_metadata
+          uname -a > public_metadata/UNAME.txt
+          docker version > public_metadata/DOCKER_VERSION.txt
+          openssl version -a > public_metadata/OPENSSL_VERSION.txt
+          python3 --version > public_metadata/PYTHON_VERSION.txt
+
+      - name: Generate one-time payload recipient certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p /tmp/nimbus-v2-input
+          openssl req \
+            -x509 \
+            -newkey rsa:4096 \
+            -nodes \
+            -sha256 \
+            -days 1 \
+            -subj "/CN=nimbus-v2-input-${GITHUB_RUN_ID}" \
+            -keyout /tmp/nimbus-v2-input/private.pem \
+            -out /tmp/nimbus-v2-input/certificate.pem \
+            >/dev/null 2>&1
+          chmod 600 /tmp/nimbus-v2-input/private.pem
+          openssl x509 \
+            -in /tmp/nimbus-v2-input/certificate.pem \
+            -noout -fingerprint -sha256 -subject -dates \
+            > public_metadata/INPUT_CERTIFICATE_METADATA.txt
+          cp /tmp/nimbus-v2-input/certificate.pem public_metadata/input_certificate.pem
+
+      - name: Publish one-time input certificate
+        uses: actions/upload-artifact@v4
+        with:
+          name: nimbus-v2-input-certificate-${{ github.run_id }}
+          path: |
+            public_metadata/input_certificate.pem
+            public_metadata/INPUT_CERTIFICATE_METADATA.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Receive and verify run-bound encrypted payload
+        id: inbox
+        shell: bash
+        env:
+          HEAD_BRANCH: ${{ github.head_ref }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test -n "$HEAD_BRANCH"
+          inbox_dir=".tooling/ephemeral-private-runner/inbox/nimbus-v2-${GITHUB_RUN_ID}"
+          ready_path="${inbox_dir}/READY"
+          remote_ref='refs/remotes/nimbus-v2-payload/head'
+          found='false'
+          for attempt in $(seq 1 1440); do
+            git fetch --quiet --no-tags --depth=1 \
+              "https://github.com/${REPOSITORY}.git" \
+              "+refs/heads/${HEAD_BRANCH}:${remote_ref}" \
+              >/dev/null 2>&1 || true
+            if git show "${remote_ref}:${ready_path}" > /tmp/nimbus-v2-input/READY 2>/dev/null; then
+              mapfile -t parts < <(
+                git ls-tree -r --name-only "$remote_ref" -- "$inbox_dir" \
+                  | grep -E '/part-[0-9]{4}$' \
+                  | sort
+              )
+              if test "${#parts[@]}" -gt 0; then
+                : > /tmp/nimbus-v2-input/payload.cms.b64
+                for part in "${parts[@]}"; do
+                  git show "${remote_ref}:${part}" >> /tmp/nimbus-v2-input/payload.cms.b64
+                done
+                base64 --decode /tmp/nimbus-v2-input/payload.cms.b64 \
+                  > /tmp/nimbus-v2-input/payload.cms
+                expected="$(tr -d '[:space:]' < /tmp/nimbus-v2-input/READY)"
+                actual="$(sha256sum /tmp/nimbus-v2-input/payload.cms | awk '{print $1}')"
+                if test -s /tmp/nimbus-v2-input/payload.cms && test "$actual" = "$expected"; then
+                  printf '%s\n' "${#parts[@]}" > public_metadata/ENCRYPTED_PAYLOAD_PART_COUNT.txt
+                  found='true'
+                  break
+                fi
+              fi
+            fi
+            sleep 5
+          done
+          test "$found" = 'true'
+          sha256sum /tmp/nimbus-v2-input/payload.cms \
+            > public_metadata/ENCRYPTED_PAYLOAD_SHA256.txt
+          printf 'payload_received=true\n' >> "$GITHUB_OUTPUT"
+
+      - name: Decrypt and validate private payload without logging plaintext
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p /tmp/nimbus-v2-payload /tmp/nimbus-v2-result
+          openssl cms \
+            -decrypt \
+            -binary \
+            -inform DER \
+            -in /tmp/nimbus-v2-input/payload.cms \
+            -recip /tmp/nimbus-v2-input/certificate.pem \
+            -inkey /tmp/nimbus-v2-input/private.pem \
+            -out /tmp/nimbus-v2-input/payload.tar \
+            >/dev/null 2>&1
+          python3 - <<'PY'
+          import pathlib
+          import tarfile
+
+          archive = pathlib.Path('/tmp/nimbus-v2-input/payload.tar')
+          target = pathlib.Path('/tmp/nimbus-v2-payload')
+          with tarfile.open(archive, 'r:*') as tf:
+              members = tf.getmembers()
+              if not members:
+                  raise SystemExit('empty payload')
+              for member in members:
+                  path = pathlib.PurePosixPath(member.name)
+                  if path.is_absolute() or '..' in path.parts:
+                      raise SystemExit('unsafe payload path')
+                  if member.issym() or member.islnk() or member.isdev():
+                      raise SystemExit('unsupported payload member')
+              tf.extractall(target, members=members, filter='data')
+          PY
+          test -f /tmp/nimbus-v2-payload/MANIFEST.sha256
+          test -f /tmp/nimbus-v2-payload/run.sh
+          test -f /tmp/nimbus-v2-payload/result_cert.pem
+          (
+            cd /tmp/nimbus-v2-payload
+            sha256sum -c MANIFEST.sha256 \
+              > /tmp/nimbus-v2-result/PAYLOAD_INTEGRITY.log 2>&1
+          )
+          chmod 700 /tmp/nimbus-v2-payload/run.sh
+
+      - name: Execute private payload
+        id: private_run
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          umask 077
+          mkdir -p /tmp/nimbus-v2-payload/results /tmp/nimbus-v2-result
+          (
+            cd /tmp/nimbus-v2-payload
+            env \
+              PRIVATE_RUNNER_RESULTS=/tmp/nimbus-v2-payload/results \
+              PRIVATE_RUNNER_PUBLIC_METADATA="$GITHUB_WORKSPACE/public_metadata" \
+              bash ./run.sh
+          ) > /tmp/nimbus-v2-result/PRIVATE_RUN.log 2>&1
+          status=$?
+          printf '%s\n' "$status" > /tmp/nimbus-v2-result/PRIVATE_RUN_STATUS.txt
+          printf 'status=%s\n' "$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Encrypt private output for designated recipient
+        if: always() && steps.inbox.outputs.payload_received == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p /tmp/nimbus-v2-result/bundle/public_metadata
+          test -f /tmp/nimbus-v2-result/PRIVATE_RUN_STATUS.txt \
+            || printf '125\n' > /tmp/nimbus-v2-result/PRIVATE_RUN_STATUS.txt
+          cp -a /tmp/nimbus-v2-result/PRIVATE_RUN.log /tmp/nimbus-v2-result/bundle/ 2>/dev/null || true
+          cp -a /tmp/nimbus-v2-result/PRIVATE_RUN_STATUS.txt /tmp/nimbus-v2-result/bundle/
+          cp -a /tmp/nimbus-v2-result/PAYLOAD_INTEGRITY.log /tmp/nimbus-v2-result/bundle/ 2>/dev/null || true
+          if test -d /tmp/nimbus-v2-payload/results; then
+            cp -a /tmp/nimbus-v2-payload/results/. /tmp/nimbus-v2-result/bundle/
+          fi
+          cp -a public_metadata/. /tmp/nimbus-v2-result/bundle/public_metadata/
+          (
+            cd /tmp/nimbus-v2-result/bundle
+            find . -type f ! -name SHA256SUMS.txt -print0 \
+              | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+          )
+          tar -cf /tmp/nimbus-v2-result/result.tar -C /tmp/nimbus-v2-result/bundle .
+          openssl cms \
+            -encrypt \
+            -binary \
+            -aes256 \
+            -in /tmp/nimbus-v2-result/result.tar \
+            -outform DER \
+            -out /tmp/nimbus-v2-result/encrypted-result.cms \
+            /tmp/nimbus-v2-payload/result_cert.pem \
+            >/dev/null 2>&1
+          sha256sum /tmp/nimbus-v2-result/encrypted-result.cms \
+            > /tmp/nimbus-v2-result/ENCRYPTED_RESULT_SHA256.txt
+          rm -rf /tmp/nimbus-v2-payload /tmp/nimbus-v2-input /tmp/nimbus-v2-result/result.tar /tmp/nimbus-v2-result/bundle
+
+      - name: Upload only encrypted private result
+        if: always() && steps.inbox.outputs.payload_received == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-private-nimbus-v2-result-${{ github.run_id }}
+          path: |
+            /tmp/nimbus-v2-result/encrypted-result.cms
+            /tmp/nimbus-v2-result/ENCRYPTED_RESULT_SHA256.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Enforce private payload result after encrypted upload
+        if: always() && steps.inbox.outputs.payload_received == 'true'
+        shell: bash
+        env:
+          PRIVATE_STATUS: ${{ steps.private_run.outputs.status }}
+        run: |
+          set -euo pipefail
+          test "$PRIVATE_STATUS" = '0'
