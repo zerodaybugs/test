@@ -54,7 +54,7 @@ interface ITermMaxGt {
 }
 
 contract TermMaxPtPostExpiryGate is Test {
-    uint256 internal constant PINNED_BLOCK = 25_661_800;
+    uint256 internal constant PINNED_BLOCK = 25_677_087;
 
     address internal constant MARKET = 0xf61d02aE5D19fA11fC825dc565cFaf264720F6C4;
     address internal constant GT = 0xD58Dd7Cd72AeA98FdAafBc4a965F4fCC49C68859;
@@ -145,6 +145,7 @@ contract TermMaxPtPostExpiryGate is Test {
         assertEq(syReceived, syOut, "YT redeem return/balance mismatch");
         assertGt(syReceived, 0, "post-expiry PT redemption failed");
 
+        emit log_named_uint("pinnedBlock", PINNED_BLOCK);
         emit log_named_uint("pendleExpiry", pendleExpiry);
         emit log_named_uint("termMaxMaturity", TERM_MATURITY);
         emit log_named_uint("postExpiryOraclePrice", oraclePrice);
