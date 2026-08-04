@@ -62,6 +62,7 @@ contract TermMaxPtPostExpiryGate is Test {
     address internal constant ORACLE = 0x16110F65047a46D39FFEB3dadd61ed33ec9FaBC2;
     address internal constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
     address internal constant USDC_FEED = 0x8fFfFfd4AfB6115b954Bd326cbe7B4BA576818f6;
+    address internal constant STRATEGY_PRICE_FEED = 0xf4d2076277fff631EFC4385Ab36b1f7734218d23;
 
     uint256 internal constant TERM_MATURITY = 1_788_055_200;
     uint256 internal constant TARGET_ID = 2;
@@ -92,14 +93,18 @@ contract TermMaxPtPostExpiryGate is Test {
             IAggregatorLike(underlyingFeed).latestRoundData();
         (uint80 dRound, int256 dAnswer, uint256 dStarted,, uint80 dAnsweredInRound) =
             IAggregatorLike(USDC_FEED).latestRoundData();
+        (uint80 sRound, int256 sAnswer, uint256 sStarted,, uint80 sAnsweredInRound) =
+            IAggregatorLike(STRATEGY_PRICE_FEED).latestRoundData();
         assertGt(uint256(uAnswer), 0, "underlying answer not positive");
         assertGt(uint256(dAnswer), 0, "USDC answer not positive");
+        assertGt(uint256(sAnswer), 0, "strategy answer not positive");
 
         // First day after Pendle PT expiry, while the TermMax market is still live.
         vm.warp(pendleExpiry + 1 days);
         assertLt(block.timestamp, TERM_MATURITY, "warp crossed TermMax maturity");
         _mockFreshRound(underlyingFeed, uRound, uAnswer, uStarted, uAnsweredInRound);
         _mockFreshRound(USDC_FEED, dRound, dAnswer, dStarted, dAnsweredInRound);
+        _mockFreshRound(STRATEGY_PRICE_FEED, sRound, sAnswer, sStarted, sAnsweredInRound);
 
         (, int256 rawPostExpiryAnswer,, uint256 rawUpdatedAt,) = feed.latestRoundData();
         assertGt(uint256(rawPostExpiryAnswer), 0, "PT feed failed after PT expiry");
@@ -126,9 +131,11 @@ contract TermMaxPtPostExpiryGate is Test {
         underlyingFeed = feed.PRICE_FEED();
         (uRound, uAnswer, uStarted,, uAnsweredInRound) = IAggregatorLike(underlyingFeed).latestRoundData();
         (dRound, dAnswer, dStarted,, dAnsweredInRound) = IAggregatorLike(USDC_FEED).latestRoundData();
+        (sRound, sAnswer, sStarted,, sAnsweredInRound) = IAggregatorLike(STRATEGY_PRICE_FEED).latestRoundData();
         vm.warp(TERM_MATURITY + 1);
         _mockFreshRound(underlyingFeed, uRound, uAnswer, uStarted, uAnsweredInRound);
         _mockFreshRound(USDC_FEED, dRound, dAnswer, dStarted, dAnsweredInRound);
+        _mockFreshRound(STRATEGY_PRICE_FEED, sRound, sAnswer, sStarted, sAnsweredInRound);
 
         (bool liquidatable,, uint128 maxRepayAmt) = gt.getLiquidationInfo(TARGET_ID);
         assertTrue(liquidatable, "GT not liquidatable in maturity window");
