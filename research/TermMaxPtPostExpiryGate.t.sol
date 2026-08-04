@@ -54,7 +54,8 @@ interface ITermMaxGt {
 }
 
 contract TermMaxPtPostExpiryGate is Test {
-    address internal constant MARKET = 0xf61d02aE5D19fA11fC825dc565cFaf264720F6C4;
+    address internal constant TERM_MAX_MARKET = 0xf61d02aE5D19fA11fC825dc565cFaf264720F6C4;
+    address internal constant PENDLE_MARKET = 0x4237a8acBD0B5a2DEc4aa83B1fd83F20162d02B8;
     address internal constant GT = 0xD58Dd7Cd72AeA98FdAafBc4a965F4fCC49C68859;
     address internal constant PT = 0x2D433b943FB8c015AE409444B7F960ED288082b4;
     address internal constant FEED = 0x762CAacE43CD1a5a57761fFc2744be6235544f1e;
@@ -79,9 +80,9 @@ contract TermMaxPtPostExpiryGate is Test {
         ITermMaxGt gt = ITermMaxGt(GT);
 
         assertEq(feed.asset(), PT, "wrong feed asset");
-        assertEq(feed.MARKET(), MARKET, "wrong Pendle market");
+        assertEq(feed.MARKET(), PENDLE_MARKET, "wrong Pendle market");
 
-        uint256 pendleExpiry = IPendleMarketExpiry(MARKET).expiry();
+        uint256 pendleExpiry = IPendleMarketExpiry(PENDLE_MARKET).expiry();
         assertEq(IPendlePT(PT).expiry(), pendleExpiry, "PT/market expiry mismatch");
         assertLt(block.timestamp, pendleExpiry, "production state already passed PT expiry");
         assertLt(pendleExpiry, TERM_MATURITY, "no PT/TermMax maturity gap");
@@ -151,6 +152,8 @@ contract TermMaxPtPostExpiryGate is Test {
         assertEq(syReceived, syOut, "YT redeem return/balance mismatch");
         assertGt(syReceived, 0, "post-expiry PT redemption failed");
 
+        emit log_named_address("termMaxMarket", TERM_MAX_MARKET);
+        emit log_named_address("pendleMarket", PENDLE_MARKET);
         emit log_named_uint("currentForkBlock", forkBlock);
         emit log_named_uint("pendleExpiry", pendleExpiry);
         emit log_named_uint("termMaxMaturity", TERM_MATURITY);
