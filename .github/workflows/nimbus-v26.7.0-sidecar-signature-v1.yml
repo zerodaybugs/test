@@ -1,0 +1,146 @@
+name: Private Nimbus v26.7.0 sidecar signature gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.research/nimbus-signature-poison/**'
+      - '.github/workflows/nimbus-v26.7.0-sidecar-signature-v1.yml'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  exact-source-regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out private harness
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install source-build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential ca-certificates cmake git git-lfs libssl-dev pkg-config
+          git lfs install
+
+      - name: Clone and pin exact Nimbus release
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --depth 1 --branch v26.7.0 \
+            https://github.com/status-im/nimbus-eth2.git upstream
+          actual="$(git -C upstream rev-parse HEAD)"
+          expected='4110bc7828a45518d22d60e2f60438ae81ff17e9'
+          test "$actual" = "$expected"
+          git -C upstream describe --tags --exact-match HEAD | grep -Fx 'v26.7.0'
+          printf '%s\n' "$actual" > NIMBUS_COMMIT.txt
+          git -C upstream submodule update --init --recursive --depth 1
+
+      - name: Install exact private regression and expose test seam
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp .research/nimbus-signature-poison/test_nimbus_signature_poison.nim \
+            upstream/tests/test_nimbus_signature_poison.nim
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('upstream/beacon_chain/sync/request_manager.nim')
+          text = path.read_text()
+          needle = 'func checkColumnResponse(idList: HashSet[DataColumnsByRootIdentifier],\n'
+          replacement = 'func checkColumnResponse*(idList: HashSet[DataColumnsByRootIdentifier],\n'
+          count = text.count(needle)
+          if count != 1:
+              raise SystemExit(f'expected one Fulu checkColumnResponse seam, found {count}')
+          path.write_text(text.replace(needle, replacement, 1))
+          PY
+          sha256sum \
+            .research/nimbus-signature-poison/test_nimbus_signature_poison.nim \
+            upstream/beacon_chain/sync/request_manager.nim \
+            > PRIVATE_INPUT_SHA256.txt
+
+      - name: Bootstrap Nimbus dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C upstream -j2 deps
+
+      - name: Compile targeted exact-source test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd upstream
+          MAKE=make ./env.sh scripts/compile_nim_program.sh \
+            nimbus_signature_poison \
+            tests/test_nimbus_signature_poison.nim \
+            -d:release \
+            --parallelBuild:1 \
+            -d:disable_libbacktrace \
+            -d:const_preset=mainnet \
+            -d:chronicles_log_level=TRACE \
+            -d:chronicles_sinks=json[file]
+
+      - name: Run signature acceptance and persistence regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          (
+            cd upstream
+            ./build/nimbus_signature_poison
+          ) 2>&1 | tee evidence/NIMBUS_SIGNATURE_POISON.log
+          grep -F 'RESULT=PASS signature_checked_by_response=false persisted_invalid_signature=true reservice_bytes=true' \
+            evidence/NIMBUS_SIGNATURE_POISON.log
+          cp NIMBUS_COMMIT.txt PRIVATE_INPUT_SHA256.txt evidence/
+          ./upstream/env.sh nim --version > evidence/NIM_VERSION.txt
+          (
+            cd evidence
+            sha256sum \
+              NIMBUS_SIGNATURE_POISON.log \
+              NIMBUS_COMMIT.txt \
+              PRIVATE_INPUT_SHA256.txt \
+              NIM_VERSION.txt \
+              > SHA256SUMS.txt
+          )
+
+      - name: Upload private evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nimbus-v26.7.0-sidecar-signature-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Publish concise result to the draft PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '## Exact Nimbus v26.7.0 signature-persistence gate'
+            echo
+            echo '- Target: `v26.7.0` / `4110bc7828a45518d22d60e2f60438ae81ff17e9`.'
+            echo '- Scope: exact-source unit/DB regression only; no public network traffic.'
+            if test -f evidence/NIMBUS_SIGNATURE_POISON.log; then
+              echo
+              echo '```text'
+              tail -c 30000 evidence/NIMBUS_SIGNATURE_POISON.log
+              echo
+              echo '```'
+            fi
+          } > /tmp/nimbus-result.md
+          gh pr comment "$PR_NUMBER" --repo "$REPOSITORY" --body-file /tmp/nimbus-result.md
