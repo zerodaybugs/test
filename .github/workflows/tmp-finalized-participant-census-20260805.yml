@@ -1,0 +1,327 @@
+name: Temporary finalized participant census
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/tmp-finalized-participant-census-20260805.yml
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download prior finalized read-only signature census
+        uses: actions/download-artifact@v4
+        with:
+          name: finalized-cadence-census-31042363817
+          path: input
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: 31042363817
+
+      - name: Decode finalized participant metadata read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          import base64
+          import collections
+          import datetime as dt
+          import json
+          import statistics
+          import time
+          import urllib.request
+          from pathlib import Path
+
+          target = base64.b64decode('dkVMb0MxYXVkWWJTWVZSWG4xdlBhVjhBeG9hOW9VNkJZbU5HWlpCRFoxUA==').decode()
+          focus_market = base64.b64decode('RkRlalhiVXJTeTZ6YXlCQ0w1eHVrMlNYTEhaZ3I4cHBmRlRMY0hieUpvclk=').decode()
+          discriminator = bytes.fromhex(base64.b64decode('ZjcxN2ZmNDFkNDVhZGRjMg==').decode())
+          endpoints = [
+              'https://moltnode.ag/solana',
+              'https://rpc.solanatracker.io/public',
+              'https://solana-rpc.publicnode.com',
+              'https://api.mainnet-beta.solana.com',
+              'https://solana.drpc.org',
+          ]
+          alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+          amap = {char: index for index, char in enumerate(alphabet)}
+
+          def b58decode(value):
+              number = 0
+              for char in value:
+                  number = number * 58 + amap[char]
+              raw = number.to_bytes((number.bit_length() + 7) // 8, 'big') if number else b''
+              return b'\0' * (len(value) - len(value.lstrip('1'))) + raw
+
+          def request(endpoint, payload, timeout=60):
+              body = json.dumps(payload).encode()
+              req = urllib.request.Request(
+                  endpoint,
+                  data=body,
+                  method='POST',
+                  headers={
+                      'content-type': 'application/json',
+                      'user-agent': 'finalized-participant-census/1.0',
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as response:
+                  return json.loads(response.read())
+
+          def rpc(method, params, preferred=None):
+              errors = []
+              candidates = [preferred] if preferred else endpoints
+              for endpoint in candidates:
+                  try:
+                      output = request(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if output.get('error'):
+                          raise RuntimeError(str(output['error']))
+                      return output['result'], endpoint
+                  except Exception as exc:
+                      errors.append(f'{endpoint}: {type(exc).__name__}: {exc}')
+              raise RuntimeError(' | '.join(errors))
+
+          def key_string(value):
+              return value if isinstance(value, str) else value.get('pubkey')
+
+          def percentile(values, fraction):
+              if not values:
+                  return None
+              ordered = sorted(values)
+              return ordered[round((len(ordered) - 1) * fraction)]
+
+          source = json.loads(Path('input/cadence-census.json').read_text())
+          signatures = [row['signature'] for row in source['matches']]
+          endpoint = source.get('rpcEndpoint') if source.get('rpcEndpoint') in endpoints else None
+          events = []
+          errors = []
+          fetched = 0
+
+          for start in range(0, len(signatures), 25):
+              chunk = signatures[start:start + 25]
+              payload = [
+                  {
+                      'jsonrpc': '2.0',
+                      'id': index + 1,
+                      'method': 'getTransaction',
+                      'params': [
+                          signature,
+                          {
+                              'encoding': 'json',
+                              'commitment': 'finalized',
+                              'maxSupportedTransactionVersion': 0,
+                          },
+                      ],
+                  }
+                  for index, signature in enumerate(chunk)
+              ]
+              by_id = {}
+              if endpoint is None:
+                  try:
+                      _, endpoint = rpc('getSlot', [{'commitment': 'finalized'}])
+                  except Exception as exc:
+                      errors.append(f'endpoint discovery: {exc}')
+                      break
+              try:
+                  response = request(endpoint, payload, timeout=90)
+                  if not isinstance(response, list):
+                      raise RuntimeError('batch response is not a list')
+                  by_id = {item.get('id'): item for item in response}
+              except Exception as exc:
+                  errors.append(f'batch {start}: {type(exc).__name__}: {exc}')
+
+              for index, signature in enumerate(chunk):
+                  item = by_id.get(index + 1)
+                  transaction = item.get('result') if item and not item.get('error') else None
+                  if transaction is None:
+                      try:
+                          transaction, _ = rpc(
+                              'getTransaction',
+                              [
+                                  signature,
+                                  {
+                                      'encoding': 'json',
+                                      'commitment': 'finalized',
+                                      'maxSupportedTransactionVersion': 0,
+                                  },
+                              ],
+                              endpoint,
+                          )
+                      except Exception as exc:
+                          errors.append(f'{signature}: {type(exc).__name__}: {exc}')
+                          continue
+                  if not transaction:
+                      continue
+                  fetched += 1
+
+                  message = transaction.get('transaction', {}).get('message', {})
+                  static_keys = [key_string(value) for value in message.get('accountKeys', [])]
+                  loaded = transaction.get('meta', {}).get('loadedAddresses') or {}
+                  keys = static_keys + loaded.get('writable', []) + loaded.get('readonly', [])
+
+                  instructions = [('outer', value) for value in message.get('instructions', [])]
+                  for group in transaction.get('meta', {}).get('innerInstructions') or []:
+                      instructions.extend(('inner', value) for value in group.get('instructions', []))
+
+                  for location, instruction in instructions:
+                      encoded = instruction.get('data')
+                      if not isinstance(encoded, str):
+                          continue
+                      try:
+                          raw = b58decode(encoded)
+                      except Exception:
+                          continue
+                      if not raw.startswith(discriminator):
+                          continue
+                      program_index = instruction.get('programIdIndex')
+                      program_id = (
+                          keys[program_index]
+                          if isinstance(program_index, int) and program_index < len(keys)
+                          else instruction.get('programId')
+                      )
+                      if program_id != target:
+                          continue
+
+                      indices = instruction.get('accounts', [])
+                      accounts = [
+                          keys[item] if isinstance(item, int) and item < len(keys) else None
+                          for item in indices
+                      ]
+                      if len(accounts) < 5:
+                          errors.append(f'{signature}: short account list {len(accounts)}')
+                          continue
+                      events.append({
+                          'signature': signature,
+                          'slot': transaction.get('slot'),
+                          'blockTime': transaction.get('blockTime'),
+                          'succeeded': transaction.get('meta', {}).get('err') is None,
+                          'location': location,
+                          'market': accounts[1],
+                          'keeperStats': accounts[3],
+                          'authority': accounts[4],
+                          'includedAccountCount': max(0, len(accounts) - 5),
+                      })
+              time.sleep(0.02)
+
+          successful = [row for row in events if row['succeeded']]
+          by_market = collections.defaultdict(list)
+          for row in successful:
+              by_market[row['market']].append(row)
+
+          markets = []
+          for market, rows in by_market.items():
+              rows.sort(key=lambda row: (row.get('blockTime') or 0, row.get('slot') or 0, row['signature']))
+              gaps = [
+                  current['blockTime'] - previous['blockTime']
+                  for previous, current in zip(rows, rows[1:])
+                  if previous.get('blockTime') is not None and current.get('blockTime') is not None
+              ]
+              counts = collections.Counter(row['authority'] for row in rows)
+              authorities = [
+                  {'authority': authority, 'count': count, 'share': count / len(rows)}
+                  for authority, count in counts.most_common()
+              ]
+              streak = best_streak = 0
+              previous_authority = None
+              for row in rows:
+                  if row['authority'] == previous_authority:
+                      streak += 1
+                  else:
+                      previous_authority = row['authority']
+                      streak = 1
+                  best_streak = max(best_streak, streak)
+              included = [row['includedAccountCount'] for row in rows]
+              markets.append({
+                  'market': market,
+                  'instructionCount': len(rows),
+                  'uniqueTransactionCount': len({row['signature'] for row in rows}),
+                  'distinctAuthorityCount': len(counts),
+                  'authorities': authorities,
+                  'topAuthorityShare': authorities[0]['share'] if authorities else None,
+                  'maxConsecutiveSameAuthority': best_streak,
+                  'firstBlockTime': rows[0].get('blockTime'),
+                  'lastBlockTime': rows[-1].get('blockTime'),
+                  'minGapSeconds': min(gaps) if gaps else None,
+                  'medianGapSeconds': statistics.median(gaps) if gaps else None,
+                  'p95GapSeconds': percentile(gaps, 0.95),
+                  'maxGapSeconds': max(gaps) if gaps else None,
+                  'gapCountAtLeast9Seconds': sum(value >= 9 for value in gaps),
+                  'gapCountAtLeast10Seconds': sum(value >= 10 for value in gaps),
+                  'includedAccountCountMin': min(included) if included else None,
+                  'includedAccountCountMedian': statistics.median(included) if included else None,
+                  'includedAccountCountMax': max(included) if included else None,
+                  'events': rows,
+              })
+
+          markets.sort(key=lambda row: row['instructionCount'], reverse=True)
+          global_counts = collections.Counter(row['authority'] for row in successful)
+          focus = next((row for row in markets if row['market'] == focus_market), None)
+          output = {
+              'status': 'PASS_FINALIZED_READ_ONLY_PARTICIPANT_CENSUS',
+              'checkedAtUtc': dt.datetime.now(dt.timezone.utc).isoformat(),
+              'rpcEndpoint': endpoint,
+              'sourceSignatureCount': len(signatures),
+              'fetchedTransactionCount': fetched,
+              'matchingInstructionCount': len(events),
+              'successfulInstructionCount': len(successful),
+              'failedInstructionCount': len(events) - len(successful),
+              'distinctMarketCount': len(markets),
+              'distinctAuthorityCount': len(global_counts),
+              'globalAuthorities': [
+                  {'authority': authority, 'count': count, 'share': count / len(successful)}
+                  for authority, count in global_counts.most_common()
+              ] if successful else [],
+              'markets': markets,
+              'focusMarket': focus_market,
+              'focusMarketSummary': focus,
+              'errorCount': len(errors),
+              'errors': errors[:100],
+              'publicChainTransactions': 0,
+              'transactionsConstructed': 0,
+              'transactionsSigned': 0,
+              'transactionsSent': 0,
+          }
+          Path('evidence/PARTICIPANT_CENSUS.json').write_text(json.dumps(output, indent=2) + '\n')
+          summary = {key: output[key] for key in [
+              'status', 'rpcEndpoint', 'sourceSignatureCount', 'fetchedTransactionCount',
+              'matchingInstructionCount', 'successfulInstructionCount', 'failedInstructionCount',
+              'distinctMarketCount', 'distinctAuthorityCount', 'focusMarketSummary', 'errorCount'
+          ]}
+          Path('evidence/SUMMARY.json').write_text(json.dumps(summary, indent=2) + '\n')
+          print(json.dumps(summary, indent=2))
+          PY
+
+      - name: Create manifest
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          root = Path('evidence')
+          rows = []
+          for path in sorted(root.glob('*')):
+              if path.is_file():
+                  data = path.read_bytes()
+                  rows.append({'name': path.name, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+          (root / 'MANIFEST.json').write_text(json.dumps(rows, indent=2) + '\n')
+          PY
+
+      - name: Upload temporary evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: finalized-participant-census-${{ github.run_id }}
+          path: evidence
+          retention-days: 1
+          if-no-files-found: error
