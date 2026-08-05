@@ -1,0 +1,231 @@
+name: Ephemeral encrypted local integration runner r10
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ephemeral-private-local-runner-r10.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  encrypted-local-run-r10:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out public runner definition
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Record public runtime baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p public_metadata
+          uname -a > public_metadata/UNAME.txt
+          docker version > public_metadata/DOCKER_VERSION.txt
+          openssl version -a > public_metadata/OPENSSL_VERSION.txt
+          python3 --version > public_metadata/PYTHON_VERSION.txt
+
+      - name: Generate one-time payload recipient certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p /tmp/ephemeral-input-key
+          openssl req \
+            -x509 \
+            -newkey rsa:4096 \
+            -nodes \
+            -sha256 \
+            -days 1 \
+            -subj "/CN=ephemeral-input-r10-${GITHUB_RUN_ID}" \
+            -keyout /tmp/ephemeral-input-key/private.pem \
+            -out /tmp/ephemeral-input-key/certificate.pem \
+            >/dev/null 2>&1
+          chmod 600 /tmp/ephemeral-input-key/private.pem
+          openssl x509 \
+            -in /tmp/ephemeral-input-key/certificate.pem \
+            -noout -fingerprint -sha256 -subject -dates \
+            > public_metadata/INPUT_CERTIFICATE_METADATA.txt
+          cp /tmp/ephemeral-input-key/certificate.pem public_metadata/input_certificate.pem
+
+      - name: Publish one-time input certificate
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephemeral-input-certificate-r10-${{ github.run_id }}
+          path: |
+            public_metadata/input_certificate.pem
+            public_metadata/INPUT_CERTIFICATE_METADATA.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Wait for run-bound encrypted payload through authenticated API
+        id: inbox
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_BRANCH: ${{ github.head_ref }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test -n "$HEAD_BRANCH"
+          inbox_dir=".tooling/ephemeral-private-runner/inbox/r10-${GITHUB_RUN_ID}"
+          encoded_ref="$(jq -rn --arg value "$HEAD_BRANCH" '$value|@uri')"
+          contents_api="https://api.github.com/repos/${REPOSITORY}/contents"
+          auth=(-H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28')
+          found='false'
+          for attempt in $(seq 1 360); do
+            listing="$(curl -fsS --max-time 20 "${auth[@]}" "${contents_api}/${inbox_dir}?ref=${encoded_ref}" 2>/dev/null || true)"
+            if jq -e 'type == "array" and any(.name == "READY")' >/dev/null 2>&1 <<<"$listing"; then
+              ready_path="$(jq -r '.[] | select(.name == "READY") | .path' <<<"$listing")"
+              ready_json="$(curl -fsS --max-time 20 "${auth[@]}" "${contents_api}/${ready_path}?ref=${encoded_ref}")"
+              jq -r '.content' <<<"$ready_json" | tr -d '\n' | base64 --decode \
+                > /tmp/ephemeral-input-key/READY
+              mapfile -t part_paths < <(jq -r '.[] | select(.name | test("^part-[0-9]{4}$")) | .path' <<<"$listing" | sort)
+              if test "${#part_paths[@]}" -gt 0; then
+                : > /tmp/ephemeral-input-key/payload.cms.b64
+                for part_path in "${part_paths[@]}"; do
+                  part_json="$(curl -fsS --max-time 20 "${auth[@]}" "${contents_api}/${part_path}?ref=${encoded_ref}")"
+                  jq -r '.content' <<<"$part_json" | tr -d '\n' | base64 --decode \
+                    >> /tmp/ephemeral-input-key/payload.cms.b64
+                done
+                base64 --decode /tmp/ephemeral-input-key/payload.cms.b64 \
+                  > /tmp/ephemeral-input-key/payload.cms
+                expected="$(tr -d '[:space:]' < /tmp/ephemeral-input-key/READY)"
+                actual="$(sha256sum /tmp/ephemeral-input-key/payload.cms | awk '{print $1}')"
+                if test -s /tmp/ephemeral-input-key/payload.cms && test "$actual" = "$expected"; then
+                  printf '%s\n' "${#part_paths[@]}" > public_metadata/ENCRYPTED_PAYLOAD_PART_COUNT.txt
+                  found='true'
+                  break
+                fi
+              fi
+            fi
+            sleep 5
+          done
+          test "$found" = 'true'
+          sha256sum /tmp/ephemeral-input-key/payload.cms \
+            > public_metadata/ENCRYPTED_PAYLOAD_SHA256.txt
+          printf 'payload_received=true\n' >> "$GITHUB_OUTPUT"
+
+      - name: Decrypt and validate payload without logging plaintext
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p /tmp/private-payload /tmp/private-result
+          openssl cms \
+            -decrypt \
+            -binary \
+            -inform DER \
+            -in /tmp/ephemeral-input-key/payload.cms \
+            -recip /tmp/ephemeral-input-key/certificate.pem \
+            -inkey /tmp/ephemeral-input-key/private.pem \
+            -out /tmp/ephemeral-input-key/payload.tar \
+            >/dev/null 2>&1
+          python3 - <<'PY'
+          import pathlib
+          import tarfile
+
+          archive = pathlib.Path('/tmp/ephemeral-input-key/payload.tar')
+          target = pathlib.Path('/tmp/private-payload')
+          with tarfile.open(archive, 'r:*') as tf:
+              members = tf.getmembers()
+              if not members:
+                  raise SystemExit('empty payload')
+              for member in members:
+                  path = pathlib.PurePosixPath(member.name)
+                  if path.is_absolute() or '..' in path.parts:
+                      raise SystemExit('unsafe payload path')
+                  if member.issym() or member.islnk() or member.isdev():
+                      raise SystemExit('unsupported payload member')
+              tf.extractall(target, members=members, filter='data')
+          PY
+          test -f /tmp/private-payload/MANIFEST.sha256
+          test -f /tmp/private-payload/run.sh
+          test -f /tmp/private-payload/result_cert.pem
+          (
+            cd /tmp/private-payload
+            sha256sum -c MANIFEST.sha256 \
+              > /tmp/private-result/PAYLOAD_INTEGRITY.log 2>&1
+          )
+          chmod 700 /tmp/private-payload/run.sh
+
+      - name: Execute private local-only payload
+        id: private_run
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          umask 077
+          mkdir -p /tmp/private-payload/results /tmp/private-result
+          (
+            cd /tmp/private-payload
+            env \
+              PRIVATE_RUNNER_RESULTS=/tmp/private-payload/results \
+              PRIVATE_RUNNER_PUBLIC_METADATA="$GITHUB_WORKSPACE/public_metadata" \
+              bash ./run.sh
+          ) > /tmp/private-result/PRIVATE_RUN.log 2>&1
+          status=$?
+          printf '%s\n' "$status" > /tmp/private-result/PRIVATE_RUN_STATUS.txt
+          printf 'status=%s\n' "$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Encrypt all private output for designated recipient
+        if: always() && steps.inbox.outputs.payload_received == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p /tmp/private-result/bundle/public_metadata
+          test -f /tmp/private-result/PRIVATE_RUN_STATUS.txt \
+            || printf '125\n' > /tmp/private-result/PRIVATE_RUN_STATUS.txt
+          cp -a /tmp/private-result/PRIVATE_RUN.log /tmp/private-result/bundle/ 2>/dev/null || true
+          cp -a /tmp/private-result/PRIVATE_RUN_STATUS.txt /tmp/private-result/bundle/
+          cp -a /tmp/private-result/PAYLOAD_INTEGRITY.log /tmp/private-result/bundle/ 2>/dev/null || true
+          if test -d /tmp/private-payload/results; then
+            cp -a /tmp/private-payload/results/. /tmp/private-result/bundle/
+          fi
+          cp -a public_metadata/. /tmp/private-result/bundle/public_metadata/
+          (
+            cd /tmp/private-result/bundle
+            find . -type f ! -name SHA256SUMS.txt -print0 \
+              | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+          )
+          tar -cf /tmp/private-result/result.tar -C /tmp/private-result/bundle .
+          openssl cms \
+            -encrypt \
+            -binary \
+            -aes256 \
+            -in /tmp/private-result/result.tar \
+            -outform DER \
+            -out /tmp/private-result/encrypted-result.cms \
+            /tmp/private-payload/result_cert.pem \
+            >/dev/null 2>&1
+          sha256sum /tmp/private-result/encrypted-result.cms \
+            > /tmp/private-result/ENCRYPTED_RESULT_SHA256.txt
+          rm -rf /tmp/private-payload /tmp/ephemeral-input-key /tmp/private-result/result.tar /tmp/private-result/bundle
+
+      - name: Upload encrypted private result
+        if: always() && steps.inbox.outputs.payload_received == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-private-result-r10-${{ github.run_id }}
+          path: |
+            /tmp/private-result/encrypted-result.cms
+            /tmp/private-result/ENCRYPTED_RESULT_SHA256.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Enforce private payload result after encrypted upload
+        if: always() && steps.inbox.outputs.payload_received == 'true'
+        shell: bash
+        env:
+          PRIVATE_STATUS: ${{ steps.private_run.outputs.status }}
+        run: |
+          set -euo pipefail
+          test "$PRIVATE_STATUS" = '0'
