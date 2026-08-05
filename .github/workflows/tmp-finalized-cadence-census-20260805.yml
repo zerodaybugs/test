@@ -1,0 +1,172 @@
+name: Temporary finalized instruction cadence census
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/tmp-finalized-cadence-census-20260805.yml
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Scan finalized instruction cadence read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          import base64, datetime as dt, json, time, urllib.request
+          from pathlib import Path
+
+          target = base64.b64decode('dkVMb0MxYXVkWWJTWVZSWG4xdlBhVjhBeG9hOW9VNkJZbU5HWlpCRFoxUA==').decode()
+          discriminator = bytes.fromhex('f717ff41d45addc2')
+          endpoints = [
+            'https://moltnode.ag/solana',
+            'https://rpc.solanatracker.io/public',
+            'https://solana-rpc.publicnode.com',
+            'https://api.mainnet-beta.solana.com',
+          ]
+          alphabet='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+          amap={c:i for i,c in enumerate(alphabet)}
+
+          def b58decode(s):
+            n=0
+            for c in s: n=n*58+amap[c]
+            raw=n.to_bytes((n.bit_length()+7)//8,'big') if n else b''
+            return b'\0'*(len(s)-len(s.lstrip('1')))+raw
+
+          def post(url, payload, timeout=45):
+            body=json.dumps(payload).encode()
+            req=urllib.request.Request(url,data=body,method='POST',headers={'content-type':'application/json','user-agent':'finalized-cadence-census/1.0'})
+            with urllib.request.urlopen(req,timeout=timeout) as r: return json.loads(r.read())
+
+          def rpc(method, params, endpoint=None):
+            errs=[]
+            choices=[endpoint] if endpoint else endpoints
+            for url in choices:
+              try:
+                out=post(url,{'jsonrpc':'2.0','id':1,'method':method,'params':params})
+                if out.get('error'): raise RuntimeError(str(out['error']))
+                return out['result'],url
+              except Exception as e: errs.append(f'{url}: {type(e).__name__}: {e}')
+            raise RuntimeError(' | '.join(errs))
+
+          # Collect a bounded recent finalized program history.
+          signatures=[]; before=None; endpoint=None; page_errors=[]
+          for page in range(8):
+            opts={'limit':1000,'commitment':'finalized'}
+            if before: opts['before']=before
+            try:
+              rows,endpoint=rpc('getSignaturesForAddress',[target,opts],endpoint)
+            except Exception as e:
+              endpoint=None
+              try: rows,endpoint=rpc('getSignaturesForAddress',[target,opts])
+              except Exception as e2:
+                page_errors.append(f'page {page}: {e2}'); break
+            if not rows: break
+            signatures.extend(rows); before=rows[-1]['signature']
+            if len(rows)<1000: break
+
+          matches=[]; tx_errors=[]
+          # Query in small JSON-RPC batches. Fall back per transaction when an endpoint rejects batches.
+          for start in range(0,len(signatures),25):
+            chunk=signatures[start:start+25]
+            payload=[]
+            for i,row in enumerate(chunk):
+              payload.append({'jsonrpc':'2.0','id':i+1,'method':'getTransaction','params':[row['signature'],{'encoding':'json','commitment':'finalized','maxSupportedTransactionVersion':0}]})
+            response=None
+            try:
+              response=post(endpoint,payload,timeout=60)
+              if not isinstance(response,list): raise RuntimeError('batch response not list')
+              byid={x.get('id'):x for x in response}
+            except Exception as e:
+              byid={}; tx_errors.append(f'batch {start}: {type(e).__name__}: {e}')
+            for i,row in enumerate(chunk):
+              item=byid.get(i+1)
+              tx=item.get('result') if item and not item.get('error') else None
+              if tx is None:
+                try: tx,_=rpc('getTransaction',[row['signature'],{'encoding':'json','commitment':'finalized','maxSupportedTransactionVersion':0}],endpoint)
+                except Exception as e:
+                  tx_errors.append(f"{row['signature']}: {type(e).__name__}: {e}"); continue
+              if not tx: continue
+              message=tx.get('transaction',{}).get('message',{})
+              keys=message.get('accountKeys',[])
+              key_strings=[k if isinstance(k,str) else k.get('pubkey') for k in keys]
+              loaded=tx.get('meta',{}).get('loadedAddresses') or {}
+              key_strings += loaded.get('writable',[]) + loaded.get('readonly',[])
+              all_ix=[]
+              all_ix.extend(message.get('instructions',[]))
+              for group in tx.get('meta',{}).get('innerInstructions') or []: all_ix.extend(group.get('instructions',[]))
+              found=False
+              for ix in all_ix:
+                data=ix.get('data')
+                if not isinstance(data,str): continue
+                try: raw=b58decode(data)
+                except Exception: continue
+                if not raw.startswith(discriminator): continue
+                pi=ix.get('programIdIndex')
+                program_id=key_strings[pi] if isinstance(pi,int) and pi<len(key_strings) else ix.get('programId')
+                if program_id==target:
+                  found=True; break
+              if found:
+                matches.append({'signature':row['signature'],'slot':tx.get('slot',row.get('slot')),'blockTime':tx.get('blockTime',row.get('blockTime')),'err':row.get('err')})
+            time.sleep(0.03)
+
+          matches.sort(key=lambda x:(x.get('blockTime') or 0,x.get('slot') or 0))
+          gaps=[]
+          for a,b in zip(matches,matches[1:]):
+            if a.get('blockTime') is None or b.get('blockTime') is None: continue
+            gaps.append({'fromSignature':a['signature'],'toSignature':b['signature'],'fromSlot':a['slot'],'toSlot':b['slot'],'seconds':b['blockTime']-a['blockTime'],'slots':b['slot']-a['slot']})
+          gaps_desc=sorted(gaps,key=lambda x:x['seconds'],reverse=True)
+          summary={
+            'status':'PASS_READ_ONLY_FINALIZED_CADENCE_CENSUS',
+            'checkedAtUtc':dt.datetime.now(dt.timezone.utc).isoformat(),
+            'rpcEndpoint':endpoint,
+            'scannedSignatureCount':len(signatures),
+            'matchingInstructionCount':len(matches),
+            'oldestScannedBlockTime':signatures[-1].get('blockTime') if signatures else None,
+            'newestScannedBlockTime':signatures[0].get('blockTime') if signatures else None,
+            'maxObservedGapSeconds':gaps_desc[0]['seconds'] if gaps_desc else None,
+            'gapCountAtLeast20Min':sum(g['seconds']>=1200 for g in gaps),
+            'gapCountAtLeast40Min':sum(g['seconds']>=2400 for g in gaps),
+            'gapCountAtLeast55Min':sum(g['seconds']>=3300 for g in gaps),
+            'topGaps':gaps_desc[:50],
+            'matches':matches,
+            'pageErrors':page_errors,
+            'transactionErrorCount':len(tx_errors),
+            'transactionErrors':tx_errors[:50],
+            'publicChainTransactions':0,
+            'transactionsConstructed':0,
+            'transactionsSigned':0,
+            'transactionsSent':0,
+          }
+          Path('evidence/cadence-census.json').write_text(json.dumps(summary,indent=2)+'\n')
+          print(json.dumps({k:summary[k] for k in ['status','rpcEndpoint','scannedSignatureCount','matchingInstructionCount','maxObservedGapSeconds','gapCountAtLeast20Min','gapCountAtLeast40Min','gapCountAtLeast55Min','transactionErrorCount']},indent=2))
+          PY
+
+      - name: Manifest
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          r=Path('evidence'); rows=[]
+          for p in sorted(r.glob('*')):
+            if p.is_file():
+              b=p.read_bytes(); rows.append({'name':p.name,'bytes':len(b),'sha256':hashlib.sha256(b).hexdigest()})
+          (r/'manifest.json').write_text(json.dumps(rows,indent=2)+'\n')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: finalized-cadence-census-${{ github.run_id }}
+          path: evidence
+          retention-days: 1
+          if-no-files-found: error
