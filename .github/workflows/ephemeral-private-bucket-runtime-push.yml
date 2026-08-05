@@ -1,0 +1,163 @@
+name: Ephemeral encrypted Bucket runtime push runner
+
+on:
+  push:
+    branches: [bucket-runtime-push-20260805]
+    paths:
+      - '.github/workflows/ephemeral-private-bucket-runtime-push.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  private-runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Generate one-time input certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p /tmp/in /tmp/out public_metadata
+          openssl req -x509 -newkey rsa:4096 -nodes -sha256 -days 1 \
+            -subj "/CN=ephemeral-bucket-runtime-${GITHUB_RUN_ID}" \
+            -keyout /tmp/in/key.pem -out /tmp/in/cert.pem >/dev/null 2>&1
+          cp /tmp/in/cert.pem public_metadata/input_certificate.pem
+          openssl x509 -in /tmp/in/cert.pem -noout -fingerprint -sha256 -subject -dates \
+            > public_metadata/INPUT_CERTIFICATE_METADATA.txt
+          uname -a > public_metadata/UNAME.txt
+          python3 --version > public_metadata/PYTHON_VERSION.txt
+          openssl version -a > public_metadata/OPENSSL_VERSION.txt
+
+      - name: Upload one-time input certificate
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephemeral-bucket-runtime-input-${{ github.run_id }}
+          path: |
+            public_metadata/input_certificate.pem
+            public_metadata/INPUT_CERTIFICATE_METADATA.txt
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Wait for encrypted payload
+        id: inbox
+        shell: bash
+        env:
+          BRANCH: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          prefix=".tooling/ephemeral-private-runner/inbox/bucket-runtime-push-${GITHUB_RUN_ID}"
+          ref='refs/remotes/payload/head'
+          found=false
+          for _ in $(seq 1 1440); do
+            git fetch --quiet --no-tags --depth=1 "https://github.com/${REPOSITORY}.git" \
+              "+refs/heads/${BRANCH}:${ref}" >/dev/null 2>&1 || true
+            if git show "${ref}:${prefix}/READY" > /tmp/in/READY 2>/dev/null; then
+              mapfile -t parts < <(git ls-tree -r --name-only "$ref" -- "$prefix" | grep -E '/part-[0-9]{4}$' | sort)
+              if test "${#parts[@]}" -gt 0; then
+                : > /tmp/in/payload.b64
+                for part in "${parts[@]}"; do git show "${ref}:${part}" >> /tmp/in/payload.b64; done
+                base64 -d /tmp/in/payload.b64 > /tmp/in/payload.cms
+                expected="$(tr -d '[:space:]' < /tmp/in/READY)"
+                actual="$(sha256sum /tmp/in/payload.cms | awk '{print $1}')"
+                if test -s /tmp/in/payload.cms && test "$actual" = "$expected"; then
+                  printf '%s\n' "${#parts[@]}" > public_metadata/ENCRYPTED_PAYLOAD_PART_COUNT.txt
+                  sha256sum /tmp/in/payload.cms > public_metadata/ENCRYPTED_PAYLOAD_SHA256.txt
+                  found=true
+                  break
+                fi
+              fi
+            fi
+            sleep 5
+          done
+          test "$found" = true
+          echo 'payload_received=true' >> "$GITHUB_OUTPUT"
+
+      - name: Decrypt and validate payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p /tmp/payload /tmp/result
+          openssl cms -decrypt -binary -inform DER -in /tmp/in/payload.cms \
+            -recip /tmp/in/cert.pem -inkey /tmp/in/key.pem -out /tmp/in/payload.tar >/dev/null 2>&1
+          python3 - <<'PY'
+          import pathlib, tarfile
+          src = pathlib.Path('/tmp/in/payload.tar')
+          dst = pathlib.Path('/tmp/payload')
+          with tarfile.open(src, 'r:*') as tf:
+              members = tf.getmembers()
+              if not members: raise SystemExit('empty payload')
+              for m in members:
+                  p = pathlib.PurePosixPath(m.name)
+                  if p.is_absolute() or '..' in p.parts or m.issym() or m.islnk() or m.isdev():
+                      raise SystemExit('unsafe payload member')
+              tf.extractall(dst, members=members, filter='data')
+          PY
+          test -f /tmp/payload/MANIFEST.sha256
+          test -f /tmp/payload/run.sh
+          test -f /tmp/payload/result_cert.pem
+          (cd /tmp/payload && sha256sum -c MANIFEST.sha256 > /tmp/result/PAYLOAD_INTEGRITY.log)
+          chmod 700 /tmp/payload/run.sh
+
+      - name: Execute private payload
+        id: private_run
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          umask 077
+          mkdir -p /tmp/payload/results /tmp/result
+          (cd /tmp/payload && env PRIVATE_RUNNER_RESULTS=/tmp/payload/results \
+            PRIVATE_RUNNER_PUBLIC_METADATA="$GITHUB_WORKSPACE/public_metadata" bash ./run.sh) \
+            > /tmp/result/PRIVATE_RUN.log 2>&1
+          status=$?
+          printf '%s\n' "$status" > /tmp/result/PRIVATE_RUN_STATUS.txt
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Encrypt private result
+        if: always() && steps.inbox.outputs.payload_received == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p /tmp/result/bundle/public_metadata
+          cp -a /tmp/result/PRIVATE_RUN.log /tmp/result/bundle/ 2>/dev/null || true
+          cp -a /tmp/result/PRIVATE_RUN_STATUS.txt /tmp/result/bundle/ 2>/dev/null || printf '125\n' > /tmp/result/bundle/PRIVATE_RUN_STATUS.txt
+          cp -a /tmp/result/PAYLOAD_INTEGRITY.log /tmp/result/bundle/ 2>/dev/null || true
+          cp -a /tmp/payload/results/. /tmp/result/bundle/ 2>/dev/null || true
+          cp -a public_metadata/. /tmp/result/bundle/public_metadata/
+          (cd /tmp/result/bundle && find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt)
+          tar -cf /tmp/result/result.tar -C /tmp/result/bundle .
+          openssl cms -encrypt -binary -aes256 -in /tmp/result/result.tar -outform DER \
+            -out /tmp/result/encrypted-result.cms /tmp/payload/result_cert.pem >/dev/null 2>&1
+          sha256sum /tmp/result/encrypted-result.cms > /tmp/result/ENCRYPTED_RESULT_SHA256.txt
+          rm -rf /tmp/payload /tmp/in /tmp/result/result.tar /tmp/result/bundle
+
+      - name: Upload encrypted result
+        if: always() && steps.inbox.outputs.payload_received == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-private-bucket-runtime-result-${{ github.run_id }}
+          path: |
+            /tmp/result/encrypted-result.cms
+            /tmp/result/ENCRYPTED_RESULT_SHA256.txt
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Enforce private result
+        if: always() && steps.inbox.outputs.payload_received == 'true'
+        shell: bash
+        env:
+          PRIVATE_STATUS: ${{ steps.private_run.outputs.status }}
+        run: |
+          set -euo pipefail
+          test "$PRIVATE_STATUS" = '0'
