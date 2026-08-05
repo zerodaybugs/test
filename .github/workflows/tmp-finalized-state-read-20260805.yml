@@ -1,0 +1,126 @@
+name: Temporary finalized read-only state check
+
+on:
+  push:
+    branches:
+      - tmp/finalized-state-read-20260805
+    paths:
+      - .github/workflows/tmp-finalized-state-read-20260805.yml
+
+permissions:
+  contents: read
+
+jobs:
+  read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Query finalized public account state
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          import base64, datetime as dt, hashlib, json, struct, urllib.request
+          from pathlib import Path
+
+          target_program = base64.b64decode('dkVMb0MxYXVkWWJTWVZSWG4xdlBhVjhBeG9hOW9VNkJZbU5HWlpCRFoxUA==').decode()
+          target_state = base64.b64decode('MmV0eDVOdlBOeGVNWjdFZkhFNkdqSmZXMmltUllFVUFOZWhOUzFXQjRDVlc=').decode()
+          expected_programdata = base64.b64decode('SGtSZjM2anZVQjMyZG5IakhxcE1uUGNLSmhVUDJUVUtKVEg3UkRUaWZKbTc=').decode()
+          expected_deployment_slot = 435978201
+          state_byte_offset = 1300 + 74
+          alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+          endpoints = [
+              'https://moltnode.ag/solana',
+              'https://rpc.solanatracker.io/public',
+              'https://solana-rpc.publicnode.com',
+              'https://api.mainnet-beta.solana.com',
+              'https://solana.drpc.org',
+              'https://1rpc.io/solana',
+          ]
+
+          def b58(raw):
+              z=len(raw)-len(raw.lstrip(b'\0')); n=int.from_bytes(raw,'big'); s=''
+              while n:
+                  n,r=divmod(n,58); s=alphabet[r]+s
+              return '1'*z+(s or ('' if z else '1'))
+
+          def call(url, method, params):
+              payload=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
+              req=urllib.request.Request(url,data=payload,method='POST',headers={'content-type':'application/json','user-agent':'finalized-state-read/1.0'})
+              with urllib.request.urlopen(req,timeout=25) as response:
+                  out=json.loads(response.read())
+              if out.get('error'): raise RuntimeError(f"{method}: {out['error']}")
+              return out['result']
+
+          attempts=[]; result=None
+          for endpoint in endpoints:
+              try:
+                  slot=call(endpoint,'getSlot',[{'commitment':'finalized'}])
+                  p=call(endpoint,'getAccountInfo',[target_program,{'commitment':'finalized','encoding':'base64','dataSlice':{'offset':0,'length':36}}])['value']
+                  ph=base64.b64decode(p['data'][0])
+                  if len(ph)!=36 or struct.unpack_from('<I',ph,0)[0]!=2: raise RuntimeError('program layout')
+                  pd=b58(ph[4:36])
+                  d=call(endpoint,'getAccountInfo',[pd,{'commitment':'finalized','encoding':'base64','dataSlice':{'offset':0,'length':45}}])['value']
+                  dh=base64.b64decode(d['data'][0])
+                  if len(dh)!=45 or struct.unpack_from('<I',dh,0)[0]!=3: raise RuntimeError('programdata layout')
+                  deployment_slot=struct.unpack_from('<Q',dh,4)[0]
+                  s=call(endpoint,'getAccountInfo',[target_state,{'commitment':'finalized','encoding':'base64'}])['value']
+                  raw=base64.b64decode(s['data'][0])
+                  if len(raw)<=state_byte_offset: raise RuntimeError('state length')
+                  value=raw[state_byte_offset]
+                  Path('evidence/state.bin').write_bytes(raw)
+                  Path('evidence/program_header.bin').write_bytes(ph)
+                  Path('evidence/programdata_header.bin').write_bytes(dh)
+                  result={
+                      'status':'PASS_FINALIZED_READ_ONLY',
+                      'checkedAtUtc':dt.datetime.now(dt.timezone.utc).isoformat(),
+                      'endpoint':endpoint,
+                      'finalizedSlot':slot,
+                      'programDataMatches':pd==expected_programdata,
+                      'deploymentSlot':deployment_slot,
+                      'deploymentSlotMatches':deployment_slot==expected_deployment_slot,
+                      'stateOwnerMatches':s['owner']==target_program,
+                      'stateBytes':len(raw),
+                      'stateSha256':hashlib.sha256(raw).hexdigest(),
+                      'selectedByteOffset':state_byte_offset,
+                      'selectedByteValue':value,
+                      'bit1Set':bool(value & 2),
+                      'publicChainTransactions':0,
+                      'transactionsConstructed':0,
+                      'transactionsSigned':0,
+                      'transactionsSent':0,
+                  }
+                  attempts.append({'endpoint':endpoint,'ok':True,'slot':slot}); break
+              except Exception as exc:
+                  attempts.append({'endpoint':endpoint,'ok':False,'error':f'{type(exc).__name__}: {exc}'})
+          if result is None:
+              result={'status':'FAIL_NO_ENDPOINT','checkedAtUtc':dt.datetime.now(dt.timezone.utc).isoformat(),'publicChainTransactions':0}
+          result['attempts']=attempts
+          result['gate']='PASS' if result.get('programDataMatches') and result.get('deploymentSlotMatches') and result.get('stateOwnerMatches') and result.get('bit1Set') else 'HOLD'
+          Path('evidence/result.json').write_text(json.dumps(result,indent=2)+'\n')
+          print(json.dumps(result,indent=2))
+          PY
+
+      - name: Create manifest
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          root=Path('evidence'); rows=[]
+          for p in sorted(root.glob('*')):
+              if p.is_file():
+                  b=p.read_bytes(); rows.append({'name':p.name,'bytes':len(b),'sha256':hashlib.sha256(b).hexdigest()})
+          (root/'manifest.json').write_text(json.dumps(rows,indent=2)+'\n')
+          PY
+
+      - name: Upload temporary read-only evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: finalized-state-read-${{ github.run_id }}
+          path: evidence
+          retention-days: 1
+          if-no-files-found: error
