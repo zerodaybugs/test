@@ -1,0 +1,131 @@
+name: Temporary finalized read-only quorum check
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/tmp-finalized-quorum-read-20260805.yml
+
+permissions:
+  contents: read
+
+jobs:
+  quorum:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Query two finalized RPCs and hash full active program
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          import base64, datetime as dt, hashlib, json, struct, urllib.request
+          from pathlib import Path
+
+          program = base64.b64decode('dkVMb0MxYXVkWWJTWVZSWG4xdlBhVjhBeG9hOW9VNkJZbU5HWlpCRFoxUA==').decode()
+          state = base64.b64decode('MmV0eDVOdlBOeGVNWjdFZkhFNkdqSmZXMmltUllFVUFOZWhOUzFXQjRDVlc=').decode()
+          expected_pd = base64.b64decode('SGtSZjM2anZVQjMyZG5IakhxcE1uUGNLSmhVUDJUVUtKVEg3UkRUaWZKbTc=').decode()
+          expected_slot = 435978201
+          expected_elf = '1b7b06d17af813b5a505df8f534bfd0779a1a7457f0d2626b1a45c8741686c80'
+          flag_offset = 1374
+          endpoints = [
+            'https://moltnode.ag/solana',
+            'https://rpc.solanatracker.io/public',
+            'https://solana-rpc.publicnode.com',
+            'https://api.mainnet-beta.solana.com',
+            'https://solana.drpc.org',
+            'https://1rpc.io/solana',
+          ]
+          alphabet='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+
+          def b58(raw):
+            z=len(raw)-len(raw.lstrip(b'\0')); n=int.from_bytes(raw,'big'); s=''
+            while n: n,r=divmod(n,58); s=alphabet[r]+s
+            return '1'*z+(s or ('' if z else '1'))
+
+          def rpc(url, method, params):
+            body=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
+            req=urllib.request.Request(url,data=body,method='POST',headers={'content-type':'application/json','user-agent':'finalized-quorum-read/1.0'})
+            with urllib.request.urlopen(req,timeout=40) as response: out=json.loads(response.read())
+            if out.get('error'): raise RuntimeError(f"{method}: {out['error']}")
+            return out['result']
+
+          def elf_size(data):
+            if len(data)<64 or data[:4]!=b'\x7fELF' or data[4]!=2 or data[5]!=1: raise RuntimeError('not ELF64LE')
+            phoff=struct.unpack_from('<Q',data,0x20)[0]; shoff=struct.unpack_from('<Q',data,0x28)[0]
+            eh,phe,phn,she,shn=struct.unpack_from('<HHHHH',data,0x34); maximum=max(64,eh)
+            if phoff and phe and phn:
+              maximum=max(maximum,phoff+phe*phn)
+              for i in range(phn):
+                off=phoff+i*phe; maximum=max(maximum,struct.unpack_from('<Q',data,off+8)[0]+struct.unpack_from('<Q',data,off+32)[0])
+            if shoff and she and shn:
+              maximum=max(maximum,shoff+she*shn)
+              for i in range(shn):
+                off=shoff+i*she; sh_type=struct.unpack_from('<I',data,off+4)[0]
+                if sh_type!=8: maximum=max(maximum,struct.unpack_from('<Q',data,off+24)[0]+struct.unpack_from('<Q',data,off+32)[0])
+            if maximum>len(data): raise RuntimeError('ELF extent')
+            return maximum
+
+          successes=[]; attempts=[]
+          for endpoint in endpoints:
+            try:
+              finalized=rpc(endpoint,'getSlot',[{'commitment':'finalized'}])
+              pv=rpc(endpoint,'getAccountInfo',[program,{'encoding':'base64','commitment':'finalized','dataSlice':{'offset':0,'length':36}}])['value']
+              ph=base64.b64decode(pv['data'][0]); pd=b58(ph[4:36])
+              dv=rpc(endpoint,'getAccountInfo',[pd,{'encoding':'base64','commitment':'finalized'}])['value']
+              draw=base64.b64decode(dv['data'][0]); deployment=struct.unpack_from('<Q',draw,4)[0]; payload=draw[45:]
+              size=elf_size(payload); canonical=payload[:size]
+              sv=rpc(endpoint,'getAccountInfo',[state,{'encoding':'base64','commitment':'finalized'}])['value']
+              sraw=base64.b64decode(sv['data'][0]); flag=sraw[flag_offset]
+              row={
+                'endpoint':endpoint,'finalizedSlot':finalized,'programData':pd,'programDataMatches':pd==expected_pd,
+                'deploymentSlot':deployment,'deploymentSlotMatches':deployment==expected_slot,
+                'canonicalElfBytes':size,'canonicalElfSha256':hashlib.sha256(canonical).hexdigest(),
+                'canonicalElfMatches':hashlib.sha256(canonical).hexdigest()==expected_elf,
+                'programDataPayloadBytes':len(payload),'programDataPayloadSha256':hashlib.sha256(payload).hexdigest(),
+                'stateOwnerMatches':sv['owner']==program,'stateBytes':len(sraw),'stateSha256':hashlib.sha256(sraw).hexdigest(),
+                'featureByteOffset':flag_offset,'featureByteValue':flag,'medianBitSet':bool(flag&2),
+              }
+              successes.append(row); attempts.append({'endpoint':endpoint,'ok':True,'finalizedSlot':finalized})
+              if len(successes)>=2: break
+            except Exception as exc:
+              attempts.append({'endpoint':endpoint,'ok':False,'error':f'{type(exc).__name__}: {exc}'})
+
+          agreeing=False
+          if len(successes)>=2:
+            keys=['programData','deploymentSlot','canonicalElfBytes','canonicalElfSha256','programDataPayloadBytes','programDataPayloadSha256','stateBytes','stateSha256','featureByteValue']
+            agreeing=all(successes[0][k]==successes[1][k] for k in keys)
+          row_checks=all(r['programDataMatches'] and r['deploymentSlotMatches'] and r['canonicalElfMatches'] and r['stateOwnerMatches'] and r['medianBitSet'] for r in successes[:2])
+          out={
+            'status':'PASS_FINALIZED_TWO_RPC_FULL_PROGRAM_QUORUM' if len(successes)>=2 and agreeing and row_checks else 'HOLD_NO_TWO_RPC_QUORUM',
+            'checkedAtUtc':dt.datetime.now(dt.timezone.utc).isoformat(),'requiredQuorum':2,'successfulRpcCount':len(successes),
+            'quorumAgrees':agreeing,'records':successes,'attempts':attempts,
+            'publicChainTransactions':0,'transactionsConstructed':0,'transactionsSigned':0,'transactionsSent':0,
+          }
+          out['gate']='PASS' if out['status'].startswith('PASS_') else 'HOLD'
+          Path('evidence/quorum-result.json').write_text(json.dumps(out,indent=2)+'\n')
+          print(json.dumps(out,indent=2))
+          PY
+
+      - name: Manifest
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          r=Path('evidence'); rows=[]
+          for p in sorted(r.glob('*')):
+            if p.is_file():
+              b=p.read_bytes(); rows.append({'name':p.name,'bytes':len(b),'sha256':hashlib.sha256(b).hexdigest()})
+          (r/'manifest.json').write_text(json.dumps(rows,indent=2)+'\n')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: finalized-quorum-read-${{ github.run_id }}
+          path: evidence
+          retention-days: 1
+          if-no-files-found: error
