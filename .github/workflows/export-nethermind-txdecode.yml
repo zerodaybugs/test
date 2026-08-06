@@ -1,0 +1,154 @@
+name: export-nethermind-txdecode
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/export-nethermind-txdecode.yml'
+      - 'nethermind-txdecode-trigger.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.100'
+
+      - name: Build generic Nethermind transaction decoder
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch 1.36.2 https://github.com/NethermindEth/nethermind.git /tmp/nethermind
+          cd /tmp/nethermind
+          test "$(git describe --tags --exact-match)" = "1.36.2"
+
+          cat > tools/TxParser/Program.cs <<'EOF'
+          // Generic public-client transaction decoder. No target vectors are embedded.
+          using System.Text.Json;
+          using Nethermind.Core;
+          using Nethermind.Core.Extensions;
+          using Nethermind.Serialization.Rlp;
+          using Nethermind.Crypto;
+          using Nethermind.Consensus.Validators;
+          using Nethermind.Core.Specs;
+          using Nethermind.Specs.Forks;
+          using Nethermind.TxPool;
+
+          IReleaseSpec spec = Fork.GetLatest();
+          const ulong chainId = BlockchainIds.Mainnet;
+          LegacySignatureTxValidator legacySignatureTxValidator = new(chainId);
+          SignatureTxValidator signatureTxValidator = SignatureTxValidator.Instance;
+          EthereumEcdsa ecdsa = new(chainId);
+          ExpectedChainIdTxValidator expectedChainIdTxValidator = new(chainId);
+
+          static void Emit(object value) => Console.WriteLine(JsonSerializer.Serialize(value));
+
+          string? input;
+          while ((input = Console.ReadLine()) is not null)
+          {
+              input = input.Trim();
+              if (input.Length == 0) continue;
+              try
+              {
+                  byte[] bytes = Bytes.FromHexString(input);
+                  Transaction tx = Rlp.Decode<Transaction>(bytes, RlpBehaviors.SkipTypedWrapping);
+
+                  ITxValidator signatureValidator = tx.Type == TxType.Legacy
+                      ? legacySignatureTxValidator
+                      : signatureTxValidator;
+                  ValidationResult signatureValidation = signatureValidator.IsWellFormed(tx, spec);
+                  ValidationResult chainValidation = tx.Type == TxType.Legacy
+                      ? ValidationResult.Success
+                      : expectedChainIdTxValidator.IsWellFormed(tx, spec);
+
+                  Address? sender = null;
+                  string? senderError = null;
+                  try
+                  {
+                      sender = ecdsa.RecoverAddress(tx, !spec.ValidateChainId);
+                      if (sender is null) senderError = "Could not recover sender address";
+                  }
+                  catch (Exception error)
+                  {
+                      senderError = error.Message;
+                  }
+
+                  string? canonical = null;
+                  string? encodeError = null;
+                  try
+                  {
+                      canonical = TxDecoder.Instance.Encode(tx, RlpBehaviors.SkipTypedWrapping).Bytes.ToHexString(true);
+                  }
+                  catch (Exception error)
+                  {
+                      encodeError = error.Message;
+                  }
+
+                  Emit(new
+                  {
+                      input,
+                      accepted = true,
+                      tx_type = (byte)tx.Type,
+                      tx_type_name = tx.Type.ToString(),
+                      chain_id = tx.ChainId?.ToString(),
+                      nonce = tx.Nonce.ToString(),
+                      gas_limit = tx.GasLimit,
+                      gas_price = tx.GasPrice.ToString(),
+                      max_priority_fee_per_gas = tx.MaxPriorityFeePerGas.ToString(),
+                      max_fee_per_gas = tx.MaxFeePerGas.ToString(),
+                      value = tx.Value.ToString(),
+                      hash = tx.Hash?.ToString(),
+                      signature_well_formed = (bool)signatureValidation,
+                      signature_error = signatureValidation ? null : signatureValidation.Error,
+                      chain_id_valid = (bool)chainValidation,
+                      chain_id_error = chainValidation ? null : chainValidation.Error,
+                      signature_recovery_ok = sender is not null,
+                      recovered_signer = sender?.ToString(),
+                      sender_error = senderError,
+                      canonical,
+                      encode_error = encodeError,
+                  });
+              }
+              catch (Exception error)
+              {
+                  Emit(new
+                  {
+                      input,
+                      accepted = false,
+                      stage = "decode",
+                      error = error.Message.Replace(Environment.NewLine, ". ").Replace("\n", ". "),
+                      error_type = error.GetType().FullName,
+                  });
+              }
+          }
+          EOF
+
+          dotnet publish tools/TxParser/TxParser.csproj \
+            -c Release \
+            -r linux-x64 \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -p:PublishTrimmed=false \
+            -o "$GITHUB_WORKSPACE/export"
+
+          printf '' | "$GITHUB_WORKSPACE/export/TxParser"
+          dotnet --info > "$GITHUB_WORKSPACE/export/DOTNET_INFO.txt"
+          git rev-parse HEAD > "$GITHUB_WORKSPACE/export/NETHERMIND_COMMIT.txt"
+          printf 'nethermind=1.36.2\n' > "$GITHUB_WORKSPACE/export/DEPENDENCY_VERSIONS.txt"
+          cd "$GITHUB_WORKSPACE"
+          sha256sum export/TxParser | sort > export/SHA256SUMS.txt
+
+      - name: Upload generic decoder
+        uses: actions/upload-artifact@v4
+        with:
+          name: nethermind-txdecode-1.36.2-linux-amd64
+          path: export/
+          if-no-files-found: error
+          retention-days: 1
