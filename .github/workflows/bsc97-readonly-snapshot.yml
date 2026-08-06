@@ -1,0 +1,328 @@
+name: bsc97-readonly-snapshot
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/bsc97-readonly-snapshot.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Install read-only RPC dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/tcg-bsc97-probe "$GITHUB_WORKSPACE/tcg-output"
+          cd /tmp/tcg-bsc97-probe
+          npm init -y >/dev/null
+          npm install --no-save --no-audit --no-fund viem@2.43.0
+
+      - name: Write read-only BSC Chapel snapshot probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/tcg-bsc97-probe/probe.mjs <<'EOF'
+          import fs from 'node:fs';
+          import { createPublicClient, formatUnits, http, keccak256, parseAbi } from 'viem';
+          import { bscTestnet } from 'viem/chains';
+
+          const ZERO = '0x0000000000000000000000000000000000000000';
+          const ADDR = {
+            TCGV: '0xba9e4d6b0b8c3bb13b28a3b3a2f09012674ed5c0',
+            NEXUS: '0xb11426b649404ef2df7f8f7acf3de3aa00e3ed60',
+            BUY_ROUTER: '0x3d5c49910f32ed78dc83141fabf1033d7b5e52e2',
+            STAKING: '0x8d2478b2901036a4a0f88c4dfe6b6075e02d197a',
+            BASIC_NFT: '0xe901ec321c5aa78f080bf99cc31e7b83c7a0fd0d',
+            FOUNDER_NFT: '0xb8a75c065556c95f7ce86eaefdce849afa8e6324',
+            INITIAL_LAUNCH: '0x411db8fa3638976b6802e76bb0789014eed4c1e9',
+            WRAPPER: '0xfdc1b93a80b56efd66dda8c82f1f5f70f3fa1178',
+            TCGR: '0xd9be1afabdcc07faed8f64d9dbfe56459085bb0d',
+            CONVERTER: '0xe150b30181d455c8a47a27dbebb1de41ec6d8d97',
+            USDC: '0xc6ace01ffc5b8925d5f4c2d427481f8612b4ca1b',
+            PAIR: '0xe7ebfbf0cadad62b03935b87ddf4bf570e9594e5',
+          };
+
+          const RPCS = [
+            'https://bsc-testnet-rpc.publicnode.com',
+            'https://data-seed-prebsc-1-s1.bnbchain.org:8545',
+            'https://data-seed-prebsc-2-s1.bnbchain.org:8545',
+            'https://bsc-testnet.public.blastapi.io',
+            'https://bsc-testnet.drpc.org',
+          ];
+
+          const ABI = parseAbi([
+            'function owner() view returns (address)',
+            'function decimals() view returns (uint8)',
+            'function totalSupply() view returns (uint256)',
+            'function balanceOf(address) view returns (uint256)',
+            'function token0() view returns (address)',
+            'function token1() view returns (address)',
+            'function getReserves() view returns (uint112,uint112,uint32)',
+            'function stakingVault() view returns (address)',
+            'function initialLaunch() view returns (address)',
+            'function buyRouter() view returns (address)',
+            'function presaleActive() view returns (bool)',
+            'function supplyRecomputed() view returns (bool)',
+            'function qualifyingNft() view returns (address)',
+            'function converter() view returns (address)',
+            'function minter() view returns (address)',
+            'function totalAssets() view returns (uint256)',
+            'function requiredStakeForBasicNFT() view returns (uint256)',
+            'function basicNFTPricingRouter() view returns (address)',
+            'function basicNFTPricingUsdc() view returns (address)',
+            'function basicNFTPricingTwapAnchor() view returns (uint32,uint256)',
+            'function totalTCGVAllocated() view returns (uint256)',
+            'function tgeTimestamp() view returns (uint256)',
+            'function presaleEndTime() view returns (uint256)',
+            'function soldCount() view returns (uint256)',
+            'function wave2StartTimestamp() view returns (uint256)',
+            'function ratio() view returns (uint256)',
+            'function tcgr() view returns (address)',
+            'function tcgv() view returns (address)',
+          ]);
+
+          let client;
+          let selectedRpc;
+          const rpcErrors = [];
+          for (const url of RPCS) {
+            const candidate = createPublicClient({
+              chain: bscTestnet,
+              transport: http(url, { timeout: 15000, retryCount: 1 }),
+              batch: { multicall: false },
+            });
+            try {
+              const [chainId, blockNumber] = await Promise.all([
+                candidate.getChainId(),
+                candidate.getBlockNumber(),
+              ]);
+              if (chainId !== 97) throw new Error(`unexpected chainId ${chainId}`);
+              client = candidate;
+              selectedRpc = url;
+              console.log(`selected RPC ${url} at block ${blockNumber}`);
+              break;
+            } catch (error) {
+              rpcErrors.push({ url, error: String(error) });
+            }
+          }
+          if (!client) throw new Error(`all public RPCs failed: ${JSON.stringify(rpcErrors)}`);
+
+          const out = {
+            schema: 'tcg-bsc97-readonly-snapshot/v1',
+            timestamp: new Date().toISOString(),
+            selectedRpc,
+            rpcErrors,
+            chainId: await client.getChainId(),
+            blockNumber: String(await client.getBlockNumber()),
+            addresses: ADDR,
+            contracts: {},
+            calls: {},
+            summary: {},
+          };
+
+          const normalize = (value) => {
+            if (typeof value === 'bigint') return value.toString();
+            if (Array.isArray(value)) return value.map(normalize);
+            return value;
+          };
+          const sameAddress = (a, b) =>
+            typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
+
+          async function read(label, address, functionName, args = []) {
+            try {
+              const value = await client.readContract({ address, abi: ABI, functionName, args });
+              out.calls[label] = { ok: true, value: normalize(value) };
+              return value;
+            } catch (error) {
+              out.calls[label] = { ok: false, error: String(error) };
+              return undefined;
+            }
+          }
+
+          for (const [name, address] of Object.entries(ADDR)) {
+            const code = await client.getCode({ address });
+            out.contracts[name] = {
+              address,
+              hasCode: Boolean(code && code !== '0x'),
+              codeBytes: code && code !== '0x' ? (code.length - 2) / 2 : 0,
+              codeHash: code && code !== '0x' ? keccak256(code) : null,
+            };
+          }
+
+          const usdcDecimals = await read('USDC.decimals', ADDR.USDC, 'decimals');
+          await read('USDC.totalSupply', ADDR.USDC, 'totalSupply');
+
+          const pairToken0 = await read('PAIR.token0', ADDR.PAIR, 'token0');
+          const pairToken1 = await read('PAIR.token1', ADDR.PAIR, 'token1');
+          const pairReserves = await read('PAIR.getReserves', ADDR.PAIR, 'getReserves');
+          const pairLpSupply = await read('PAIR.totalSupply', ADDR.PAIR, 'totalSupply');
+
+          const tcgvSupply = await read('TCGV.totalSupply', ADDR.TCGV, 'totalSupply');
+          const tcgvConverterReserve = await read('TCGV.balanceOf(CONVERTER)', ADDR.TCGV, 'balanceOf', [ADDR.CONVERTER]);
+          const tcgvPairBalance = await read('TCGV.balanceOf(PAIR)', ADDR.TCGV, 'balanceOf', [ADDR.PAIR]);
+          const tcgvStaking = await read('TCGV.stakingVault', ADDR.TCGV, 'stakingVault');
+          const tcgvLaunch = await read('TCGV.initialLaunch', ADDR.TCGV, 'initialLaunch');
+          const tcgvBuyRouter = await read('TCGV.buyRouter', ADDR.TCGV, 'buyRouter');
+          const presaleActive = await read('TCGV.presaleActive', ADDR.TCGV, 'presaleActive');
+          const supplyRecomputed = await read('TCGV.supplyRecomputed', ADDR.TCGV, 'supplyRecomputed');
+
+          const tcgrSupply = await read('TCGR.totalSupply', ADDR.TCGR, 'totalSupply');
+          const qualifyingNft = await read('TCGR.qualifyingNft', ADDR.TCGR, 'qualifyingNft');
+          const tcgrConverter = await read('TCGR.converter', ADDR.TCGR, 'converter');
+          const tcgrMinter = await read('TCGR.minter', ADDR.TCGR, 'minter');
+
+          const nexusSupply = await read('NEXUS.totalSupply', ADDR.NEXUS, 'totalSupply');
+
+          const stakingAssets = await read('STAKING.totalAssets', ADDR.STAKING, 'totalAssets');
+          const stakingShares = await read('STAKING.totalSupply', ADDR.STAKING, 'totalSupply');
+          const requiredStake = await read('STAKING.requiredStakeForBasicNFT', ADDR.STAKING, 'requiredStakeForBasicNFT');
+          const pricingRouter = await read('STAKING.basicNFTPricingRouter', ADDR.STAKING, 'basicNFTPricingRouter');
+          const pricingUsdc = await read('STAKING.basicNFTPricingUsdc', ADDR.STAKING, 'basicNFTPricingUsdc');
+          const twapAnchor = await read('STAKING.basicNFTPricingTwapAnchor', ADDR.STAKING, 'basicNFTPricingTwapAnchor');
+
+          const basicNftSupply = await read('BASIC_NFT.totalSupply', ADDR.BASIC_NFT, 'totalSupply');
+          const founderSold = await read('FOUNDER_NFT.soldCount', ADDR.FOUNDER_NFT, 'soldCount');
+          const founderWave2 = await read('FOUNDER_NFT.wave2StartTimestamp', ADDR.FOUNDER_NFT, 'wave2StartTimestamp');
+          const launchAllocation = await read('INITIAL_LAUNCH.totalTCGVAllocated', ADDR.INITIAL_LAUNCH, 'totalTCGVAllocated');
+          const launchTge = await read('INITIAL_LAUNCH.tgeTimestamp', ADDR.INITIAL_LAUNCH, 'tgeTimestamp');
+          const launchEnd = await read('INITIAL_LAUNCH.presaleEndTime', ADDR.INITIAL_LAUNCH, 'presaleEndTime');
+
+          const converterRatio = await read('CONVERTER.ratio', ADDR.CONVERTER, 'ratio');
+          const converterTcgr = await read('CONVERTER.tcgr', ADDR.CONVERTER, 'tcgr');
+          const converterTcgv = await read('CONVERTER.tcgv', ADDR.CONVERTER, 'tcgv');
+
+          for (const [name, account] of Object.entries({
+            PAIR: ADDR.PAIR,
+            CONVERTER: ADDR.CONVERTER,
+            STAKING: ADDR.STAKING,
+            BUY_ROUTER: ADDR.BUY_ROUTER,
+            INITIAL_LAUNCH: ADDR.INITIAL_LAUNCH,
+            FOUNDER_NFT: ADDR.FOUNDER_NFT,
+          })) {
+            await read(`USDC.balanceOf(${name})`, ADDR.USDC, 'balanceOf', [account]);
+          }
+
+          let pair = null;
+          if (Array.isArray(pairReserves) && pairReserves.length >= 2 && pairToken0 && pairToken1) {
+            const r0 = pairReserves[0];
+            const r1 = pairReserves[1];
+            const tcgvReserve = sameAddress(pairToken0, ADDR.TCGV) ? r0 : r1;
+            const usdcReserve = sameAddress(pairToken0, ADDR.USDC) ? r0 : r1;
+            pair = {
+              token0: pairToken0,
+              token1: pairToken1,
+              reserve0: String(r0),
+              reserve1: String(r1),
+              tcgvReserve: String(tcgvReserve),
+              usdcReserve: String(usdcReserve),
+              tcgvFormatted: formatUnits(tcgvReserve, 18),
+              usdcFormatted: usdcDecimals === undefined ? null : formatUnits(usdcReserve, Number(usdcDecimals)),
+              lpTotalSupply: pairLpSupply === undefined ? null : String(pairLpSupply),
+            };
+          }
+
+          const nonZero = (value) => typeof value === 'bigint' && value > 0n;
+          out.summary = {
+            pair,
+            usdcDecimals: normalize(usdcDecimals),
+            tcgvTotalSupply: normalize(tcgvSupply),
+            tcgrTotalSupply: normalize(tcgrSupply),
+            nexusTotalSupply: normalize(nexusSupply),
+            converterTcgvReserve: normalize(tcgvConverterReserve),
+            stakingAssets: normalize(stakingAssets),
+            stakingShares: normalize(stakingShares),
+            basicNftSupply: normalize(basicNftSupply),
+            founderSold: normalize(founderSold),
+            founderWave2Start: normalize(founderWave2),
+            initialLaunchAllocation: normalize(launchAllocation),
+            initialLaunchTge: normalize(launchTge),
+            initialLaunchEnd: normalize(launchEnd),
+            qualifyingNft: normalize(qualifyingNft),
+            requiredStake: normalize(requiredStake),
+            pricingRouter: normalize(pricingRouter),
+            pricingUsdc: normalize(pricingUsdc),
+            twapGetterSupported: out.calls['STAKING.basicNFTPricingTwapAnchor']?.ok === true,
+            twapAnchor: normalize(twapAnchor),
+            bindings: {
+              tcgvStakingMatches: sameAddress(tcgvStaking, ADDR.STAKING),
+              tcgvLaunchMatches: sameAddress(tcgvLaunch, ADDR.INITIAL_LAUNCH),
+              tcgvBuyRouterMatches: sameAddress(tcgvBuyRouter, ADDR.BUY_ROUTER),
+              tcgrConverterMatches: sameAddress(tcgrConverter, ADDR.CONVERTER),
+              tcgrMinterMatches: sameAddress(tcgrMinter, ADDR.BUY_ROUTER),
+              converterTcgrMatches: sameAddress(converterTcgr, ADDR.TCGR),
+              converterTcgvMatches: sameAddress(converterTcgv, ADDR.TCGV),
+            },
+            stateFlags: { presaleActive, supplyRecomputed },
+            activation: {
+              pairHasLiquidity: Boolean(pair && (BigInt(pair.tcgvReserve) > 0n || BigInt(pair.usdcReserve) > 0n || BigInt(pair.lpTotalSupply ?? '0') > 0n)),
+              converterFunded: nonZero(tcgvConverterReserve),
+              tcgvMinted: nonZero(tcgvSupply),
+              tcgrMinted: nonZero(tcgrSupply),
+              nexusMinted: nonZero(nexusSupply),
+              stakingActive: nonZero(stakingAssets) || nonZero(stakingShares),
+              basicNftActive: nonZero(basicNftSupply),
+              presaleHasAllocation: nonZero(launchAllocation),
+              qualifyingNftEnabled: typeof qualifyingNft === 'string' && qualifyingNft.toLowerCase() !== ZERO,
+            },
+          };
+
+          const outDir = `${process.env.GITHUB_WORKSPACE}/tcg-output`;
+          fs.mkdirSync(outDir, { recursive: true });
+          fs.writeFileSync(`${outDir}/current-snapshot.json`, JSON.stringify(out, null, 2));
+          const active = Object.entries(out.summary.activation).filter(([, enabled]) => enabled).map(([name]) => name);
+          const summary = [
+            `TIMESTAMP=${out.timestamp}`,
+            `RPC=${selectedRpc}`,
+            `BLOCK=${out.blockNumber}`,
+            `USDC_DECIMALS=${String(usdcDecimals)}`,
+            `ACTIVE_GATES=${active.join(',') || 'none'}`,
+            `PAIR=${JSON.stringify(pair)}`,
+            `CONVERTER_TCGV_RESERVE=${String(tcgvConverterReserve)}`,
+            `TCGV_TOTAL_SUPPLY=${String(tcgvSupply)}`,
+            `TCGR_TOTAL_SUPPLY=${String(tcgrSupply)}`,
+            `NEXUS_TOTAL_SUPPLY=${String(nexusSupply)}`,
+            `STAKING_ASSETS=${String(stakingAssets)}`,
+            `STAKING_SHARES=${String(stakingShares)}`,
+            `BASIC_NFT_SUPPLY=${String(basicNftSupply)}`,
+            `INITIAL_LAUNCH_ALLOCATION=${String(launchAllocation)}`,
+            `QUALIFYING_NFT=${String(qualifyingNft)}`,
+            `TWAP_GETTER_SUPPORTED=${String(out.summary.twapGetterSupported)}`,
+          ].join('\n') + '\n';
+          fs.writeFileSync(`${outDir}/summary.txt`, summary);
+          console.log(summary);
+          EOF
+
+      - name: Execute read-only snapshot
+        shell: bash
+        working-directory: /tmp/tcg-bsc97-probe
+        run: |
+          set -o pipefail
+          node probe.mjs 2>&1 | tee "$GITHUB_WORKSPACE/tcg-output/probe.log"
+
+      - name: Record integrity
+        if: always()
+        shell: bash
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          sha256sum tcg-output/* 2>/dev/null | sort > tcg-output/SHA256SUMS.txt || true
+
+      - name: Upload snapshot evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bsc97-readonly-snapshot
+          path: tcg-output/
+          if-no-files-found: warn
+          retention-days: 1
