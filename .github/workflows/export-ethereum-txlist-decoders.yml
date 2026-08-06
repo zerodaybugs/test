@@ -1,0 +1,167 @@
+name: export-ethereum-txlist-decoders
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/export-ethereum-txlist-decoders.yml'
+      - 'ethereum-txlist-decoders-trigger.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  alloy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Build Reth-compatible Alloy transaction-list decoder
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/alloy-txlist/src export-alloy
+          cat > /tmp/alloy-txlist/Cargo.toml <<'EOF'
+          [package]
+          name = "alloy-txlist-decode"
+          version = "0.1.0"
+          edition = "2024"
+          rust-version = "1.95"
+          publish = false
+
+          [dependencies]
+          alloy-consensus = { version = "=2.1.1", features = ["k256"] }
+          alloy-eips = "=2.1.1"
+          alloy-primitives = "=1.6.1"
+          alloy-rlp = "=0.3.16"
+          alloy-serde = "=2.1.1"
+          alloy-tx-macros = "=2.1.1"
+          hex = "=0.4.3"
+          serde_json = "=1.0.145"
+          EOF
+          cat > /tmp/alloy-txlist/src/main.rs <<'EOF'
+          use alloy_consensus::{transaction::SignerRecoverable, Transaction, TxEnvelope};
+          use alloy_eips::{Encodable2718, Typed2718};
+          use alloy_rlp::{Decodable, Encodable};
+          use serde_json::json;
+          use std::io::{self, BufRead};
+
+          fn main() {
+              let stdin = io::stdin();
+              for line in stdin.lock().lines() {
+                  let input = match line { Ok(v) => v, Err(e) => { println!("{}", json!({"accepted":false,"stage":"stdin","error":e.to_string()})); continue; } };
+                  let input = input.trim();
+                  if input.is_empty() { continue; }
+                  let raw = input.strip_prefix("0x").unwrap_or(input);
+                  let bytes = match hex::decode(raw) { Ok(v) => v, Err(e) => { println!("{}", json!({"input":input,"accepted":false,"stage":"hex","error":e.to_string()})); continue; } };
+                  let mut cursor = bytes.as_slice();
+                  match Vec::<TxEnvelope>::decode(&mut cursor) {
+                      Ok(txs) if cursor.is_empty() => {
+                          let items: Vec<_> = txs.iter().map(|tx| {
+                              let recovery = tx.recover_signer().map(|a| format!("{a:?}"));
+                              let mut network = Vec::new();
+                              tx.encode(&mut network);
+                              let mut trie = Vec::new();
+                              tx.encode_2718(&mut trie);
+                              json!({
+                                  "tx_type":tx.ty(), "chain_id":tx.chain_id(), "nonce":tx.nonce(), "gas_limit":tx.gas_limit(),
+                                  "signature_recovery_ok":recovery.is_ok(), "recovered_signer":recovery.ok(),
+                                  "stored_hash":format!("{:?}", tx.tx_hash()),
+                                  "network_rlp":"0x".to_string()+&hex::encode(network),
+                                  "trie_encoding":"0x".to_string()+&hex::encode(trie),
+                              })
+                          }).collect();
+                          let mut reencoded = Vec::new();
+                          txs.encode(&mut reencoded);
+                          println!("{}", json!({"input":input,"accepted":true,"count":txs.len(),"items":items,"reencoded_list":"0x".to_string()+&hex::encode(reencoded)}));
+                      }
+                      Ok(_) => println!("{}", json!({"input":input,"accepted":false,"stage":"trailing_bytes"})),
+                      Err(e) => println!("{}", json!({"input":input,"accepted":false,"stage":"rlp_tx_list","error":e.to_string(),"error_debug":format!("{e:?}")})),
+                  }
+              }
+          }
+          EOF
+          cd /tmp/alloy-txlist
+          cargo generate-lockfile
+          cargo build --release --locked
+          cp target/release/alloy-txlist-decode "$GITHUB_WORKSPACE/export-alloy/"
+          cp Cargo.toml Cargo.lock "$GITHUB_WORKSPACE/export-alloy/"
+          rustc --version > "$GITHUB_WORKSPACE/export-alloy/RUSTC_VERSION.txt"
+          sha256sum "$GITHUB_WORKSPACE/export-alloy"/* | sort > "$GITHUB_WORKSPACE/export-alloy/SHA256SUMS.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alloy-txlist-reth-2.4.1-linux-amd64
+          path: export-alloy/
+          if-no-files-found: error
+          retention-days: 1
+
+  geth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.6'
+      - name: Build Geth transaction-list decoder
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/geth-txlist export-geth
+          cat > /tmp/geth-txlist/go.mod <<'EOF'
+          module geth-txlist-decode
+          go 1.24
+          require github.com/ethereum/go-ethereum v1.17.4
+          EOF
+          cat > /tmp/geth-txlist/main.go <<'EOF'
+          package main
+
+          import (
+              "bufio"
+              "encoding/hex"
+              "encoding/json"
+              "fmt"
+              "os"
+              "strings"
+              "github.com/ethereum/go-ethereum/core/types"
+              "github.com/ethereum/go-ethereum/rlp"
+          )
+
+          func emit(v any) { b,_ := json.Marshal(v); fmt.Println(string(b)) }
+
+          func main() {
+              scanner := bufio.NewScanner(os.Stdin)
+              scanner.Buffer(make([]byte,1024),16*1024*1024)
+              for scanner.Scan() {
+                  input := strings.TrimSpace(scanner.Text()); if input=="" { continue }
+                  raw := strings.TrimPrefix(input,"0x")
+                  bytes,err := hex.DecodeString(raw); if err!=nil { emit(map[string]any{"input":input,"accepted":false,"stage":"hex","error":err.Error()}); continue }
+                  var txs types.Transactions
+                  if err := rlp.DecodeBytes(bytes,&txs); err!=nil { emit(map[string]any{"input":input,"accepted":false,"stage":"rlp_tx_list","error":err.Error()}); continue }
+                  items := make([]map[string]any,0,len(txs))
+                  for _,tx := range txs {
+                      encoded,encErr := tx.MarshalBinary()
+                      item := map[string]any{"tx_type":tx.Type(),"chain_id":tx.ChainId().String(),"nonce":tx.Nonce(),"gas_limit":tx.Gas(),"hash":tx.Hash().Hex()}
+                      if encErr==nil { item["trie_encoding"]="0x"+hex.EncodeToString(encoded) } else { item["encode_error"]=encErr.Error() }
+                      items=append(items,item)
+                  }
+                  reencoded,encErr := rlp.EncodeToBytes(txs)
+                  out := map[string]any{"input":input,"accepted":true,"count":len(txs),"items":items}
+                  if encErr==nil { out["reencoded_list"]="0x"+hex.EncodeToString(reencoded) } else { out["encode_error"]=encErr.Error() }
+                  emit(out)
+              }
+          }
+          EOF
+          cd /tmp/geth-txlist
+          go mod tidy
+          go build -trimpath -ldflags='-s -w' -o geth-txlist-decode ./
+          cp geth-txlist-decode go.mod go.sum "$GITHUB_WORKSPACE/export-geth/"
+          go version > "$GITHUB_WORKSPACE/export-geth/GO_VERSION.txt"
+          sha256sum "$GITHUB_WORKSPACE/export-geth"/* | sort > "$GITHUB_WORKSPACE/export-geth/SHA256SUMS.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: geth-txlist-1.17.4-linux-amd64
+          path: export-geth/
+          if-no-files-found: error
+          retention-days: 1
