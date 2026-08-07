@@ -1,0 +1,183 @@
+name: Temporary Velocity Jupiter mock SBF compatibility build 20260807
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp_velocity_jupiter_mock_compat_build_20260807.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install pinned Agave 2.3.11 SBF toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libssl-dev pkg-config zlib1g-dev llvm clang cmake make libudev-dev >/dev/null
+          sh -c "$(curl -sSfL https://release.anza.xyz/v2.3.11/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
+          solana --version | tee toolchain.txt
+          cargo build-sbf --version | tee -a toolchain.txt
+
+      - name: Generate minimal Bankrun-compatible Jupiter-v6 mock
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p mock/src artifact
+          mv toolchain.txt artifact/TOOLCHAIN.txt
+          cat > mock/Cargo.toml <<'TOML'
+          [package]
+          name = "velocity-jupiter-mock"
+          version = "0.1.0"
+          edition = "2021"
+          publish = false
+
+          [lib]
+          crate-type = ["cdylib", "lib"]
+
+          [dependencies]
+          solana-program = "=1.18.26"
+
+          [profile.release]
+          overflow-checks = true
+          lto = "fat"
+          codegen-units = 1
+          TOML
+
+          cat > mock/src/lib.rs <<'RUST'
+          use solana_program::{
+              account_info::{next_account_info, AccountInfo},
+              declare_id,
+              entrypoint,
+              entrypoint::ProgramResult,
+              instruction::{AccountMeta, Instruction},
+              program::{invoke, invoke_signed},
+              program_error::ProgramError,
+              pubkey::Pubkey,
+          };
+
+          declare_id!("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4");
+          entrypoint!(process_instruction);
+
+          fn token_transfer_ix(
+              token_program: &Pubkey,
+              source: &Pubkey,
+              destination: &Pubkey,
+              authority: &Pubkey,
+              amount: u64,
+          ) -> Instruction {
+              let mut data = Vec::with_capacity(9);
+              data.push(3);
+              data.extend_from_slice(&amount.to_le_bytes());
+              Instruction {
+                  program_id: *token_program,
+                  accounts: vec![
+                      AccountMeta::new(*source, false),
+                      AccountMeta::new(*destination, false),
+                      AccountMeta::new_readonly(*authority, true),
+                  ],
+                  data,
+              }
+          }
+
+          pub fn process_instruction(
+              program_id: &Pubkey,
+              accounts: &[AccountInfo],
+              data: &[u8],
+          ) -> ProgramResult {
+              if data.len() != 16 {
+                  return Err(ProgramError::InvalidInstructionData);
+              }
+              let amount_in = u64::from_le_bytes(
+                  data[0..8].try_into().map_err(|_| ProgramError::InvalidInstructionData)?,
+              );
+              let amount_out = u64::from_le_bytes(
+                  data[8..16].try_into().map_err(|_| ProgramError::InvalidInstructionData)?,
+              );
+              let mut iter = accounts.iter();
+              let authority = next_account_info(&mut iter)?;
+              let asset_source = next_account_info(&mut iter)?;
+              let asset_pool = next_account_info(&mut iter)?;
+              let liability_pool = next_account_info(&mut iter)?;
+              let liability_destination = next_account_info(&mut iter)?;
+              let pool_authority = next_account_info(&mut iter)?;
+              let token_program = next_account_info(&mut iter)?;
+              if iter.next().is_some() {
+                  return Err(ProgramError::InvalidArgument);
+              }
+              if !authority.is_signer {
+                  return Err(ProgramError::MissingRequiredSignature);
+              }
+              let (expected_pool_authority, bump) = Pubkey::find_program_address(&[b"pool"], program_id);
+              if expected_pool_authority != *pool_authority.key {
+                  return Err(ProgramError::InvalidSeeds);
+              }
+              if amount_in > 0 {
+                  let ix = token_transfer_ix(token_program.key, asset_source.key, asset_pool.key, authority.key, amount_in);
+                  invoke(&ix, &[asset_source.clone(), asset_pool.clone(), authority.clone(), token_program.clone()])?;
+              }
+              if amount_out > 0 {
+                  let ix = token_transfer_ix(token_program.key, liability_pool.key, liability_destination.key, pool_authority.key, amount_out);
+                  let signer_seeds: &[&[u8]] = &[b"pool", &[bump]];
+                  invoke_signed(
+                      &ix,
+                      &[liability_pool.clone(), liability_destination.clone(), pool_authority.clone(), token_program.clone()],
+                      &[signer_seeds],
+                  )?;
+              }
+              Ok(())
+          }
+          RUST
+
+          curl -fsSL https://raw.githubusercontent.com/anza-xyz/agave/v1.18.26/Cargo.lock -o mock/Cargo.lock
+          cat >> mock/Cargo.lock <<'LOCK'
+
+          [[package]]
+          name = "velocity-jupiter-mock"
+          version = "0.1.0"
+          dependencies = [
+           "solana-program",
+          ]
+          LOCK
+          sha256sum mock/Cargo.toml mock/Cargo.lock mock/src/lib.rs | tee artifact/SOURCE_SHA256SUMS.txt
+
+      - name: Build exact compatibility SBF
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
+          cargo build-sbf --manifest-path mock/Cargo.toml --sbf-out-dir artifact --locked 2>&1 | tee artifact/BUILD.log
+          test -s artifact/velocity_jupiter_mock.so
+          sha256sum artifact/velocity_jupiter_mock.so | tee artifact/BINARY_SHA256.txt
+          file artifact/velocity_jupiter_mock.so | tee artifact/FILE_TYPE.txt
+          readelf -h artifact/velocity_jupiter_mock.so > artifact/ELF_HEADER.txt
+          stat -c '%n %s bytes' artifact/velocity_jupiter_mock.so | tee artifact/BINARY_SIZE.txt
+
+      - name: Build manifest
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          root=Path('artifact'); rows=[]
+          for p in sorted(root.glob('*')):
+              if p.is_file():
+                  b=p.read_bytes(); rows.append({'name':p.name,'bytes':len(b),'sha256':hashlib.sha256(b).hexdigest()})
+          (root/'MANIFEST.json').write_text(json.dumps(rows,indent=2)+'\n')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: velocity-jupiter-mock-compat-${{ github.run_id }}
+          path: artifact/
+          retention-days: 1
+          if-no-files-found: error
