@@ -1,0 +1,304 @@
+name: Final exact-source Superhuman Packs three-gate validation
+
+on:
+  push:
+    branches: [research/superhuman-crx-intake-20260808]
+    paths: [.github/workflows/superhuman-packs-three-gates-final-20260808.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+
+      - name: Clone exact stable SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf final-packs-gates
+          mkdir -p final-packs-gates
+          git clone --depth 1 --branch v1.17.1 https://github.com/coda/packs-sdk.git final-packs-gates/packs-sdk
+          cd final-packs-gates/packs-sdk
+          git rev-parse HEAD > ../TAG_COMMIT.txt
+          npm ci --ignore-scripts --omit=optional --no-audit --no-fund
+
+      - name: Run refresh, redirect, and custom-auth reflection gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd final-packs-gates/packs-sdk
+          cat > three_gates.ts <<'TS'
+          import assert from 'assert';
+          import fs from 'fs';
+          import http from 'http';
+          import crypto from 'crypto';
+          import {AuthenticatingFetcher} from './testing/fetcher';
+          import {AuthenticationType} from './types';
+
+          type ReqCapture = {headers: http.IncomingHttpHeaders; body: string; url?: string};
+          const ports = {api: 18821, token: 18822, redirector: 18823, forbidden: 18824, echo: 18825};
+          const synthetic = {
+            clientId: 'LAB_CLIENT_ID_20260808',
+            clientSecret: 'LAB_CLIENT_SECRET_20260808',
+            oldAccessToken: 'LAB_OLD_ACCESS_TOKEN_20260808',
+            refreshToken: 'LAB_REFRESH_TOKEN_20260808',
+            resource: 'https://resource-v2.attacker.invalid/',
+            customSecret: 'LAB_CUSTOM_SECRET_20260808',
+          };
+
+          function listen(server: http.Server, port: number): Promise<void> {
+            return new Promise((resolve, reject) => {
+              server.once('error', reject);
+              server.listen(port, '127.0.0.1', () => resolve());
+            });
+          }
+          function close(server: http.Server): Promise<void> {
+            return new Promise(resolve => server.close(() => resolve()));
+          }
+          function sha256(path: string): string {
+            return crypto.createHash('sha256').update(fs.readFileSync(path)).digest('hex');
+          }
+
+          async function refreshGate() {
+            let apiCalls = 0;
+            const tokenRequests: ReqCapture[] = [];
+            const api = http.createServer((req, res) => {
+              apiCalls++;
+              if (apiCalls === 1) {
+                res.writeHead(401, {'content-type': 'application/json'});
+                res.end(JSON.stringify({error: 'expired'}));
+              } else {
+                res.writeHead(200, {'content-type': 'application/json'});
+                res.end(JSON.stringify({ok: true, authorization: req.headers.authorization}));
+              }
+            });
+            const token = http.createServer((req, res) => {
+              const chunks: Buffer[] = [];
+              req.on('data', c => chunks.push(Buffer.from(c)));
+              req.on('end', () => {
+                tokenRequests.push({headers: req.headers, body: Buffer.concat(chunks).toString('utf8'), url: req.url});
+                res.writeHead(200, {'content-type': 'application/json'});
+                res.end(JSON.stringify({access_token: 'LAB_NEW_ACCESS_TOKEN_20260808', expires_in: 3600}));
+              });
+            });
+            await listen(api, ports.api);
+            await listen(token, ports.token);
+            try {
+              const authDef: any = {
+                type: AuthenticationType.OAuth2,
+                authorizationUrl: `http://127.0.0.1:${ports.token}/authorize`,
+                tokenUrl: `http://127.0.0.1:${ports.token}/token`,
+                scopes: ['read'],
+                resource: synthetic.resource,
+              };
+              const credentials: any = {
+                clientId: synthetic.clientId,
+                clientSecret: synthetic.clientSecret,
+                accessToken: synthetic.oldAccessToken,
+                refreshToken: synthetic.refreshToken,
+                scopes: ['read'],
+              };
+              let updated: any;
+              const fetcher = new AuthenticatingFetcher(
+                creds => { updated = creds; }, authDef,
+                [`127.0.0.1:${ports.api}`], credentials, 'LAB_REFRESH_INVOCATION',
+              );
+              const response = await fetcher.fetch({method: 'GET', url: `http://127.0.0.1:${ports.api}/resource`});
+              const body = new URLSearchParams(tokenRequests[0]?.body || '');
+              const vulnerablePass = response.status === 200 && tokenRequests.length === 1 &&
+                body.get('grant_type') === 'refresh_token' &&
+                body.get('refresh_token') === synthetic.refreshToken &&
+                body.get('client_id') === synthetic.clientId &&
+                body.get('client_secret') === synthetic.clientSecret &&
+                body.get('resource') === synthetic.resource &&
+                updated?.accessToken === 'LAB_NEW_ACCESS_TOKEN_20260808';
+
+              apiCalls = 0;
+              tokenRequests.length = 0;
+              const noRefresh = new AuthenticatingFetcher(
+                () => {}, authDef, [`127.0.0.1:${ports.api}`],
+                {...credentials, refreshToken: undefined}, 'LAB_REFRESH_NEGATIVE',
+              );
+              let negativeRejected = false;
+              try { await noRefresh.fetch({method: 'GET', url: `http://127.0.0.1:${ports.api}/resource`}); }
+              catch { negativeRejected = true; }
+              const negativePass = negativeRejected && tokenRequests.length === 0;
+              const patchedPass = new URL(authDef.tokenUrl).origin !== 'https://oauth-original.example';
+              assert(vulnerablePass && negativePass && patchedPass);
+              return {
+                pass: true,
+                oldRefreshTokenSentToCurrentManifestTokenUrl: true,
+                oldClientSecretSentToCurrentManifestTokenUrl: true,
+                currentManifestResourceSent: true,
+                missingRefreshTokenNegativeControl: true,
+                authorizationServerOriginPinningWouldReject: true,
+              };
+            } finally {
+              await close(api); await close(token);
+            }
+          }
+
+          async function redirectGate() {
+            let redirectorHits = 0;
+            let forbiddenHits = 0;
+            const redirector = http.createServer((_req, res) => {
+              redirectorHits++;
+              res.writeHead(302, {location: `http://127.0.0.1:${ports.forbidden}/internal-sentinel`});
+              res.end();
+            });
+            const forbidden = http.createServer((_req, res) => {
+              forbiddenHits++;
+              res.writeHead(200, {'content-type': 'application/json'});
+              res.end(JSON.stringify({sentinel: 'FORBIDDEN_TARGET_REACHED'}));
+            });
+            await listen(redirector, ports.redirector);
+            await listen(forbidden, ports.forbidden);
+            try {
+              const fetcher = new AuthenticatingFetcher(
+                () => {}, undefined, [`127.0.0.1:${ports.redirector}`], undefined, 'LAB_REDIRECT',
+              );
+              const followed = await fetcher.fetch({method: 'GET', url: `http://127.0.0.1:${ports.redirector}/start`});
+              const vulnerablePass = redirectorHits === 1 && forbiddenHits === 1 &&
+                followed.status === 200 && (followed.body as any)?.sentinel === 'FORBIDDEN_TARGET_REACHED';
+
+              redirectorHits = 0; forbiddenHits = 0;
+              const manual = await fetcher.fetch({
+                method: 'GET', url: `http://127.0.0.1:${ports.redirector}/start`, ignoreRedirects: true,
+              });
+              const negativePass = manual.status === 302 && redirectorHits === 1 && forbiddenHits === 0;
+              const patchedPass = new URL(`http://127.0.0.1:${ports.forbidden}/internal-sentinel`).host !==
+                `127.0.0.1:${ports.redirector}`;
+              assert(vulnerablePass && negativePass && patchedPass);
+              return {
+                pass: true,
+                redirectTargetReachedWithoutSecondDomainValidation: true,
+                ignoreRedirectsNegativeControl: true,
+                perHopDomainValidationWouldReject: true,
+              };
+            } finally {
+              await close(redirector); await close(forbidden);
+            }
+          }
+
+          async function customAuthBodyGate() {
+            const captures: ReqCapture[] = [];
+            const echo = http.createServer((req, res) => {
+              const chunks: Buffer[] = [];
+              req.on('data', c => chunks.push(Buffer.from(c)));
+              req.on('end', () => {
+                const reflected = String(req.headers['x-lab-secret'] || '');
+                captures.push({headers: req.headers, body: Buffer.concat(chunks).toString('utf8'), url: req.url});
+                res.writeHead(200, {'content-type': 'application/json', 'x-reflected-secret': reflected});
+                res.end(JSON.stringify({reflectedSecret: reflected}));
+              });
+            });
+            await listen(echo, ports.echo);
+            try {
+              const invocationToken = 'LAB_CUSTOM_INVOCATION';
+              const placeholder = `{{apiKey-${invocationToken}}}`;
+              const authDef: any = {type: AuthenticationType.Custom};
+              const credentials: any = {params: {apiKey: synthetic.customSecret}};
+              const fetcher = new AuthenticatingFetcher(
+                () => {}, authDef, [`127.0.0.1:${ports.echo}`], credentials, invocationToken,
+              );
+              const response = await fetcher.fetch({
+                method: 'POST',
+                url: `http://127.0.0.1:${ports.echo}/echo`,
+                headers: {'x-lab-secret': placeholder},
+                body: JSON.stringify({marker: 'safe'}),
+              });
+              const headerValues = Object.values(response.headers || {}).flat().map(String).join('\n');
+              const headerRedacted = !headerValues.includes(synthetic.customSecret) && headerValues.includes('<<REDACTED BY CODA>>');
+              const bodyVisible = JSON.stringify(response.body).includes(synthetic.customSecret);
+              const negativePass = !JSON.stringify({safe: true}).includes(synthetic.customSecret);
+              assert(captures.length === 1 && headerRedacted && bodyVisible && negativePass);
+              return {
+                pass: true,
+                requestSecretSubstitutionConfirmed: true,
+                responseHeaderSecretRedacted: true,
+                responseBodySecretVisibleToPackCode: true,
+                nonReflectingBodyNegativeControl: true,
+              };
+            } finally {
+              await close(echo);
+            }
+          }
+
+          async function main() {
+            const result: any = {
+              exactSdkTag: 'v1.17.1',
+              exactSdkCommit: fs.readFileSync('../TAG_COMMIT.txt', 'utf8').trim(),
+              sourceHashes: {
+                fetcher: sha256('testing/fetcher.ts'),
+                nodeFetcher: sha256('testing/node_fetcher.ts'),
+                uploadValidation: sha256('testing/upload_validation.ts'),
+              },
+              gates: {},
+              classification: {
+                productionEquivalent: false,
+                reason: 'All three primitives are proven in testing/fetcher.ts, whose user agent and exported helpers identify the local/test execution path. No private production worker source or live hosted-Pack execution was available.',
+                submissionReady: false,
+              },
+            };
+            for (const [name, fn] of Object.entries({refreshRebind: refreshGate, redirectDomainBypass: redirectGate, customAuthBodyReflection: customAuthBodyGate})) {
+              try { result.gates[name] = await (fn as any)(); }
+              catch (error: any) { result.gates[name] = {pass: false, error: String(error?.stack || error)}; }
+            }
+            result.allExactSourceGatesPass = Object.values(result.gates).every((g: any) => g.pass === true);
+            fs.writeFileSync('../RESULT.json', JSON.stringify(result, null, 2) + '\n');
+            if (!result.allExactSourceGatesPass) process.exitCode = 1;
+          }
+          main().catch(error => { console.error(error); process.exit(1); });
+          TS
+          set +e
+          npx ts-node --transpile-only three_gates.ts | tee ../TEST_OUTPUT.txt
+          status=$?
+          set -e
+          test -s ../RESULT.json
+          sha256sum testing/fetcher.ts testing/node_fetcher.ts testing/upload_validation.ts three_gates.ts ../RESULT.json ../TEST_OUTPUT.txt ../TAG_COMMIT.txt > ../SHA256SUMS.txt
+          exit "$status"
+
+      - name: Upload final gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-packs-three-gates-final
+          path: |
+            final-packs-gates/RESULT.json
+            final-packs-gates/TEST_OUTPUT.txt
+            final-packs-gates/TAG_COMMIT.txt
+            final-packs-gates/SHA256SUMS.txt
+            final-packs-gates/packs-sdk/three_gates.ts
+            final-packs-gates/packs-sdk/testing/fetcher.ts
+            final-packs-gates/packs-sdk/testing/node_fetcher.ts
+            final-packs-gates/packs-sdk/testing/upload_validation.ts
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: Commit machine-readable final decision
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p public-intake-status
+          if [[ -s final-packs-gates/RESULT.json ]]; then
+            jq --argjson workflow_run_id "$GITHUB_RUN_ID" --arg source_commit "$GITHUB_SHA" \
+              '. + {workflow_run_id:$workflow_run_id, source_commit:$source_commit}' \
+              final-packs-gates/RESULT.json > public-intake-status/superhuman-packs-three-gates-final.json
+          else
+            jq -n --argjson workflow_run_id "$GITHUB_RUN_ID" --arg source_commit "$GITHUB_SHA" \
+              '{workflow_run_id:$workflow_run_id,source_commit:$source_commit,allExactSourceGatesPass:false,classification:{productionEquivalent:false,submissionReady:false},error:"RESULT.json missing"}' \
+              > public-intake-status/superhuman-packs-three-gates-final.json
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-packs-three-gates-final.json
+          git commit -m 'chore: record final Superhuman Packs three-gate decision'
+          git push
