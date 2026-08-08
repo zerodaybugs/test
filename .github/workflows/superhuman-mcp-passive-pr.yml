@@ -1,0 +1,71 @@
+name: Isolated Superhuman MCP passive PR gate
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run passive auth and CORS gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p mcp-pr/evidence mcp-pr/raw
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,re,subprocess
+          root=pathlib.Path('mcp-pr'); raw=root/'raw'; ev=root/'evidence'
+          base='https://mcp.mail.superhuman.com'; origin='https://attacker.example'
+          cases=[
+            ('options','OPTIONS',base+'/mcp',[f'Origin: {origin}','Access-Control-Request-Method: POST','Access-Control-Request-Headers: authorization,content-type,mcp-protocol-version,mcp-session-id'],None),
+            ('init_noauth','POST',base+'/mcp',[f'Origin: {origin}','Content-Type: application/json','Accept: application/json, text/event-stream','MCP-Protocol-Version: 2025-06-18'],json.dumps({'jsonrpc':'2.0','id':'lab-noauth','method':'initialize','params':{'protocolVersion':'2025-06-18','capabilities':{},'clientInfo':{'name':'bounded-gate','version':'1'}}})),
+            ('init_bogus','POST',base+'/mcp',[f'Origin: {origin}','Authorization: Bearer LAB_ONLY_INVALID_20260808','Content-Type: application/json','Accept: application/json, text/event-stream','MCP-Protocol-Version: 2025-06-18'],json.dumps({'jsonrpc':'2.0','id':'lab-bogus','method':'initialize','params':{'protocolVersion':'2025-06-18','capabilities':{},'clientInfo':{'name':'bounded-gate','version':'1'}}})),
+            ('protected','GET',base+'/.well-known/oauth-protected-resource/mcp',[],None),
+            ('authmeta','GET',base+'/.well-known/oauth-authorization-server',[],None),
+          ]
+          def call(name,method,url,headers,body):
+            hp=raw/f'{name}.headers'; bp=raw/f'{name}.body'
+            cmd=['curl','-sS','--max-time','20','--max-redirs','0','-X',method,'-A','bounded-authorized-research','-D',str(hp),'-o',str(bp),'-w','%{http_code}',url]
+            for h in headers: cmd+=['-H',h]
+            if body is not None: cmd+=['--data-binary',body]
+            p=subprocess.run(cmd,text=True,capture_output=True)
+            try: status=int(p.stdout.strip()[-3:])
+            except: status=0
+            ht=hp.read_text(errors='replace') if hp.exists() else ''; bb=bp.read_bytes()[:1000000] if bp.exists() else b''
+            hm={}
+            for line in ht.splitlines():
+              if ':' in line:
+                k,v=line.split(':',1); hm.setdefault(k.strip().lower(),[]).append(v.strip())
+            try: obj=json.loads(bb.decode())
+            except: obj=None
+            return {'name':name,'url':url,'status':status,'curl_exit':p.returncode,'headers':hm,'json':obj,'body_size':len(bb),'body_sha256':hashlib.sha256(bb).hexdigest()}
+          rows=[call(*c) for c in cases]
+          disclosed=[]
+          for r in rows:
+            for h in r['headers'].get('www-authenticate',[]):
+              disclosed += re.findall(r'(?:resource_metadata|authorization_uri)="([^"]+)"',h)
+          for i,u in enumerate(sorted(set(x for x in disclosed if x.startswith('https://')))[:4]): rows.append(call(f'disclosed_{i}','GET',u,[],None))
+          reflected=[r['name'] for r in rows if origin in r['headers'].get('access-control-allow-origin',[])]
+          wildcard=[r['name'] for r in rows if '*' in r['headers'].get('access-control-allow-origin',[]) and 'true' in [x.lower() for x in r['headers'].get('access-control-allow-credentials',[])]]
+          unauth=[r['name'] for r in rows if r['name'].startswith('init_') and 200<=r['status']<300]
+          sessions=[r['name'] for r in rows if r['name'].startswith('init_') and r['headers'].get('mcp-session-id')]
+          registrations=[]
+          for r in rows:
+            if isinstance(r['json'],dict) and isinstance(r['json'].get('registration_endpoint'),str): registrations.append(r['json']['registration_endpoint'])
+          result={'workflow_run_id':int(os.environ['GITHUB_RUN_ID']),'request_count':len(rows),'reflected_attacker_origin_cases':reflected,'wildcard_origin_with_credentials_cases':wildcard,'unauthenticated_initialize_success_cases':unauth,'session_id_issued_without_valid_auth_cases':sessions,'registration_endpoints_disclosed':sorted(set(registrations)),'cross_account_or_mailbox_access_proven':False,'submit_ready':False,'decision':'PASSIVE_REVIEW','results':rows}
+          (ev/'RESULT.json').write_text(json.dumps(result,indent=2)+'\n')
+          PY
+          sha256sum mcp-pr/evidence/RESULT.json > mcp-pr/evidence/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: isolated-superhuman-mcp-passive-pr-gate
+          path: mcp-pr/
+          retention-days: 1
+          if-no-files-found: error
