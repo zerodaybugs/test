@@ -1,0 +1,161 @@
+name: Sui new VM bounded mainnet backtest 20260808
+
+on:
+  push:
+    branches:
+      - research/sui-vm-bounty-20260808
+    paths:
+      - '.github/workflows/sui-new-vm-mainnet-backtest-20260808.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/sui-new-vm-mainnet-backtest-20260808.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SUI_COMMIT: 5a9f37431c473fa2f6d49abecbcc6a6d7190f533
+  CARGO_INCREMENTAL: '0'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  bounded-read-only-backtest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    steps:
+      - name: Checkout research harness
+        uses: actions/checkout@v4
+
+      - name: Clone exact public Sui source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init sui
+          git -C sui remote add origin https://github.com/MystenLabs/sui.git
+          git -C sui fetch --depth=1 origin "${SUI_COMMIT}"
+          git -C sui checkout --detach FETCH_HEAD
+          test "$(git -C sui rev-parse HEAD)" = "${SUI_COMMIT}"
+          git -C sui rev-parse HEAD | tee SUI_SOURCE_COMMIT.txt
+          mkdir -p backtest-results/package-cache
+
+      - name: Resolve latest completed mainnet epoch with one benign RPC request
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error \
+            --connect-timeout 20 --max-time 60 \
+            https://fullnode.mainnet.sui.io:443 \
+            -H 'content-type: application/json' \
+            --data '{"jsonrpc":"2.0","id":1,"method":"suix_getLatestSuiSystemState","params":[]}' \
+            > backtest-results/LATEST_SYSTEM_STATE.json
+          jq -e '.result.epoch | tonumber' backtest-results/LATEST_SYSTEM_STATE.json >/dev/null
+          current_epoch=$(jq -r '.result.epoch | tonumber' backtest-results/LATEST_SYSTEM_STATE.json)
+          protocol_version=$(jq -r '.result.protocolVersion' backtest-results/LATEST_SYSTEM_STATE.json)
+          if [ "${current_epoch}" -le 0 ]; then
+            echo 'Invalid mainnet epoch' >&2
+            exit 1
+          fi
+          completed_epoch=$((current_epoch - 1))
+          echo "${current_epoch}" | tee backtest-results/CURRENT_EPOCH.txt
+          echo "${completed_epoch}" | tee backtest-results/TARGET_COMPLETED_EPOCH.txt
+          echo "${protocol_version}" | tee backtest-results/CURRENT_PROTOCOL_VERSION.txt
+
+      - name: Build exact execution backtest
+        shell: bash
+        run: |
+          set -o pipefail
+          cd sui
+          timeout 4200 cargo build -p sui-execution-backtest \
+            2>&1 | tee ../backtest-results/BACKTEST_BUILD.log
+
+      - name: Replay a bounded recent mainnet sample
+        shell: bash
+        run: |
+          set +e
+          target_epoch=$(cat backtest-results/TARGET_COMPLETED_EPOCH.txt)
+          cd sui
+          timeout 3300 cargo run -p sui-execution-backtest -- \
+            --remote-store-url https://checkpoints.mainnet.sui.io \
+            --fullnode-url https://fullnode.mainnet.sui.io:443 \
+            --graphql mainnet \
+            --start-epoch "${target_epoch}" \
+            --end-epoch "${target_epoch}" \
+            --max-checkpoints-per-epoch 30 \
+            --status success \
+            --execute-concurrency 1 \
+            --cache ../backtest-results/package-cache \
+            --store ndjson \
+            --output ../backtest-results/divergences.ndjson \
+            2>&1 | tee ../backtest-results/BACKTEST_RUN.log
+          rc=${PIPESTATUS[0]}
+          echo "${rc}" > ../backtest-results/BACKTEST_RUN.exit_code
+          exit 0
+
+      - name: Classify exact-effect divergences
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from collections import Counter
+          from pathlib import Path
+
+          root = Path('backtest-results')
+          rows = []
+          path = root / 'divergences.ndjson'
+          if path.exists():
+              for line in path.read_text(errors='replace').splitlines():
+                  if not line.strip():
+                      continue
+                  try:
+                      rows.append(json.loads(line))
+                  except json.JSONDecodeError:
+                      pass
+          divergences = [r for r in rows if r.get('row_type') == 'divergence' or 'tx_digest' in r]
+          stats = [r for r in rows if r.get('row_type') == 'run_stats' or 'checked' in r]
+          clean = []
+          reconstruction = []
+          for row in divergences:
+              gap = sum(int(row.get(k) or 0) for k in (
+                  'missing_modified', 'missing_loaded', 'missing_consensus', 'digest_mismatches'
+              ))
+              (reconstruction if gap else clean).append(row)
+          by_error = Counter(str(r.get('recomputed_error_kind')) for r in clean)
+          payload = {
+              'source_commit': Path('SUI_SOURCE_COMMIT.txt').read_text().strip(),
+              'target_epoch': (root / 'TARGET_COMPLETED_EPOCH.txt').read_text().strip() if (root / 'TARGET_COMPLETED_EPOCH.txt').exists() else None,
+              'backtest_exit_code': int((root / 'BACKTEST_RUN.exit_code').read_text().strip()) if (root / 'BACKTEST_RUN.exit_code').exists() else None,
+              'rows': len(rows),
+              'stats_rows': len(stats),
+              'divergences_total': len(divergences),
+              'clean_divergences': len(clean),
+              'reconstruction_gap_divergences': len(reconstruction),
+              'clean_divergences_by_error': dict(by_error),
+              'candidate_transactions': clean[:100],
+              'gate': 'CANDIDATE_DIVERGENCE' if clean else ('PASS_NO_CLEAN_DIVERGENCE' if rows else 'INFRA_OR_NO_ROWS'),
+          }
+          (root / 'BACKTEST_ANALYSIS.json').write_text(json.dumps(payload, indent=2))
+          with (root / 'CLEAN_DIVERGENCES.ndjson').open('w') as f:
+              for row in clean:
+                  f.write(json.dumps(row, sort_keys=True) + '\n')
+          print(json.dumps(payload, indent=2))
+          PY
+          find backtest-results -type f \
+            ! -path 'backtest-results/package-cache/*' \
+            -print0 | sort -z | xargs -0 sha256sum \
+            > backtest-results/EVIDENCE_SHA256SUMS.txt
+          rm -rf backtest-results/package-cache
+
+      - name: Upload bounded backtest evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sui-new-vm-bounded-mainnet-backtest-20260808
+          path: |
+            SUI_SOURCE_COMMIT.txt
+            backtest-results/
+          retention-days: 2
