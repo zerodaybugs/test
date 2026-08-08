@@ -1,0 +1,106 @@
+name: Temporary Superhuman desktop preload map
+
+on:
+  push:
+    branches: [research/superhuman-desktop-20260808]
+    paths: [.github/workflows/superhuman-desktop-preload-map-20260808.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Download and extract exact official desktop release
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf preload-map
+          mkdir -p preload-map/raw preload-map/evidence
+          URL='https://storage.googleapis.com/download.superhuman.com/supertron-update/Superhuman-1041.0.29-latest-mac.zip'
+          curl --fail --show-error --silent --location --retry 3 --retry-all-errors "$URL" -o preload-map/raw/release.zip
+          echo '5b753f4c31dd0e5732f0e555bbd76e595c573445bf93b91fd25320e29bf2f014  preload-map/raw/release.zip' | sha256sum -c -
+          unzip -q preload-map/raw/release.zip -d preload-map/raw/unpacked
+          APP="$(find preload-map/raw/unpacked -name 'Superhuman.app' -type d | head -1)"
+          test -n "$APP"
+          npm --silent --no-progress install --global @electron/asar@3.4.1
+          asar extract "$APP/Contents/Resources/app.asar" preload-map/raw/source
+          cp preload-map/raw/source/dist/main.js preload-map/evidence/main.js
+          cp preload-map/raw/source/package.json preload-map/evidence/package.json
+          cp "$APP/Contents/Info.plist" preload-map/evidence/Info.plist
+          find preload-map/raw/source/dist -maxdepth 1 -type f \( -iname '*preload*.js' -o -iname '*hubspot*.js' \) -print0 | while IFS= read -r -d '' file; do
+            cp "$file" "preload-map/evidence/$(basename "$file")"
+          done
+          find preload-map/raw/source/dist -maxdepth 1 -type f -printf '%f\t%s\n' | sort > preload-map/evidence/dist-files.tsv
+
+      - name: Extract IPC and origin trust map
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json, os, re
+
+          root = Path('preload-map/evidence')
+          files = sorted(p for p in root.glob('*.js') if p.is_file())
+          records = []
+          patterns = {
+              'context_bridge': re.compile(r'exposeInMainWorld\s*\('),
+              'ipc_send': re.compile(r'ipcRenderer\.(?:send|sendSync)\s*\('),
+              'ipc_invoke': re.compile(r'ipcRenderer\.invoke\s*\('),
+              'ipc_receive': re.compile(r'ipcRenderer\.(?:on|once)\s*\('),
+              'main_on': re.compile(r'ipcMain\.on\s*\('),
+              'main_handle': re.compile(r'ipcMain\.handle\s*\('),
+              'window_open': re.compile(r'setWindowOpenHandler|will-navigate|will-redirect'),
+              'hubspot_origin': re.compile(r'app\.hubspot\.com/object-builder|HUBSPOT_[A-Z_]+'),
+              'privileged_sink': re.compile(r'shell\.openExternal|showItemInFolder|previewFile|CHECK_FILE_EXISTS|FORCE_UPDATE|USE_UPGRADE_CHANNEL|CLEAR_CACHE'),
+          }
+          for p in files:
+              text = p.read_text(errors='ignore')
+              for kind, rx in patterns.items():
+                  for m in list(rx.finditer(text))[:500]:
+                      records.append({
+                          'file': p.name,
+                          'kind': kind,
+                          'offset': m.start(),
+                          'context': text[max(0,m.start()-600):m.start()+1800].replace('\n',' '),
+                      })
+          channels = {}
+          channel_rx = re.compile(r"(?:send|sendSync|invoke|on|once|handle)\s*\(\s*['\"]([^'\"]+)['\"]")
+          for p in files:
+              text = p.read_text(errors='ignore')
+              for m in channel_rx.finditer(text):
+                  channels.setdefault(m.group(1), []).append({'file':p.name,'offset':m.start()})
+          status = {
+              'workflow_run_id': int(os.environ['GITHUB_RUN_ID']),
+              'source_commit': os.environ['GITHUB_SHA'],
+              'desktop_version': '1041.0.29',
+              'release_sha256': '5b753f4c31dd0e5732f0e555bbd76e595c573445bf93b91fd25320e29bf2f014',
+              'javascript_files': [p.name for p in files],
+              'record_count': len(records),
+              'channel_count': len(channels),
+              'sha256': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in files},
+          }
+          (root/'status.json').write_text(json.dumps(status,indent=2)+'\n')
+          (root/'ipc-origin-map.json').write_text(json.dumps(records,indent=2)+'\n')
+          (root/'channels.json').write_text(json.dumps(channels,indent=2,sort_keys=True)+'\n')
+          PY
+          find preload-map/evidence -type f -print0 | sort -z | xargs -0 sha256sum > preload-map/evidence/SHA256SUMS.txt
+          rm -rf preload-map/raw
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-desktop-preload-map-1041.0.29
+          path: preload-map/evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
