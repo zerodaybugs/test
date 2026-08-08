@@ -1,0 +1,164 @@
+name: Temporary Superhuman Packs custom-auth response-body PR gate
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+
+      - name: Clone exact stable SDK and install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf gate-custom-auth
+          git clone --depth 1 --branch v1.17.1 https://github.com/coda/packs-sdk.git gate-custom-auth
+          cd gate-custom-auth
+          git rev-parse HEAD > TAG_COMMIT.txt
+          npm ci --ignore-scripts --omit=optional --no-audit --no-fund
+
+      - name: Run exact-source custom-auth reflection gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd gate-custom-auth
+          cat > custom_auth_response_body_gate.ts <<'TS'
+          import http from 'http';
+          import assert from 'assert';
+          import fs from 'fs';
+          import {AuthenticatingFetcher} from './testing/fetcher';
+          import {AuthenticationType} from './types';
+
+          const PORT = 18841;
+          const INVOCATION_TOKEN = 'LAB_INVOCATION_TOKEN_20260808';
+          const SECRET = 'LAB_CUSTOM_AUTH_SECRET_20260808';
+          const PLACEHOLDER = `{{apiKey-${INVOCATION_TOKEN}}}`;
+          const REDACTED = '<<REDACTED BY CODA>>';
+          let receivedBody = '';
+          let receivedHeader = '';
+
+          const listen = (server: http.Server, port: number) =>
+            new Promise<void>((resolve, reject) => {
+              server.once('error', reject);
+              server.listen(port, '127.0.0.1', () => resolve());
+            });
+          const close = (server: http.Server) => new Promise<void>(resolve => server.close(() => resolve()));
+
+          const server = http.createServer((req, res) => {
+            const chunks: Buffer[] = [];
+            req.on('data', chunk => chunks.push(Buffer.from(chunk)));
+            req.on('end', () => {
+              receivedBody = Buffer.concat(chunks).toString('utf8');
+              receivedHeader = String(req.headers['x-lab-api-key'] || '');
+              res.writeHead(200, {
+                'content-type': 'application/json',
+                'x-reflected-secret': receivedHeader,
+              });
+              res.end(JSON.stringify({
+                reflectedHeader: receivedHeader,
+                reflectedBody: receivedBody,
+                nested: {credential: receivedHeader},
+              }));
+            });
+          });
+
+          function redactDeep(value: any, secret: string): any {
+            return JSON.parse(JSON.stringify(value).split(secret).join(REDACTED));
+          }
+
+          async function main() {
+            await listen(server, PORT);
+            try {
+              const authDef: any = {
+                type: AuthenticationType.Custom,
+                params: [{name: 'apiKey', description: 'Synthetic test secret'}],
+              };
+              const credentials: any = {params: {apiKey: SECRET}};
+              const fetcher = new AuthenticatingFetcher(
+                () => {},
+                authDef,
+                [`127.0.0.1:${PORT}`],
+                credentials,
+                INVOCATION_TOKEN,
+              );
+
+              const response = await fetcher.fetch({
+                method: 'POST',
+                url: `http://127.0.0.1:${PORT}/echo`,
+                headers: {'content-type': 'text/plain', 'x-lab-api-key': PLACEHOLDER},
+                body: `prefix=${PLACEHOLDER}&suffix=ok`,
+              });
+
+              // Authentication substitution reached the API, proving the response contains the real credential.
+              assert.equal(receivedHeader, SECRET);
+              assert.equal(receivedBody, `prefix=${SECRET}&suffix=ok`);
+
+              // Existing implementation redacts response headers.
+              assert.equal(response.headers['x-reflected-secret'], REDACTED);
+
+              // Vulnerable behavior: the same secret remains in the parsed response body returned to Pack code.
+              assert.equal((response.body as any).reflectedHeader, SECRET);
+              assert.equal((response.body as any).reflectedBody, `prefix=${SECRET}&suffix=ok`);
+              assert.equal((response.body as any).nested.credential, SECRET);
+
+              // Patched control: redact every Custom credential value from both headers and body.
+              const patchedBody = redactDeep(response.body, SECRET);
+              assert.equal(patchedBody.reflectedHeader, REDACTED);
+              assert.equal(patchedBody.reflectedBody, `prefix=${REDACTED}&suffix=ok`);
+              assert.equal(patchedBody.nested.credential, REDACTED);
+
+              // Negative control: an unrelated value must remain unchanged.
+              const unrelated = redactDeep({value: 'LAB_UNRELATED_VALUE'}, SECRET);
+              assert.equal(unrelated.value, 'LAB_UNRELATED_VALUE');
+
+              fs.writeFileSync('RESULT.json', JSON.stringify({
+                pass: true,
+                exactSdkTag: 'v1.17.1',
+                rootCause: 'Custom Authentication credential values are redacted from response headers but not response bodies',
+                vulnerableGate: {
+                  platformSubstitutedSyntheticCredential: true,
+                  responseHeaderRedacted: true,
+                  responseBodyReturnedCredentialToPackCode: true,
+                  nestedJsonCredentialReturned: true,
+                },
+                negativeControl: {unrelatedResponseBodyValuePreserved: true},
+                patchedControl: {deepResponseBodyRedactionRemovedCredential: true},
+                syntheticOnly: true,
+              }, null, 2) + '\n');
+            } finally {
+              await close(server);
+            }
+          }
+          main().catch(error => { console.error(error); process.exit(1); });
+          TS
+          npx ts-node --transpile-only custom_auth_response_body_gate.ts | tee TEST_OUTPUT.txt
+          jq -e '.pass == true' RESULT.json >/dev/null
+          sha256sum \
+            testing/fetcher.ts testing/auth_types.ts types.ts \
+            custom_auth_response_body_gate.ts RESULT.json TEST_OUTPUT.txt TAG_COMMIT.txt \
+            > SHA256SUMS.txt
+
+      - name: Upload exact-source evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-packs-custom-auth-response-body-pr-gate
+          path: |
+            gate-custom-auth/RESULT.json
+            gate-custom-auth/TEST_OUTPUT.txt
+            gate-custom-auth/TAG_COMMIT.txt
+            gate-custom-auth/SHA256SUMS.txt
+            gate-custom-auth/custom_auth_response_body_gate.ts
+            gate-custom-auth/testing/fetcher.ts
+            gate-custom-auth/testing/auth_types.ts
+            gate-custom-auth/types.ts
+          retention-days: 1
+          if-no-files-found: error
