@@ -1,0 +1,112 @@
+name: Temporary Grammarly extension focused bridge source
+
+on:
+  push:
+    branches: [research/superhuman-crx-intake-20260808]
+    paths: [.github/workflows/superhuman-grammarly-extension-focused-source-20260808.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch current CRX and extract executable bridge files
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf focused-extension
+          mkdir -p focused-extension/raw focused-extension/extracted focused-extension/focused/source
+          ID='kbfnbcaeplbcioakkpcpgfkobkghlhen'
+          URL="https://clients2.google.com/service/update2/crx?response=redirect&prod=chromium&prodversion=151.0.0.0&acceptformat=crx3&x=id%3D${ID}%26installsource%3Dondemand%26uc"
+          curl --fail --show-error --silent --location --retry 4 --retry-all-errors \
+            --user-agent 'Mozilla/5.0 Chrome/151.0.0.0' "$URL" -o focused-extension/raw/current.crx
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct, hashlib, json
+          root=Path('focused-extension')
+          d=(root/'raw/current.crx').read_bytes()
+          if d[:4]!=b'Cr24' or struct.unpack_from('<I',d,4)[0]!=3: raise SystemExit('not CRX3')
+          n=struct.unpack_from('<I',d,8)[0]; payload=d[12+n:]
+          (root/'raw/current.zip').write_bytes(payload)
+          (root/'focused/crx.json').write_text(json.dumps({'sha256':hashlib.sha256(d).hexdigest(),'size':len(d)},indent=2)+'\n')
+          PY
+          unzip -q focused-extension/raw/current.zip -d focused-extension/extracted
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, shutil, re, hashlib
+          root=Path('focused-extension'); src=root/'extracted'; out=root/'focused'; source=out/'source'
+          manifest=json.loads((src/'manifest.json').read_text())
+          selected=set(['manifest.json'])
+          bg=manifest.get('background') or {}
+          for key in ('service_worker','page'):
+              if bg.get(key): selected.add(bg[key])
+          for s in bg.get('scripts',[]) or []: selected.add(s)
+          for row in manifest.get('content_scripts',[]) or []:
+              for p in row.get('js',[]) or []: selected.add(p)
+              for p in row.get('css',[]) or []: selected.add(p)
+          # Include web-accessible JS/HTML and files referenced by selected scripts.
+          for row in manifest.get('web_accessible_resources',[]) or []:
+              for p in row.get('resources',[]) or []:
+                  if p.endswith(('.js','.mjs','.cjs','.html','.json')) and '*' not in p: selected.add(p)
+          # Add likely page bridge scripts even if dynamically loaded.
+          rx=re.compile(r'(?:src|importScripts|import)\s*[:=(]?\s*["\']([^"\']+\.(?:js|mjs|cjs|html))["\']')
+          changed=True
+          while changed:
+              changed=False
+              for rel in list(selected):
+                  p=src/rel
+                  if not p.is_file() or p.stat().st_size>30_000_000: continue
+                  text=p.read_text(errors='ignore')
+                  for m in rx.finditer(text):
+                      cand=m.group(1).lstrip('./')
+                      if (src/cand).is_file() and cand not in selected:
+                          selected.add(cand); changed=True
+          copied=[]
+          for rel in sorted(selected):
+              p=src/rel
+              if not p.is_file(): continue
+              dest=source/rel; dest.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(p,dest); copied.append(rel)
+          # Build exact string constants and listener contexts from selected JS.
+          hits=[]; constants=set()
+          patterns=[
+            re.compile(r'onMessageExternal|onConnectExternal|runtime\.onMessage|runtime\.onConnect'),
+            re.compile(r'addEventListener\s*\(\s*["\']message["\']|window\.postMessage|\.postMessage\s*\('),
+            re.compile(r'event\.origin|sender\.(?:origin|url|tab)|source\s*===\s*window|source\s*!==\s*window'),
+            re.compile(r'accessToken|refreshToken|authToken|sessionToken|launchAuthFlow|bgRpc|external:'),
+          ]
+          strrx=re.compile(r'["\']([^"\'\\\n]{2,180})["\']')
+          for rel in copied:
+              p=src/rel
+              if p.suffix.lower() not in {'.js','.mjs','.cjs','.html'} or p.stat().st_size>30_000_000: continue
+              text=p.read_text(errors='ignore')
+              for rxp in patterns:
+                  for m in list(rxp.finditer(text))[:300]:
+                      context=text[max(0,m.start()-1600):m.start()+5000]
+                      hits.append({'file':rel,'pattern':rxp.pattern,'offset':m.start(),'context':context.replace('\n',' ')})
+                      for s in strrx.findall(context):
+                          low=s.lower()
+                          if any(k in low for k in ['external:','rpc','auth','token','session','user','account','login','logout','superhuman','grammarly','changed-']): constants.add(s)
+          status={'name':manifest.get('name'),'version':manifest.get('version'),'manifest_version':manifest.get('manifest_version'),
+                  'externally_connectable':manifest.get('externally_connectable'),
+                  'selected_files':copied,'selected_file_count':len(copied),'hit_count':len(hits),
+                  'string_constants':sorted(constants)}
+          (out/'status.json').write_text(json.dumps(status,indent=2)+'\n')
+          (out/'bridge-contexts.json').write_text(json.dumps(hits,indent=2)+'\n')
+          PY
+          find focused-extension/focused -type f -print0 | sort -z | xargs -0 sha256sum > focused-extension/focused/SHA256SUMS.txt
+          rm -rf focused-extension/raw focused-extension/extracted
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grammarly-current-extension-focused-source
+          path: focused-extension/focused/
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 9
