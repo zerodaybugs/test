@@ -1,0 +1,75 @@
+name: Superhuman MCP authorization-server passive gate
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect public OAuth metadata without registration or authorization writes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p auth-gate/raw auth-gate/evidence
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,re,subprocess,urllib.parse
+          root=pathlib.Path('auth-gate'); raw=root/'raw'; ev=root/'evidence'
+          host='https://mcp.auth.mail.superhuman.com'; origin='https://attacker.example'
+          urls=[
+            ('oauth_meta',host+'/.well-known/oauth-authorization-server'),
+            ('oidc_meta',host+'/.well-known/openid-configuration'),
+            ('oauth_meta_mcp',host+'/.well-known/oauth-authorization-server/mcp'),
+            ('oidc_meta_mcp',host+'/.well-known/openid-configuration/mcp'),
+          ]
+          def call(name,method,url,headers=None):
+            headers=headers or []; hp=raw/f'{name}.headers'; bp=raw/f'{name}.body'
+            cmd=['curl','-sS','--max-time','20','--max-redirs','0','-X',method,'-A','bounded-authorized-research','-D',str(hp),'-o',str(bp),'-w','%{http_code}',url]
+            for h in headers: cmd+=['-H',h]
+            p=subprocess.run(cmd,text=True,capture_output=True)
+            try: status=int(p.stdout.strip()[-3:])
+            except: status=0
+            ht=hp.read_text(errors='replace') if hp.exists() else ''; bb=bp.read_bytes()[:1000000] if bp.exists() else b''
+            hm={}
+            for line in ht.splitlines():
+              if ':' in line:
+                k,v=line.split(':',1); hm.setdefault(k.strip().lower(),[]).append(v.strip())
+            try: obj=json.loads(bb.decode())
+            except: obj=None
+            r={'name':name,'method':method,'url':url,'status':status,'curl_exit':p.returncode,'headers':hm,'json':obj,'body_size':len(bb),'body_sha256':hashlib.sha256(bb).hexdigest(),'stderr':p.stderr[-1000:]}
+            (raw/f'{name}.json').write_text(json.dumps(r,indent=2)+'\n'); return r
+          rows=[]
+          for n,u in urls:
+            rows.append(call(n,'GET',u))
+            rows.append(call(n+'_options','OPTIONS',u,[f'Origin: {origin}','Access-Control-Request-Method: GET']))
+          discovered=set()
+          for r in rows:
+            if isinstance(r['json'],dict):
+              for key in ('authorization_endpoint','token_endpoint','registration_endpoint','revocation_endpoint','introspection_endpoint','jwks_uri','issuer'):
+                v=r['json'].get(key)
+                if isinstance(v,str) and v.startswith('https://'): discovered.add(v)
+          endpoint_rows=[]
+          for i,u in enumerate(sorted(discovered)[:12]):
+            endpoint_rows.append(call(f'endpoint_{i}_get','GET',u))
+            endpoint_rows.append(call(f'endpoint_{i}_options','OPTIONS',u,[f'Origin: {origin}','Access-Control-Request-Method: POST','Access-Control-Request-Headers: content-type,authorization']))
+          rows+=endpoint_rows
+          reflected=[r['name'] for r in rows if origin in r['headers'].get('access-control-allow-origin',[])]
+          wildcard_cred=[r['name'] for r in rows if '*' in r['headers'].get('access-control-allow-origin',[]) and 'true' in [x.lower() for x in r['headers'].get('access-control-allow-credentials',[])]]
+          metadata=[r['json'] for r in rows if isinstance(r['json'],dict) and ('authorization_endpoint' in r['json'] or 'issuer' in r['json'])]
+          result={'workflow_run_id':int(os.environ['GITHUB_RUN_ID']),'request_count':len(rows),'metadata_documents':metadata,'discovered_endpoints':sorted(discovered),'reflected_attacker_origin_cases':reflected,'wildcard_origin_with_credentials_cases':wildcard_cred,'dynamic_registration_performed':False,'authorization_request_performed':False,'submit_ready':False,'decision':'PASSIVE_AUTH_SERVER_REVIEW','results':rows}
+          (ev/'RESULT.json').write_text(json.dumps(result,indent=2)+'\n')
+          PY
+          sha256sum auth-gate/evidence/RESULT.json auth-gate/raw/*.json auth-gate/raw/*.headers > auth-gate/evidence/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: superhuman-mcp-auth-server-passive-gate
+          path: auth-gate/
+          retention-days: 1
+          if-no-files-found: error
