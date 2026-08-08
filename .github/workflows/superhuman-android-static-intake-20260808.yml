@@ -1,0 +1,309 @@
+name: Temporary Superhuman Android static intake
+
+on:
+  push:
+    branches: [research/superhuman-android-20260808]
+    paths: [.github/workflows/superhuman-android-static-intake-20260808.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install static-analysis tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq apktool jq ripgrep unzip file
+          mkdir -p android-intake/tools
+          JADX_URL="$(curl -fsSL https://api.github.com/repos/skylot/jadx/releases/latest | jq -r '.assets[] | select(.name | test("jadx-.*\\.zip$")) | .browser_download_url' | head -n1)"
+          test -n "$JADX_URL"
+          curl -fsSL --retry 3 --retry-all-errors "$JADX_URL" -o android-intake/tools/jadx.zip
+          unzip -q android-intake/tools/jadx.zip -d android-intake/tools/jadx
+          chmod +x android-intake/tools/jadx/bin/jadx
+          android-intake/tools/jadx/bin/jadx --version | tee android-intake/JADX_VERSION.txt
+
+      - name: Download current public package candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p android-intake/download android-intake/apks android-intake/evidence android-intake/decompiled
+          urls=(
+            'https://d.apkpure.com/b/APK/com.superhuman.mail?version=latest'
+            'https://d.apkpure.net/b/APK/com.superhuman.mail?version=latest'
+          )
+          ok=0
+          for url in "${urls[@]}"; do
+            if curl -fL --retry 3 --retry-all-errors \
+              -A 'Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/144 Mobile Safari/537.36' \
+              "$url" -o android-intake/download/package.bin; then
+              printf '%s\n' "$url" > android-intake/download/SOURCE_URL.txt
+              ok=1
+              break
+            fi
+          done
+          test "$ok" = 1
+          test -s android-intake/download/package.bin
+          file android-intake/download/package.bin | tee android-intake/download/FILE_TYPE.txt
+          sha256sum android-intake/download/package.bin > android-intake/download/PACKAGE_SHA256.txt
+
+          python3 - <<'PY'
+          import pathlib, zipfile, shutil, sys
+          root=pathlib.Path('android-intake')
+          src=root/'download/package.bin'
+          if src.read_bytes()[:2] != b'PK':
+              raise SystemExit('download is not ZIP/APK')
+          with zipfile.ZipFile(src) as z:
+              names=z.namelist()
+              if 'AndroidManifest.xml' in names:
+                  shutil.copy2(src, root/'apks/base.apk')
+              else:
+                  z.extractall(root/'download/unpacked')
+                  apks=sorted((root/'download/unpacked').rglob('*.apk'))
+                  if not apks:
+                      raise SystemExit('no APK found in package')
+                  for i,p in enumerate(apks):
+                      out=root/'apks'/('base.apk' if p.name in {'base.apk','com.superhuman.mail.apk'} else f'split_{i}_{p.name}')
+                      shutil.copy2(p,out)
+          PY
+          test -f android-intake/apks/base.apk
+          sha256sum android-intake/apks/*.apk > android-intake/APK_SHA256SUMS.txt
+
+      - name: Verify APK identity and signer
+        shell: bash
+        run: |
+          set -euo pipefail
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n1)"
+          AAPT="$(find "$ANDROID_HOME/build-tools" -type f -name aapt | sort -V | tail -n1)"
+          test -x "$APKSIGNER"
+          test -x "$AAPT"
+          "$APKSIGNER" verify --verbose --print-certs android-intake/apks/base.apk | tee android-intake/evidence/APKSIGNER.txt
+          "$AAPT" dump badging android-intake/apks/base.apk | tee android-intake/evidence/AAPT_BADGING.txt
+          grep -q "package: name='com.superhuman.mail'" android-intake/evidence/AAPT_BADGING.txt
+          "$AAPT" dump permissions android-intake/apks/base.apk | tee android-intake/evidence/AAPT_PERMISSIONS.txt
+
+      - name: Decode manifest and decompile base code
+        shell: bash
+        run: |
+          set -euo pipefail
+          apktool d -f -s android-intake/apks/base.apk -o android-intake/decompiled/apktool > android-intake/evidence/APKTOOL.log 2>&1
+          android-intake/tools/jadx/bin/jadx \
+            --no-debug-info --show-bad-code --deobf --deobf-min 2 --deobf-max 64 \
+            -j 4 -d android-intake/decompiled/jadx android-intake/apks/base.apk \
+            > android-intake/evidence/JADX.log 2>&1
+          test -f android-intake/decompiled/apktool/AndroidManifest.xml
+          cp android-intake/decompiled/apktool/AndroidManifest.xml android-intake/evidence/AndroidManifest.xml
+
+      - name: Build exported-component and trust-boundary analysis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib, re, hashlib, xml.etree.ElementTree as ET, os, shutil
+          root=pathlib.Path('android-intake')
+          manifest=root/'evidence/AndroidManifest.xml'
+          tree=ET.parse(manifest)
+          r=tree.getroot()
+          ns='{http://schemas.android.com/apk/res/android}'
+          pkg=r.attrib.get('package','')
+          app=r.find('application')
+          def av(el,name,default=None): return el.attrib.get(ns+name,default)
+          def fq(name):
+              if not name: return None
+              if name.startswith('.'): return pkg+name
+              if '.' not in name: return pkg+'.'+name
+              return name
+          app_flags={k:av(app,k) for k in ['allowBackup','debuggable','usesCleartextTraffic','networkSecurityConfig','taskAffinity','requestLegacyExternalStorage']}
+          components=[]
+          for tag in ['activity','activity-alias','service','receiver','provider']:
+              for el in app.findall(tag):
+                  filters=[]
+                  for f in el.findall('intent-filter'):
+                      filters.append({
+                        'actions':[av(x,'name') for x in f.findall('action')],
+                        'categories':[av(x,'name') for x in f.findall('category')],
+                        'data':[{k:av(d,k) for k in ['scheme','host','port','path','pathPrefix','pathPattern','mimeType']} for d in f.findall('data')],
+                        'autoVerify':av(f,'autoVerify'),
+                        'priority':av(f,'priority'),
+                      })
+                  exported_raw=av(el,'exported')
+                  exported=(exported_raw=='true') or (exported_raw is None and bool(filters))
+                  row={
+                    'type':tag,'name':fq(av(el,'name')),'exported':exported,'exportedRaw':exported_raw,
+                    'permission':av(el,'permission'),'readPermission':av(el,'readPermission'),'writePermission':av(el,'writePermission'),
+                    'authorities':av(el,'authorities'),'grantUriPermissions':av(el,'grantUriPermissions'),
+                    'launchMode':av(el,'launchMode'),'taskAffinity':av(el,'taskAffinity'),'excludeFromRecents':av(el,'excludeFromRecents'),
+                    'filters':filters,
+                  }
+                  row['browsable']=any('android.intent.category.BROWSABLE' in (f['categories'] or []) for f in filters)
+                  components.append(row)
+
+          source_root=root/'decompiled/jadx/sources'
+          patterns={
+            'intent_input':r'getIntent\(|getData\(|getDataString\(|getStringExtra\(|getParcelableExtra\(|getSerializableExtra\(',
+            'uri_params':r'getQueryParameter\(|getPathSegments\(|getHost\(|getScheme\(',
+            'webview':r'WebView|loadUrl\(|loadDataWithBaseURL\(|evaluateJavascript\(',
+            'javascript':r'setJavaScriptEnabled\(true\)|addJavascriptInterface\(',
+            'intent_forward':r'Intent\.parseUri\(|startActivity\(|startService\(|sendBroadcast\(|setClassName\(|setComponent\(',
+            'file_uri':r'FileProvider|getUriForFile\(|openFileDescriptor\(|ContentResolver|content://',
+            'oauth':r'code_verifier|code_challenge|PKCE|oauth|authorization_code|redirect_uri|state',
+            'tokens':r'access[_-]?token|refresh[_-]?token|id[_-]?token|Authorization|Bearer ',
+            'unsafe_ssl':r'HostnameVerifier|onReceivedSslError|proceed\(\)|TrustManager|checkServerTrusted',
+            'pending_intent':r'PendingIntent\.(getActivity|getService|getBroadcast)|FLAG_MUTABLE|FLAG_IMMUTABLE',
+            'serialization':r'ObjectInputStream|readObject\(|Serializable|Parcelable',
+          }
+          source_files=list(source_root.rglob('*.java')) if source_root.exists() else []
+          exported=[c for c in components if c['exported']]
+          candidates=[]
+          copied=[]
+          for c in exported:
+              name=c['name'] or ''
+              simple=name.rsplit('.',1)[-1]
+              likely=[p for p in source_files if p.stem==simple or simple in p.name]
+              hits=[]
+              for p in likely[:20]:
+                  text=p.read_text(errors='ignore')
+                  ph={k:len(re.findall(v,text,re.I)) for k,v in patterns.items()}
+                  ph={k:v for k,v in ph.items() if v}
+                  if ph:
+                      hits.append({'file':str(p.relative_to(root)),'patterns':ph})
+                  if p.stat().st_size < 500_000:
+                      dest=root/'evidence/exported_sources'/p.name
+                      dest.parent.mkdir(parents=True,exist_ok=True)
+                      shutil.copy2(p,dest)
+                      copied.append(str(dest.relative_to(root)))
+              score=0
+              if not c.get('permission'): score+=4
+              if c.get('browsable'): score+=5
+              if c['type']=='provider' and not (c.get('readPermission') or c.get('writePermission') or c.get('permission')): score+=7
+              totals={}
+              for h in hits:
+                  for k,v in h['patterns'].items(): totals[k]=totals.get(k,0)+v
+              score += min(totals.get('intent_input',0),4)
+              score += min(totals.get('uri_params',0),4)
+              score += 5 if totals.get('webview') else 0
+              score += 8 if totals.get('javascript') else 0
+              score += 5 if totals.get('intent_forward') else 0
+              score += 5 if totals.get('file_uri') else 0
+              score += 4 if totals.get('oauth') else 0
+              score += 8 if totals.get('unsafe_ssl') else 0
+              candidates.append({'component':c,'sourceHits':hits,'totals':totals,'score':score})
+
+          # Global high-signal scan, bounded snippets only.
+          global_hits=[]
+          regexes={k:re.compile(v,re.I) for k,v in patterns.items()}
+          for p in source_files:
+              try: text=p.read_text(errors='ignore')
+              except: continue
+              matched=[k for k,rx in regexes.items() if rx.search(text)]
+              if not matched: continue
+              if {'javascript','unsafe_ssl'} & set(matched) or ('webview' in matched and 'intent_input' in matched) or ('oauth' in matched and 'intent_input' in matched):
+                  snippets=[]
+                  for k in matched:
+                      m=regexes[k].search(text)
+                      if m:
+                          snippets.append({'kind':k,'offset':m.start(),'snippet':re.sub(r'\s+',' ',text[max(0,m.start()-350):m.start()+900])[:1400]})
+                  global_hits.append({'file':str(p.relative_to(root)),'matched':matched,'snippets':snippets})
+                  if len(global_hits)>=250: break
+
+          provider_paths=[]
+          for p in (root/'decompiled/apktool/res/xml').glob('*paths*.xml') if (root/'decompiled/apktool/res/xml').exists() else []:
+              provider_paths.append({'file':str(p.relative_to(root)),'content':p.read_text(errors='ignore')})
+
+          result={
+            'package':pkg,'applicationFlags':app_flags,'components':components,'exportedComponents':exported,
+            'rankedCandidates':sorted(candidates,key=lambda x:x['score'],reverse=True),
+            'globalHighSignalHits':global_hits,'providerPathConfigs':provider_paths,'copiedExportedSources':copied,
+          }
+          (root/'evidence/STATIC_ANALYSIS.json').write_text(json.dumps(result,indent=2)+'\n')
+
+          md=['# Superhuman Android static trust-boundary scan','',f'- Package: `{pkg}`',f'- Exported components: **{len(exported)}**',f'- Decompiled Java files: **{len(source_files)}**','',
+              '## Application flags','', '```json',json.dumps(app_flags,indent=2),'```','',
+              '## Ranked exported-component candidates','']
+          for item in sorted(candidates,key=lambda x:x['score'],reverse=True):
+              c=item['component']
+              md += [f"### Score {item['score']} — `{c['type']} {c['name']}`",'',
+                     f"- Permission: `{c.get('permission')}`; browsable: `{c.get('browsable')}`; authorities: `{c.get('authorities')}`",f"- Pattern totals: `{json.dumps(item['totals'],sort_keys=True)}`",'',
+                     '```json',json.dumps(c.get('filters'),indent=2),'```','']
+              for h in item['sourceHits']:
+                  md += [f"- Source: `{h['file']}` — `{json.dumps(h['patterns'],sort_keys=True)}`"]
+              md.append('')
+          md += ['## Global high-signal files','']
+          for h in global_hits:
+              md += [f"### `{h['file']}` — {', '.join(h['matched'])}",'']
+              for s in h['snippets'][:4]: md += [f"**{s['kind']}**",'```java',s['snippet'],'```','']
+          if provider_paths:
+              md += ['## FileProvider path configurations','']
+              for p in provider_paths: md += [f"### `{p['file']}`",'```xml',p['content'],'```','']
+          (root/'evidence/STATIC_ANALYSIS.md').write_text('\n'.join(md))
+          PY
+
+          rg -n -i --no-heading \
+            'addJavascriptInterface|setJavaScriptEnabled\(true\)|onReceivedSslError|HostnameVerifier|Intent\.parseUri|PendingIntent\.|FileProvider|authorization_code|code_verifier|code_challenge|refresh_token|access_token' \
+            android-intake/decompiled/jadx/sources \
+            > android-intake/evidence/GLOBAL_PATTERN_HITS.txt || true
+          head -n 5000 android-intake/evidence/GLOBAL_PATTERN_HITS.txt > android-intake/evidence/GLOBAL_PATTERN_HITS_TOP5000.txt
+
+      - name: Build provenance and status
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib,json,re,hashlib,os
+          root=pathlib.Path('android-intake')
+          bad=(root/'evidence/AAPT_BADGING.txt').read_text(errors='ignore')
+          signer=(root/'evidence/APKSIGNER.txt').read_text(errors='ignore')
+          m=re.search(r"package: name='([^']+)' versionCode='([^']+)' versionName='([^']+)'",bad)
+          cert=re.findall(r'Signer #\d+ certificate SHA-256 digest: ([0-9a-fA-F:]+)',signer)
+          analysis=json.loads((root/'evidence/STATIC_ANALYSIS.json').read_text())
+          top=analysis['rankedCandidates'][:15]
+          status={
+            'workflowRunId':int(os.environ['GITHUB_RUN_ID']),'sourceCommit':os.environ['GITHUB_SHA'],
+            'distributionSource':(root/'download/SOURCE_URL.txt').read_text().strip(),
+            'package':m.group(1) if m else None,'versionCode':m.group(2) if m else None,'versionName':m.group(3) if m else None,
+            'baseApkSize':(root/'apks/base.apk').stat().st_size,
+            'baseApkSha256':hashlib.sha256((root/'apks/base.apk').read_bytes()).hexdigest(),
+            'signerCertificateSha256':cert,
+            'exportedComponentCount':len(analysis['exportedComponents']),
+            'topCandidates':[{'score':x['score'],'type':x['component']['type'],'name':x['component']['name'],'browsable':x['component']['browsable'],'permission':x['component']['permission'],'totals':x['totals']} for x in top],
+            'provenanceLimit':'Binary downloaded from APKPure delivery endpoint; package name and signer recorded. Any report requires confirmation against a Play-installed build or matching official signer provenance.',
+            'submissionReady':False,
+          }
+          (root/'STATUS.json').write_text(json.dumps(status,indent=2)+'\n')
+          PY
+          find android-intake/evidence android-intake/STATUS.json android-intake/APK_SHA256SUMS.txt android-intake/download/PACKAGE_SHA256.txt -type f -print0 \
+            | sort -z | xargs -0 sha256sum > android-intake/SHA256SUMS.txt
+
+      - name: Upload ephemeral evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-android-current-static-intake
+          path: |
+            android-intake/STATUS.json
+            android-intake/SHA256SUMS.txt
+            android-intake/APK_SHA256SUMS.txt
+            android-intake/download/SOURCE_URL.txt
+            android-intake/download/FILE_TYPE.txt
+            android-intake/download/PACKAGE_SHA256.txt
+            android-intake/evidence/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Commit non-binary status for review
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p public-intake-status
+          cp android-intake/STATUS.json public-intake-status/superhuman-android-current.json
+          cp android-intake/evidence/STATIC_ANALYSIS.md public-intake-status/superhuman-android-static-analysis.md
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add public-intake-status/superhuman-android-current.json public-intake-status/superhuman-android-static-analysis.md
+          git commit -m 'chore: record temporary Superhuman Android static intake status'
+          git push
