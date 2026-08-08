@@ -1,0 +1,141 @@
+name: Temporary Superhuman extension page-bridge gate
+
+on:
+  push:
+    branches: [research/superhuman-crx-intake-20260808]
+    paths: [.github/workflows/superhuman-extension-page-bridge-gate-20260808.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+      - name: Intake official current CRX
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf ext-gate
+          mkdir -p ext-gate/crx ext-gate/unpacked ext-gate/evidence ext-gate/lab
+          url='https://clients2.google.com/service/update2/crx?response=redirect&prod=chromium&prodversion=144.0.7559.96&acceptformat=crx3&x=id%3Ddcgcnpooblobhncpnddnhoendgbnglpn%26installsource%3Dondemand%26uc'
+          curl -fsSL --retry 3 --retry-all-errors -A 'Mozilla/5.0 Chrome/144.0.7559.96' "$url" -o ext-gate/crx/current.crx
+          python3 - <<'PY'
+          import pathlib,struct,hashlib,json
+          r=pathlib.Path('ext-gate');d=(r/'crx/current.crx').read_bytes()
+          if d[:4]!=b'Cr24':raise SystemExit('bad CRX')
+          v=struct.unpack_from('<I',d,4)[0];h=struct.unpack_from('<I',d,8)[0];z=d[12+h:]
+          if z[:2]!=b'PK':raise SystemExit('no ZIP')
+          (r/'crx/current.zip').write_bytes(z)
+          (r/'evidence/CRX_METADATA.json').write_text(json.dumps({'format':v,'headerLength':h,'crxSha256':hashlib.sha256(d).hexdigest(),'zipSha256':hashlib.sha256(z).hexdigest(),'crxSize':len(d),'zipSize':len(z)},indent=2)+'\n')
+          PY
+          unzip -q ext-gate/crx/current.zip -d ext-gate/unpacked
+          test -f ext-gate/unpacked/manifest.json
+          cp ext-gate/unpacked/manifest.json ext-gate/evidence/manifest.json
+      - name: Static message-channel inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > ext-gate/static_scan.py <<'PY'
+          import json,pathlib,re
+          R=pathlib.Path('ext-gate');U=R/'unpacked';E=R/'evidence';m=json.loads((U/'manifest.json').read_text())
+          patterns={'runtime_onmessage':r'chrome\.runtime\.onMessage(?:External)?\.addListener|browser\.runtime\.onMessage(?:External)?\.addListener','window_message':r'(?:window\.)?addEventListener\s*\(\s*["\']message["\']|window\.onmessage','postmessage':r'\.postMessage\s*\(','sendmessage':r'(?:chrome|browser)\.runtime\.sendMessage\s*\(','storage':r'chrome\.storage|browser\.storage','cookies':r'chrome\.cookies|browser\.cookies','identity':r'chrome\.identity|launchWebAuthFlow','tabs':r'chrome\.tabs|browser\.tabs','scripting':r'chrome\.scripting|executeScript','native':r'connectNative|sendNativeMessage','token_terms':r'access[_-]?token|refresh[_-]?token|authorization|session|credential|external[_-]?id|user[_-]?email','origin_check':r'event\.origin|sender\.origin|sender\.url|sender\.tab\.url|new URL\([^\)]*sender','source_check':r'event\.source|sender\.id|sender\.tab'}
+          rx={k:re.compile(v,re.I|re.S) for k,v in patterns.items()};rows=[];types=set()
+          for p in U.rglob('*'):
+           if not p.is_file() or p.suffix.lower() not in {'.js','.mjs','.cjs','.html'} or p.stat().st_size>30_000_000:continue
+           t=p.read_text(errors='ignore');hits={k:len(v.findall(t)) for k,v in rx.items()};hits={k:v for k,v in hits.items() if v}
+           if not hits:continue
+           score=10*bool(hits.get('runtime_onmessage'))+8*bool(hits.get('window_message'))+6*bool(hits.get('postmessage'))+6*bool(hits.get('sendmessage'))+6*bool(hits.get('storage'))+8*bool(hits.get('cookies'))+8*bool(hits.get('identity'))+6*bool(hits.get('tabs'))+8*bool(hits.get('scripting'))+10*bool(hits.get('native'))+6*bool(hits.get('token_terms'))
+           if (hits.get('window_message') or hits.get('runtime_onmessage')) and not hits.get('origin_check'):score+=12
+           snippets=[]
+           for k,v in rx.items():
+            x=v.search(t)
+            if x:snippets.append({'kind':k,'offset':x.start(),'snippet':re.sub(r'\s+',' ',t[max(0,x.start()-350):x.start()+1200])[:1700]})
+           for pat in [r'(?:type|action|kind|event|command|method)\s*[:=]\s*["\']([A-Za-z0-9_.:-]{2,120})["\']',r'["\']([A-Za-z0-9_.:-]{3,120})["\']\s*===?\s*[^;]{0,80}(?:type|action|kind|event|command|method)']:
+            types.update(re.findall(pat,t,re.I))
+           rows.append({'score':score,'file':str(p.relative_to(U)),'bytes':p.stat().st_size,'hits':hits,'snippets':snippets})
+          rows.sort(key=lambda x:(-x['score'],x['file']))
+          result={'manifest':m,'rankedFiles':rows[:300],'candidateMessageTypes':sorted(types)[:1000]}
+          (E/'STATIC_MESSAGE_SCAN.json').write_text(json.dumps(result,indent=2)+'\n')
+          md=['# Superhuman current extension message-channel scan','',f"- Version: `{m.get('version')}`",f"- Manifest version: `{m.get('manifest_version')}`",f"- Externally connectable: `{json.dumps(m.get('externally_connectable'))}`",f"- Candidate message strings: **{len(result['candidateMessageTypes'])}**",'', 'Static hits are not findings.','']
+          for row in rows[:80]:
+           md += [f"## Score {row['score']} — `{row['file']}`",'',f"`{json.dumps(row['hits'],sort_keys=True)}`",'']
+           for s in row['snippets'][:8]:md += [f"**{s['kind']}**",'```text',s['snippet'],'```','']
+          (E/'STATIC_MESSAGE_SCAN.md').write_text('\n'.join(md))
+          PY
+          python3 ext-gate/static_scan.py
+      - name: Build synthetic attacker pages and CDP harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > ext-gate/lab/index.html <<'HTML'
+          <!doctype html><meta charset=utf-8><title>ZD extension bridge lab</title><script>window.__lab={messages:[],errors:[],external:[]};addEventListener('message',e=>window.__lab.messages.push({origin:e.origin,data:e.data}));addEventListener('error',e=>window.__lab.errors.push(String(e.message||e.error)));</script><body>LAB</body>
+          HTML
+          cat > ext-gate/lab/server.py <<'PY'
+          from http.server import SimpleHTTPRequestHandler,ThreadingHTTPServer
+          import os
+          os.chdir('ext-gate/lab');ThreadingHTTPServer(('0.0.0.0',18081),SimpleHTTPRequestHandler).serve_forever()
+          PY
+          cat > ext-gate/dynamic_gate.mjs <<'JS'
+          import fs from 'fs';import http from 'http';
+          const EXT='dcgcnpooblobhncpnddnhoendgbnglpn',BASE='http://127.0.0.1:9223';const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+          function req(method,path){return new Promise((resolve,reject)=>{const q=http.request(BASE+path,{method},r=>{let b='';r.on('data',c=>b+=c);r.on('end',()=>{try{resolve(JSON.parse(b))}catch(e){reject(new Error(b))}})});q.on('error',reject);q.end()})}
+          class CDP{constructor(url){this.id=0;this.pending=new Map;this.ws=new WebSocket(url);this.ready=new Promise((r,j)=>{this.ws.onopen=r;this.ws.onerror=j});this.ws.onmessage=e=>{const m=JSON.parse(e.data);const p=this.pending.get(m.id);if(p){this.pending.delete(m.id);m.error?p.j(m.error):p.r(m.result)}}}async send(method,params={}){await this.ready;const id=++this.id;const p=new Promise((r,j)=>this.pending.set(id,{r,j}));this.ws.send(JSON.stringify({id,method,params}));return p}async eval(expression){const r=await this.send('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});if(r.exceptionDetails)throw new Error(JSON.stringify(r.exceptionDetails));return r.result.value}}
+          const manifest=JSON.parse(fs.readFileSync('ext-gate/evidence/manifest.json'));const scan=JSON.parse(fs.readFileSync('ext-gate/evidence/STATIC_MESSAGE_SCAN.json'));const result={pass:false,extensionId:EXT,version:manifest.version,manifestExternallyConnectable:manifest.externally_connectable,targets:[],arbitraryOrigin:{},syntheticFirstPartyOrigin:{}};
+          let targets=[];for(let i=0;i<100;i++){targets=await req('GET','/json/list');if(targets.some(t=>String(t.url).includes(EXT)))break;await sleep(250)}result.targets=targets.map(t=>({type:t.type,url:t.url,title:t.title}));
+          const worker=targets.find(t=>String(t.url).includes(EXT)&&(t.type==='service_worker'||t.type==='background_page'));if(worker){const c=new CDP(worker.webSocketDebuggerUrl);await c.ready;await c.eval(`new Promise(r=>chrome.storage.local.set({accessToken:'ZD_SENTINEL_ACCESS_20260808',refreshToken:'ZD_SENTINEL_REFRESH_20260808',sessionToken:'ZD_SENTINEL_SESSION_20260808',user:{email:'zd-sentinel@example.invalid',externalId:'ZD_SENTINEL_EXTERNAL_ID'}},r))`);result.storageSeeded=true}
+          async function page(url){const t=await req('PUT','/json/new?'+encodeURIComponent(url));const c=new CDP(t.webSocketDebuggerUrl);await c.ready;await c.send('Page.enable');await c.send('Runtime.enable');await sleep(3000);return c}
+          async function fuzz(url,label){const c=await page(url);const types=scan.candidateMessageTypes.slice(0,300);const payloads=[];for(const x of types){payloads.push({type:x},{action:x},{kind:x},{message:{type:x}},{source:'page',type:x})}payloads.push({type:'getUser'},{type:'getAuth'},{type:'getToken'},{type:'external:changed-user'},{type:'external:enable-superhuman-go'});const out=await c.eval(`(async()=>{const ps=${JSON.stringify(payloads)};for(const p of ps){window.postMessage(p,'*');try{if(globalThis.chrome?.runtime?.sendMessage){await new Promise(r=>chrome.runtime.sendMessage('${EXT}',p,x=>{window.__lab.external.push({p,x,error:chrome.runtime.lastError&&chrome.runtime.lastError.message});r()}))}}catch(e){window.__lab.errors.push(String(e))}}await new Promise(r=>setTimeout(r,3000));return window.__lab})()`);result[label]=out;return out}
+          await fuzz('http://127.0.0.1:18081/','arbitraryOrigin');await fuzz('http://mail.superhuman.com:18081/','syntheticFirstPartyOrigin');const blob=JSON.stringify(result);result.sentinelExposed=/ZD_SENTINEL_(ACCESS|REFRESH|SESSION|EXTERNAL_ID)|zd-sentinel@example\.invalid/.test(blob);result.pass=!result.sentinelExposed;fs.writeFileSync('ext-gate/evidence/DYNAMIC_PAGE_BRIDGE_RESULT.json',JSON.stringify(result,null,2)+'\n');console.log(JSON.stringify(result,null,2));if(result.sentinelExposed)process.exitCode=2;
+          JS
+      - name: Run current extension in Chrome
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 ext-gate/lab/server.py > ext-gate/evidence/LAB_SERVER.log 2>&1 & echo $! > ext-gate/evidence/LAB_SERVER.pid
+          CHROME="$(command -v google-chrome-stable || command -v google-chrome || command -v chromium)"
+          "$CHROME" --headless=new --no-sandbox --disable-dev-shm-usage --disable-gpu --disable-extensions-except="$PWD/ext-gate/unpacked" --load-extension="$PWD/ext-gate/unpacked" --remote-debugging-port=9223 --user-data-dir="$PWD/ext-gate/profile" --host-resolver-rules='MAP mail.superhuman.com 127.0.0.1' about:blank > ext-gate/evidence/CHROME.log 2>&1 & echo $! > ext-gate/evidence/CHROME.pid
+          for i in $(seq 1 100);do curl -fsS http://127.0.0.1:9223/json/version >/dev/null && break;sleep .25;done
+          node --experimental-websocket ext-gate/dynamic_gate.mjs | tee ext-gate/evidence/DYNAMIC_OUTPUT.txt || test $? = 2
+          kill $(cat ext-gate/evidence/CHROME.pid) 2>/dev/null || true;kill $(cat ext-gate/evidence/LAB_SERVER.pid) 2>/dev/null || true
+      - name: Finalize decision
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib,os
+          R=pathlib.Path('ext-gate');E=R/'evidence';m=json.loads((E/'manifest.json').read_text());d={}
+          if (E/'DYNAMIC_PAGE_BRIDGE_RESULT.json').exists():d=json.loads((E/'DYNAMIC_PAGE_BRIDGE_RESULT.json').read_text())
+          status={'workflowRunId':int(os.environ['GITHUB_RUN_ID']),'sourceCommit':os.environ['GITHUB_SHA'],'extensionId':'dcgcnpooblobhncpnddnhoendgbnglpn','version':m.get('version'),'sentinelExposed':d.get('sentinelExposed'),'dynamicGateCompleted':bool(d),'submissionReady':False,'decision':'GO_REVIEW_SENTINEL_EXPOSURE' if d.get('sentinelExposed') else 'HOLD_OR_KILL_NO_SENTINEL_EXPOSURE'}
+          (R/'STATUS.json').write_text(json.dumps(status,indent=2)+'\n')
+          PY
+          find ext-gate/evidence ext-gate/STATUS.json -type f -print0 | sort -z | xargs -0 sha256sum > ext-gate/SHA256SUMS.txt
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-extension-page-bridge-gate
+          path: |
+            ext-gate/STATUS.json
+            ext-gate/SHA256SUMS.txt
+            ext-gate/evidence/
+            ext-gate/dynamic_gate.mjs
+          if-no-files-found: warn
+          retention-days: 1
+      - name: Commit status
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f ext-gate/STATUS.json || exit 0
+          mkdir -p public-intake-status
+          cp ext-gate/STATUS.json public-intake-status/superhuman-extension-page-bridge.json
+          git config user.name 'github-actions[bot]';git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add public-intake-status/superhuman-extension-page-bridge.json
+          git commit -m 'chore: record temporary Superhuman extension page bridge gate' || exit 0
+          git push
