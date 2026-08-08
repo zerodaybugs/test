@@ -1,0 +1,120 @@
+name: Temporary first-party domain inventory
+
+on:
+  push:
+    branches: [research/superhuman-crx-intake-20260808]
+    paths: [.github/workflows/superhuman-first-party-domain-inventory-20260808.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+      - name: Passive CT and DNS inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p domain-inventory public-intake-status
+          python3 - <<'PY'
+          import concurrent.futures, json, os, pathlib, socket, ssl, urllib.parse, urllib.request
+
+          ROOTS=['coda.io','superhuman.com','pp-sh.io','qa-sh.io']
+          OUT=pathlib.Path('domain-inventory')
+          ua={'User-Agent':'ZeroDayBugs authorized passive inventory/2026-08-08'}
+          names=set(ROOTS)
+          source_rows=[]
+
+          for root in ROOTS:
+              url='https://crt.sh/?q='+urllib.parse.quote('%.'+root)+'&output=json'
+              try:
+                  req=urllib.request.Request(url,headers=ua)
+                  with urllib.request.urlopen(req,timeout=40) as r:
+                      body=r.read()
+                  rows=json.loads(body)
+                  source_rows.append({'root':root,'ok':True,'bytes':len(body),'records':len(rows)})
+                  for row in rows:
+                      for raw in str(row.get('name_value','')).splitlines():
+                          name=raw.strip().lower().rstrip('.')
+                          if name.startswith('*.'): name=name[2:]
+                          if name==root or name.endswith('.'+root):
+                              if all(c.isalnum() or c in '.-_' for c in name): names.add(name)
+              except Exception as e:
+                  source_rows.append({'root':root,'ok':False,'error':repr(e)})
+
+          def resolve(name):
+              result={'name':name,'a':[],'aaaa':[],'cname':None,'mx':[],'errors':[]}
+              try:
+                  infos=socket.getaddrinfo(name,None,proto=socket.IPPROTO_TCP)
+                  for fam,_,_,_,addr in infos:
+                      ip=addr[0]
+                      if fam==socket.AF_INET: result['a'].append(ip)
+                      elif fam==socket.AF_INET6: result['aaaa'].append(ip)
+              except Exception as e:
+                  result['errors'].append('getaddrinfo:'+repr(e))
+              return result
+
+          with concurrent.futures.ThreadPoolExecutor(max_workers=24) as ex:
+              records=list(ex.map(resolve,sorted(names)))
+
+          # Use dig for CNAME/MX to preserve passive DNS record types.
+          import subprocess
+          for rec in records:
+              name=rec['name']
+              for typ,key in [('CNAME','cname'),('MX','mx')]:
+                  try:
+                      p=subprocess.run(['dig','+short',typ,name],capture_output=True,text=True,timeout=8)
+                      vals=[x.strip().rstrip('.') for x in p.stdout.splitlines() if x.strip()]
+                      rec[key]=vals[0] if typ=='CNAME' and vals else (vals if typ=='MX' else None)
+                  except Exception as e:
+                      rec['errors'].append('dig-'+typ+':'+repr(e))
+              rec['a']=sorted(set(rec['a']))
+              rec['aaaa']=sorted(set(rec['aaaa']))
+
+          dangling_patterns=[
+              'amazonaws.com','cloudfront.net','azurewebsites.net','trafficmanager.net','herokudns.com',
+              'github.io','netlify.app','vercel.app','fastly.net','readthedocs.io','ghost.io','zendesk.com',
+              'wpengine.com','pantheonsite.io','surge.sh','pages.dev','storage.googleapis.com'
+          ]
+          suspicious=[]
+          for rec in records:
+              c=(rec.get('cname') or '').lower()
+              if c and any(c==p or c.endswith('.'+p) for p in dangling_patterns):
+                  suspicious.append(rec)
+
+          summary={
+              'workflow_run_id':int(os.environ['GITHUB_RUN_ID']),
+              'source_commit':os.environ['GITHUB_SHA'],
+              'roots':ROOTS,
+              'ct_sources':source_rows,
+              'unique_names':len(names),
+              'resolved_names':sum(bool(r['a'] or r['aaaa'] or r['cname']) for r in records),
+              'unresolved_names':sum(not (r['a'] or r['aaaa'] or r['cname']) for r in records),
+              'third_party_cname_candidates':len(suspicious),
+          }
+          (OUT/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
+          (OUT/'records.json').write_text(json.dumps(records,indent=2)+'\n')
+          (OUT/'third_party_cname_candidates.json').write_text(json.dumps(suspicious,indent=2)+'\n')
+          (OUT/'names.txt').write_text('\n'.join(sorted(names))+'\n')
+          pathlib.Path('public-intake-status/superhuman-first-party-domain-inventory.json').write_text(json.dumps(summary,indent=2)+'\n')
+          PY
+          sha256sum domain-inventory/* | sort > domain-inventory/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-first-party-domain-inventory
+          path: domain-inventory/
+          if-no-files-found: error
+          retention-days: 1
+      - name: Record non-sensitive summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add public-intake-status/superhuman-first-party-domain-inventory.json
+          git commit -m 'chore: record first-party domain inventory summary'
+          git push
