@@ -1,0 +1,135 @@
+name: Temporary current Grammarly extension bridge intake
+
+on:
+  push:
+    branches: [research/superhuman-crx-intake-20260808]
+    paths: [.github/workflows/superhuman-grammarly-current-extension-intake-20260808.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  intake:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+
+      - name: Download and verify current official CRX3
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf grammarly-extension-intake
+          mkdir -p grammarly-extension-intake/raw grammarly-extension-intake/extracted grammarly-extension-intake/evidence public-intake-status
+          ID='kbfnbcaeplbcioakkpcpgfkobkghlhen'
+          URL="https://clients2.google.com/service/update2/crx?response=redirect&prod=chromium&prodversion=151.0.0.0&acceptformat=crx3&x=id%3D${ID}%26installsource%3Dondemand%26uc"
+          curl --fail --show-error --silent --location --retry 4 --retry-all-errors \
+            --user-agent 'Mozilla/5.0 Chrome/151.0.0.0' "$URL" -o grammarly-extension-intake/raw/current.crx
+          test "$(head -c 4 grammarly-extension-intake/raw/current.crx)" = 'Cr24'
+          python3 - <<'PY'
+          import hashlib, json, pathlib, struct
+          root=pathlib.Path('grammarly-extension-intake')
+          data=(root/'raw/current.crx').read_bytes()
+          version=struct.unpack_from('<I',data,4)[0]
+          if version != 3: raise SystemExit(f'expected CRX3, got {version}')
+          header_len=struct.unpack_from('<I',data,8)[0]
+          offset=12+header_len
+          payload=data[offset:]
+          if payload[:2] != b'PK': raise SystemExit('missing ZIP payload')
+          (root/'raw/current.zip').write_bytes(payload)
+          meta={'crx_format':version,'crx_header_length':header_len,'zip_offset':offset,
+                'crx_size':len(data),'crx_sha256':hashlib.sha256(data).hexdigest(),
+                'zip_size':len(payload),'zip_sha256':hashlib.sha256(payload).hexdigest()}
+          (root/'evidence/crx-metadata.json').write_text(json.dumps(meta,indent=2)+'\n')
+          PY
+          unzip -q grammarly-extension-intake/raw/current.zip -d grammarly-extension-intake/extracted
+          test -f grammarly-extension-intake/extracted/manifest.json
+          cp grammarly-extension-intake/extracted/manifest.json grammarly-extension-intake/evidence/manifest.json
+
+      - name: Build exact page/background messaging map
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, re, hashlib, os
+          root=Path('grammarly-extension-intake')
+          src=root/'extracted'; ev=root/'evidence'
+          manifest=json.loads((src/'manifest.json').read_text())
+          patterns={
+            'external_listener':re.compile(r'onMessageExternal|onConnectExternal|externally_connectable',re.I),
+            'runtime_listener':re.compile(r'runtime\.onMessage|runtime\.onConnect|addListener\s*\(',re.I),
+            'page_message':re.compile(r'addEventListener\s*\(\s*["\']message["\']|window\.postMessage|\.postMessage\s*\(',re.I),
+            'sender_validation':re.compile(r'sender\.(?:origin|url|tab)|senderFrame|event\.origin|source\s*===\s*window|allowedOrigins?|trustedOrigins?',re.I),
+            'auth_session':re.compile(r'accessToken|refreshToken|authToken|sessionToken|jwt|cookie|credentials|login|logout|userId|account',re.I),
+            'privileged_action':re.compile(r'launchAuthFlow|tabs\.(?:create|update|remove|query)|cookies\.|identity\.|storage\.|fetch\s*\(|XMLHttpRequest|nativeMessaging|connectNative',re.I),
+            'superhuman_go':re.compile(r'Superhuman Go|enable-superhuman-go|external:|bgRpc|api_launchAuthFlow',re.I),
+          }
+          hits=[]; files=[]
+          for p in src.rglob('*'):
+            if not p.is_file() or p.stat().st_size>30_000_000 or p.suffix.lower() not in {'.js','.mjs','.cjs','.json','.html'}: continue
+            files.append(str(p.relative_to(src)))
+            text=p.read_text(errors='ignore')
+            for kind,rx in patterns.items():
+              count=0
+              for m in rx.finditer(text):
+                hits.append({'file':str(p.relative_to(src)),'kind':kind,'offset':m.start(),
+                             'match':m.group(0),'context':text[max(0,m.start()-900):m.start()+2600].replace('\n',' ')})
+                count+=1
+                if count>=120: break
+          external=manifest.get('externally_connectable') or {}
+          content_scripts=manifest.get('content_scripts') or []
+          war=manifest.get('web_accessible_resources') or []
+          status={
+            'workflow_run_id':int(os.environ['GITHUB_RUN_ID']),
+            'source_commit':os.environ['GITHUB_SHA'],
+            'extension_id':'kbfnbcaeplbcioakkpcpgfkobkghlhen',
+            'name':manifest.get('name'),'version':manifest.get('version'),
+            'manifest_version':manifest.get('manifest_version'),
+            'externally_connectable':external,
+            'content_script_matches':[m for row in content_scripts for m in row.get('matches',[])],
+            'web_accessible_resource_entries':len(war),
+            'total_scanned_files':len(files),'hit_count':len(hits),
+            'crx_sha256':json.loads((ev/'crx-metadata.json').read_text())['crx_sha256'],
+          }
+          (ev/'status.json').write_text(json.dumps(status,indent=2)+'\n')
+          (ev/'messaging-hits.json').write_text(json.dumps(hits,indent=2)+'\n')
+          # compact ranked map: page-message/external listener contexts with nearby auth/action signal
+          ranked=[]
+          for h in hits:
+            c=h['context'].lower()
+            score=0
+            if h['kind']=='external_listener': score+=8
+            if h['kind']=='page_message': score+=5
+            if any(x in c for x in ['token','cookie','session','auth','credential']): score+=5
+            if any(x in c for x in ['launchauthflow','tabs.','storage.','fetch(','connectnative']): score+=4
+            if any(x in c for x in ['origin','sender','source === window','allowed']): score+=2
+            if score>=7: ranked.append({**h,'score':score})
+          ranked.sort(key=lambda x:(-x['score'],x['file'],x['offset']))
+          (ev/'ranked-bridge-hits.json').write_text(json.dumps(ranked[:1500],indent=2)+'\n')
+          PY
+          find grammarly-extension-intake/extracted -type f -print0 | sort -z | xargs -0 sha256sum > grammarly-extension-intake/evidence/SOURCE_SHA256SUMS.txt
+          sha256sum grammarly-extension-intake/evidence/* > grammarly-extension-intake/evidence/EVIDENCE_SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grammarly-current-extension-bridge-intake
+          path: grammarly-extension-intake/evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
+
+      - name: Record non-sensitive status
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp grammarly-extension-intake/evidence/status.json public-intake-status/grammarly-current-extension-bridge.json
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/grammarly-current-extension-bridge.json
+          git commit -m 'chore: record current Grammarly extension bridge intake'
+          git push
