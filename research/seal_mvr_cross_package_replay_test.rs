@@ -3,7 +3,7 @@
 #[tokio::test]
 async fn test_mvr_session_certificate_cross_package_replay() {
     use crate::mvr;
-    use crate::signed_message::{signed_request, signed_message as _};
+    use crate::signed_message::signed_request;
     use crate::tests::{to_sdk_address, to_sdk_ptb, SealTestCluster};
     use crate::time::current_epoch_time;
     use crate::valid_ptb::ValidPtb;
