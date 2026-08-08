@@ -1,0 +1,137 @@
+name: Sui new VM local surfer seed sweep 20260808
+
+on:
+  push:
+    branches:
+      - research/sui-vm-bounty-20260808
+    paths:
+      - '.github/workflows/sui-new-vm-surfer-seeds-20260808.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/sui-new-vm-surfer-seeds-20260808.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SUI_COMMIT: 5a9f37431c473fa2f6d49abecbcc6a6d7190f533
+  CARGO_INCREMENTAL: '0'
+  RUST_BACKTRACE: full
+  MSIM_WATCHDOG_TIMEOUT_MS: '180000'
+
+jobs:
+  local-surfer-seeds:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout research harness
+        uses: actions/checkout@v4
+
+      - name: Clone exact public Sui source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init sui
+          git -C sui remote add origin https://github.com/MystenLabs/sui.git
+          git -C sui fetch --depth=1 origin "${SUI_COMMIT}"
+          git -C sui checkout --detach FETCH_HEAD
+          test "$(git -C sui rev-parse HEAD)" = "${SUI_COMMIT}"
+          git -C sui rev-parse HEAD | tee SUI_SOURCE_COMMIT.txt
+          mkdir -p surfer-results/logs
+
+      - name: Build the exact local simulator test once
+        shell: bash
+        run: |
+          set -o pipefail
+          cd sui
+          scripts/simtest/cargo-simtest simtest \
+            --package sui-surfer \
+            --test smoke_tests \
+            --no-run \
+            --profile simtest \
+            2>&1 | tee ../surfer-results/SURFER_BUILD.log
+
+      - name: Run deterministic local seed sweep
+        shell: bash
+        run: |
+          set +e
+          cd sui
+          overall=0
+          for seed in \
+            108080001 108080002 108080003 108080004 108080005 \
+            108080006 108080007 108080008 108080009 108080010
+          do
+            echo "===== MSIM_TEST_SEED=${seed} ====="
+            MSIM_TEST_SEED="${seed}" \
+            MSIM_WATCHDOG_TIMEOUT_MS=180000 \
+              timeout 240 scripts/simtest/cargo-simtest simtest \
+                --package sui-surfer \
+                --test smoke_tests \
+                smoke_test \
+                --test-threads 1 \
+                --profile simtest \
+                --nocapture \
+                > "../surfer-results/logs/seed-${seed}.log" 2>&1
+            rc=$?
+            echo "${rc}" > "../surfer-results/logs/seed-${seed}.exit_code"
+            if [ "${rc}" -ne 0 ]; then overall=1; fi
+            tail -n 40 "../surfer-results/logs/seed-${seed}.log"
+            rm -rf /tmp/tmp.* /tmp/.tmp* /tmp/sui-* 2>/dev/null || true
+          done
+          echo "${overall}" > ../surfer-results/SURFER_SWEEP.exit_code
+          exit 0
+
+      - name: Classify failures and coverage markers
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          root = Path('surfer-results')
+          rows = []
+          fatal_re = re.compile(
+              r'(panicked at|SIGABRT|SIGSEGV|SIGBUS|SIGILL|SIGFPE|TIMEOUT|deadlock|'
+              r'UNKNOWN_INVARIANT_VIOLATION|InvariantViolation|invariant violation)',
+              re.I,
+          )
+          for code_path in sorted((root / 'logs').glob('seed-*.exit_code')):
+              seed = code_path.stem.removeprefix('seed-').removesuffix('.exit_code')
+              code = int(code_path.read_text().strip())
+              log_path = code_path.with_suffix('.log')
+              text = log_path.read_text(errors='replace') if log_path.exists() else ''
+              markers = sorted(set(m.group(0) for m in fatal_re.finditer(text)))
+              rows.append({
+                  'seed': seed,
+                  'exit_code': code,
+                  'pass': code == 0 and not markers,
+                  'fatal_markers': markers,
+                  'log': str(log_path),
+              })
+          payload = {
+              'source_commit': Path('SUI_SOURCE_COMMIT.txt').read_text().strip(),
+              'seeds': rows,
+              'all_pass': bool(rows) and all(r['pass'] for r in rows),
+              'failed_seeds': [r['seed'] for r in rows if not r['pass']],
+          }
+          (root / 'SURFER_SEED_RESULTS.json').write_text(json.dumps(payload, indent=2))
+          print(json.dumps(payload, indent=2))
+          PY
+          find surfer-results -type f -print0 | sort -z | xargs -0 sha256sum \
+            > surfer-results/EVIDENCE_SHA256SUMS.txt
+
+      - name: Upload local surfer evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sui-new-vm-local-surfer-seeds-20260808
+          path: |
+            SUI_SOURCE_COMMIT.txt
+            surfer-results/
+          retention-days: 2
