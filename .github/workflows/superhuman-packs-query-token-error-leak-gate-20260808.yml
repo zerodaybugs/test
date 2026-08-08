@@ -1,0 +1,220 @@
+name: Temporary Superhuman Packs query-token error leak gate
+
+on:
+  push:
+    branches: [research/superhuman-crx-intake-20260808]
+    paths: [.github/workflows/superhuman-packs-query-token-error-leak-gate-20260808.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install exact stable SDK including isolated-vm
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf query-token-gate
+          mkdir -p query-token-gate
+          git clone --depth 1 --branch v1.17.1 https://github.com/coda/packs-sdk.git query-token-gate/packs-sdk
+          cd query-token-gate/packs-sdk
+          git rev-parse HEAD > ../TAG_COMMIT.txt
+          npm install --no-audit --no-fund --legacy-peer-deps
+          node -e "const ivm=require('isolated-vm'); console.log('isolated-vm loaded', !!ivm.Isolate)" | tee ../IVM_STATUS.txt
+
+      - name: Run exact host and production-runtime bridge gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd query-token-gate/packs-sdk
+          cat > query_token_error_leak_gate.ts <<'TS'
+          import assert from 'assert';
+          import fs from 'fs';
+          import {AuthenticatingFetcher} from './testing/fetcher';
+          import {AuthenticationType} from './types';
+          import {
+            createIsolate,
+            createIsolateContext,
+            getThunkPath,
+            injectExecutionContext,
+            registerBundle,
+          } from './runtime/bootstrap';
+
+          const SECRET = 'LAB_QUERY_TOKEN_SECRET_20260808';
+          const CLOSED_PORT = 18991;
+          const REQUEST_URL = `http://127.0.0.1:${CLOSED_PORT}/unreachable`;
+          const NETWORK_DOMAIN = `127.0.0.1:${CLOSED_PORT}`;
+
+          function makeQueryFetcher(secret: string) {
+            const authDef: any = {
+              type: AuthenticationType.QueryParamToken,
+              paramName: 'api_key',
+            };
+            const credentials: any = {paramValue: secret};
+            return new AuthenticatingFetcher(
+              () => {}, authDef, [NETWORK_DOMAIN], credentials, 'LAB_QUERY_TOKEN_INVOCATION',
+            );
+          }
+
+          function makeHeaderFetcher(secret: string) {
+            const authDef: any = {type: AuthenticationType.HeaderBearerToken};
+            const credentials: any = {token: secret};
+            return new AuthenticatingFetcher(
+              () => {}, authDef, [NETWORK_DOMAIN], credentials, 'LAB_HEADER_TOKEN_INVOCATION',
+            );
+          }
+
+          async function captureHostError(fetcher: any) {
+            try {
+              await fetcher.fetch({method: 'GET', url: REQUEST_URL});
+              throw new Error('unexpected success');
+            } catch (error: any) {
+              return {
+                name: error?.name,
+                message: String(error?.message || error),
+                stack: String(error?.stack || ''),
+                ownProperties: Object.getOwnPropertyNames(error || {}),
+              };
+            }
+          }
+
+          async function captureThroughIvm(fetcher: any) {
+            const isolate = createIsolate({memoryLimit: 128});
+            const context = await createIsolateContext(isolate);
+            await registerBundle(isolate, context, getThunkPath(), 'coda', false);
+            await injectExecutionContext({
+              context,
+              fetcher,
+              temporaryBlobStorage: {
+                async storeBlob() { throw new Error('not used'); },
+                async storeUrl() { throw new Error('not used'); },
+              } as any,
+              syncStateService: undefined,
+              logger: console,
+              endpoint: undefined,
+              invocationLocation: {protocolAndHost: 'https://coda.io'},
+              timezone: 'UTC',
+              invocationToken: 'LAB_IVM_INVOCATION',
+              sync: undefined,
+              authenticationName: undefined,
+              executionId: 'LAB_EXECUTION_ID',
+              previousAttemptError: undefined,
+            });
+            try {
+              const value = await context.evalClosure(
+                `return (async () => {
+                  try {
+                    await executionContext.fetcher.fetch({method: 'GET', url: $0});
+                    return {unexpectedSuccess: true};
+                  } catch (error) {
+                    return {
+                      name: error && error.name,
+                      message: String(error && error.message || error),
+                      stack: String(error && error.stack || ''),
+                      ownProperties: Object.getOwnPropertyNames(error || {}),
+                      options: error && error.options,
+                      response: error && error.response,
+                    };
+                  }
+                })();`,
+                [REQUEST_URL],
+                {arguments: {copy: true}, result: {copy: true, promise: true}},
+              );
+              return value;
+            } finally {
+              isolate.dispose();
+            }
+          }
+
+          function redactUrlSecrets(message: string, secrets: string[]) {
+            let out = message;
+            for (const secret of secrets) out = out.split(secret).join('<<REDACTED BY CODA>>');
+            return out;
+          }
+
+          async function main() {
+            const queryFetcher = makeQueryFetcher(SECRET);
+            const headerFetcher = makeHeaderFetcher(SECRET);
+
+            const queryHost = await captureHostError(queryFetcher);
+            const headerHost = await captureHostError(headerFetcher);
+            assert(queryHost.message.includes(SECRET), `host error did not contain query token: ${queryHost.message}`);
+            assert(!headerHost.message.includes(SECRET), 'header-token negative control leaked secret in message');
+
+            const queryIvm = await captureThroughIvm(queryFetcher);
+            const headerIvm = await captureThroughIvm(headerFetcher);
+            assert(queryIvm.message.includes(SECRET), `IVM Pack-visible error did not contain query token: ${queryIvm.message}`);
+            assert(!headerIvm.message.includes(SECRET), 'IVM header-token negative control leaked secret in message');
+
+            const patched = redactUrlSecrets(queryIvm.message, [SECRET]);
+            assert(!patched.includes(SECRET));
+            assert(patched.includes('<<REDACTED BY CODA>>'));
+
+            const result = {
+              pass: true,
+              exactSdkTag: 'v1.17.1',
+              exactSdkCommit: fs.readFileSync('../TAG_COMMIT.txt','utf8').trim(),
+              secretMarker: SECRET,
+              hostDirect: {
+                queryParamTokenVisibleInErrorMessage: queryHost.message.includes(SECRET),
+                headerBearerNegativeControlClean: !headerHost.message.includes(SECRET),
+                queryErrorName: queryHost.name,
+                queryErrorMessage: queryHost.message,
+                queryErrorOwnProperties: queryHost.ownProperties,
+              },
+              isolatedVmBoundary: {
+                queryParamTokenVisibleToPackCode: queryIvm.message.includes(SECRET),
+                headerBearerNegativeControlClean: !headerIvm.message.includes(SECRET),
+                queryErrorName: queryIvm.name,
+                queryErrorMessage: queryIvm.message,
+                queryErrorOwnProperties: queryIvm.ownProperties,
+                copiedOptionsPresent: Boolean(queryIvm.options),
+                copiedResponsePresent: Boolean(queryIvm.response),
+              },
+              patchedRedactionControl: {
+                secretRemoved: !patched.includes(SECRET),
+                redactionMarkerPresent: patched.includes('<<REDACTED BY CODA>>'),
+              },
+            };
+            fs.writeFileSync('../RESULT.json', JSON.stringify(result,null,2)+'\n');
+            console.log(JSON.stringify(result,null,2));
+          }
+
+          main().catch(error => { console.error(error); process.exit(1); });
+          TS
+
+          npx ts-node --transpile-only query_token_error_leak_gate.ts | tee ../TEST_OUTPUT.txt
+          jq -e '.pass == true and .hostDirect.queryParamTokenVisibleInErrorMessage == true and .isolatedVmBoundary.queryParamTokenVisibleToPackCode == true and .isolatedVmBoundary.headerBearerNegativeControlClean == true and .patchedRedactionControl.secretRemoved == true' ../RESULT.json >/dev/null
+          sha256sum \
+            testing/fetcher.ts testing/node_fetcher.ts runtime/bootstrap/index.ts runtime/thunk/thunk.ts \
+            query_token_error_leak_gate.ts ../RESULT.json ../TEST_OUTPUT.txt ../TAG_COMMIT.txt ../IVM_STATUS.txt \
+            > ../SHA256SUMS.txt
+
+      - name: Upload exact evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-packs-query-token-error-leak-v1.17.1
+          path: |
+            query-token-gate/RESULT.json
+            query-token-gate/TEST_OUTPUT.txt
+            query-token-gate/TAG_COMMIT.txt
+            query-token-gate/IVM_STATUS.txt
+            query-token-gate/SHA256SUMS.txt
+            query-token-gate/packs-sdk/query_token_error_leak_gate.ts
+            query-token-gate/packs-sdk/testing/fetcher.ts
+            query-token-gate/packs-sdk/testing/node_fetcher.ts
+            query-token-gate/packs-sdk/runtime/bootstrap/index.ts
+            query-token-gate/packs-sdk/runtime/thunk/thunk.ts
+          if-no-files-found: warn
+          retention-days: 1
