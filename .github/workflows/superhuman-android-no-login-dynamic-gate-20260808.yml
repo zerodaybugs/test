@@ -1,0 +1,224 @@
+name: Temporary Superhuman Android no-login dynamic gate
+
+on:
+  push:
+    branches: [research/superhuman-android-20260808]
+    paths: [.github/workflows/superhuman-android-no-login-dynamic-gate-20260808.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  dynamic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare current APK and probe scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq apktool jq unzip file
+          rm -rf android-dynamic
+          mkdir -p android-dynamic/download android-dynamic/apks android-dynamic/decoded android-dynamic/probe android-dynamic/evidence
+          urls=(
+            'https://d.apkpure.com/b/APK/com.superhuman.mail?version=latest'
+            'https://d.apkpure.net/b/APK/com.superhuman.mail?version=latest'
+          )
+          ok=0
+          for url in "${urls[@]}"; do
+            if curl -fL --retry 3 --retry-all-errors -A 'Mozilla/5.0 (Linux; Android 16) Chrome/144 Mobile' "$url" -o android-dynamic/download/package.bin; then
+              echo "$url" > android-dynamic/evidence/SOURCE_URL.txt
+              ok=1; break
+            fi
+          done
+          test "$ok" = 1
+          python3 - <<'PY'
+          import pathlib,zipfile,shutil
+          r=pathlib.Path('android-dynamic'); src=r/'download/package.bin'
+          if src.read_bytes()[:2] != b'PK': raise SystemExit('not zip/apk')
+          with zipfile.ZipFile(src) as z:
+              if 'AndroidManifest.xml' in z.namelist(): shutil.copy2(src,r/'apks/base.apk')
+              else:
+                  z.extractall(r/'download/unpacked')
+                  apks=sorted((r/'download/unpacked').rglob('*.apk'))
+                  if not apks: raise SystemExit('no apk')
+                  base=next((p for p in apks if p.name in {'base.apk','com.superhuman.mail.apk'}),apks[0])
+                  shutil.copy2(base,r/'apks/base.apk')
+                  for i,p in enumerate(apks):
+                      if p!=base: shutil.copy2(p,r/'apks'/f'split_{i}_{p.name}')
+          PY
+          apktool d -f -s android-dynamic/apks/base.apk -o android-dynamic/decoded >/dev/null
+          test -f android-dynamic/decoded/AndroidManifest.xml
+          sha256sum android-dynamic/apks/*.apk > android-dynamic/evidence/APK_SHA256SUMS.txt
+
+          cat > android-dynamic/probe/run_probe.py <<'PY'
+          import json, pathlib, re, subprocess, time, xml.etree.ElementTree as ET
+          ROOT=pathlib.Path('/home/runner/work/test/test/android-dynamic')
+          E=ROOT/'evidence'; E.mkdir(parents=True,exist_ok=True)
+          MAN=ROOT/'decoded/AndroidManifest.xml'; NS='{http://schemas.android.com/apk/res/android}'
+          root=ET.parse(MAN).getroot(); pkg=root.attrib.get('package','com.superhuman.mail'); app=root.find('application')
+          def av(el,n,d=None): return el.attrib.get(NS+n,d)
+          def fq(n):
+              if not n:return None
+              if n.startswith('.'):return pkg+n
+              if '.' not in n:return pkg+'.'+n
+              return n
+          comps=[]
+          for tag in ['activity','activity-alias','service','receiver','provider']:
+              for el in app.findall(tag):
+                  fs=[]
+                  for f in el.findall('intent-filter'):
+                      fs.append({'actions':[av(x,'name') for x in f.findall('action')],
+                                 'categories':[av(x,'name') for x in f.findall('category')],
+                                 'data':[{k:av(d,k) for k in ['scheme','host','port','path','pathPrefix','pathPattern','mimeType']} for d in f.findall('data')]})
+                  raw=av(el,'exported'); exported=raw=='true' or (raw is None and bool(fs))
+                  if exported:
+                      comps.append({'type':tag,'name':fq(av(el,'name')),'permission':av(el,'permission'),
+                                    'readPermission':av(el,'readPermission'),'writePermission':av(el,'writePermission'),
+                                    'authorities':av(el,'authorities'),'filters':fs})
+          def sh(args,timeout=15):
+              p=subprocess.run(args,text=True,capture_output=True,timeout=timeout)
+              return {'cmd':args,'rc':p.returncode,'stdout':p.stdout[-12000:],'stderr':p.stderr[-12000:]}
+          def adb(*args,timeout=15): return sh(['adb',*args],timeout)
+          adb('wait-for-device',timeout=60)
+          adb('shell','settings','put','global','window_animation_scale','0')
+          adb('shell','settings','put','global','transition_animation_scale','0')
+          adb('shell','settings','put','global','animator_duration_scale','0')
+          apks=[str(p) for p in sorted((ROOT/'apks').glob('*.apk'))]
+          install=adb('install-multiple','-r','-t',*apks,timeout=120) if len(apks)>1 else adb('install','-r','-t',apks[0],timeout=120)
+          if install['rc']!=0: raise SystemExit(json.dumps(install))
+          adb('shell','pm','clear',pkg)
+          sentinel='http://10.0.2.2:18080/sentinel?source=superhuman_dynamic'
+          probes=[]
+          def capture(label,command,timeout=20):
+              adb('logcat','-c')
+              try: res=adb(*command,timeout=timeout)
+              except Exception as e: res={'cmd':['adb',*command],'rc':999,'stdout':'','stderr':repr(e)}
+              time.sleep(1.2)
+              logs=adb('logcat','-d','-v','threadtime','*:V',timeout=20)
+              after=adb('shell','dumpsys','activity','activities',timeout=10)
+              entry={'label':label,'result':res,'after':after['stdout'][-8000:],'logcat':logs['stdout'][-40000:]}
+              entry['fatal']=bool(re.search(r'FATAL EXCEPTION|Process: '+re.escape(pkg)+r'.*?\n',entry['logcat'],re.S))
+              entry['securityException']='SecurityException' in entry['logcat'] or 'Permission Denial' in res.get('stderr','') or 'Permission Denial' in res.get('stdout','')
+              probes.append(entry)
+          capture('baseline_monkey',['shell','monkey','-p',pkg,'-c','android.intent.category.LAUNCHER','1'],30)
+          extra_keys=['url','uri','link','target','redirect','redirect_uri','next','return_url','deep_link','deeplink','callback','fallback_url','browser_fallback_url']
+          for c in comps:
+              typ,name=c['type'],c['name']
+              if not name: continue
+              if typ in {'activity','activity-alias'}:
+                  capture(f'activity_explicit::{name}',['shell','am','start','-W','-n',f'{pkg}/{name}'],25)
+                  for f in c['filters']:
+                      for d in f['data']:
+                          scheme=d.get('scheme'); host=d.get('host'); path=d.get('path') or d.get('pathPrefix') or '/'
+                          if scheme:
+                              u=f'{scheme}://{host}{path}' if host else f'{scheme}://{path.lstrip("/")}'
+                              capture(f'deeplink_declared::{name}::{u}',['shell','am','start','-W','-a','android.intent.action.VIEW','-c','android.intent.category.BROWSABLE','-d',u],25)
+                              if host:
+                                  for u2 in [f'{scheme}://{host}@example.invalid{path}',f'{scheme}://{host}\\@example.invalid{path}',f'{scheme}://{host}.example.invalid{path}',f'{scheme}://{host}/%2e%2e/%2e%2e/sentinel']:
+                                      capture(f'deeplink_variant::{name}::{u2}',['shell','am','start','-W','-a','android.intent.action.VIEW','-c','android.intent.category.BROWSABLE','-d',u2],25)
+                  for key in extra_keys:
+                      capture(f'extra_url::{name}::{key}',['shell','am','start','-W','-n',f'{pkg}/{name}','--es',key,sentinel],25)
+              elif typ=='receiver':
+                  actions=sorted({a for f in c['filters'] for a in f['actions'] if a}) or ['android.intent.action.VIEW']
+                  for action in actions[:10]:
+                      capture(f'receiver::{name}::{action}',['shell','am','broadcast','-n',f'{pkg}/{name}','-a',action,'--es','url',sentinel],20)
+              elif typ=='service':
+                  capture(f'service::{name}',['shell','am','startservice','-n',f'{pkg}/{name}'],20)
+              elif typ=='provider' and c.get('authorities'):
+                  for auth in str(c['authorities']).split(';'):
+                      if not auth: continue
+                      for uri in [f'content://{auth}',f'content://{auth}/',f'content://{auth}/../shared_prefs',f'content://{auth}/%2e%2e/shared_prefs']:
+                          capture(f'provider_query::{auth}::{uri}',['shell','content','query','--uri',uri],20)
+                          capture(f'provider_type::{auth}::{uri}',['shell','content','gettype','--uri',uri],20)
+          perms=adb('shell','dumpsys','package',pkg,timeout=30)
+          summary=[]
+          for p in probes:
+              txt=(p['result'].get('stdout','')+'\n'+p['result'].get('stderr','')+'\n'+p['logcat'])
+              summary.append({'label':p['label'],'rc':p['result'].get('rc'),'fatal':p['fatal'],'securityException':p['securityException'],
+                              'returnedRows':bool(re.search(r'Row:\s*\d+|Result=|_id=',txt,re.I)),
+                              'openedExternalSentinel':('10.0.2.2:18080' in txt or 'example.invalid' in p['after']),
+                              'topActivity':next(iter(re.findall(r'mResumedActivity:.*|topResumedActivity=.*',p['after'])),None)})
+          decision={'submissionReady':False,'finding':None,'reason':'Generic no-login dynamic gate; crashes/open navigation are not security findings without unauthorized data or action.',
+                    'highSignal':[x for x in summary if x['returnedRows'] or (x['openedExternalSentinel'] and 'provider_' in x['label'])],
+                    'fatalCount':sum(x['fatal'] for x in summary),'probeCount':len(summary)}
+          (E/'COMPONENTS.json').write_text(json.dumps(comps,indent=2)+'\n')
+          (E/'PROBES_FULL.json').write_text(json.dumps(probes,indent=2)+'\n')
+          (E/'PROBES_SUMMARY.json').write_text(json.dumps(summary,indent=2)+'\n')
+          (E/'DECISION.json').write_text(json.dumps(decision,indent=2)+'\n')
+          (E/'DUMPSYS_PACKAGE.txt').write_text(perms['stdout'])
+          print(json.dumps(decision,indent=2))
+          PY
+
+          cat > android-dynamic/probe/sentinel_server.py <<'PY'
+          from http.server import BaseHTTPRequestHandler,HTTPServer
+          from pathlib import Path
+          import json,time
+          out=Path('/home/runner/work/test/test/android-dynamic/evidence/SENTINEL_REQUESTS.jsonl')
+          class H(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  out.parent.mkdir(parents=True,exist_ok=True)
+                  with out.open('a') as f:f.write(json.dumps({'time':time.time(),'path':self.path,'headers':dict(self.headers)})+'\n')
+                  self.send_response(200);self.send_header('content-type','text/html');self.end_headers();self.wfile.write(b'<html><body>ZD SENTINEL</body></html>')
+              def log_message(self,*a):pass
+          HTTPServer(('0.0.0.0',18080),H).serve_forever()
+          PY
+
+      - name: Run no-login emulator probes
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          profile: pixel_7
+          target: google_apis
+          disable-animations: true
+          emulator-boot-timeout: 900
+          script: |
+            python3 android-dynamic/probe/sentinel_server.py > android-dynamic/evidence/SENTINEL_SERVER.log 2>&1 &
+            echo $! > android-dynamic/evidence/SENTINEL_SERVER.pid
+            python3 android-dynamic/probe/run_probe.py | tee android-dynamic/evidence/PROBE_OUTPUT.txt
+            kill $(cat android-dynamic/evidence/SENTINEL_SERVER.pid) 2>/dev/null || true
+
+      - name: Finalize provenance
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find android-dynamic/evidence android-dynamic/apks -type f -print0 | sort -z | xargs -0 -r sha256sum > android-dynamic/SHA256SUMS.txt
+          python3 - <<'PY'
+          import json,pathlib,hashlib,os
+          r=pathlib.Path('android-dynamic'); e=r/'evidence'; base=r/'apks/base.apk'
+          d=json.loads((e/'DECISION.json').read_text()) if (e/'DECISION.json').exists() else {'submissionReady':False,'reason':'dynamic gate did not complete'}
+          s={'workflowRunId':int(os.environ['GITHUB_RUN_ID']),'sourceCommit':os.environ['GITHUB_SHA'],'package':'com.superhuman.mail',
+             'baseApkSha256':hashlib.sha256(base.read_bytes()).hexdigest() if base.exists() else None,
+             'decision':d,'provenanceLimit':'Third-party distribution candidate. A report requires matching Play-installed signer/build provenance.'}
+          (r/'STATUS.json').write_text(json.dumps(s,indent=2)+'\n')
+          PY
+
+      - name: Upload dynamic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-android-no-login-dynamic-gate
+          path: |
+            android-dynamic/STATUS.json
+            android-dynamic/SHA256SUMS.txt
+            android-dynamic/evidence/
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Commit non-binary status
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f android-dynamic/STATUS.json || exit 0
+          mkdir -p public-intake-status
+          cp android-dynamic/STATUS.json public-intake-status/superhuman-android-dynamic-current.json
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add public-intake-status/superhuman-android-dynamic-current.json
+          git commit -m 'chore: record temporary Superhuman Android dynamic gate' || exit 0
+          git push
