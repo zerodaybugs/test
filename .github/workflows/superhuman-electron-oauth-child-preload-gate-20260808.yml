@@ -1,0 +1,177 @@
+name: Temporary Superhuman Electron OAuth child preload gate
+
+on:
+  push:
+    branches: [research/superhuman-desktop-20260808]
+    paths: [.github/workflows/superhuman-electron-oauth-child-preload-gate-20260808.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install exact embedded Electron runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf electron-oauth-gate
+          mkdir -p electron-oauth-gate/evidence
+          cd electron-oauth-gate
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund --ignore-scripts=false electron@41.6.1
+          npx electron --version | tee evidence/electron-version.txt
+
+      - name: Run BrowserView OAuth redirect inheritance gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd electron-oauth-gate
+          cat > preload.js <<'JS'
+          const { contextBridge, ipcRenderer } = require('electron')
+          contextBridge.exposeInMainWorld('NativeApi', {
+            marker: 'SUPERHUMAN_SYNTHETIC_PRELOAD_MARKER_20260808',
+            canSendIpc: typeof ipcRenderer.send === 'function'
+          })
+          JS
+          cat > main.js <<'JS'
+          const { app, BrowserWindow, BrowserView } = require('electron')
+          const http = require('http')
+          const fs = require('fs')
+          const path = require('path')
+
+          const MARKER = 'SUPERHUMAN_SYNTHETIC_PRELOAD_MARKER_20260808'
+          const evidence = { pass: false, electron: process.versions.electron, tests: {} }
+
+          function listen(server) {
+            return new Promise((resolve, reject) => {
+              server.once('error', reject)
+              server.listen(0, '127.0.0.1', () => resolve(server.address().port))
+            })
+          }
+          function onceFinished(webContents) {
+            return new Promise((resolve, reject) => {
+              const timer = setTimeout(() => reject(new Error('did-finish-load timeout')), 15000)
+              webContents.once('did-finish-load', () => { clearTimeout(timer); resolve() })
+              webContents.once('did-fail-load', (_e, code, description, url) => {
+                clearTimeout(timer); reject(new Error(`did-fail-load ${code} ${description} ${url}`))
+              })
+            })
+          }
+          async function inspectChild(child) {
+            await onceFinished(child.webContents)
+            return child.webContents.executeJavaScript(`({
+              href: location.href,
+              marker: globalThis.NativeApi && globalThis.NativeApi.marker,
+              hasNativeApi: !!globalThis.NativeApi,
+              canSendIpc: !!(globalThis.NativeApi && globalThis.NativeApi.canSendIpc)
+            })`, true)
+          }
+          async function openAndCapture(view, url, label) {
+            return new Promise(async (resolve, reject) => {
+              const timer = setTimeout(() => reject(new Error(`${label} child timeout`)), 20000)
+              view.webContents.once('did-create-window', async (child, details) => {
+                try {
+                  const inspected = await inspectChild(child)
+                  clearTimeout(timer)
+                  resolve({ details: { url: details.url, options: details.options }, inspected })
+                  child.destroy()
+                } catch (error) {
+                  clearTimeout(timer); reject(error)
+                }
+              })
+              try {
+                await view.webContents.executeJavaScript(`window.open(${JSON.stringify(url)}, '_blank'); true`, true)
+              } catch (error) {
+                clearTimeout(timer); reject(error)
+              }
+            })
+          }
+
+          const server = http.createServer((req, res) => {
+            if (req.url === '/parent') {
+              res.writeHead(200, {'content-type':'text/html'})
+              res.end('<!doctype html><title>parent</title><p>parent</p>')
+              return
+            }
+            if (req.url === '/oauth') {
+              res.writeHead(302, { Location: '/attacker' })
+              res.end('redirect')
+              return
+            }
+            if (req.url === '/attacker') {
+              res.writeHead(200, {'content-type':'text/html'})
+              res.end('<!doctype html><title>attacker</title><p id="attacker">attacker-controlled landing</p>')
+              return
+            }
+            res.writeHead(404); res.end('not found')
+          })
+
+          app.whenReady().then(async () => {
+            let win
+            try {
+              const port = await listen(server)
+              const origin = `http://127.0.0.1:${port}`
+              win = new BrowserWindow({show:false})
+              const view = new BrowserView({
+                webPreferences: {
+                  preload: path.join(__dirname, 'preload.js'),
+                  contextIsolation: true,
+                  nodeIntegration: false,
+                  sandbox: true
+                }
+              })
+              win.setBrowserView(view)
+              view.setBounds({x:0,y:0,width:800,height:600})
+              view.webContents.setWindowOpenHandler(({url}) => {
+                if (url.startsWith(`${origin}/oauth`) || url.startsWith('about:blank')) {
+                  return {action:'allow'}
+                }
+                return {action:'deny'}
+              })
+              view.webContents.loadURL(`${origin}/parent`)
+              await onceFinished(view.webContents)
+              evidence.parent = await view.webContents.executeJavaScript(`({marker:NativeApi.marker, hasNativeApi:!!NativeApi})`, true)
+
+              evidence.tests.oauthRedirect = await openAndCapture(view, `${origin}/oauth`, 'oauthRedirect')
+              evidence.tests.aboutBlank = await openAndCapture(view, 'about:blank', 'aboutBlank')
+
+              const oauth = evidence.tests.oauthRedirect.inspected
+              const blank = evidence.tests.aboutBlank.inspected
+              evidence.assertions = {
+                parentPreloadActive: evidence.parent.marker === MARKER,
+                oauthRedirectLandsOnAttacker: oauth.href === `${origin}/attacker`,
+                oauthRedirectInheritedPreload: oauth.marker === MARKER && oauth.canSendIpc === true,
+                aboutBlankInheritedPreload: blank.marker === MARKER && blank.canSendIpc === true
+              }
+              evidence.pass = Object.values(evidence.assertions).every(Boolean)
+            } catch (error) {
+              evidence.error = String(error && error.stack || error)
+            } finally {
+              fs.writeFileSync(path.join(__dirname,'evidence','RESULT.json'), JSON.stringify(evidence,null,2)+'\n')
+              try { server.close() } catch (_) {}
+              try { if (win && !win.isDestroyed()) win.destroy() } catch (_) {}
+              app.exit(evidence.pass ? 0 : 1)
+            }
+          })
+          JS
+          xvfb-run -a npx electron main.js 2>&1 | tee evidence/TEST_OUTPUT.txt
+          jq . evidence/RESULT.json
+          sha256sum main.js preload.js evidence/RESULT.json evidence/TEST_OUTPUT.txt evidence/electron-version.txt > evidence/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: superhuman-electron-oauth-child-preload-gate
+          path: electron-oauth-gate/evidence/
+          if-no-files-found: warn
+          retention-days: 1
