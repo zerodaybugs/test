@@ -1,0 +1,150 @@
+name: Temporary official Superhuman desktop static audit
+
+on:
+  push:
+    branches: [research/superhuman-crx-intake-20260808]
+    paths: [.github/workflows/superhuman-desktop-static-audit-20260808-v2.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  audit:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve current official Homebrew cask and download signed app
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p desktop-audit/input desktop-audit/extracted desktop-audit/evidence
+          curl --fail --show-error --silent --location \
+            'https://raw.githubusercontent.com/Homebrew/homebrew-cask/main/Casks/s/superhuman.rb' \
+            -o desktop-audit/input/superhuman.rb
+          python3 - <<'PY'
+          import json, pathlib, re
+          text=pathlib.Path('desktop-audit/input/superhuman.rb').read_text()
+          version=re.search(r'version\s+"([^"]+)"',text).group(1)
+          arm=re.search(r'sha256 arm:\s+"([0-9a-f]{64})"',text).group(1)
+          intel=re.search(r'intel:\s+"([0-9a-f]{64})"',text).group(1)
+          data={'version':version,'arm_sha256':arm,'intel_sha256':intel,
+                'arm_url':f'https://storage.googleapis.com/download.superhuman.com/supertron-update/Superhuman-{version}-arm64-latest-mac.zip'}
+          pathlib.Path('desktop-audit/input/cask.json').write_text(json.dumps(data,indent=2)+'\n')
+          PY
+          VERSION=$(python3 -c 'import json;print(json.load(open("desktop-audit/input/cask.json"))["version"])')
+          URL=$(python3 -c 'import json;print(json.load(open("desktop-audit/input/cask.json"))["arm_url"])')
+          EXPECTED=$(python3 -c 'import json;print(json.load(open("desktop-audit/input/cask.json"))["arm_sha256"])')
+          curl --fail --show-error --silent --location --retry 3 --retry-all-errors "$URL" -o desktop-audit/input/Superhuman-arm64.zip
+          ACTUAL=$(shasum -a 256 desktop-audit/input/Superhuman-arm64.zip | awk '{print $1}')
+          test "$ACTUAL" = "$EXPECTED"
+          unzip -q desktop-audit/input/Superhuman-arm64.zip -d desktop-audit/extracted
+          find desktop-audit/extracted -type f -name app.asar -print -quit > desktop-audit/input/asar_path.txt
+          test -s desktop-audit/input/asar_path.txt
+
+      - name: Extract app.asar
+        shell: bash
+        run: |
+          set -euo pipefail
+          ASAR=$(cat desktop-audit/input/asar_path.txt)
+          mkdir -p desktop-audit/app
+          npx --yes @electron/asar extract "$ASAR" desktop-audit/app
+          test -f desktop-audit/app/package.json
+
+      - name: Audit privileged trust boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,re,hashlib,os
+          root=Path('desktop-audit')
+          app=root/'app'
+          text_ext={'.js','.cjs','.mjs','.json','.html','.ts'}
+          files=[p for p in app.rglob('*') if p.is_file() and p.suffix.lower() in text_ext and p.stat().st_size<=40_000_000]
+          patterns={
+            'nodeIntegration_true':r'nodeIntegration\s*:\s*true',
+            'contextIsolation_false':r'contextIsolation\s*:\s*false',
+            'webSecurity_false':r'webSecurity\s*:\s*false',
+            'sandbox_false':r'sandbox\s*:\s*false',
+            'allowRunningInsecureContent_true':r'allowRunningInsecureContent\s*:\s*true',
+            'custom_protocol':r'(?:registerFileProtocol|registerBufferProtocol|protocol\.handle|registerSchemesAsPrivileged|superhuman-app://)',
+            'navigation_guard':r'(?:setWindowOpenHandler|will-navigate|new-window)',
+            'external_open':r'(?:shell\.)?openExternal',
+            'ipc_main':r'ipcMain\.(?:handle|on|once)',
+            'context_bridge':r'contextBridge\.exposeInMainWorld',
+            'renderer_ipc':r'ipcRenderer\.(?:invoke|send|sendSync|postMessage)',
+            'execute_javascript':r'webContents\.executeJavaScript',
+            'updater':r'(?:autoUpdater|setFeedURL|electron-updater|latest-mac\.yml)',
+            'certificate_override':r'(?:setCertificateVerifyProc|certificate-error)',
+            'permission_handler':r'setPermissionRequestHandler',
+          }
+          hits={k:[] for k in patterns}
+          for p in files:
+            try: text=p.read_text(errors='replace')
+            except Exception: continue
+            for name,pat in patterns.items():
+              for m in re.finditer(pat,text,re.I):
+                a=max(0,m.start()-260); b=min(len(text),m.end()+700)
+                hits[name].append({'file':str(p.relative_to(app)),'offset':m.start(),'snippet':text[a:b].replace('\x00','')})
+                if len(hits[name])>=200: break
+          package=json.loads((app/'package.json').read_text())
+          cask=json.loads((root/'input/cask.json').read_text())
+          flags=[]
+          for key in ['nodeIntegration_true','contextIsolation_false','webSecurity_false','allowRunningInsecureContent_true']:
+            if hits[key]: flags.append(key)
+          # sandbox:false is not automatically vulnerable; retain only as review surface.
+          result={
+            'cask':cask,
+            'package_name':package.get('name'),
+            'package_version':package.get('version'),
+            'electron_dependency':(package.get('devDependencies') or {}).get('electron') or (package.get('dependencies') or {}).get('electron'),
+            'files_scanned':len(files),
+            'hit_counts':{k:len(v) for k,v in hits.items()},
+            'high_confidence_literal_flags':flags,
+            'decision':'STATIC_REVIEW_REQUIRED_NO_VULNERABILITY_FROM_LITERAL_HITS_ALONE',
+          }
+          (root/'evidence/result.json').write_text(json.dumps(result,indent=2)+'\n')
+          (root/'evidence/hits.json').write_text(json.dumps(hits,indent=2)+'\n')
+          # Produce focused excerpts without shipping the full proprietary application.
+          for name,rows in hits.items():
+            with (root/'evidence'/f'{name}.txt').open('w') as f:
+              for i,row in enumerate(rows[:40],1):
+                f.write(f'--- hit {i}: {row["file"]} @ {row["offset"]} ---\n{row["snippet"]}\n\n')
+          PY
+          shasum -a 256 desktop-audit/evidence/* | sort > desktop-audit/evidence/SHA256SUMS.txt
+
+      - name: Record concise status
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib, os
+          result=json.loads(pathlib.Path('desktop-audit/evidence/result.json').read_text())
+          status={'workflow_run_id':int(os.environ['GITHUB_RUN_ID']),'source_commit':os.environ['GITHUB_SHA'],**result}
+          p=pathlib.Path('public-intake-status/superhuman-desktop-static-audit.json')
+          p.parent.mkdir(parents=True,exist_ok=True)
+          p.write_text(json.dumps(status,indent=2)+'\n')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-desktop-static-audit
+          path: |
+            desktop-audit/input/cask.json
+            desktop-audit/evidence/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Commit concise status
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add public-intake-status/superhuman-desktop-static-audit.json
+          git commit -m 'chore: record official Superhuman desktop static audit'
+          git push
