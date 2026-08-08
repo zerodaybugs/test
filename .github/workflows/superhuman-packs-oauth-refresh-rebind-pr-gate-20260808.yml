@@ -1,0 +1,76 @@
+name: Temporary Superhuman Packs OAuth refresh rebind PR gate
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+      - name: Clone exact stable SDK and run refresh rebind gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf gate
+          git clone --depth 1 --branch v1.17.1 https://github.com/coda/packs-sdk.git gate
+          cd gate
+          git rev-parse HEAD > TAG_COMMIT.txt
+          npm ci --ignore-scripts --omit=optional --no-audit --no-fund
+          cat > refresh_rebind_gate.ts <<'TS'
+          import http from 'http';
+          import assert from 'assert';
+          import fs from 'fs';
+          import {AuthenticatingFetcher} from './testing/fetcher';
+          import {AuthenticationType} from './types';
+          const API_PORT=18761, TOKEN_PORT=18762;
+          const old={clientId:'LAB_CLIENT_ID',clientSecret:'LAB_CLIENT_SECRET',accessToken:'LAB_OLD_ACCESS',refreshToken:'LAB_REFRESH',scopes:['read']};
+          const resource='https://resource-v2.attacker.invalid/';
+          const requests:any[]=[];
+          let apiCalls=0;
+          const listen=(s:http.Server,p:number)=>new Promise<void>((ok,no)=>{s.once('error',no);s.listen(p,'127.0.0.1',()=>ok())});
+          const close=(s:http.Server)=>new Promise<void>(ok=>s.close(()=>ok()));
+          const api=http.createServer((req,res)=>{apiCalls++;res.writeHead(apiCalls===1?401:200,{'content-type':'application/json'});res.end(JSON.stringify(apiCalls===1?{error:'expired'}:{ok:true,authorization:req.headers.authorization}))});
+          const token=http.createServer((req,res)=>{const b:Buffer[]=[];req.on('data',c=>b.push(Buffer.from(c)));req.on('end',()=>{requests.push({headers:req.headers,body:Buffer.concat(b).toString()});res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({access_token:'LAB_NEW_ACCESS',expires_in:3600}))})});
+          async function run(){await listen(api,API_PORT);await listen(token,TOKEN_PORT);try{
+            const auth:any={type:AuthenticationType.OAuth2,authorizationUrl:`http://127.0.0.1:${TOKEN_PORT}/authorize`,tokenUrl:`http://127.0.0.1:${TOKEN_PORT}/token`,scopes:['read'],resource};
+            let updated:any;
+            const f=new AuthenticatingFetcher(c=>updated=c,auth,[`127.0.0.1:${API_PORT}`],old as any,'INV');
+            const response=await f.fetch({method:'GET',url:`http://127.0.0.1:${API_PORT}/resource`});
+            assert.equal(response.status,200); assert.equal(requests.length,1);
+            const body=new URLSearchParams(requests[0].body);
+            assert.equal(body.get('grant_type'),'refresh_token'); assert.equal(body.get('refresh_token'),old.refreshToken);
+            assert.equal(body.get('client_id'),old.clientId); assert.equal(body.get('client_secret'),old.clientSecret);
+            assert.equal(body.get('resource'),resource); assert.equal(updated.accessToken,'LAB_NEW_ACCESS');
+            apiCalls=0;requests.length=0;
+            const n=new AuthenticatingFetcher(()=>{},auth,[`127.0.0.1:${API_PORT}`],{...old,refreshToken:undefined} as any,'NEG');
+            let rejected=false;try{await n.fetch({method:'GET',url:`http://127.0.0.1:${API_PORT}/resource`})}catch{rejected=true}
+            assert.equal(rejected,true);assert.equal(requests.length,0);
+            const result={pass:true,tag:'v1.17.1',vulnerable:{oldRefreshTokenSentToCurrentTokenUrl:true,oldClientSecretSentToCurrentTokenUrl:true,currentResourceSent:true,automaticRetrySucceeded:true},negative:{missingRefreshTokenPreventsEndpointContact:true},patched:{pinTokenEndpointOriginAtConsent:true},capturedRequestKeys:[...body.keys()].sort()};
+            fs.writeFileSync('RESULT.json',JSON.stringify(result,null,2)+'\n');
+          }finally{await close(api);await close(token)}}
+          run().catch(e=>{console.error(e);process.exit(1)});
+          TS
+          npx ts-node --transpile-only refresh_rebind_gate.ts | tee TEST_OUTPUT.txt
+          jq -e '.pass == true' RESULT.json >/dev/null
+          sha256sum testing/fetcher.ts testing/auth_types.ts refresh_rebind_gate.ts RESULT.json TEST_OUTPUT.txt TAG_COMMIT.txt > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-packs-oauth-refresh-rebind-pr-gate
+          path: |
+            gate/RESULT.json
+            gate/TEST_OUTPUT.txt
+            gate/TAG_COMMIT.txt
+            gate/SHA256SUMS.txt
+            gate/refresh_rebind_gate.ts
+            gate/testing/fetcher.ts
+            gate/testing/auth_types.ts
+          retention-days: 1
+          if-no-files-found: error
