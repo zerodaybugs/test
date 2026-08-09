@@ -1,4 +1,4 @@
-name: Bucket Credit ACL Manager Identity Gate
+name: Bucket Live Debtor Receiver Audit
 
 on:
   pull_request:
@@ -11,133 +11,247 @@ permissions:
   contents: read
 
 jobs:
-  identity-gate:
+  debtor-audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
-      - name: Query manager addresses as objects and accounts
+      - name: Fetch production debtor bytecode, ABI, objects, and recent calls
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf bucket-credit-manager-gate
-          mkdir -p bucket-credit-manager-gate/raw
-          cat > bucket-credit-manager-gate/query.py <<'PY'
+          rm -rf bucket-debtor-audit
+          mkdir -p bucket-debtor-audit/{raw,asm,analysis}
+          cat > bucket-debtor-audit/audit.py <<'PY'
           import json
           import pathlib
+          import re
           import time
           import urllib.request
 
-          OUT = pathlib.Path('bucket-credit-manager-gate')
+          OUT = pathlib.Path('bucket-debtor-audit')
           RAW = OUT / 'raw'
+          ASM = OUT / 'asm'
+          ANALYSIS = OUT / 'analysis'
           GQL = 'https://graphql.mainnet.sui.io/graphql'
-          CDP_ACL = '0x578045427984976a5d7d6d2f35f2d23da6b85e6062771e999aaddf1dd54fcd3f'
-          MANAGERS = {
-              'manager_admin_like': '0x938884d43de2bcf13a2f8f5886ea6382994ba49dcf7b3d08203acdd508778b6b',
-              'manager_shared_between_cdp_psm': '0xbb7e63ea8820707968c5c9879c5e3a8ac6ffe59337c7e307490089b8c6caf6ef',
-              'manager_psm_only': '0xbfd2e22f32d4bcaaf6f12f218fcc26488fdf63f338481e0d4f96e95160d61ba9',
+          RPCS = [
+              'https://sui-mainnet-endpoint.blockvision.org',
+              'https://fullnode.mainnet.sui.io:443',
+          ]
+          PACKAGES = {
+              'delegation_farm': '0xd95810493736139876e9f1fe0cd1de12639a6d6abe7c92c86d7d4f9ada96adce',
+              'navi_farm': '0x22955b7a13502d3b20383a6904abadad683456128141d9ff6820260c7020f0cb',
+              'framework_v2': '0xe2d49d67ff42dc500275f2d84841bf35632aa6c1abdb70af66a10e1de93a4400',
+              'cdp_v4': '0xc1dd29778f3fccd19a4ac79d1c35a14bf9d65a0b48f1c5bba98a949cacc53e26',
+          }
+          ENTITY_NAMES = {
+              'delegation_farm': 'DelegationEntity',
+              'navi_farm': 'NaviFarmEntity',
           }
 
-          def gql(query, variables=None, retries=5):
-              payload = json.dumps({'query': query, 'variables': variables or {}}).encode()
+          def http_post(url, payload, retries=5, timeout=120):
+              data = json.dumps(payload).encode()
               last = None
               for n in range(retries):
                   try:
                       req = urllib.request.Request(
-                          GQL,
-                          data=payload,
+                          url,
+                          data=data,
                           method='POST',
-                          headers={'Content-Type':'application/json','User-Agent':'bucket-credit-manager-gate/1'},
+                          headers={'Content-Type':'application/json','User-Agent':'bucket-debtor-audit/1'},
                       )
-                      with urllib.request.urlopen(req, timeout=90) as response:
+                      with urllib.request.urlopen(req, timeout=timeout) as response:
                           body = json.loads(response.read().decode())
-                      if body.get('errors'):
-                          raise RuntimeError(json.dumps(body['errors']))
                       return body
                   except Exception as exc:
                       last = exc
                       time.sleep(2 ** n)
-              raise RuntimeError(f'GraphQL failure: {last}')
+              raise RuntimeError(f'POST failure for {url}: {last}')
 
-          def dump(name, value):
-              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+          def gql(query, variables=None):
+              body = http_post(GQL, {'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body
 
-          keys = [CDP_ACL] + list(MANAGERS.values())
-          q_objects = '''query O($keys:[ObjectKey!]!){multiGetObjects(keys:$keys){address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}}}}'''
-          objects = gql(q_objects, {'keys':[{'address':x} for x in keys]})
-          dump('objects.json', objects)
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = http_post(endpoint, {'jsonrpc':'2.0','id':1,'method':method,'params':params}, timeout=90)
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint':endpoint,'error':type(exc).__name__,'message':str(exc)})
+              return {'failures': failures}
 
-          q_address = '''query A($address:SuiAddress!){address(address:$address){address balances(first:20){nodes{coinType coinObjectCount totalBalance}}objects(first:50){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}contents{type{repr}json bcs}hasPublicTransfer}}transactions(first:20,relation:SENT){pageInfo{hasNextPage endCursor}nodes{digest sender{address}effects{status errors}kind{__typename}}}}}'''
-          address_results = {}
-          for label, address in MANAGERS.items():
-              try:
-                  address_results[label] = gql(q_address, {'address':address})
-              except Exception as exc:
-                  address_results[label] = {'error':type(exc).__name__,'message':str(exc)}
-          dump('addresses.json', address_results)
+          def dump(path, value):
+              path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
 
-          object_nodes = objects['data']['multiGetObjects']
-          by_address = {node['address'].lower():node for node in object_nodes if node and node.get('address')}
-          rows = []
-          dangerous = []
-          for label, address in MANAGERS.items():
-              node = by_address.get(address.lower())
-              move = (node or {}).get('asMoveObject') or {}
-              contents = move.get('contents') or {}
-              type_repr = (contents.get('type') or {}).get('repr')
-              owner = (node or {}).get('owner')
-              row = {
-                  'label': label,
-                  'address': address,
-                  'address_resolves_to_live_object': bool(node),
-                  'object_type': type_repr,
-                  'object_owner': owner,
-                  'has_public_transfer': move.get('hasPublicTransfer'),
-                  'is_bucket_account_object': bool(type_repr and type_repr.endswith('::account::Account')),
-                  'is_shared_object': bool(owner and owner.get('__typename') == 'Shared'),
+          def split_functions(disassembly):
+              lines = disassembly.splitlines()
+              starts = []
+              pattern = re.compile(r'^(entry\s+)?(public(?:\([^)]*\))?\s+)?(?:fun\s+)?([^\s<(]+)(?:<[^>]*>)?\(')
+              for index, line in enumerate(lines):
+                  match = pattern.match(line)
+                  if match and not line.startswith(('B', 'L')):
+                      starts.append((index, match.group(3), line))
+              result = []
+              for pos, (start, name, signature) in enumerate(starts):
+                  end = starts[pos + 1][0] if pos + 1 < len(starts) else len(lines)
+                  result.append({
+                      'name': name,
+                      'signature': signature,
+                      'body': '\n'.join(lines[start:end]).rstrip() + '\n',
+                  })
+              return result
+
+          package_metadata = {}
+          function_inventory = []
+          entity_constructor_sites = []
+          hot_potato_sites = []
+          security_sites = []
+
+          package_query = '''query P($address:SuiAddress!){object(address:$address){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}modules{nodes{name fileFormatVersion disassembly functions(first:100){nodes{name visibility isEntry parameters{repr}return{repr}typeParameters{constraints}}}structs(first:100){nodes{name abilities fields{name type{repr}}typeParameters{constraints}}}}}}}}'''
+
+          for label, package_id in PACKAGES.items():
+              response = gql(package_query, {'address': package_id})
+              dump(RAW / f'{label}.package.json', response)
+              package = response['data']['object']['asMovePackage']
+              package_metadata[label] = {
+                  'package_id': package_id,
+                  'version': package.get('version'),
+                  'linkage': package.get('linkage'),
+                  'type_origins': package.get('typeOrigins'),
+                  'previous_transaction': response['data']['object'].get('previousTransaction'),
               }
-              rows.append(row)
-              if row['is_bucket_account_object'] and row['is_shared_object']:
-                  dangerous.append(row)
+              for module in package['modules']['nodes']:
+                  module_name = module['name']
+                  disassembly = module.get('disassembly') or ''
+                  (ASM / f'{label}__{module_name}.asm').write_text(disassembly)
+                  gql_functions = {f['name']:f for f in (module.get('functions') or {}).get('nodes', [])}
+                  gql_structs = {s['name']:s for s in (module.get('structs') or {}).get('nodes', [])}
+                  for function in split_functions(disassembly):
+                      meta = gql_functions.get(function['name'], {})
+                      row = {
+                          'package_label': label,
+                          'package_id': package_id,
+                          'module': module_name,
+                          'name': function['name'],
+                          'signature': function['signature'],
+                          'visibility': meta.get('visibility'),
+                          'is_entry': meta.get('isEntry'),
+                          'parameters': [x.get('repr') for x in meta.get('parameters', [])],
+                          'returns': [x.get('repr') for x in meta.get('return', [])],
+                      }
+                      function_inventory.append(row)
+                      body = function['body']
+                      entity_name = ENTITY_NAMES.get(label)
+                      if entity_name and (
+                          f'Pack[' in body and entity_name in json.dumps(gql_structs)
+                          or entity_name in function['signature']
+                          or entity_name in body
+                      ):
+                          entity_constructor_sites.append({**row, 'body': body})
+                      if any(term in body for term in (
+                          'sheet::receive', 'sheet::pay', 'sheet::collect', 'sheet::lend',
+                          'vault::loan', 'request_repayment', 'collect_repayment',
+                          'Loan<', 'Request<',
+                      )):
+                          hot_potato_sites.append({**row, 'body': body})
+                      if any(term in function['signature'] + '\n' + body for term in (
+                          'AdminCap', 'ManagerCap', 'OwnerCap', 'Witness', 'Entity',
+                          'sender', 'assert', 'whitelist', 'blacklist', 'clock',
+                      )):
+                          security_sites.append({**row, 'body': body})
 
-          acl_node = by_address.get(CDP_ACL.lower())
-          acl_json = (((acl_node or {}).get('asMoveObject') or {}).get('contents') or {}).get('json')
+                  for struct_name, struct_meta in gql_structs.items():
+                      if struct_name == ENTITY_NAMES.get(label):
+                          dump(ANALYSIS / f'{label}.entity_struct.json', struct_meta)
+
+              normalized = rpc('sui_getNormalizedMoveModulesByPackage', [package_id])
+              dump(RAW / f'{label}.normalized.json', normalized)
+
+              live_objects_query = '''query O($type:String!){objects(first:50,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+              try:
+                  live_objects = gql(live_objects_query, {'type': package_id})
+              except Exception as exc:
+                  live_objects = {'error':type(exc).__name__,'message':str(exc)}
+              dump(RAW / f'{label}.live_objects.json', live_objects)
+
+              recent_calls = rpc('suix_queryTransactionBlocks', [
+                  {
+                      'filter': {'MoveFunction': {'package': package_id}},
+                      'options': {
+                          'showInput': True,
+                          'showRawInput': False,
+                          'showEffects': True,
+                          'showEvents': True,
+                          'showObjectChanges': True,
+                          'showBalanceChanges': True,
+                      },
+                  },
+                  None,
+                  50,
+                  True,
+              ])
+              dump(RAW / f'{label}.recent_calls.json', recent_calls)
+
+          dump(ANALYSIS / 'function_inventory.json', function_inventory)
+          dump(ANALYSIS / 'entity_constructor_sites.json', entity_constructor_sites)
+          dump(ANALYSIS / 'hot_potato_sites.json', hot_potato_sites)
+          dump(ANALYSIS / 'security_sites.json', security_sites)
+
+          public_entity_factories = []
+          permissionless_receive_candidates = []
+          for row in entity_constructor_sites:
+              visible = str(row.get('visibility') or '').upper() == 'PUBLIC'
+              if visible or row.get('is_entry'):
+                  public_entity_factories.append({k:v for k,v in row.items() if k != 'body'})
+          for row in hot_potato_sites:
+              visible = str(row.get('visibility') or '').upper() == 'PUBLIC'
+              body = row.get('body','')
+              if (visible or row.get('is_entry')) and ('sheet::receive' in body or 'Loan<' in row.get('signature','')):
+                  permissionless_receive_candidates.append({k:v for k,v in row.items() if k != 'body'})
+
           summary = {
               'network': 'sui-mainnet',
-              'cdp_access_control': CDP_ACL,
-              'live_acl_json': acl_json,
-              'manager_identity_rows': rows,
-              'permissionless_shared_account_manager_candidates': dangerous,
-              'critical_gate': 'PASS' if dangerous else 'NO_SHARED_ACCOUNT_MANAGER_FOUND',
+              'packages': package_metadata,
+              'function_count': len(function_inventory),
+              'entity_constructor_site_count': len(entity_constructor_sites),
+              'hot_potato_site_count': len(hot_potato_sites),
+              'public_or_entry_entity_factory_candidates': public_entity_factories,
+              'public_or_entry_receive_candidates': permissionless_receive_candidates,
               'writes': 0,
               'transactions_constructed': 0,
               'generated_unix': int(time.time()),
           }
-          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          dump(OUT / 'SUMMARY.json', summary)
           print(json.dumps(summary, indent=2))
           PY
-          python3 bucket-credit-manager-gate/query.py | tee bucket-credit-manager-gate/run.log
-          find bucket-credit-manager-gate -type f -print0 | sort -z | xargs -0 sha256sum > bucket-credit-manager-gate/SHA256SUMS.txt
+          python3 bucket-debtor-audit/audit.py | tee bucket-debtor-audit/run.log
+          find bucket-debtor-audit -type f -print0 | sort -z | xargs -0 sha256sum > bucket-debtor-audit/SHA256SUMS.txt
 
       - name: Validate read-only boundary
         shell: bash
         run: |
           set -euo pipefail
-          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-credit-manager-gate && exit 1 || true
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-debtor-audit && exit 1 || true
           python3 - <<'PY'
           import json
-          s=json.load(open('bucket-credit-manager-gate/SUMMARY.json'))
+          s=json.load(open('bucket-debtor-audit/SUMMARY.json'))
           assert s['writes'] == 0
           assert s['transactions_constructed'] == 0
-          assert len(s['manager_identity_rows']) == 3
-          print('BUCKET_CREDIT_MANAGER_IDENTITY_READ_ONLY_PASS')
+          assert s['function_count'] > 0
+          print('BUCKET_DEBTOR_RECEIVER_READ_ONLY_PASS')
           PY
 
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-credit-manager-identity-gate
-          path: bucket-credit-manager-gate
+          name: bucket-live-debtor-receiver-audit
+          path: bucket-debtor-audit
           if-no-files-found: error
           retention-days: 7
