@@ -1,4 +1,4 @@
-name: Bucket Legacy Replay Tooling Discovery R6
+name: Bucket Live Position Aggregate Reconciliation R6
 
 on:
   pull_request:
@@ -11,56 +11,163 @@ permissions:
   contents: read
 
 jobs:
-  tooling:
+  reconcile:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download official Sui mainnet release and capture replay/fork help
+      - name: Enumerate every live Vault position and reconcile raw aggregates
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf bucket-sui-tooling-r6
-          mkdir -p bucket-sui-tooling-r6/bin
-          curl -fsSL https://api.github.com/repos/MystenLabs/sui/releases/latest -o bucket-sui-tooling-r6/release.json
-          jq -r '.tag_name' bucket-sui-tooling-r6/release.json | tee bucket-sui-tooling-r6/TAG.txt
-          jq -r '.assets[] | [.name,.browser_download_url] | @tsv' bucket-sui-tooling-r6/release.json | tee bucket-sui-tooling-r6/ASSETS.tsv
-          url=$(jq -r '.assets[] | select(.name | test("ubuntu.*x86_64|linux.*x86_64";"i")) | .browser_download_url' bucket-sui-tooling-r6/release.json | head -n1)
-          if [ -z "$url" ]; then
-            url=$(jq -r '.assets[] | select(.name | test("ubuntu|linux";"i")) | .browser_download_url' bucket-sui-tooling-r6/release.json | head -n1)
-          fi
-          test -n "$url"
-          echo "$url" > bucket-sui-tooling-r6/SELECTED_URL.txt
-          curl -fL "$url" -o bucket-sui-tooling-r6/release_asset
-          file bucket-sui-tooling-r6/release_asset | tee bucket-sui-tooling-r6/FILE.txt
-          if file bucket-sui-tooling-r6/release_asset | grep -qi 'zip'; then
-            unzip -q bucket-sui-tooling-r6/release_asset -d bucket-sui-tooling-r6/bin
-          else
-            tar -xf bucket-sui-tooling-r6/release_asset -C bucket-sui-tooling-r6/bin
-          fi
-          find bucket-sui-tooling-r6/bin -maxdepth 4 -type f -printf '%p\n' | sort | tee bucket-sui-tooling-r6/FILES.txt
-          SUI=$(find bucket-sui-tooling-r6/bin -type f -name sui | head -n1)
-          test -n "$SUI"
-          chmod +x "$SUI"
-          "$SUI" --version | tee bucket-sui-tooling-r6/SUI_VERSION.txt
-          "$SUI" replay --help > bucket-sui-tooling-r6/SUI_REPLAY_HELP.txt 2>&1 || true
-          "$SUI" replay transaction --help > bucket-sui-tooling-r6/SUI_REPLAY_TRANSACTION_HELP.txt 2>&1 || true
-          "$SUI" client --help > bucket-sui-tooling-r6/SUI_CLIENT_HELP.txt 2>&1 || true
-          FORK=$(find bucket-sui-tooling-r6/bin -type f -name 'sui-fork*' | head -n1 || true)
-          if [ -n "$FORK" ]; then
-            chmod +x "$FORK"
-            "$FORK" --help > bucket-sui-tooling-r6/SUI_FORK_HELP.txt 2>&1 || true
-          else
-            echo 'sui-fork binary not present in selected release asset' > bucket-sui-tooling-r6/SUI_FORK_HELP.txt
-          fi
-          sha256sum bucket-sui-tooling-r6/release_asset > bucket-sui-tooling-r6/RELEASE_ASSET.sha256
-          find bucket-sui-tooling-r6 -type f ! -path '*/bin/*' -print0 | sort -z | xargs -0 sha256sum > bucket-sui-tooling-r6/SHA256SUMS.txt
+          rm -rf bucket-position-reconcile-r6
+          mkdir -p bucket-position-reconcile-r6/raw
+          cat > bucket-position-reconcile-r6/reconcile.py <<'PY'
+          import json, pathlib, time, urllib.request
+          OUT=pathlib.Path('bucket-position-reconcile-r6'); RAW=OUT/'raw'
+          GQL='https://graphql.mainnet.sui.io/graphql'
+          RPCS=['https://sui-mainnet-endpoint.blockvision.org','https://fullnode.mainnet.sui.io:443']
+          VAULT_TYPE='0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e::vault::Vault'
+
+          def post(url,payload,retries=6,timeout=120):
+              data=json.dumps(payload).encode(); last=None
+              for n in range(retries):
+                  try:
+                      req=urllib.request.Request(url,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-position-reconcile-r6/1'})
+                      with urllib.request.urlopen(req,timeout=timeout) as r: body=json.loads(r.read().decode())
+                      return body
+                  except Exception as exc:
+                      last=exc; time.sleep(2**n)
+              raise RuntimeError(f'POST failed {url}: {last}')
+          def gql(query,variables=None):
+              body=post(GQL,{'query':query,'variables':variables or {}})
+              if body.get('errors'): raise RuntimeError(json.dumps(body['errors']))
+              return body
+          def rpc(method,params):
+              failures=[]
+              for endpoint in RPCS:
+                  try:
+                      body=post(endpoint,{'jsonrpc':'2.0','id':1,'method':method,'params':params})
+                      if body.get('error'): raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint':endpoint,'result':body.get('result')}
+                  except Exception as exc: failures.append({'endpoint':endpoint,'error':type(exc).__name__,'message':str(exc)})
+              return {'failures':failures}
+          def result(wrapper): return wrapper.get('result') if isinstance(wrapper,dict) else None
+          def as_int(value):
+              try: return int(value)
+              except Exception: return None
+          def rec_find(value,key):
+              if isinstance(value,dict):
+                  if key in value and not isinstance(value[key],(dict,list)): return value[key]
+                  for v in value.values():
+                      got=rec_find(v,key)
+                      if got is not None: return got
+              elif isinstance(value,list):
+                  for v in value:
+                      got=rec_find(v,key)
+                      if got is not None: return got
+              return None
+
+          q='''query V($after:String){objects(first:50,after:$after,filter:{type:"'''+VAULT_TYPE+'''"}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename}asMoveObject{contents{type{repr}json bcs}}}}}'''
+          vaults=[]; after=None
+          while True:
+              body=gql(q,{'after':after}); conn=body['data']['objects']; vaults.extend(conn.get('nodes') or [])
+              page=conn.get('pageInfo') or {}
+              if not page.get('hasNextPage'): break
+              after=page.get('endCursor')
+          (RAW/'vaults.json').write_text(json.dumps(vaults,indent=2,sort_keys=True)+'\n')
+
+          rows=[]; all_nodes={}
+          for vault in vaults:
+              contents=((vault.get('asMoveObject') or {}).get('contents') or {})
+              state=contents.get('json') or {}
+              table=(state.get('position_table') or {})
+              table_id=table.get('id') if isinstance(table,dict) else None
+              expected_size=as_int(table.get('size')) if isinstance(table,dict) else None
+              fields=[]; cursor=None
+              if table_id:
+                  for _ in range(100):
+                      w=rpc('suix_getDynamicFields',[table_id,cursor,50]); r=result(w)
+                      if not isinstance(r,dict): break
+                      fields.extend(r.get('data') or [])
+                      if not r.get('hasNextPage'): break
+                      cursor=r.get('nextCursor')
+              objects=[]
+              ids=[f.get('objectId') for f in fields if f.get('objectId')]
+              for i in range(0,len(ids),50):
+                  w=rpc('sui_multiGetObjects',[ids[i:i+50],{'showType':True,'showOwner':True,'showPreviousTransaction':True,'showDisplay':False,'showContent':True,'showBcs':True}])
+                  r=result(w)
+                  if isinstance(r,list): objects.extend(r)
+              nodes=[]
+              for field,obj in zip(fields,objects):
+                  data=(obj or {}).get('data') or {}
+                  content=data.get('content') or {}
+                  flds=content.get('fields') or {}
+                  name=flds.get('name')
+                  if isinstance(name,dict): name=name.get('value') or name.get('fields') or name
+                  val=flds.get('value') or {}
+                  coll=as_int(rec_find(val,'coll_amount'))
+                  debt=as_int(rec_find(val,'debt_amount'))
+                  interest=rec_find(val,'interest_unit')
+                  debtor=None
+                  n=field.get('name') or {}
+                  debtor=n.get('value') if isinstance(n,dict) else n
+                  nodes.append({'debtor':debtor,'field_object_id':field.get('objectId'),'coll_amount':coll,'debt_amount':debt,'interest_unit':interest,'object_type':data.get('type')})
+              all_nodes[vault.get('address')]=nodes
+              raw_coll=sum(n['coll_amount'] or 0 for n in nodes)
+              raw_debt=sum(n['debt_amount'] or 0 for n in nodes)
+              total_coll=as_int(state.get('total_coll_amount'))
+              total_debt=as_int(state.get('total_debt_amount'))
+              balance=as_int(state.get('balance'))
+              limited=state.get('limited_supply') or {}
+              supply=as_int(limited.get('supply')) if isinstance(limited,dict) else None
+              row={
+                  'vault_id':vault.get('address'),'coin_type':(contents.get('type') or {}).get('repr'),
+                  'decimal':as_int(state.get('decimal')),'position_table_id':table_id,
+                  'expected_position_count':expected_size,'enumerated_position_count':len(nodes),
+                  'raw_position_coll_sum':raw_coll,'vault_total_coll_amount':total_coll,
+                  'coll_delta_total_minus_raw':(total_coll-raw_coll) if total_coll is not None else None,
+                  'vault_balance':balance,'balance_delta_total_minus_balance':(total_coll-balance) if total_coll is not None and balance is not None else None,
+                  'raw_position_debt_sum':raw_debt,'vault_total_debt_amount':total_debt,
+                  'debt_delta_total_minus_raw':(total_debt-raw_debt) if total_debt is not None else None,
+                  'limited_supply_supply':supply,'supply_delta_minus_total_debt':(supply-total_debt) if supply is not None and total_debt is not None else None,
+                  'negative_debt_delta': total_debt is not None and total_debt < raw_debt,
+                  'position_count_mismatch': expected_size is not None and expected_size != len(nodes),
+              }
+              rows.append(row)
+          (RAW/'position_nodes.json').write_text(json.dumps(all_nodes,indent=2,sort_keys=True)+'\n')
+          anomalies=[r for r in rows if r['negative_debt_delta'] or r['position_count_mismatch'] or (r['coll_delta_total_minus_raw'] not in (None,0))]
+          summary={
+              'network':'sui-mainnet','vault_count':len(rows),'position_count':sum(r['enumerated_position_count'] for r in rows),
+              'negative_debt_delta_count':sum(1 for r in rows if r['negative_debt_delta']),
+              'position_count_mismatch_count':sum(1 for r in rows if r['position_count_mismatch']),
+              'collateral_accounting_mismatch_count':sum(1 for r in rows if r['coll_delta_total_minus_raw'] not in (None,0)),
+              'rows':rows,'anomalies':anomalies,'writes':0,'transactions_constructed':0,'generated_unix':int(time.time())
+          }
+          (OUT/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({'vault_count':summary['vault_count'],'position_count':summary['position_count'],'negative_debt_delta_count':summary['negative_debt_delta_count'],'position_count_mismatch_count':summary['position_count_mismatch_count'],'collateral_accounting_mismatch_count':summary['collateral_accounting_mismatch_count'],'anomalies':anomalies},indent=2))
+          PY
+          python3 bucket-position-reconcile-r6/reconcile.py | tee bucket-position-reconcile-r6/run.log
+          find bucket-position-reconcile-r6 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-position-reconcile-r6/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-position-reconcile-r6 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          s=json.load(open('bucket-position-reconcile-r6/SUMMARY.json'))
+          assert s['writes']==0 and s['transactions_constructed']==0
+          assert s['vault_count']>0
+          print('BUCKET_POSITION_RECONCILE_R6_READ_ONLY_PASS')
+          PY
 
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-sui-tooling-r6
-          path: bucket-sui-tooling-r6
+          name: bucket-position-reconcile-r6
+          path: bucket-position-reconcile-r6
           if-no-files-found: error
           retention-days: 7
