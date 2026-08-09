@@ -1,4 +1,4 @@
-name: Bucket BUCK PSM Historical Price Age Gate R4
+name: Bucket CDP Full Upgrade Chain and Legacy Bypass Audit R5
 
 on:
   pull_request:
@@ -11,288 +11,173 @@ permissions:
   contents: read
 
 jobs:
-  age-gate:
+  legacy-audit:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Measure historical BUCK price ages consumed by successful PSM swaps
+      - name: Reconstruct CDP upgrade chain and diff every deployed package
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf bucket-buck-psm-age-gate-r4
-          mkdir -p bucket-buck-psm-age-gate-r4/raw
-          cat > bucket-buck-psm-age-gate-r4/gate.py <<'PY'
-          import csv
-          import json
-          import pathlib
-          import time
-          import urllib.request
-
-          OUT = pathlib.Path('bucket-buck-psm-age-gate-r4')
-          RPC = 'https://sui-mainnet-endpoint.blockvision.org'
-          AGG = '0xe7683cdd76af3f80da4f022afa2c31b554a45d23dcd1f418d11eff8cd5c9bf82'
-          PSM = {
-              '0xc2ae6693383e4a81285136effc8190c7baaf0e75aafa36d1c69cd2170cfc3803',
-              '0x8a46afe6ab0b972e2ee3923f5669104ae9465c12b84cd5e78ea1ff6404e4bfaf',
+          rm -rf bucket-cdp-legacy-r5
+          mkdir -p bucket-cdp-legacy-r5/{raw,asm,diff,analysis}
+          cat > bucket-cdp-legacy-r5/audit.py <<'PY'
+          import difflib, hashlib, json, pathlib, re, time, urllib.request
+          OUT=pathlib.Path('bucket-cdp-legacy-r5'); RAW=OUT/'raw'; ASM=OUT/'asm'; DIFF=OUT/'diff'; ANALYSIS=OUT/'analysis'
+          GQL='https://graphql.mainnet.sui.io/graphql'
+          RPCS=['https://sui-mainnet-endpoint.blockvision.org','https://fullnode.mainnet.sui.io:443']
+          ORIGINAL='0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e'
+          KNOWN={
+            'v1':ORIGINAL,
+            'v3':'0x1a9ed525e699c5716923d36ac02f554368a7f52b83bc59679eef1f99efee324a',
+            'v4':'0xc1dd29778f3fccd19a4ac79d1c35a14bf9d65a0b48f1c5bba98a949cacc53e26',
           }
-          PYTH_RULE = {
-              '0x6ee87742e673749a97f5fbe576b92d8dd294a482307d3a3fb2c6f73a56b906a0',
-              '0x5bc4f912b59c5cfcc86dfc90419837b9c3f9d3a3a94cef7a198838fa196bac4a',
-          }
+          KNOWN_TXS=['ohy1VSE2DDfyfqbcDuadWLJ42TULCM2igG8WAR6ZRUG','Hrec83VDAHcu8xjYNi6sqMvqEEm3snzNgGe8JaKB4H9W','TzbfvdroB3drZ6MB53ps3vSACnwidF5kVrC2Vh79oXc']
 
-          def rpc(method, params, retries=6):
-              payload = json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
-              last = None
-              for n in range(retries):
-                  try:
-                      req = urllib.request.Request(
-                          RPC, data=payload, method='POST',
-                          headers={'Content-Type':'application/json','User-Agent':'bucket-buck-psm-age-gate-r4/1'},
-                      )
-                      with urllib.request.urlopen(req, timeout=120) as response:
-                          body = json.loads(response.read().decode())
-                      if body.get('error'):
-                          raise RuntimeError(json.dumps(body['error']))
-                      return body.get('result')
-                  except Exception as exc:
-                      last = exc
-                      time.sleep(2 ** n)
-              raise RuntimeError(f'{method} failed: {last}')
-
-          def object_id(arg, inputs):
-              if not isinstance(arg, dict) or 'Input' not in arg:
-                  return None
+          def post(url,payload,retries=5,timeout=150):
+            data=json.dumps(payload).encode(); last=None
+            for n in range(retries):
               try:
-                  value = inputs[arg['Input']]
-              except Exception:
-                  return None
-              return value.get('objectId') if isinstance(value, dict) else None
+                req=urllib.request.Request(url,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-cdp-legacy-r5/1'})
+                with urllib.request.urlopen(req,timeout=timeout) as r: return json.loads(r.read().decode())
+              except Exception as e: last=e; time.sleep(2**n)
+            raise RuntimeError(f'POST failure {url}: {last}')
+          def gql(q,v=None):
+            b=post(GQL,{'query':q,'variables':v or {}})
+            if b.get('errors'): raise RuntimeError(json.dumps(b['errors']))
+            return b
+          def rpc(method,params):
+            errs=[]
+            for ep in RPCS:
+              try:
+                b=post(ep,{'jsonrpc':'2.0','id':1,'method':method,'params':params},timeout=120)
+                if b.get('error'): raise RuntimeError(json.dumps(b['error']))
+                return {'endpoint':ep,'result':b.get('result')}
+              except Exception as e: errs.append({'endpoint':ep,'error':type(e).__name__,'message':str(e)})
+            return {'failures':errs}
+          def dump(p,v): p.write_text(json.dumps(v,indent=2,sort_keys=True)+'\n')
 
-          def scalar_paths(value, path=()):
-              rows = []
-              if isinstance(value, dict):
-                  for key, child in value.items():
-                      rows.extend(scalar_paths(child, path + (str(key),)))
-              elif isinstance(value, list):
-                  for index, child in enumerate(value):
-                      rows.extend(scalar_paths(child, path + (str(index),)))
-              else:
-                  rows.append(('.'.join(path), value))
-              return rows
+          opts={'showInput':True,'showRawInput':False,'showEffects':True,'showEvents':True,'showObjectChanges':True,'showBalanceChanges':True}
+          seed={}
+          cap_ids=set(); published=set(KNOWN.values())
+          for digest in KNOWN_TXS:
+            w=rpc('sui_getTransactionBlock',[digest,opts]); seed[digest]=w
+            result=w.get('result') if isinstance(w,dict) else None
+            for c in (result or {}).get('objectChanges') or []:
+              typ=str(c.get('objectType') or c.get('type') or '')
+              if '::package::UpgradeCap' in typ and c.get('objectId'): cap_ids.add(c['objectId'])
+              if c.get('type')=='published' and c.get('packageId'): published.add(c['packageId'])
+          dump(RAW/'seed_transactions.json',seed)
 
-          def extract_price_fields(content):
-              scalars = scalar_paths(content)
-              timestamps = []
-              prices = []
-              confidences = []
-              expos = []
-              for path, value in scalars:
-                  low = path.lower()
-                  if any(term in low for term in ('timestamp', 'publish_time', 'publish-time')):
-                      try:
-                          timestamps.append((path, int(value)))
-                      except Exception:
-                          pass
-                  if low.endswith('.price'):
-                      try:
-                          prices.append((path, int(value)))
-                      except Exception:
-                          pass
-                  if low.endswith('.conf') or low.endswith('.confidence'):
-                      try:
-                          confidences.append((path, int(value)))
-                      except Exception:
-                          pass
-                  if low.endswith('.expo') or low.endswith('.exponent'):
-                      try:
-                          expos.append((path, int(value)))
-                      except Exception:
-                          pass
-              preferred = [row for row in timestamps if '.price.' in row[0].lower() and 'ema' not in row[0].lower()]
-              timestamp = preferred[0][1] if preferred else (timestamps[0][1] if timestamps else None)
-              return {
-                  'publish_time': timestamp,
-                  'timestamp_candidates': timestamps,
-                  'price_candidates': prices,
-                  'confidence_candidates': confidences,
-                  'exponent_candidates': expos,
-              }
+          cap_activity={}
+          for cap in sorted(cap_ids):
+            cursor=None; rows=[]
+            for _ in range(20):
+              w=rpc('suix_queryTransactionBlocks',[{'filter':{'InputObject':cap},'options':opts},cursor,50,False])
+              result=w.get('result') if isinstance(w,dict) else None
+              if not isinstance(result,dict): break
+              rows.extend(result.get('data') or [])
+              if not result.get('hasNextPage'): break
+              cursor=result.get('nextCursor')
+            cap_activity[cap]=rows
+            for tx in rows:
+              for c in tx.get('objectChanges') or []:
+                if c.get('type')=='published' and c.get('packageId'): published.add(c['packageId'])
+          dump(RAW/'upgrade_cap_activity.json',cap_activity)
 
-          transactions = []
-          cursor = None
-          for _ in range(10):
-              page = rpc('suix_queryTransactionBlocks', [{
-                  'filter': {'InputObject': AGG},
-                  'options': {
-                      'showInput': True,
-                      'showRawInput': False,
-                      'showEffects': True,
-                      'showEvents': True,
-                      'showObjectChanges': True,
-                      'showBalanceChanges': True,
-                  },
-              }, cursor, 50, True])
-              transactions.extend(page.get('data') or [])
-              if not page.get('hasNextPage'):
-                  break
-              cursor = page.get('nextCursor')
+          Q='''query P($a:SuiAddress!){object(address:$a){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}modules{nodes{name fileFormatVersion disassembly functions(first:50){nodes{name visibility isEntry parameters{repr}return{repr}typeParameters{constraints}}}structs(first:50){nodes{name abilities fields{name type{repr}}typeParameters{constraints}}}}}}}}'''
+          packages={}; valid=[]
+          for pid in sorted(published):
+            try:
+              r=gql(Q,{'a':pid}); dump(RAW/f'package_{pid[2:]}.json',r)
+              obj=r['data']['object']; pkg=(obj or {}).get('asMovePackage')
+              if not pkg: continue
+              origins=pkg.get('typeOrigins') or []
+              is_cdp=any(str(x.get('definingId')).lower()==ORIGINAL.lower() for x in origins)
+              packages[pid]={'object_version':obj.get('version'),'package_version':pkg.get('version'),'digest':obj.get('digest'),'previous_transaction':obj.get('previousTransaction'),'linkage':pkg.get('linkage'),'type_origins':origins,'is_cdp_lineage':is_cdp}
+              if is_cdp: valid.append(pid)
+            except Exception as e: packages[pid]={'error':type(e).__name__,'message':str(e)}
+          dump(ANALYSIS/'all_candidate_packages.json',packages)
 
-          rows = []
-          past_cache = {}
-          for tx in transactions:
-              status = ((tx.get('effects') or {}).get('status') or {}).get('status')
-              if status != 'success':
-                  continue
-              txdata = (((tx.get('transaction') or {}).get('data') or {}).get('transaction') or {})
-              inputs = txdata.get('inputs') or []
-              commands = txdata.get('transactions') or []
-              swaps = []
-              feeds = []
-              pyth_updates = []
-              for index, command in enumerate(commands):
-                  call = command.get('MoveCall') if isinstance(command, dict) else None
-                  if not call:
-                      continue
-                  package = str(call.get('package') or '').lower()
-                  module = call.get('module')
-                  function = call.get('function')
-                  if package in PSM and module == 'pool' and function in ('swap_in', 'swap_out'):
-                      swaps.append((index, call))
-                  if package in PYTH_RULE and module == 'pyth_rule' and function == 'feed':
-                      feeds.append((index, call))
-                  if module == 'pyth' and function and 'update' in function:
-                      pyth_updates.append((index, call))
-              if not swaps or not feeds:
-                  continue
-              feed = feeds[0][1]
-              args = feed.get('arguments') or []
-              price_object = object_id(args[-1], inputs) if args else None
-              price_version = None
-              price_digest = None
-              for ref in (tx.get('effects') or {}).get('sharedObjects') or []:
-                  if str(ref.get('objectId')).lower() == str(price_object).lower():
-                      price_version = int(ref.get('version'))
-                      price_digest = ref.get('digest')
-                      break
-              historical = None
-              extracted = {'publish_time': None, 'timestamp_candidates': [], 'price_candidates': [], 'confidence_candidates': [], 'exponent_candidates': []}
-              object_type = None
-              if price_object and price_version is not None:
-                  cache_key = f'{price_object}@{price_version}'
-                  if cache_key not in past_cache:
-                      past_cache[cache_key] = rpc('sui_tryGetPastObject', [price_object, price_version, {
-                          'showType': True,
-                          'showOwner': True,
-                          'showPreviousTransaction': True,
-                          'showDisplay': False,
-                          'showContent': True,
-                          'showBcs': True,
-                      }])
-                  historical = past_cache[cache_key]
-                  if isinstance(historical, dict) and historical.get('status') == 'VersionFound':
-                      details = historical.get('details') or {}
-                      data = details.get('data') if isinstance(details, dict) else None
-                      if not data and isinstance(details, dict):
-                          data = details
-                      object_type = (data or {}).get('type') if isinstance(data, dict) else None
-                      content = (data or {}).get('content') if isinstance(data, dict) else None
-                      extracted = extract_price_fields(content)
-              tx_ms = int(tx.get('timestampMs')) if tx.get('timestampMs') is not None else None
-              publish_time = extracted['publish_time']
-              age_sec = tx_ms // 1000 - publish_time if tx_ms is not None and publish_time is not None else None
-              event = None
-              for item in tx.get('events') or []:
-                  if 'PsmSwap' in str(item.get('type')):
-                      event = item.get('parsedJson')
-                      break
-              rows.append({
-                  'digest': tx.get('digest'),
-                  'tx_timestamp_ms': tx_ms,
-                  'psm_function': swaps[0][1].get('function'),
-                  'same_ptb_pyth_update': bool(pyth_updates),
-                  'price_info_object': price_object,
-                  'price_info_version': price_version,
-                  'price_info_digest': price_digest,
-                  'object_type': object_type,
-                  'publish_time': publish_time,
-                  'age_sec': age_sec,
-                  'timestamp_candidates': extracted['timestamp_candidates'],
-                  'price_candidates': extracted['price_candidates'],
-                  'confidence_candidates': extracted['confidence_candidates'],
-                  'exponent_candidates': extracted['exponent_candidates'],
-                  'psm_event': event,
-              })
+          # include known packages even if UpgradeCap activity did not reveal all of them
+          for pid in KNOWN.values():
+            if pid not in valid: valid.append(pid)
+          valid=sorted(set(valid),key=lambda p:(packages.get(p,{}).get('package_version') or 999,p))
 
-          (OUT / 'ROWS.json').write_text(json.dumps(rows, indent=2, sort_keys=True) + '\n')
-          (OUT / 'raw' / 'PAST_OBJECTS.json').write_text(json.dumps(past_cache, indent=2, sort_keys=True) + '\n')
-          (OUT / 'raw' / 'TRANSACTIONS.json').write_text(json.dumps(transactions, indent=2, sort_keys=True) + '\n')
-          with (OUT / 'ROWS.csv').open('w', newline='') as handle:
-              fields = ['digest','tx_timestamp_ms','psm_function','same_ptb_pyth_update','price_info_object','price_info_version','publish_time','age_sec']
-              writer = csv.DictWriter(handle, fieldnames=fields)
-              writer.writeheader()
-              for row in rows:
-                  writer.writerow({key: row.get(key) for key in fields})
+          sig=re.compile(r'^(?:entry\s+)?(?:public(?:\([^)]*\))?\s+|fun\s+)?([^\s<(]+)(?:<[^>]*>)?\(')
+          def split(text):
+            lines=text.splitlines(); starts=[]
+            for i,line in enumerate(lines):
+              m=sig.match(line)
+              if m and not line.startswith(('B','L')): starts.append((i,m.group(1),line))
+            out={}
+            for n,(st,name,signature) in enumerate(starts):
+              en=starts[n+1][0] if n+1<len(starts) else len(lines); body='\n'.join(lines[st:en]).rstrip()+'\n'
+              key=name; k=2
+              while key in out: key=f'{name}#{k}'; k+=1
+              out[key]={'signature':signature,'body':body,'sha256':hashlib.sha256(body.encode()).hexdigest()}
+            return out
 
-          ages = [row['age_sec'] for row in rows if row['age_sec'] is not None]
-          ranked = sorted((row for row in rows if row['age_sec'] is not None), key=lambda row: row['age_sec'], reverse=True)
-          version_found = sum(1 for value in past_cache.values() if isinstance(value, dict) and value.get('status') == 'VersionFound')
-          summary = {
-              'network': 'sui-mainnet',
-              'aggregator': AGG,
-              'transactions_scanned': len(transactions),
-              'successful_buck_psm_swaps': len(rows),
-              'same_ptb_pyth_update_count': sum(1 for row in rows if row['same_ptb_pyth_update']),
-              'without_same_ptb_pyth_update_count': sum(1 for row in rows if not row['same_ptb_pyth_update']),
-              'unique_historical_objects_requested': len(past_cache),
-              'historical_version_found_count': version_found,
-              'age_count': len(ages),
-              'age_min_sec': min(ages) if ages else None,
-              'age_max_sec': max(ages) if ages else None,
-              'age_average_sec': sum(ages) / len(ages) if ages else None,
-              'oldest_20_successful_swaps': ranked[:20],
-              'writes': 0,
-              'transactions_constructed': 0,
-              'generated_unix': int(time.time()),
-          }
-          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
-          print(json.dumps({
-              'transactions_scanned': summary['transactions_scanned'],
-              'successful_buck_psm_swaps': summary['successful_buck_psm_swaps'],
-              'same_ptb_pyth_update_count': summary['same_ptb_pyth_update_count'],
-              'without_same_ptb_pyth_update_count': summary['without_same_ptb_pyth_update_count'],
-              'historical_version_found_count': summary['historical_version_found_count'],
-              'age_count': summary['age_count'],
-              'age_min_sec': summary['age_min_sec'],
-              'age_max_sec': summary['age_max_sec'],
-              'age_average_sec': summary['age_average_sec'],
-              'oldest_5': [{key: row.get(key) for key in ('digest','psm_function','same_ptb_pyth_update','publish_time','age_sec')} for row in ranked[:5]],
-          }, indent=2))
+          bodies={}; meta={}
+          for pid in valid:
+            raw=json.load(open(RAW/f'package_{pid[2:]}.json')) if (RAW/f'package_{pid[2:]}.json').exists() else gql(Q,{'a':pid})
+            pkg=raw['data']['object']['asMovePackage']; label=f"v{pkg.get('version')}_{pid[2:10]}"; meta[label]={'package_id':pid,**packages.get(pid,{})}; bodies[label]={}
+            d=ASM/label; d.mkdir(exist_ok=True)
+            for mod in pkg['modules']['nodes']:
+              name=mod['name']; text=mod.get('disassembly') or ''; (d/f'{name}.asm').write_text(text); bodies[label][name]=split(text)
+          labels=sorted(meta,key=lambda x:(meta[x].get('package_version') or 999,x))
+
+          changes=[]
+          security=re.compile(r'liquid|borrow|repay|withdraw|deposit|interest|mint|burn|security|manager|admin|request|response|debt|collateral|position|limit|price|donor|beneficiary|blacklist',re.I)
+          for left,right in zip(labels,labels[1:]):
+            modules=sorted(set(bodies[left])|set(bodies[right]))
+            for module in modules:
+              names=sorted(set(bodies[left].get(module,{}))|set(bodies[right].get(module,{})))
+              for fn in names:
+                a=bodies[left].get(module,{}).get(fn); b=bodies[right].get(module,{}).get(fn)
+                if a and b and a['sha256']==b['sha256']: continue
+                row={'left':left,'right':right,'module':module,'function':fn,'left_present':bool(a),'right_present':bool(b),'left_signature':a['signature'] if a else None,'right_signature':b['signature'] if b else None,'security_shaped':bool(security.search(module+' '+fn))}
+                changes.append(row)
+                if a and b:
+                  patch=''.join(difflib.unified_diff(a['body'].splitlines(True),b['body'].splitlines(True),fromfile=left,tofile=right)); (DIFF/f'{left}__{right}__{module}__{fn}.patch').write_text(patch)
+          dump(ANALYSIS/'changes.json',changes); dump(ANALYSIS/'lineage.json',meta)
+
+          # Search old public functions that current version removed or tightened.
+          latest=labels[-1]; legacy_surface=[]
+          current_index={(m,f) for m,fs in bodies[latest].items() for f in fs}
+          for label in labels[:-1]:
+            for module,fs in bodies[label].items():
+              for fn,data in fs.items():
+                signature=data['signature']; public=signature.startswith('public') or signature.startswith('entry public') or signature.startswith('public entry')
+                if public and ((module,fn) not in current_index or data['sha256']!=bodies[latest].get(module,{}).get(fn,{}).get('sha256')) and security.search(module+' '+fn):
+                  legacy_surface.append({'version':label,'package_id':meta[label]['package_id'],'module':module,'function':fn,'signature':signature,'removed_in_latest':(module,fn) not in current_index})
+          dump(ANALYSIS/'legacy_security_surface.json',legacy_surface)
+          summary={'network':'sui-mainnet','upgrade_cap_ids':sorted(cap_ids),'candidate_package_count':len(published),'cdp_lineage':meta,'ordered_labels':labels,'change_count':len(changes),'security_change_count':sum(1 for x in changes if x['security_shaped']),'legacy_security_surface':legacy_surface,'writes':0,'transactions_constructed':0,'generated_unix':int(time.time())}
+          dump(OUT/'SUMMARY.json',summary)
+          print(json.dumps({'upgrade_cap_ids':summary['upgrade_cap_ids'],'ordered_labels':labels,'packages':{k:v['package_id'] for k,v in meta.items()},'security_change_count':summary['security_change_count'],'legacy_security_surface':legacy_surface},indent=2))
           PY
-          python3 bucket-buck-psm-age-gate-r4/gate.py | tee bucket-buck-psm-age-gate-r4/run.log
-          find bucket-buck-psm-age-gate-r4 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-buck-psm-age-gate-r4/SHA256SUMS.txt
+          python3 bucket-cdp-legacy-r5/audit.py | tee bucket-cdp-legacy-r5/run.log
+          find bucket-cdp-legacy-r5 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-cdp-legacy-r5/SHA256SUMS.txt
 
-      - name: Validate read-only boundary and extraction
+      - name: Validate read-only boundary
         shell: bash
         run: |
           set -euo pipefail
-          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-buck-psm-age-gate-r4 && exit 1 || true
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-cdp-legacy-r5 && exit 1 || true
           python3 - <<'PY'
           import json
-          summary = json.load(open('bucket-buck-psm-age-gate-r4/SUMMARY.json'))
-          assert summary['writes'] == 0
-          assert summary['transactions_constructed'] == 0
-          assert summary['successful_buck_psm_swaps'] > 0
-          assert summary['historical_version_found_count'] > 0
-          assert summary['age_count'] > 0
-          print('BUCKET_BUCK_PSM_AGE_GATE_R4_PASS')
+          s=json.load(open('bucket-cdp-legacy-r5/SUMMARY.json'))
+          assert s['writes']==0 and s['transactions_constructed']==0
+          assert len(s['ordered_labels'])>=3
+          print('BUCKET_CDP_LEGACY_R5_READ_ONLY_PASS')
           PY
 
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-buck-psm-age-gate-r4
-          path: bucket-buck-psm-age-gate-r4
+          name: bucket-cdp-legacy-r5
+          path: bucket-cdp-legacy-r5
           if-no-files-found: error
           retention-days: 7
