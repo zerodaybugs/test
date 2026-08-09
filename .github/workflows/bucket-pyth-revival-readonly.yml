@@ -1,4 +1,4 @@
-name: Bucket CDP V3 V4 Security Diff
+name: Bucket Credit ACL Manager Identity Gate
 
 on:
   pull_request:
@@ -11,35 +11,36 @@ permissions:
   contents: read
 
 jobs:
-  security-diff:
+  identity-gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch deployed disassembly and derive function-level diff
+      - name: Query manager addresses as objects and accounts
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf bucket-cdp-security-diff
-          mkdir -p bucket-cdp-security-diff/{raw,asm,diff}
-          cat > bucket-cdp-security-diff/diff.py <<'PY'
-          import hashlib
+          rm -rf bucket-credit-manager-gate
+          mkdir -p bucket-credit-manager-gate/raw
+          cat > bucket-credit-manager-gate/query.py <<'PY'
           import json
           import pathlib
-          import re
           import time
           import urllib.request
 
-          OUT = pathlib.Path('bucket-cdp-security-diff')
+          OUT = pathlib.Path('bucket-credit-manager-gate')
+          RAW = OUT / 'raw'
           GQL = 'https://graphql.mainnet.sui.io/graphql'
-          PACKAGES = {
-              'v3': '0x1a9ed525e699c5716923d36ac02f554368a7f52b83bc59679eef1f99efee324a',
-              'v4': '0xc1dd29778f3fccd19a4ac79d1c35a14bf9d65a0b48f1c5bba98a949cacc53e26',
+          CDP_ACL = '0x578045427984976a5d7d6d2f35f2d23da6b85e6062771e999aaddf1dd54fcd3f'
+          MANAGERS = {
+              'manager_admin_like': '0x938884d43de2bcf13a2f8f5886ea6382994ba49dcf7b3d08203acdd508778b6b',
+              'manager_shared_between_cdp_psm': '0xbb7e63ea8820707968c5c9879c5e3a8ac6ffe59337c7e307490089b8c6caf6ef',
+              'manager_psm_only': '0xbfd2e22f32d4bcaaf6f12f218fcc26488fdf63f338481e0d4f96e95160d61ba9',
           }
 
-          def gql(query, retries=5):
-              payload = json.dumps({'query': query}).encode()
+          def gql(query, variables=None, retries=5):
+              payload = json.dumps({'query': query, 'variables': variables or {}}).encode()
               last = None
               for n in range(retries):
                   try:
@@ -47,9 +48,9 @@ jobs:
                           GQL,
                           data=payload,
                           method='POST',
-                          headers={'Content-Type':'application/json','User-Agent':'bucket-cdp-security-diff/1'},
+                          headers={'Content-Type':'application/json','User-Agent':'bucket-credit-manager-gate/1'},
                       )
-                      with urllib.request.urlopen(req, timeout=120) as response:
+                      with urllib.request.urlopen(req, timeout=90) as response:
                           body = json.loads(response.read().decode())
                       if body.get('errors'):
                           raise RuntimeError(json.dumps(body['errors']))
@@ -59,122 +60,84 @@ jobs:
                       time.sleep(2 ** n)
               raise RuntimeError(f'GraphQL failure: {last}')
 
-          def split_functions(text):
-              starts = []
-              lines = text.splitlines()
-              pattern = re.compile(r'^(?:entry\s+)?(?:public(?:\([^)]*\))?\s+|fun\s+)([^\s<(]+)')
-              for index, line in enumerate(lines):
-                  match = pattern.match(line)
-                  if match:
-                      starts.append((index, match.group(1), line))
-              result = {}
-              for pos, (start, name, signature) in enumerate(starts):
-                  end = starts[pos + 1][0] if pos + 1 < len(starts) else len(lines)
-                  body = '\n'.join(lines[start:end]).rstrip() + '\n'
-                  key = name
-                  suffix = 2
-                  while key in result:
-                      key = f'{name}#{suffix}'
-                      suffix += 1
-                  result[key] = {
-                      'signature': signature,
-                      'body': body,
-                      'sha256': hashlib.sha256(body.encode()).hexdigest(),
-                  }
-              return result
+          def dump(name, value):
+              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
 
-          package_data = {}
-          function_maps = {}
-          for label, package_id in PACKAGES.items():
-              query = f'''{{ object(address: "{package_id}") {{ address version digest asMovePackage {{ address version linkage {{ originalId upgradedId version }} modules {{ nodes {{ name disassembly }} }} }} }} }}'''
-              response = gql(query)
-              (OUT / 'raw' / f'{label}.json').write_text(json.dumps(response, indent=2, sort_keys=True) + '\n')
-              package = response['data']['object']['asMovePackage']
-              package_data[label] = {
-                  'address': package.get('address'),
-                  'version': package.get('version'),
-                  'linkage': package.get('linkage'),
+          keys = [CDP_ACL] + list(MANAGERS.values())
+          q_objects = '''query O($keys:[ObjectKey!]!){multiGetObjects(keys:$keys){address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}}}}'''
+          objects = gql(q_objects, {'keys':[{'address':x} for x in keys]})
+          dump('objects.json', objects)
+
+          q_address = '''query A($address:SuiAddress!){address(address:$address){address balances(first:20){nodes{coinType coinObjectCount totalBalance}}objects(first:50){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}contents{type{repr}json bcs}hasPublicTransfer}}transactions(first:20,relation:SENT){pageInfo{hasNextPage endCursor}nodes{digest sender{address}effects{status errors}kind{__typename}}}}}'''
+          address_results = {}
+          for label, address in MANAGERS.items():
+              try:
+                  address_results[label] = gql(q_address, {'address':address})
+              except Exception as exc:
+                  address_results[label] = {'error':type(exc).__name__,'message':str(exc)}
+          dump('addresses.json', address_results)
+
+          object_nodes = objects['data']['multiGetObjects']
+          by_address = {node['address'].lower():node for node in object_nodes if node and node.get('address')}
+          rows = []
+          dangerous = []
+          for label, address in MANAGERS.items():
+              node = by_address.get(address.lower())
+              move = (node or {}).get('asMoveObject') or {}
+              contents = move.get('contents') or {}
+              type_repr = (contents.get('type') or {}).get('repr')
+              owner = (node or {}).get('owner')
+              row = {
+                  'label': label,
+                  'address': address,
+                  'address_resolves_to_live_object': bool(node),
+                  'object_type': type_repr,
+                  'object_owner': owner,
+                  'has_public_transfer': move.get('hasPublicTransfer'),
+                  'is_bucket_account_object': bool(type_repr and type_repr.endswith('::account::Account')),
+                  'is_shared_object': bool(owner and owner.get('__typename') == 'Shared'),
               }
-              function_maps[label] = {}
-              for module in package['modules']['nodes']:
-                  name = module['name']
-                  disassembly = module.get('disassembly') or ''
-                  (OUT / 'asm' / f'{label}_{name}.asm').write_text(disassembly)
-                  function_maps[label][name] = split_functions(disassembly)
+              rows.append(row)
+              if row['is_bucket_account_object'] and row['is_shared_object']:
+                  dangerous.append(row)
 
-          changed = []
-          modules = sorted(set(function_maps['v3']) | set(function_maps['v4']))
-          security_terms = re.compile(r'liquid|interest|security|manager|admin|request|response|mint|burn|debt|collateral|supply|position|withdraw|repay|borrow|lock|limit|price', re.I)
-          for module in modules:
-              left = function_maps['v3'].get(module, {})
-              right = function_maps['v4'].get(module, {})
-              names = sorted(set(left) | set(right))
-              for name in names:
-                  a = left.get(name)
-                  b = right.get(name)
-                  if a and b and a['sha256'] == b['sha256']:
-                      continue
-                  row = {
-                      'module': module,
-                      'function': name,
-                      'v3_present': bool(a),
-                      'v4_present': bool(b),
-                      'v3_sha256': a['sha256'] if a else None,
-                      'v4_sha256': b['sha256'] if b else None,
-                      'v3_signature': a['signature'] if a else None,
-                      'v4_signature': b['signature'] if b else None,
-                      'security_shaped': bool(security_terms.search(f'{module} {name}')),
-                  }
-                  changed.append(row)
-                  if a:
-                      (OUT / 'diff' / f'{module}__{name}__v3.asm').write_text(a['body'])
-                  if b:
-                      (OUT / 'diff' / f'{module}__{name}__v4.asm').write_text(b['body'])
-
+          acl_node = by_address.get(CDP_ACL.lower())
+          acl_json = (((acl_node or {}).get('asMoveObject') or {}).get('contents') or {}).get('json')
           summary = {
               'network': 'sui-mainnet',
-              'packages': package_data,
-              'changed_function_count': len(changed),
-              'security_shaped_changes': [x for x in changed if x['security_shaped']],
-              'all_changes': changed,
+              'cdp_access_control': CDP_ACL,
+              'live_acl_json': acl_json,
+              'manager_identity_rows': rows,
+              'permissionless_shared_account_manager_candidates': dangerous,
+              'critical_gate': 'PASS' if dangerous else 'NO_SHARED_ACCOUNT_MANAGER_FOUND',
               'writes': 0,
               'transactions_constructed': 0,
               'generated_unix': int(time.time()),
           }
           (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
-          print(json.dumps({
-              'packages': package_data,
-              'changed_function_count': len(changed),
-              'security_shaped_changes': summary['security_shaped_changes'],
-          }, indent=2))
+          print(json.dumps(summary, indent=2))
           PY
-          python3 bucket-cdp-security-diff/diff.py | tee bucket-cdp-security-diff/run.log
-          for pair in bucket-cdp-security-diff/diff/*__v3.asm; do
-            base="${pair%__v3.asm}"
-            if [ -f "${base}__v4.asm" ]; then
-              diff -u "$pair" "${base}__v4.asm" > "${base}.patch" || true
-            fi
-          done
-          find bucket-cdp-security-diff -type f -print0 | sort -z | xargs -0 sha256sum > bucket-cdp-security-diff/SHA256SUMS.txt
+          python3 bucket-credit-manager-gate/query.py | tee bucket-credit-manager-gate/run.log
+          find bucket-credit-manager-gate -type f -print0 | sort -z | xargs -0 sha256sum > bucket-credit-manager-gate/SHA256SUMS.txt
 
       - name: Validate read-only boundary
         shell: bash
         run: |
           set -euo pipefail
-          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-cdp-security-diff && exit 1 || true
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-credit-manager-gate && exit 1 || true
           python3 - <<'PY'
           import json
-          s=json.load(open('bucket-cdp-security-diff/SUMMARY.json'))
+          s=json.load(open('bucket-credit-manager-gate/SUMMARY.json'))
           assert s['writes'] == 0
           assert s['transactions_constructed'] == 0
-          assert s['changed_function_count'] > 0
-          print('BUCKET_CDP_SECURITY_DIFF_PASS')
+          assert len(s['manager_identity_rows']) == 3
+          print('BUCKET_CREDIT_MANAGER_IDENTITY_READ_ONLY_PASS')
           PY
 
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-cdp-v3-v4-security-diff
-          path: bucket-cdp-security-diff
+          name: bucket-credit-manager-identity-gate
+          path: bucket-credit-manager-gate
           if-no-files-found: error
           retention-days: 7
