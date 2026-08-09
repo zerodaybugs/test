@@ -1,0 +1,153 @@
+name: Superhuman public Pack gallery browser network gate
+
+on:
+  push:
+    branches: [research/superhuman-pack-gallery-20260809]
+    paths: [.github/workflows/superhuman-pack-gallery-browser-network-gate.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+
+      - name: Capture public browser network traffic and metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf pack-gallery-browser
+          mkdir -p pack-gallery-browser/evidence public-intake-status
+          CHROME="$(command -v google-chrome-stable || command -v google-chrome || command -v chromium)"
+          DRIVER="$(command -v chromedriver)"
+          "$DRIVER" --port=9515 --allowed-ips= > /tmp/chromedriver.log 2>&1 &
+          DRIVER_PID=$!
+          trap 'kill "$DRIVER_PID" 2>/dev/null || true' EXIT
+          sleep 2
+          export CHROME
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, re, time, urllib.request
+
+          OUT=pathlib.Path('pack-gallery-browser/evidence')
+          BASE='http://127.0.0.1:9515'
+          TARGETS=['https://coda.io/packs','https://docs.superhuman.com/packs','https://coda.io/gallery','https://docs.superhuman.com/gallery']
+
+          def request(method,path,data=None):
+              body=None if data is None else json.dumps(data).encode()
+              req=urllib.request.Request(BASE+path,data=body,method=method,headers={'Content-Type':'application/json'})
+              with urllib.request.urlopen(req,timeout=90) as r:
+                  return json.loads(r.read())['value']
+
+          caps={'capabilities':{'alwaysMatch':{
+              'browserName':'chrome',
+              'goog:chromeOptions':{
+                  'binary':os.environ['CHROME'],
+                  'args':['--headless=new','--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--window-size=1440,1200'],
+                  'perfLoggingPrefs':{'enableNetwork':True,'enablePage':False},
+              },
+              'goog:loggingPrefs':{'performance':'ALL','browser':'ALL'},
+          }}}
+          session=request('POST','/session',caps)
+          sid=session.get('sessionId') if isinstance(session,dict) else session
+          if not sid: raise SystemExit('no webdriver session')
+
+          captured=[]; doms=[]; browser_logs=[]
+          try:
+              for target in TARGETS:
+                  request('POST',f'/session/{sid}/url',{'url':target})
+                  time.sleep(8)
+                  for _ in range(5):
+                      request('POST',f'/session/{sid}/execute/sync',{'script':'window.scrollTo(0, document.body.scrollHeight); return document.body.scrollHeight;','args':[]})
+                      time.sleep(1.5)
+                  current=request('GET',f'/session/{sid}/url')
+                  title=request('GET',f'/session/{sid}/title')
+                  source=request('GET',f'/session/{sid}/source')
+                  doms.append({'target':target,'current':current,'title':title,'source':source[:3_000_000]})
+                  try:
+                      logs=request('POST',f'/session/{sid}/log',{'type':'performance'})
+                  except Exception:
+                      logs=[]
+                  for row in logs:
+                      try:
+                          msg=json.loads(row['message'])['message']
+                      except Exception:
+                          continue
+                      method=msg.get('method'); params=msg.get('params') or {}
+                      if method=='Network.responseReceived':
+                          resp=params.get('response') or {}
+                          url=resp.get('url') or ''
+                          if any(x in url.lower() for x in ('pack','listing','manifest','metadata','gallery','graphql','api')):
+                              captured.append({
+                                  'target':target,'requestId':params.get('requestId'),'url':url,
+                                  'status':resp.get('status'),'mimeType':resp.get('mimeType'),
+                                  'headers':resp.get('headers') or {},
+                              })
+                  try:
+                      browser_logs.extend(request('POST',f'/session/{sid}/log',{'type':'browser'}))
+                  except Exception:
+                      pass
+          finally:
+              try: request('DELETE',f'/session/{sid}')
+              except Exception: pass
+
+          # Deduplicate network responses and extract IDs/metadata URLs from DOM and response URLs.
+          unique={}
+          for row in captured: unique[(row['url'],row.get('status'))]=row
+          captured=list(unique.values())
+          pack_ids=set(); metadata_urls=set(); candidate_urls=set()
+          text='\n'.join(x['source'] for x in doms)+'\n'+'\n'.join(x['url'] for x in captured)
+          for m in re.finditer(r'"?(?:packId|pack_id)"?\s*[:=]\s*"?(\d+)',text,re.I): pack_ids.add(int(m.group(1)))
+          for m in re.finditer(r'https://[^"\'<>\\\s]+(?:metadata|manifest)[^"\'<>\\\s]*',text,re.I): metadata_urls.add(m.group(0).replace('&amp;','&'))
+          for row in captured:
+              u=row['url']
+              if any(x in u.lower() for x in ('listing','metadata','manifest','packs/')): candidate_urls.add(u)
+
+          result={
+              'workflow_run_id':int(os.environ['GITHUB_RUN_ID']),
+              'source_commit':os.environ['GITHUB_SHA'],
+              'targets':TARGETS,
+              'dom_count':len(doms),
+              'network_candidate_count':len(captured),
+              'discovered_pack_ids':sorted(pack_ids),
+              'discovered_pack_id_count':len(pack_ids),
+              'discovered_metadata_urls':sorted(metadata_urls),
+              'discovered_metadata_url_count':len(metadata_urls),
+              'candidate_urls':sorted(candidate_urls)[:500],
+              'browser_log_count':len(browser_logs),
+              'deployed_match_count':0,
+              'submit_ready':False,
+              'decision':'NETWORK_METADATA_DISCOVERED' if (pack_ids or metadata_urls or candidate_urls) else 'NO_PUBLIC_DEPLOYED_METADATA_DISCOVERED',
+          }
+          (OUT/'RESULT.json').write_text(json.dumps(result,indent=2)+'\n')
+          (OUT/'NETWORK.json').write_text(json.dumps(captured,indent=2)+'\n')
+          (OUT/'DOM_SUMMARY.json').write_text(json.dumps([{k:v for k,v in x.items() if k!='source'}|{'source_sha256':hashlib.sha256(x['source'].encode()).hexdigest(),'source_size':len(x['source'])} for x in doms],indent=2)+'\n')
+          (OUT/'DOM_SOURCES.json').write_text(json.dumps(doms,indent=2)+'\n')
+          (OUT/'BROWSER_LOGS.json').write_text(json.dumps(browser_logs,indent=2)+'\n')
+          pathlib.Path('public-intake-status/superhuman-pack-gallery-browser-network-result.json').write_text(json.dumps(result,indent=2)+'\n')
+          PY
+          find pack-gallery-browser/evidence -type f -print0 | sort -z | xargs -0 sha256sum > pack-gallery-browser/evidence/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-pack-gallery-browser-network-gate
+          path: pack-gallery-browser/evidence/
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 9
+
+      - name: Commit compact result
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-pack-gallery-browser-network-result.json
+          git commit -m 'chore: record public Pack gallery browser network gate'
+          git push
