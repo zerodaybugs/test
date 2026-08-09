@@ -1,0 +1,340 @@
+name: Bucket Cetus Unauthorized Removal Live Census R6
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enumerate live Cetus provider, managers, positions, pools, and historical calls
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-cetus-remove-census-r6
+          mkdir -p bucket-cetus-remove-census-r6/raw
+          cat > bucket-cetus-remove-census-r6/census.py <<'PY'
+          import json
+          import pathlib
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-cetus-remove-census-r6')
+          RAW = OUT / 'raw'
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+          RPCS = [
+              'https://sui-mainnet-endpoint.blockvision.org',
+              'https://fullnode.mainnet.sui.io:443',
+          ]
+
+          PACKAGE = '0xb9204c991f982e4ec53dd9161ed56ff837716c81861929853e894d77eec71bea'
+          PROVIDER_TYPE = f'{PACKAGE}::cetus_lp_provider::CetusLpProvider'
+          CETUS_ORIGIN = '0x1eabed72c53feb3805120a081dc15963c204dc8d091542592abaf7a35689b2fb'
+          GLOBAL_CONFIG_TYPE = f'{CETUS_ORIGIN}::config::GlobalConfig'
+          TREASURY_ID = '0x4de1c29a89d6888ebf8f7ae20364571dce4e1e42b9c9221f7df924ad6f9e617d'
+          CLOCK_ID = '0x0000000000000000000000000000000000000000000000000000000000000006'
+
+          def post(url, payload, retries=6, timeout=180):
+              body = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      request = urllib.request.Request(
+                          url,
+                          data=body,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-cetus-remove-census-r6/1',
+                          },
+                      )
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2 ** attempt)
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def gql(query, variables=None):
+              body = post(GQL, {'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': str(exc)})
+              return {'failures': failures}
+
+          def result(wrapper):
+              return wrapper.get('result') if isinstance(wrapper, dict) else None
+
+          def dump(name, value):
+              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def find_all(value, keys):
+              rows = []
+              if isinstance(value, dict):
+                  for key, child in value.items():
+                      if key.lower() in keys:
+                          rows.append(child)
+                      rows.extend(find_all(child, keys))
+              elif isinstance(value, list):
+                  for child in value:
+                      rows.extend(find_all(child, keys))
+              return rows
+
+          def addresses(value):
+              found = set()
+              if isinstance(value, str) and value.startswith('0x') and len(value) == 66:
+                  found.add(value)
+              elif isinstance(value, dict):
+                  for child in value.values():
+                      found.update(addresses(child))
+              elif isinstance(value, list):
+                  for child in value:
+                      found.update(addresses(child))
+              return found
+
+          object_query = '''query Objects($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+
+          def objects(type_name):
+              rows = []
+              cursor = None
+              while True:
+                  connection = gql(object_query, {'type': type_name, 'after': cursor})['objects']
+                  rows.extend(connection.get('nodes') or [])
+                  page = connection.get('pageInfo') or {}
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('endCursor')
+              return rows
+
+          checkpoint = gql('query { checkpoint { sequenceNumber timestamp } }')['checkpoint']
+          providers = objects(PROVIDER_TYPE)
+          configs = objects(GLOBAL_CONFIG_TYPE)
+          dump('providers_graphql.json', providers)
+          dump('global_configs_graphql.json', configs)
+
+          provider_rows = []
+          full_transactions = {}
+          queried_objects = {}
+          candidate_addresses = {TREASURY_ID, CLOCK_ID}
+
+          options = {
+              'showInput': True,
+              'showRawInput': True,
+              'showEffects': True,
+              'showEvents': True,
+              'showObjectChanges': True,
+              'showBalanceChanges': True,
+          }
+
+          for provider in providers:
+              provider_id = provider.get('address')
+              content = ((provider.get('asMoveObject') or {}).get('contents') or {})
+              state = content.get('json') or {}
+              manager_values = find_all(state, {'managers', 'contents'})
+              manager_addresses = sorted({address for value in manager_values for address in addresses(value)})
+              all_state_addresses = sorted(addresses(state))
+              candidate_addresses.update(all_state_addresses)
+
+              txs = []
+              cursor = None
+              failures = []
+              for _ in range(20):
+                  wrapper = rpc('suix_queryTransactionBlocks', [
+                      {'filter': {'InputObject': provider_id}, 'options': options},
+                      cursor,
+                      50,
+                      True,
+                  ])
+                  page = result(wrapper)
+                  if not isinstance(page, dict):
+                      failures.append(wrapper)
+                      break
+                  txs.extend(page.get('data') or [])
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('nextCursor')
+              full_transactions[f'provider:{provider_id}'] = txs
+
+              manager_txs = []
+              for manager in manager_addresses:
+                  cursor = None
+                  for _ in range(20):
+                      wrapper = rpc('suix_queryTransactionBlocks', [
+                          {'filter': {'FromAddress': manager}, 'options': options},
+                          cursor,
+                          50,
+                          True,
+                      ])
+                      page = result(wrapper)
+                      if not isinstance(page, dict):
+                          failures.append(wrapper)
+                          break
+                      for tx in page.get('data') or []:
+                          try:
+                              commands = tx['transaction']['data']['transaction']['transactions']
+                          except Exception:
+                              commands = []
+                          if any(
+                              isinstance(command, dict)
+                              and isinstance(command.get('MoveCall'), dict)
+                              and command['MoveCall'].get('package') == PACKAGE
+                              for command in commands or []
+                          ):
+                              manager_txs.append(tx)
+                      if not page.get('hasNextPage'):
+                          break
+                      cursor = page.get('nextCursor')
+              full_transactions[f'managers:{provider_id}'] = manager_txs
+
+              relevant_calls = []
+              seen = set()
+              for tx in txs + manager_txs:
+                  digest = tx.get('digest')
+                  if digest in seen:
+                      continue
+                  seen.add(digest)
+                  try:
+                      commands = tx['transaction']['data']['transaction']['transactions']
+                  except Exception:
+                      commands = []
+                  for index, command in enumerate(commands or []):
+                      move = command.get('MoveCall') if isinstance(command, dict) else None
+                      if move and move.get('package') == PACKAGE:
+                          relevant_calls.append({
+                              'digest': digest,
+                              'timestampMs': tx.get('timestampMs'),
+                              'sender': ((tx.get('transaction') or {}).get('data') or {}).get('sender'),
+                              'status': (tx.get('effects') or {}).get('status'),
+                              'index': index,
+                              'module': move.get('module'),
+                              'function': move.get('function'),
+                              'type_arguments': move.get('type_arguments'),
+                              'arguments': move.get('arguments'),
+                              'inputs': ((tx.get('transaction') or {}).get('data') or {}).get('transaction', {}).get('inputs'),
+                              'balance_changes': tx.get('balanceChanges'),
+                              'object_changes': tx.get('objectChanges'),
+                          })
+                          for change in tx.get('objectChanges') or []:
+                              object_id = change.get('objectId')
+                              if object_id:
+                                  candidate_addresses.add(object_id)
+
+              function_counts = {}
+              for call in relevant_calls:
+                  key = f"{call['module']}::{call['function']}"
+                  function_counts[key] = function_counts.get(key, 0) + 1
+
+              provider_rows.append({
+                  'id': provider_id,
+                  'version': provider.get('version'),
+                  'digest': provider.get('digest'),
+                  'owner': provider.get('owner'),
+                  'managers': manager_addresses,
+                  'all_state_addresses': all_state_addresses,
+                  'state': state,
+                  'input_object_transaction_count': len(txs),
+                  'manager_scanned_matching_transaction_count': len(manager_txs),
+                  'relevant_calls': relevant_calls,
+                  'function_counts': function_counts,
+                  'query_failures': failures,
+              })
+
+          # Query every object address surfaced by provider state or historical calls.
+          for object_id in sorted(candidate_addresses):
+              wrapper = rpc('sui_getObject', [object_id, {
+                  'showType': True,
+                  'showOwner': True,
+                  'showPreviousTransaction': True,
+                  'showDisplay': True,
+                  'showContent': True,
+                  'showBcs': True,
+              }])
+              queried_objects[object_id] = wrapper
+
+          dump('provider_rows.json', provider_rows)
+          dump('full_transactions.json', full_transactions)
+          dump('queried_objects.json', queried_objects)
+
+          summary = {
+              'schema': 'bucket-cetus-unauthorized-remove-live-census-r6/v1',
+              'network': 'sui-mainnet',
+              'checkpoint': checkpoint,
+              'readOnly': True,
+              'package': PACKAGE,
+              'provider_type': PROVIDER_TYPE,
+              'provider_count': len(provider_rows),
+              'providers': provider_rows,
+              'global_config_count': len(configs),
+              'global_configs': configs,
+              'queried_object_count': len(queried_objects),
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'provider_count': summary['provider_count'],
+              'global_config_count': summary['global_config_count'],
+              'providers': [
+                  {
+                      'id': row['id'],
+                      'managers': row['managers'],
+                      'input_object_transaction_count': row['input_object_transaction_count'],
+                      'manager_scanned_matching_transaction_count': row['manager_scanned_matching_transaction_count'],
+                      'function_counts': row['function_counts'],
+                      'state': row['state'],
+                  }
+                  for row in provider_rows
+              ],
+          }, indent=2))
+          PY
+          python3 bucket-cetus-remove-census-r6/census.py | tee bucket-cetus-remove-census-r6/run.log
+          find bucket-cetus-remove-census-r6 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-cetus-remove-census-r6/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-cetus-remove-census-r6 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-cetus-remove-census-r6/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          print('BUCKET_CETUS_REMOVE_CENSUS_R6_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-cetus-remove-census-r6
+          path: bucket-cetus-remove-census-r6
+          if-no-files-found: error
+          retention-days: 7
