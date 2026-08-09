@@ -1,4 +1,4 @@
-name: Bucket Live Position Aggregate Reconciliation R6
+name: Bucket Object-Owned Account Authorization Audit R6
 
 on:
   pull_request:
@@ -11,34 +11,33 @@ permissions:
   contents: read
 
 jobs:
-  reconcile:
+  account-parent-audit:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Enumerate every live Vault position and reconcile raw aggregates
+      - name: Trace object-owned Account parents, package ABIs and live call paths
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf bucket-position-reconcile-r6
-          mkdir -p bucket-position-reconcile-r6/raw
-          cat > bucket-position-reconcile-r6/reconcile.py <<'PY'
-          import json, pathlib, time, urllib.request
-          OUT=pathlib.Path('bucket-position-reconcile-r6'); RAW=OUT/'raw'
+          rm -rf bucket-account-parent-r6
+          mkdir -p bucket-account-parent-r6/{raw,asm,analysis}
+          cat > bucket-account-parent-r6/audit.py <<'PY'
+          import json, pathlib, re, time, urllib.request
+          OUT=pathlib.Path('bucket-account-parent-r6'); RAW=OUT/'raw'; ASM=OUT/'asm'; ANALYSIS=OUT/'analysis'
           GQL='https://graphql.mainnet.sui.io/graphql'
           RPCS=['https://sui-mainnet-endpoint.blockvision.org','https://fullnode.mainnet.sui.io:443']
-          VAULT_TYPE='0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e::vault::Vault'
+          ACCOUNT_TYPE='0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc::account::Account'
+          ACCOUNT_ORIGIN='0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc'
 
           def post(url,payload,retries=6,timeout=120):
               data=json.dumps(payload).encode(); last=None
               for n in range(retries):
                   try:
-                      req=urllib.request.Request(url,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-position-reconcile-r6/1'})
-                      with urllib.request.urlopen(req,timeout=timeout) as r: body=json.loads(r.read().decode())
-                      return body
-                  except Exception as exc:
-                      last=exc; time.sleep(2**n)
+                      req=urllib.request.Request(url,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-account-parent-r6/1'})
+                      with urllib.request.urlopen(req,timeout=timeout) as r: return json.loads(r.read().decode())
+                  except Exception as exc: last=exc; time.sleep(2**n)
               raise RuntimeError(f'POST failed {url}: {last}')
           def gql(query,variables=None):
               body=post(GQL,{'query':query,'variables':variables or {}})
@@ -53,121 +52,94 @@ jobs:
                       return {'endpoint':endpoint,'result':body.get('result')}
                   except Exception as exc: failures.append({'endpoint':endpoint,'error':type(exc).__name__,'message':str(exc)})
               return {'failures':failures}
-          def result(wrapper): return wrapper.get('result') if isinstance(wrapper,dict) else None
-          def as_int(value):
-              try: return int(value)
-              except Exception: return None
-          def rec_find(value,key):
-              if isinstance(value,dict):
-                  if key in value and not isinstance(value[key],(dict,list)): return value[key]
-                  for v in value.values():
-                      got=rec_find(v,key)
-                      if got is not None: return got
-              elif isinstance(value,list):
-                  for v in value:
-                      got=rec_find(v,key)
-                      if got is not None: return got
-              return None
+          def result(w): return w.get('result') if isinstance(w,dict) else None
+          def dump(path,value): path.write_text(json.dumps(value,indent=2,sort_keys=True)+'\n')
 
-          q='''query V($after:String){objects(first:50,after:$after,filter:{type:"'''+VAULT_TYPE+'''"}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename}asMoveObject{contents{type{repr}json bcs}}}}}'''
-          vaults=[]; after=None
+          q_accounts='''query A($after:String){objects(first:50,after:$after,filter:{type:"'''+ACCOUNT_TYPE+'''"}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+          accounts=[]; after=None
           while True:
-              body=gql(q,{'after':after}); conn=body['data']['objects']; vaults.extend(conn.get('nodes') or [])
+              body=gql(q_accounts,{'after':after}); conn=body['data']['objects']; accounts.extend(conn.get('nodes') or [])
               page=conn.get('pageInfo') or {}
               if not page.get('hasNextPage'): break
               after=page.get('endCursor')
-          (RAW/'vaults.json').write_text(json.dumps(vaults,indent=2,sort_keys=True)+'\n')
+          object_owned=[]
+          for a in accounts:
+              owner=a.get('owner') or {}
+              if owner.get('__typename')=='ObjectOwner':
+                  object_owned.append({'account':a.get('address'),'parent':((owner.get('address') or {}).get('address')),'account_version':a.get('version')})
+          dump(RAW/'accounts.json',accounts)
 
-          rows=[]; all_nodes={}
-          for vault in vaults:
-              contents=((vault.get('asMoveObject') or {}).get('contents') or {})
-              state=contents.get('json') or {}
-              table=(state.get('position_table') or {})
-              table_id=table.get('id') if isinstance(table,dict) else None
-              expected_size=as_int(table.get('size')) if isinstance(table,dict) else None
-              fields=[]; cursor=None
-              if table_id:
-                  for _ in range(100):
-                      w=rpc('suix_getDynamicFields',[table_id,cursor,50]); r=result(w)
-                      if not isinstance(r,dict): break
-                      fields.extend(r.get('data') or [])
-                      if not r.get('hasNextPage'): break
-                      cursor=r.get('nextCursor')
-              objects=[]
-              ids=[f.get('objectId') for f in fields if f.get('objectId')]
-              for i in range(0,len(ids),50):
-                  w=rpc('sui_multiGetObjects',[ids[i:i+50],{'showType':True,'showOwner':True,'showPreviousTransaction':True,'showDisplay':False,'showContent':True,'showBcs':True}])
-                  r=result(w)
-                  if isinstance(r,list): objects.extend(r)
-              nodes=[]
-              for field,obj in zip(fields,objects):
-                  data=(obj or {}).get('data') or {}
-                  content=data.get('content') or {}
-                  flds=content.get('fields') or {}
-                  name=flds.get('name')
-                  if isinstance(name,dict): name=name.get('value') or name.get('fields') or name
-                  val=flds.get('value') or {}
-                  coll=as_int(rec_find(val,'coll_amount'))
-                  debt=as_int(rec_find(val,'debt_amount'))
-                  interest=rec_find(val,'interest_unit')
-                  debtor=None
-                  n=field.get('name') or {}
-                  debtor=n.get('value') if isinstance(n,dict) else n
-                  nodes.append({'debtor':debtor,'field_object_id':field.get('objectId'),'coll_amount':coll,'debt_amount':debt,'interest_unit':interest,'object_type':data.get('type')})
-              all_nodes[vault.get('address')]=nodes
-              raw_coll=sum(n['coll_amount'] or 0 for n in nodes)
-              raw_debt=sum(n['debt_amount'] or 0 for n in nodes)
-              total_coll=as_int(state.get('total_coll_amount'))
-              total_debt=as_int(state.get('total_debt_amount'))
-              balance=as_int(state.get('balance'))
-              limited=state.get('limited_supply') or {}
-              supply=as_int(limited.get('supply')) if isinstance(limited,dict) else None
-              row={
-                  'vault_id':vault.get('address'),'coin_type':(contents.get('type') or {}).get('repr'),
-                  'decimal':as_int(state.get('decimal')),'position_table_id':table_id,
-                  'expected_position_count':expected_size,'enumerated_position_count':len(nodes),
-                  'raw_position_coll_sum':raw_coll,'vault_total_coll_amount':total_coll,
-                  'coll_delta_total_minus_raw':(total_coll-raw_coll) if total_coll is not None else None,
-                  'vault_balance':balance,'balance_delta_total_minus_balance':(total_coll-balance) if total_coll is not None and balance is not None else None,
-                  'raw_position_debt_sum':raw_debt,'vault_total_debt_amount':total_debt,
-                  'debt_delta_total_minus_raw':(total_debt-raw_debt) if total_debt is not None else None,
-                  'limited_supply_supply':supply,'supply_delta_minus_total_debt':(supply-total_debt) if supply is not None and total_debt is not None else None,
-                  'negative_debt_delta': total_debt is not None and total_debt < raw_debt,
-                  'position_count_mismatch': expected_size is not None and expected_size != len(nodes),
-              }
-              rows.append(row)
-          (RAW/'position_nodes.json').write_text(json.dumps(all_nodes,indent=2,sort_keys=True)+'\n')
-          anomalies=[r for r in rows if r['negative_debt_delta'] or r['position_count_mismatch'] or (r['coll_delta_total_minus_raw'] not in (None,0))]
-          summary={
-              'network':'sui-mainnet','vault_count':len(rows),'position_count':sum(r['enumerated_position_count'] for r in rows),
-              'negative_debt_delta_count':sum(1 for r in rows if r['negative_debt_delta']),
-              'position_count_mismatch_count':sum(1 for r in rows if r['position_count_mismatch']),
-              'collateral_accounting_mismatch_count':sum(1 for r in rows if r['coll_delta_total_minus_raw'] not in (None,0)),
-              'rows':rows,'anomalies':anomalies,'writes':0,'transactions_constructed':0,'generated_unix':int(time.time())
-          }
+          parents={}; package_ids=set()
+          for row in object_owned:
+              parent=row['parent']; w=rpc('sui_getObject',[parent,{'showType':True,'showOwner':True,'showPreviousTransaction':True,'showDisplay':True,'showContent':True,'showBcs':True}]); parents[parent]=w
+              r=result(w); data=(r or {}).get('data') if isinstance(r,dict) else None
+              typ=(data or {}).get('type') if isinstance(data,dict) else None
+              row['parent_type']=typ; row['parent_owner']=(data or {}).get('owner') if isinstance(data,dict) else None
+              if isinstance(typ,str) and '::' in typ: package_ids.add('0x'+typ.split('::')[0].removeprefix('0x'))
+          dump(RAW/'parents.json',parents)
+
+          q_pkg='''query P($a:SuiAddress!){object(address:$a){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}modules{nodes{name disassembly functions(first:100){nodes{name visibility isEntry parameters{repr}return{repr}typeParameters{constraints}}}structs(first:100){nodes{name abilities fields{name type{repr}}}}}}}}}}'''
+          packages={}; candidates=[]
+          sensitive=re.compile(r'account|request_with_account|borrow|withdraw|claim|redeem|transfer|owner|sender|auth|cap|admin|manager|position|debt|collateral',re.I)
+          for pid in sorted(package_ids):
+              body=gql(q_pkg,{'a':pid}); dump(RAW/f'package_{pid[2:]}.json',body)
+              obj=body['data']['object']; pkg=(obj or {}).get('asMovePackage')
+              if not pkg: continue
+              packages[pid]={'version':pkg.get('version'),'linkage':pkg.get('linkage'),'type_origins':pkg.get('typeOrigins'),'previous_transaction':obj.get('previousTransaction')}
+              d=ASM/pid[2:]; d.mkdir(parents=True,exist_ok=True)
+              for mod in pkg['modules']['nodes']:
+                  text=mod.get('disassembly') or ''; (d/f"{mod['name']}.asm").write_text(text)
+                  for fn in (mod.get('functions') or {}).get('nodes',[]):
+                      params=[x.get('repr') for x in fn.get('parameters',[])]; returns=[x.get('repr') for x in fn.get('return',[])]
+                      row={'package':pid,'module':mod['name'],'function':fn.get('name'),'visibility':fn.get('visibility'),'is_entry':fn.get('isEntry'),'parameters':params,'returns':returns}
+                      public=str(fn.get('visibility')).upper()=='PUBLIC' or fn.get('isEntry')
+                      account_related=ACCOUNT_ORIGIN in json.dumps(row) or 'Account' in json.dumps(row) or 'request_with_account' in text
+                      if public and account_related and sensitive.search(json.dumps(row)+' '+text): candidates.append(row)
+          dump(ANALYSIS/'candidate_functions.json',candidates)
+
+          activity={}; calls=[]
+          opts={'showInput':True,'showRawInput':False,'showEffects':True,'showEvents':True,'showObjectChanges':True,'showBalanceChanges':True}
+          for row in object_owned:
+              parent=row['parent']; cursor=None; txs=[]
+              for _ in range(10):
+                  w=rpc('suix_queryTransactionBlocks',[{'filter':{'InputObject':parent},'options':opts},cursor,50,True]); r=result(w)
+                  if not isinstance(r,dict): break
+                  txs.extend(r.get('data') or [])
+                  if not r.get('hasNextPage'): break
+                  cursor=r.get('nextCursor')
+              activity[parent]=txs
+              for tx in txs:
+                  try: commands=tx['transaction']['data']['transaction']['transactions']
+                  except Exception: commands=[]
+                  for index,c in enumerate(commands or []):
+                      mc=c.get('MoveCall') if isinstance(c,dict) else None
+                      if mc: calls.append({'parent':parent,'account':row['account'],'digest':tx.get('digest'),'sender':((tx.get('transaction') or {}).get('data') or {}).get('sender'),'status':((tx.get('effects') or {}).get('status')),'index':index,'package':mc.get('package'),'module':mc.get('module'),'function':mc.get('function'),'type_arguments':mc.get('type_arguments')})
+          dump(RAW/'parent_activity.json',activity); dump(ANALYSIS/'move_calls.json',calls)
+
+          shared_parent_count=sum(1 for r in object_owned if isinstance(r.get('parent_owner'),dict) and ('Shared' in r['parent_owner'] or r['parent_owner'].get('__typename')=='Shared'))
+          summary={'network':'sui-mainnet','account_count':len(accounts),'object_owned_account_count':len(object_owned),'object_owned_accounts':object_owned,'parent_package_count':len(package_ids),'packages':packages,'candidate_function_count':len(candidates),'candidate_functions':candidates,'parent_move_call_count':len(calls),'shared_parent_count':shared_parent_count,'writes':0,'transactions_constructed':0,'generated_unix':int(time.time())}
           (OUT/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
-          print(json.dumps({'vault_count':summary['vault_count'],'position_count':summary['position_count'],'negative_debt_delta_count':summary['negative_debt_delta_count'],'position_count_mismatch_count':summary['position_count_mismatch_count'],'collateral_accounting_mismatch_count':summary['collateral_accounting_mismatch_count'],'anomalies':anomalies},indent=2))
+          print(json.dumps({'object_owned_accounts':object_owned,'candidate_function_count':len(candidates),'candidate_functions':candidates,'shared_parent_count':shared_parent_count,'parent_move_call_count':len(calls)},indent=2))
           PY
-          python3 bucket-position-reconcile-r6/reconcile.py | tee bucket-position-reconcile-r6/run.log
-          find bucket-position-reconcile-r6 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-position-reconcile-r6/SHA256SUMS.txt
+          python3 bucket-account-parent-r6/audit.py | tee bucket-account-parent-r6/run.log
+          find bucket-account-parent-r6 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-account-parent-r6/SHA256SUMS.txt
 
       - name: Validate read-only boundary
         shell: bash
         run: |
           set -euo pipefail
-          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-position-reconcile-r6 && exit 1 || true
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-account-parent-r6 && exit 1 || true
           python3 - <<'PY'
           import json
-          s=json.load(open('bucket-position-reconcile-r6/SUMMARY.json'))
+          s=json.load(open('bucket-account-parent-r6/SUMMARY.json'))
           assert s['writes']==0 and s['transactions_constructed']==0
-          assert s['vault_count']>0
-          print('BUCKET_POSITION_RECONCILE_R6_READ_ONLY_PASS')
+          print('BUCKET_ACCOUNT_PARENT_R6_READ_ONLY_PASS')
           PY
 
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-position-reconcile-r6
-          path: bucket-position-reconcile-r6
+          name: bucket-account-parent-r6
+          path: bucket-account-parent-r6
           if-no-files-found: error
           retention-days: 7
