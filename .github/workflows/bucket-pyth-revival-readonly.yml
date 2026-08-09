@@ -1,4 +1,4 @@
-name: Bucket CDP Module Cap Reachability Gate R6
+name: Bucket Frozen HASUI Liquidation Impact Gate R6
 
 on:
   pull_request:
@@ -11,131 +11,222 @@ permissions:
   contents: read
 
 jobs:
-  cap-gate:
+  impact-gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
-      - name: Capture current Treasury and all CDP Vault cap values
+      - name: Capture current frozen positions, Pyth price and admin recovery surface
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf bucket-cdp-cap-gate-r6
-          mkdir -p bucket-cdp-cap-gate-r6/raw
-          cat > bucket-cdp-cap-gate-r6/gate.py <<'PY'
-          import json, pathlib, time, urllib.request
-          OUT=pathlib.Path('bucket-cdp-cap-gate-r6'); RAW=OUT/'raw'
-          GQL='https://graphql.mainnet.sui.io/graphql'
-          TREASURY_TYPE='0xe14726c336e81b32328e92afc37345d159f5b550b09fa92bd43640cfdd0a0cfd::usdb::Treasury'
-          VAULT_TYPE='0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e::vault::Vault'
-          U64_MAX=(1<<64)-1
+          rm -rf bucket-frozen-hasui-impact-r6
+          mkdir -p bucket-frozen-hasui-impact-r6/raw
+          cat > bucket-frozen-hasui-impact-r6/gate.py <<'PY'
+          import base64, datetime, json, math, pathlib, time, urllib.parse, urllib.request
 
-          def post(payload,retries=6,timeout=120):
-              data=json.dumps(payload).encode(); last=None
+          OUT=pathlib.Path('bucket-frozen-hasui-impact-r6'); RAW=OUT/'raw'
+          GQL='https://graphql.mainnet.sui.io/graphql'
+          RPC='https://sui-mainnet-endpoint.blockvision.org'
+          HERMES='https://hermes.pyth.network'
+
+          HASUI_VAULT='0x83367e510389536e2041d50b3faabc2d1b1c8194ca5570a2a3a3e460d6113e86'
+          BLACKLIST='0x10ac2a1f47aaf8afac17d5ed3c869e5f3b932e8d4ae233932c6c7c686ca02ec2'
+          PRICE_INFO='0x4c1d831576b60fec657e0c310943eff8c1f28197c552e57d1fefdc55edddb263'
+          PYTH_STATE='0x1f9310238ee9298fb703c3419030b35b22bb1cc37113e3bb5007c99aec79e5b8'
+          PYTH_CONFIG='0x00aea60b799575ae4203bcc80c16844c4d514d5af661200c4565f6d5a6deac1f'
+          AGGREGATOR='0x8201e8138ada9945499db1e74cb86f92d102238b35f7d46f9cfe266426564edc'
+          POSITION_FIELDS={
+              '0xe54a304524adca781d8e78faf759c1f18b1cfbe20ecf5dc82724050bec459f5c':'0x5b25330ae02eb158f1808f39f1e5a4ef8bfc7021c956ba0369a06cae4d4bf837',
+              '0x5939b998325f79f0bf600ea355558e908d6fba739e0d97eb39725636f4ab8192':'0x77c4c933cdf83f1e4bb4f3a7d6d99e46d4d41957c2f902a99749402b13e12dba',
+          }
+          ADMIN_CAP_TYPE='0xe14726c336e81b32328e92afc37345d159f5b550b09fa92bd43640cfdd0a0cfd::admin::AdminCap'
+          FEED_ID='6120ffcf96395c70aa77e72dcb900bf9d40dccab228efca59a17b90ce423d5e8'
+          DOUBLE=10**18
+          ONE_YEAR_MS=31_536_000_000
+
+          def request(url, payload=None, retries=6, timeout=120):
+              last=None
               for n in range(retries):
                   try:
-                      req=urllib.request.Request(GQL,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-cdp-cap-gate-r6/1'})
-                      with urllib.request.urlopen(req,timeout=timeout) as r: body=json.loads(r.read().decode())
-                      if body.get('errors'): raise RuntimeError(json.dumps(body['errors']))
-                      return body
+                      data=None if payload is None else json.dumps(payload).encode()
+                      req=urllib.request.Request(url,data=data,method='GET' if payload is None else 'POST',headers={'Content-Type':'application/json','User-Agent':'bucket-frozen-hasui-impact-r6/1'})
+                      with urllib.request.urlopen(req,timeout=timeout) as response:
+                          return json.loads(response.read().decode())
                   except Exception as exc:
                       last=exc; time.sleep(2**n)
-              raise RuntimeError(f'GraphQL failed: {last}')
-          def gql(query,variables=None): return post({'query':query,'variables':variables or {}})['data']
-          def as_int(v):
-              if isinstance(v,int) and not isinstance(v,bool): return v
-              if isinstance(v,str) and v.isdigit(): return int(v)
-              raise RuntimeError(f'invalid integer {v!r}')
-          def vecmap(v):
-              if isinstance(v,dict): v=v.get('contents')
-              return v if isinstance(v,list) else []
+              raise RuntimeError(f'request failed {url}: {last}')
+          def gql(query,variables=None):
+              body=request(GQL,{'query':query,'variables':variables or {}})
+              if body.get('errors'): raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+          def rpc(method,params):
+              body=request(RPC,{'jsonrpc':'2.0','id':1,'method':method,'params':params})
+              if body.get('error'): raise RuntimeError(json.dumps(body['error']))
+              return body.get('result')
           def dump(name,value): (RAW/name).write_text(json.dumps(value,indent=2,sort_keys=True)+'\n')
+          def i(value):
+              if isinstance(value,bool) or value is None: raise ValueError(value)
+              if isinstance(value,int): return value
+              if isinstance(value,str) and (value.isdigit() or (value.startswith('-') and value[1:].isdigit())): return int(value)
+              if isinstance(value,dict):
+                  if 'value' in value: return i(value['value'])
+                  if 'magnitude' in value:
+                      mag=i(value['magnitude']); neg=value.get('negative') or value.get('is_negative')
+                      return -mag if neg else mag
+                  fields=value.get('fields')
+                  if isinstance(fields,dict): return i(fields)
+              raise ValueError(value)
+          def find_key(value,key):
+              if isinstance(value,dict):
+                  if key in value: return value[key]
+                  for child in value.values():
+                      found=find_key(child,key)
+                      if found is not None: return found
+              elif isinstance(value,list):
+                  for child in value:
+                      found=find_key(child,key)
+                      if found is not None: return found
+              return None
+          def scalar_paths(value,path=()):
+              rows=[]
+              if isinstance(value,dict):
+                  for k,v in value.items(): rows.extend(scalar_paths(v,path+(str(k),)))
+              elif isinstance(value,list):
+                  for n,v in enumerate(value): rows.extend(scalar_paths(v,path+(str(n),)))
+              else: rows.append(('.'.join(path),value))
+              return rows
+          def get_object(oid):
+              return rpc('sui_getObject',[oid,{'showType':True,'showOwner':True,'showPreviousTransaction':True,'showDisplay':False,'showContent':True,'showBcs':True}])
+          def content(obj):
+              return ((obj or {}).get('data') or {}).get('content') or {}
+          def fields(obj):
+              return content(obj).get('fields') or {}
 
           checkpoint=gql('query { checkpoint { sequenceNumber timestamp } }')['checkpoint']
-          query='''query O($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename}previousTransaction{digest sender{address}}asMoveObject{contents{type{repr}json bcs}}}}}'''
-          def objects(type_):
-              rows=[]; after=None
-              while True:
-                  conn=gql(query,{'type':type_,'after':after})['objects']; rows.extend(conn.get('nodes') or [])
-                  page=conn.get('pageInfo') or {}
-                  if not page.get('hasNextPage'): break
-                  after=page.get('endCursor')
-              return rows
+          now_ms=int(datetime.datetime.fromisoformat(checkpoint['timestamp'].replace('Z','+00:00')).timestamp()*1000)
 
-          treasuries=objects(TREASURY_TYPE)
-          if len(treasuries)!=1: raise RuntimeError(f'expected one Treasury, got {len(treasuries)}')
-          treasury=treasuries[0]
-          tj=treasury['asMoveObject']['contents']['json']
-          configs=vecmap(tj.get('module_config_map'))
-          cdp=[x for x in configs if 'BucketV2CDP' in str(x.get('key'))]
-          if len(cdp)!=1: raise RuntimeError(f'expected one CDP module config, got {len(cdp)}')
-          module_ls=cdp[0]['value']['limited_supply']
-          module_limit=as_int(module_ls['limit']); module_supply=as_int(module_ls['supply'])
-          module_headroom=max(0,module_limit-module_supply)
+          objects={oid:get_object(oid) for oid in [HASUI_VAULT,BLACKLIST,PRICE_INFO,PYTH_STATE,PYTH_CONFIG,AGGREGATOR,*POSITION_FIELDS.values()]}
+          dump('objects.json',objects)
+          vault=fields(objects[HASUI_VAULT])
+          blacklist=fields(objects[BLACKLIST])
+          price_content=content(objects[PRICE_INFO])
 
-          vaults=objects(VAULT_TYPE)
-          parsed=[]
-          for row in vaults:
-              c=row['asMoveObject']['contents']; j=c['json']; ls=j['limited_supply']
-              limit=as_int(ls['limit']); supply=as_int(ls['supply'])
-              parsed.append({
-                  'id':row['address'],'version':str(row['version']),'digest':row['digest'],
-                  'type':c['type']['repr'],'decimal':as_int(j['decimal']),
-                  'limit':limit,'supply':supply,'headroom':max(0,limit-supply),
-                  'totalDebt':as_int(j.get('total_debt_amount','0')),
-                  'totalCollateral':as_int(j.get('total_coll_amount','0')),
-                  'positionCount':as_int((j.get('position_table') or {}).get('size','0')),
-                  'interestRateRaw':j.get('interest_rate'),
-                  'minimumCollateralRatioRaw':j.get('min_collateral_ratio'),
+          # Use Hermes as an independent current-price cross-check, while the on-chain object remains the production input.
+          query=urllib.parse.urlencode([('ids[]',FEED_ID),('parsed','true')])
+          hermes=request(HERMES+'/v2/updates/price/latest?'+query)
+          dump('hermes_latest.json',hermes)
+          parsed=(hermes.get('parsed') or [None])[0] or {}
+          hp=parsed.get('price') or {}
+          hermes_price_raw=i(hp.get('price'))
+          hermes_expo=i(hp.get('expo'))
+          hermes_price=hermes_price_raw*(10**hermes_expo)
+          hermes_publish=i(hp.get('publish_time'))
+
+          # Extract every timestamp/price-shaped scalar from the exact on-chain PriceInfoObject for auditability.
+          scalars=scalar_paths(price_content)
+          timestamps=[]; prices=[]; expos=[]; confs=[]
+          for path,value in scalars:
+              low=path.lower()
+              try:
+                  if any(x in low for x in ('timestamp','publish_time')): timestamps.append((path,i(value)))
+                  if low.endswith('.price') or low.endswith('.price.fields.magnitude'): prices.append((path,i(value)))
+                  if low.endswith('.expo') or low.endswith('.exponent') or low.endswith('.expo.fields.magnitude'): expos.append((path,i(value)))
+                  if low.endswith('.conf') or low.endswith('.confidence'): confs.append((path,i(value)))
+              except Exception: pass
+          onchain_candidates={'timestamps':timestamps,'prices':prices,'exponents':expos,'confidences':confs}
+          dump('onchain_price_candidates.json',onchain_candidates)
+
+          vault_interest=i(vault['interest_unit']); rate=i(vault['interest_rate']); vault_timestamp=i(vault['timestamp'])
+          duration=max(0,now_ms-vault_timestamp)
+          duration_double=duration*DOUBLE//ONE_YEAR_MS
+          current_vault_interest=vault_interest+(rate*duration_double//DOUBLE)
+          mcr=i(vault['min_collateral_ratio'])/1_000_000_000
+
+          positions=[]
+          for debtor,oid in POSITION_FIELDS.items():
+              f=fields(objects[oid])
+              value=f.get('value') or f
+              coll=i(find_key(value,'coll_amount'))
+              raw_debt=i(find_key(value,'debt_amount'))
+              position_interest=i(find_key(value,'interest_unit'))
+              interest_diff=max(0,current_vault_interest-position_interest)
+              accrued=(interest_diff*raw_debt+DOUBLE-1)//DOUBLE
+              debt=raw_debt+accrued
+              threshold=mcr*(debt/1_000_000)/(coll/1_000_000_000)
+              cr=(coll/1_000_000_000)*hermes_price/(debt/1_000_000)
+              positions.append({
+                  'debtor':debtor,'fieldObject':oid,'collateralRaw':coll,'collateralHASUI':coll/1_000_000_000,
+                  'rawDebtRaw':raw_debt,'accruedInterestRaw':accrued,'currentDebtRaw':debt,'currentDebtUSDB':debt/1_000_000,
+                  'positionInterestUnitRaw':position_interest,'currentVaultInterestUnitRaw':current_vault_interest,
+                  'liquidationThresholdUSDBPerHASUI':threshold,'currentCollateralRatio':cr,
+                  'currentPriceAboveThresholdPercent':(hermes_price/threshold-1)*100,
+                  'currentlyLiquidatableAtHermesPrice':cr<mcr,
               })
-          aggregate=sum(v['headroom'] for v in parsed)
-          active=[v for v in parsed if v['totalDebt']>0 and v['headroom']>0]
-          coverage=aggregate/module_headroom if module_headroom else None
-          analysis={
-              'moduleCapFinite':0<module_limit<U64_MAX,
-              'moduleLimitRaw':module_limit,'moduleSupplyRaw':module_supply,'moduleHeadroomRaw':module_headroom,
-              'aggregateVaultHeadroomRaw':aggregate,'aggregateVaultHeadroomCoversModuleHeadroom':aggregate>=module_headroom,
-              'coverageRatio':coverage,'reachabilityShortfallRaw':max(0,module_headroom-aggregate),
-              'activeVaultCount':len(active),'activeVaultIds':[v['id'] for v in active],
-              'automatedTechnicalGatePass':0<module_limit<U64_MAX and aggregate>=module_headroom and len(active)>0,
-              'usdbDecimalsAssumedForDisplayOnly':6,
-              'moduleHeadroomDisplayUSDB':module_headroom/1_000_000,
-              'aggregateVaultHeadroomDisplayUSDB':aggregate/1_000_000,
-              'reachabilityShortfallDisplayUSDB':max(0,module_headroom-aggregate)/1_000_000,
-          }
+
+          q='''query O($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{contents{type{repr}json bcs}}}}}'''
+          caps=[]; after=None
+          while True:
+              conn=gql(q,{'type':ADMIN_CAP_TYPE,'after':after})['objects']; caps.extend(conn.get('nodes') or [])
+              page=conn.get('pageInfo') or {}
+              if not page.get('hasNextPage'): break
+              after=page.get('endCursor')
+          dump('admin_caps.json',caps)
+
+          # Recent blacklist-object transaction history and exact functions called.
+          history=rpc('suix_queryTransactionBlocks',[{'filter':{'InputObject':BLACKLIST},'options':{'showInput':True,'showRawInput':False,'showEffects':True,'showEvents':True,'showObjectChanges':True,'showBalanceChanges':True}},None,100,True])
+          dump('blacklist_history.json',history)
+          calls=[]
+          for tx in history.get('data') or []:
+              try: commands=tx['transaction']['data']['transaction']['transactions']
+              except Exception: commands=[]
+              for index,cmd in enumerate(commands or []):
+                  mc=cmd.get('MoveCall') if isinstance(cmd,dict) else None
+                  if mc:
+                      calls.append({'digest':tx.get('digest'),'timestampMs':tx.get('timestampMs'),'sender':((tx.get('transaction') or {}).get('data') or {}).get('sender'),'status':((tx.get('effects') or {}).get('status')),'index':index,'package':mc.get('package'),'module':mc.get('module'),'function':mc.get('function')})
+          dump('blacklist_calls.json',calls)
+
+          frozen=find_key(blacklist,'frozen_addresses')
+          combined_debt=sum(p['currentDebtUSDB'] for p in positions)
+          combined_coll=sum(p['collateralHASUI'] for p in positions)
           summary={
-              'schema':'bucket-cdp-module-cap-reachability-r6/v1','network':'sui-mainnet','readOnly':True,
-              'checkpoint':checkpoint,
-              'treasury':{'id':treasury['address'],'version':str(treasury['version']),'digest':treasury['digest'],'moduleConfigKey':cdp[0]['key'],'validVersions':cdp[0]['value'].get('valid_versions')},
-              'analysis':analysis,'vaults':sorted(parsed,key=lambda x:x['headroom']),
+              'schema':'bucket-frozen-hasui-impact-r6/v1','network':'sui-mainnet','readOnly':True,'checkpoint':checkpoint,
+              'hasuiPriceHermes':hermes_price,'hasuiPriceRaw':hermes_price_raw,'hasuiPriceExpo':hermes_expo,'hermesPublishTime':hermes_publish,
+              'onchainPriceInfoObject':PRICE_INFO,'onchainPriceCandidates':onchain_candidates,
+              'vault':{'id':HASUI_VAULT,'mcr':mcr,'interestRateRaw':rate,'interestUnitRaw':vault_interest,'timestampMs':vault_timestamp,'currentInterestUnitRaw':current_vault_interest,'requestChecklist':vault.get('request_checklist'),'positionCount':i((vault.get('position_table') or {}).get('size'))},
+              'blacklist':{'id':BLACKLIST,'frozenAddresses':frozen,'managerSet':find_key(blacklist,'managers')},
+              'positions':positions,'combinedCurrentDebtUSDB':combined_debt,'combinedCollateralHASUI':combined_coll,
+              'currentlyLiquidatableCount':sum(1 for p in positions if p['currentlyLiquidatableAtHermesPrice']),
+              'adminCaps':caps,'recentBlacklistCalls':calls,
+              'recoverySurface':{'unblacklistRequiresAdminCap':True,'permissionlessRecoveryFound':False,'adminCapObjectCount':len(caps)},
               'writes':0,'transactionsConstructed':0,'generatedUnix':int(time.time()),
           }
-          dump('treasury.json',treasury); dump('vaults.json',vaults)
           (OUT/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
           print(json.dumps(summary,indent=2))
           PY
-          python3 bucket-cdp-cap-gate-r6/gate.py | tee bucket-cdp-cap-gate-r6/run.log
-          find bucket-cdp-cap-gate-r6 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-cdp-cap-gate-r6/SHA256SUMS.txt
+          python3 bucket-frozen-hasui-impact-r6/gate.py | tee bucket-frozen-hasui-impact-r6/run.log
+          find bucket-frozen-hasui-impact-r6 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-frozen-hasui-impact-r6/SHA256SUMS.txt
 
-      - name: Validate read-only boundary
+      - name: Validate read-only boundary and material binding
         shell: bash
         run: |
           set -euo pipefail
-          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-cdp-cap-gate-r6 && exit 1 || true
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-frozen-hasui-impact-r6 && exit 1 || true
           python3 - <<'PY'
           import json
-          s=json.load(open('bucket-cdp-cap-gate-r6/SUMMARY.json'))
+          s=json.load(open('bucket-frozen-hasui-impact-r6/SUMMARY.json'))
           assert s['readOnly'] is True
           assert s['writes']==0 and s['transactionsConstructed']==0
-          assert len(s['vaults'])>0
-          print('BUCKET_CDP_CAP_GATE_R6_READ_ONLY_PASS')
+          assert len(s['positions'])==2
+          assert s['combinedCurrentDebtUSDB']>1_000_000
+          print('BUCKET_FROZEN_HASUI_IMPACT_R6_PASS')
           PY
 
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-cdp-cap-gate-r6
-          path: bucket-cdp-cap-gate-r6
+          name: bucket-frozen-hasui-impact-r6
+          path: bucket-frozen-hasui-impact-r6
           if-no-files-found: error
           retention-days: 7
