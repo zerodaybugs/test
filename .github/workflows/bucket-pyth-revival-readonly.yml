@@ -1,4 +1,4 @@
-name: Bucket Object-Owned Account Authorization Audit R6B
+name: Bucket CDP Module Cap Reachability Gate R6
 
 on:
   pull_request:
@@ -11,149 +11,131 @@ permissions:
   contents: read
 
 jobs:
-  account-parent-audit:
+  cap-gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
-      - name: Trace object-owned Account parents and public authorization surfaces
+      - name: Capture current Treasury and all CDP Vault cap values
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf bucket-account-parent-r6b
-          mkdir -p bucket-account-parent-r6b/raw
-          cat > bucket-account-parent-r6b/audit.py <<'PY'
-          import json, pathlib, re, time, urllib.request
-          OUT=pathlib.Path('bucket-account-parent-r6b'); RAW=OUT/'raw'
+          rm -rf bucket-cdp-cap-gate-r6
+          mkdir -p bucket-cdp-cap-gate-r6/raw
+          cat > bucket-cdp-cap-gate-r6/gate.py <<'PY'
+          import json, pathlib, time, urllib.request
+          OUT=pathlib.Path('bucket-cdp-cap-gate-r6'); RAW=OUT/'raw'
           GQL='https://graphql.mainnet.sui.io/graphql'
-          RPCS=['https://sui-mainnet-endpoint.blockvision.org','https://fullnode.mainnet.sui.io:443']
-          ACCOUNT_TYPE='0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc::account::Account'
-          ACCOUNT_ORIGIN='0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc'
+          TREASURY_TYPE='0xe14726c336e81b32328e92afc37345d159f5b550b09fa92bd43640cfdd0a0cfd::usdb::Treasury'
+          VAULT_TYPE='0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e::vault::Vault'
+          U64_MAX=(1<<64)-1
 
-          def post(url,payload,retries=6,timeout=120):
+          def post(payload,retries=6,timeout=120):
               data=json.dumps(payload).encode(); last=None
               for n in range(retries):
                   try:
-                      req=urllib.request.Request(url,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-account-parent-r6b/1'})
-                      with urllib.request.urlopen(req,timeout=timeout) as r: return json.loads(r.read().decode())
+                      req=urllib.request.Request(GQL,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-cdp-cap-gate-r6/1'})
+                      with urllib.request.urlopen(req,timeout=timeout) as r: body=json.loads(r.read().decode())
+                      if body.get('errors'): raise RuntimeError(json.dumps(body['errors']))
+                      return body
                   except Exception as exc:
                       last=exc; time.sleep(2**n)
-              raise RuntimeError(f'POST failed {url}: {last}')
-          def gql(query,variables=None):
-              body=post(GQL,{'query':query,'variables':variables or {}})
-              if body.get('errors'): raise RuntimeError(json.dumps(body['errors']))
-              return body
-          def rpc(method,params):
-              failures=[]
-              for endpoint in RPCS:
-                  try:
-                      body=post(endpoint,{'jsonrpc':'2.0','id':1,'method':method,'params':params})
-                      if body.get('error'): raise RuntimeError(json.dumps(body['error']))
-                      return {'endpoint':endpoint,'result':body.get('result')}
-                  except Exception as exc: failures.append({'endpoint':endpoint,'error':type(exc).__name__,'message':str(exc)})
-              return {'failures':failures}
-          def result(w): return w.get('result') if isinstance(w,dict) else None
+              raise RuntimeError(f'GraphQL failed: {last}')
+          def gql(query,variables=None): return post({'query':query,'variables':variables or {}})['data']
+          def as_int(v):
+              if isinstance(v,int) and not isinstance(v,bool): return v
+              if isinstance(v,str) and v.isdigit(): return int(v)
+              raise RuntimeError(f'invalid integer {v!r}')
+          def vecmap(v):
+              if isinstance(v,dict): v=v.get('contents')
+              return v if isinstance(v,list) else []
           def dump(name,value): (RAW/name).write_text(json.dumps(value,indent=2,sort_keys=True)+'\n')
 
-          query='''query A($after:String){objects(first:50,after:$after,filter:{type:"'''+ACCOUNT_TYPE+'''"}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
-          accounts=[]; after=None
-          while True:
-              body=gql(query,{'after':after}); conn=body['data']['objects']; accounts.extend(conn.get('nodes') or [])
-              page=conn.get('pageInfo') or {}
-              if not page.get('hasNextPage'): break
-              after=page.get('endCursor')
-          dump('accounts.json',accounts)
+          checkpoint=gql('query { checkpoint { sequenceNumber timestamp } }')['checkpoint']
+          query='''query O($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename}previousTransaction{digest sender{address}}asMoveObject{contents{type{repr}json bcs}}}}}'''
+          def objects(type_):
+              rows=[]; after=None
+              while True:
+                  conn=gql(query,{'type':type_,'after':after})['objects']; rows.extend(conn.get('nodes') or [])
+                  page=conn.get('pageInfo') or {}
+                  if not page.get('hasNextPage'): break
+                  after=page.get('endCursor')
+              return rows
 
-          object_owned=[]; parents={}; package_ids=set()
-          for account in accounts:
-              owner=account.get('owner') or {}
-              if owner.get('__typename')!='ObjectOwner': continue
-              parent=((owner.get('address') or {}).get('address'))
-              row={'account':account.get('address'),'account_version':account.get('version'),'parent':parent}
-              wrapper=rpc('sui_getObject',[parent,{'showType':True,'showOwner':True,'showPreviousTransaction':True,'showDisplay':True,'showContent':True,'showBcs':True}])
-              parents[parent]=wrapper
-              data=(result(wrapper) or {}).get('data') if isinstance(result(wrapper),dict) else None
-              row['parent_type']=(data or {}).get('type') if isinstance(data,dict) else None
-              row['parent_owner']=(data or {}).get('owner') if isinstance(data,dict) else None
-              typ=row['parent_type']
-              if isinstance(typ,str) and '::' in typ: package_ids.add('0x'+typ.split('::')[0].removeprefix('0x'))
-              object_owned.append(row)
-          dump('parents.json',parents)
+          treasuries=objects(TREASURY_TYPE)
+          if len(treasuries)!=1: raise RuntimeError(f'expected one Treasury, got {len(treasuries)}')
+          treasury=treasuries[0]
+          tj=treasury['asMoveObject']['contents']['json']
+          configs=vecmap(tj.get('module_config_map'))
+          cdp=[x for x in configs if 'BucketV2CDP' in str(x.get('key'))]
+          if len(cdp)!=1: raise RuntimeError(f'expected one CDP module config, got {len(cdp)}')
+          module_ls=cdp[0]['value']['limited_supply']
+          module_limit=as_int(module_ls['limit']); module_supply=as_int(module_ls['supply'])
+          module_headroom=max(0,module_limit-module_supply)
 
-          modules={}; candidates=[]
-          sensitive=re.compile(r'account|request|borrow|withdraw|claim|redeem|transfer|owner|sender|auth|cap|admin|manager|position|debt|collateral',re.I)
-          for package in sorted(package_ids):
-              wrapper=rpc('sui_getNormalizedMoveModulesByPackage',[package]); modules[package]=wrapper
-              normalized=result(wrapper)
-              if not isinstance(normalized,dict): continue
-              for module_name,module in normalized.items():
-                  functions=module.get('exposedFunctions') or {}
-                  for function_name,function in functions.items():
-                      visibility=str(function.get('visibility') or '')
-                      is_entry=bool(function.get('isEntry'))
-                      parameters=function.get('parameters') or []
-                      returns=function.get('return') or []
-                      serialized=json.dumps({'module':module_name,'function':function_name,'parameters':parameters,'returns':returns})
-                      public=visibility.lower()=='public' or is_entry
-                      account_related=ACCOUNT_ORIGIN in serialized or 'Account' in serialized or sensitive.search(function_name)
-                      if public and account_related:
-                          candidates.append({'package':package,'module':module_name,'function':function_name,'visibility':visibility,'is_entry':is_entry,'parameters':parameters,'returns':returns})
-          dump('normalized_modules.json',modules); dump('candidate_functions.json',candidates)
-
-          opts={'showInput':True,'showRawInput':False,'showEffects':True,'showEvents':True,'showObjectChanges':True,'showBalanceChanges':True}
-          activity={}; calls=[]
-          for row in object_owned:
-              for label,oid in [('parent',row['parent']),('account',row['account'])]:
-                  cursor=None; txs=[]
-                  for _ in range(10):
-                      wrapper=rpc('suix_queryTransactionBlocks',[{'filter':{'InputObject':oid},'options':opts},cursor,50,True]); page=result(wrapper)
-                      if not isinstance(page,dict): break
-                      txs.extend(page.get('data') or [])
-                      if not page.get('hasNextPage'): break
-                      cursor=page.get('nextCursor')
-                  activity[f'{label}:{oid}']=txs
-                  for tx in txs:
-                      try: commands=tx['transaction']['data']['transaction']['transactions']
-                      except Exception: commands=[]
-                      for index,command in enumerate(commands or []):
-                          move=command.get('MoveCall') if isinstance(command,dict) else None
-                          if move:
-                              calls.append({'input_kind':label,'input_object':oid,'account':row['account'],'parent':row['parent'],'digest':tx.get('digest'),'sender':((tx.get('transaction') or {}).get('data') or {}).get('sender'),'status':((tx.get('effects') or {}).get('status')),'index':index,'package':move.get('package'),'module':move.get('module'),'function':move.get('function'),'type_arguments':move.get('type_arguments')})
-          dump('activity.json',activity); dump('move_calls.json',calls)
-
-          def owner_kind(owner):
-              if not isinstance(owner,dict): return 'unknown'
-              if 'Shared' in owner: return 'shared'
-              if 'AddressOwner' in owner: return 'address'
-              if 'ObjectOwner' in owner: return 'object'
-              if 'Immutable' in owner: return 'immutable'
-              return 'unknown'
-          for row in object_owned: row['parent_owner_kind']=owner_kind(row.get('parent_owner'))
-          shared=[row for row in object_owned if row['parent_owner_kind']=='shared']
-          summary={'network':'sui-mainnet','account_count':len(accounts),'object_owned_account_count':len(object_owned),'object_owned_accounts':object_owned,'shared_parent_count':len(shared),'shared_parent_accounts':shared,'parent_package_count':len(package_ids),'candidate_function_count':len(candidates),'candidate_functions':candidates,'move_call_count':len(calls),'writes':0,'transactions_constructed':0,'generated_unix':int(time.time())}
+          vaults=objects(VAULT_TYPE)
+          parsed=[]
+          for row in vaults:
+              c=row['asMoveObject']['contents']; j=c['json']; ls=j['limited_supply']
+              limit=as_int(ls['limit']); supply=as_int(ls['supply'])
+              parsed.append({
+                  'id':row['address'],'version':str(row['version']),'digest':row['digest'],
+                  'type':c['type']['repr'],'decimal':as_int(j['decimal']),
+                  'limit':limit,'supply':supply,'headroom':max(0,limit-supply),
+                  'totalDebt':as_int(j.get('total_debt_amount','0')),
+                  'totalCollateral':as_int(j.get('total_coll_amount','0')),
+                  'positionCount':as_int((j.get('position_table') or {}).get('size','0')),
+                  'interestRateRaw':j.get('interest_rate'),
+                  'minimumCollateralRatioRaw':j.get('min_collateral_ratio'),
+              })
+          aggregate=sum(v['headroom'] for v in parsed)
+          active=[v for v in parsed if v['totalDebt']>0 and v['headroom']>0]
+          coverage=aggregate/module_headroom if module_headroom else None
+          analysis={
+              'moduleCapFinite':0<module_limit<U64_MAX,
+              'moduleLimitRaw':module_limit,'moduleSupplyRaw':module_supply,'moduleHeadroomRaw':module_headroom,
+              'aggregateVaultHeadroomRaw':aggregate,'aggregateVaultHeadroomCoversModuleHeadroom':aggregate>=module_headroom,
+              'coverageRatio':coverage,'reachabilityShortfallRaw':max(0,module_headroom-aggregate),
+              'activeVaultCount':len(active),'activeVaultIds':[v['id'] for v in active],
+              'automatedTechnicalGatePass':0<module_limit<U64_MAX and aggregate>=module_headroom and len(active)>0,
+              'usdbDecimalsAssumedForDisplayOnly':6,
+              'moduleHeadroomDisplayUSDB':module_headroom/1_000_000,
+              'aggregateVaultHeadroomDisplayUSDB':aggregate/1_000_000,
+              'reachabilityShortfallDisplayUSDB':max(0,module_headroom-aggregate)/1_000_000,
+          }
+          summary={
+              'schema':'bucket-cdp-module-cap-reachability-r6/v1','network':'sui-mainnet','readOnly':True,
+              'checkpoint':checkpoint,
+              'treasury':{'id':treasury['address'],'version':str(treasury['version']),'digest':treasury['digest'],'moduleConfigKey':cdp[0]['key'],'validVersions':cdp[0]['value'].get('valid_versions')},
+              'analysis':analysis,'vaults':sorted(parsed,key=lambda x:x['headroom']),
+              'writes':0,'transactionsConstructed':0,'generatedUnix':int(time.time()),
+          }
+          dump('treasury.json',treasury); dump('vaults.json',vaults)
           (OUT/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
           print(json.dumps(summary,indent=2))
           PY
-          python3 bucket-account-parent-r6b/audit.py | tee bucket-account-parent-r6b/run.log
-          find bucket-account-parent-r6b -type f -print0 | sort -z | xargs -0 sha256sum > bucket-account-parent-r6b/SHA256SUMS.txt
+          python3 bucket-cdp-cap-gate-r6/gate.py | tee bucket-cdp-cap-gate-r6/run.log
+          find bucket-cdp-cap-gate-r6 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-cdp-cap-gate-r6/SHA256SUMS.txt
 
       - name: Validate read-only boundary
         shell: bash
         run: |
           set -euo pipefail
-          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-account-parent-r6b && exit 1 || true
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-cdp-cap-gate-r6 && exit 1 || true
           python3 - <<'PY'
           import json
-          s=json.load(open('bucket-account-parent-r6b/SUMMARY.json'))
-          assert s['writes']==0 and s['transactions_constructed']==0
-          print('BUCKET_ACCOUNT_PARENT_R6B_READ_ONLY_PASS')
+          s=json.load(open('bucket-cdp-cap-gate-r6/SUMMARY.json'))
+          assert s['readOnly'] is True
+          assert s['writes']==0 and s['transactionsConstructed']==0
+          assert len(s['vaults'])>0
+          print('BUCKET_CDP_CAP_GATE_R6_READ_ONLY_PASS')
           PY
 
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-account-parent-r6b
-          path: bucket-account-parent-r6b
+          name: bucket-cdp-cap-gate-r6
+          path: bucket-cdp-cap-gate-r6
           if-no-files-found: error
           retention-days: 7
