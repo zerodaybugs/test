@@ -1,0 +1,206 @@
+name: Temporary Ethereum ETH72 Encrypted PR Gate
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    if: github.head_ref == 'ethereum-fusaka-eth72-fuzz-20260809'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact released Geth source
+        uses: actions/checkout@v4
+        with:
+          repository: ethereum/go-ethereum
+          ref: 9621c6ad10934a01b5514886fb6fbd87640b6c05
+          path: geth
+          persist-credentials: false
+
+      - name: Configure Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: geth/go.mod
+          cache: true
+          cache-dependency-path: geth/go.sum
+
+      - name: Install generic ETH72 fuzz harness
+        shell: bash
+        run: |
+          cat > geth/eth/protocols/eth/eth72_research_fuzz_test.go <<'EOF'
+          package eth
+
+          import (
+              "testing"
+
+              "github.com/ethereum/go-ethereum/common"
+              "github.com/ethereum/go-ethereum/core/types"
+              "github.com/ethereum/go-ethereum/crypto/kzg4844"
+              "github.com/ethereum/go-ethereum/rlp"
+          )
+
+          func eth72Seed(v any) []byte {
+              enc, err := rlp.EncodeToBytes(v)
+              if err != nil {
+                  panic(err)
+              }
+              return enc
+          }
+
+          func eth72FuzzPeer(f *testing.F) (*testBackend, *testPeer) {
+              backend := newTestBackend(4)
+              peer, _ := newTestPeer("eth72-fuzz", ETH72, backend)
+              go func() {
+                  for {
+                      msg, err := peer.app.ReadMsg()
+                      if err != nil {
+                          return
+                      }
+                      msg.Discard()
+                  }
+              }()
+              f.Cleanup(func() {
+                  peer.close()
+                  backend.close()
+              })
+              return backend, peer
+          }
+
+          func addETH72Seeds(f *testing.F) {
+              f.Add(byte(NewPooledTransactionHashesMsg), eth72Seed(&NewPooledTransactionHashesPacket72{}))
+              f.Add(byte(NewPooledTransactionHashesMsg), eth72Seed(&NewPooledTransactionHashesPacket72{
+                  Types:  []byte{types.BlobTxType},
+                  Sizes:  []uint32{1024},
+                  Hashes: []common.Hash{{1}},
+                  Mask:   types.CustodyBitmapData,
+              }))
+              f.Add(byte(GetCellsMsg), eth72Seed(&GetCellsRequestPacket{
+                  RequestId: 1,
+                  GetCellsRequest: GetCellsRequest{
+                      Hashes: []common.Hash{{1}},
+                      Mask:   types.CustodyBitmapAll,
+                  },
+              }))
+              var emptyCells rlp.RawList[rlp.RawList[kzg4844.Cell]]
+              f.Add(byte(CellsMsg), eth72Seed(&CellsPacket{
+                  RequestId: 1,
+                  CellsResponse: CellsResponse{
+                      Cells: emptyCells,
+                      Mask:  types.CustodyBitmapAll,
+                  },
+              }))
+          }
+
+          func FuzzEth72ProtocolHandlers(f *testing.F) {
+              addETH72Seeds(f)
+              backend, peer := eth72FuzzPeer(f)
+              f.Fuzz(func(t *testing.T, code byte, msg []byte) {
+                  if len(msg) > maxMessageSize {
+                      return
+                  }
+                  handler := eth72[uint64(code)%protocolLengths[ETH72]]
+                  if handler == nil {
+                      return
+                  }
+                  _ = handler(backend, decoder{msg: msg}, peer.Peer)
+              })
+          }
+
+          func FuzzEth72SparseHandlers(f *testing.F) {
+              addETH72Seeds(f)
+              backend, peer := eth72FuzzPeer(f)
+              f.Fuzz(func(t *testing.T, selector byte, msg []byte) {
+                  if len(msg) > maxMessageSize {
+                      return
+                  }
+                  var handler msgHandler
+                  switch selector % 3 {
+                  case 0:
+                      handler = eth72[NewPooledTransactionHashesMsg]
+                  case 1:
+                      handler = eth72[GetCellsMsg]
+                  default:
+                      handler = eth72[CellsMsg]
+                  }
+                  _ = handler(backend, decoder{msg: msg}, peer.Peer)
+              })
+          }
+          EOF
+          cd geth
+          gofmt -w eth/protocols/eth/eth72_research_fuzz_test.go
+          go test ./eth/protocols/eth -run '^TestBlockAccessListsUnavailableDecode$' -count=1
+
+      - name: Run bounded fuzz and race gates without public raw output
+        shell: bash
+        run: |
+          set -u
+          mkdir -p research-result
+          printf 'geth_commit=%s\n' "$(git -C geth rev-parse HEAD)" > research-result/environment.txt
+          printf 'go_version=%s\n' "$(go version)" >> research-result/environment.txt
+
+          run_gate() {
+            name="$1"
+            shift
+            set +e
+            timeout 240s "$@" > "research-result/${name}.log" 2>&1
+            rc=$?
+            set -e
+            printf '%s=%s\n' "$name" "$rc" >> research-result/exit-codes.txt
+          }
+
+          set -e
+          run_gate all_handlers go test ./geth/eth/protocols/eth -run '^$' -fuzz '^FuzzEth72ProtocolHandlers$' -fuzztime=120s -parallel=2 -count=1
+          run_gate sparse_handlers go test ./geth/eth/protocols/eth -run '^$' -fuzz '^FuzzEth72SparseHandlers$' -fuzztime=180s -parallel=2 -count=1
+          run_gate sparse_race go test -race ./geth/eth/protocols/eth -run '^$' -fuzz '^FuzzEth72SparseHandlers$' -fuzztime=25s -parallel=1 -count=1
+
+          if [ -d geth/eth/protocols/eth/testdata/fuzz ]; then
+            cp -a geth/eth/protocols/eth/testdata/fuzz research-result/fuzz-corpus
+          fi
+
+      - name: Encrypt all research output before upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted-artifact
+          cat > /tmp/research-public.pem <<'EOF'
+          -----BEGIN PUBLIC KEY-----
+          MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAtKxz8mg3ok3Lk82so0S1
+          dUKwhR8gmTdegVVvQ48jOcXy4HknIQUfoVxne1Qi5TWV3Qnpk3ErqF5invvzeBMt
+          Jp71OSa3kDD4ddJAo/dDZr7XRbki5BQuhl2sGvuVqoqs8/h+dNCtIrJ6gFPIPwpk
+          JgR6W2jOxJQ+8fMgYjPjrNzUuDGX2yUK+AIYIkluHXeqSXrG0j3aleFBjBjC4SV+
+          FjswsfdoiZGK+OdrQJcZAaeo7LY9i4fBNyXA69IbLU4zb8N48E0Ya/kvs/+TILTD
+          mMP9vrLcPLx9nKhdH4/hKWHWtlbzQ0i/UpORf43PKEnOhS4nWwudzocskNP1rfG9
+          hZ4zNIub8TvaJ/WlAx8e32TuzCj11ahQIzwtaneIF3ax4Xlp0aS7Rv0MeAXOp/7B
+          OjvywymjI3fEPvTOeIX81nwtT/tCXs5163X+6uoEilfCq8FkuT9oLr+39sE0D5E4
+          SQPCH/y+vVIYyBvmADaCrCH33gKcCRpAMQnvOYnqj+snAgMBAAE=
+          -----END PUBLIC KEY-----
+          EOF
+
+          tar -czf /tmp/research-result.tar.gz research-result
+          keyhex="$(openssl rand -hex 32)"
+          ivhex="$(openssl rand -hex 16)"
+          printf '%s\n%s\n' "$keyhex" "$ivhex" > /tmp/key-material.txt
+          openssl enc -aes-256-cbc -K "$keyhex" -iv "$ivhex" \
+            -in /tmp/research-result.tar.gz \
+            -out encrypted-artifact/research-result.tar.gz.enc
+          openssl pkeyutl -encrypt -pubin -inkey /tmp/research-public.pem \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+            -in /tmp/key-material.txt \
+            -out encrypted-artifact/key-material.rsa-oaep.enc
+          sha256sum encrypted-artifact/* > encrypted-artifact/SHA256SUMS.txt
+          printf 'ENCRYPTED_RESEARCH_ARTIFACT_V1\n' > encrypted-artifact/FORMAT.txt
+          rm -rf research-result /tmp/research-result.tar.gz /tmp/key-material.txt /tmp/research-public.pem
+          echo 'ENCRYPTED_RESEARCH_ARTIFACT_READY'
+
+      - name: Upload encrypted-only result
+        uses: actions/upload-artifact@v4
+        with:
+          name: ethereum-fusaka-eth72-encrypted-result
+          path: encrypted-artifact
+          if-no-files-found: error
+          retention-days: 1
