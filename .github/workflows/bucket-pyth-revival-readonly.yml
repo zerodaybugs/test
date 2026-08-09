@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch production debtor bytecode, ABI, objects, and recent calls
+      - name: Fetch debtor packages and derive receiver-witness call graph
         shell: bash
         run: |
           set -euo pipefail
@@ -42,15 +42,13 @@ jobs:
           PACKAGES = {
               'delegation_farm': '0xd95810493736139876e9f1fe0cd1de12639a6d6abe7c92c86d7d4f9ada96adce',
               'navi_farm': '0x22955b7a13502d3b20383a6904abadad683456128141d9ff6820260c7020f0cb',
-              'framework_v2': '0xe2d49d67ff42dc500275f2d84841bf35632aa6c1abdb70af66a10e1de93a4400',
-              'cdp_v4': '0xc1dd29778f3fccd19a4ac79d1c35a14bf9d65a0b48f1c5bba98a949cacc53e26',
           }
           ENTITY_NAMES = {
               'delegation_farm': 'DelegationEntity',
               'navi_farm': 'NaviFarmEntity',
           }
 
-          def http_post(url, payload, retries=5, timeout=120):
+          def post(url, payload, retries=5, timeout=120):
               data = json.dumps(payload).encode()
               last = None
               for n in range(retries):
@@ -59,18 +57,17 @@ jobs:
                           url,
                           data=data,
                           method='POST',
-                          headers={'Content-Type':'application/json','User-Agent':'bucket-debtor-audit/1'},
+                          headers={'Content-Type':'application/json','User-Agent':'bucket-debtor-audit/2'},
                       )
                       with urllib.request.urlopen(req, timeout=timeout) as response:
-                          body = json.loads(response.read().decode())
-                      return body
+                          return json.loads(response.read().decode())
                   except Exception as exc:
                       last = exc
                       time.sleep(2 ** n)
-              raise RuntimeError(f'POST failure for {url}: {last}')
+              raise RuntimeError(f'POST failure: {last}')
 
           def gql(query, variables=None):
-              body = http_post(GQL, {'query': query, 'variables': variables or {}})
+              body = post(GQL, {'query':query,'variables':variables or {}})
               if body.get('errors'):
                   raise RuntimeError(json.dumps(body['errors']))
               return body
@@ -79,18 +76,18 @@ jobs:
               failures = []
               for endpoint in RPCS:
                   try:
-                      body = http_post(endpoint, {'jsonrpc':'2.0','id':1,'method':method,'params':params}, timeout=90)
+                      body = post(endpoint, {'jsonrpc':'2.0','id':1,'method':method,'params':params}, timeout=90)
                       if body.get('error'):
                           raise RuntimeError(json.dumps(body['error']))
-                      return {'endpoint': endpoint, 'result': body.get('result')}
+                      return {'endpoint':endpoint,'result':body.get('result')}
                   except Exception as exc:
                       failures.append({'endpoint':endpoint,'error':type(exc).__name__,'message':str(exc)})
-              return {'failures': failures}
+              return {'failures':failures}
 
           def dump(path, value):
               path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
 
-          def split_functions(disassembly):
+          def functions(disassembly):
               lines = disassembly.splitlines()
               starts = []
               pattern = re.compile(r'^(entry\s+)?(public(?:\([^)]*\))?\s+)?(?:fun\s+)?([^\s<(]+)(?:<[^>]*>)?\(')
@@ -101,132 +98,89 @@ jobs:
               result = []
               for pos, (start, name, signature) in enumerate(starts):
                   end = starts[pos + 1][0] if pos + 1 < len(starts) else len(lines)
-                  result.append({
-                      'name': name,
-                      'signature': signature,
-                      'body': '\n'.join(lines[start:end]).rstrip() + '\n',
-                  })
+                  result.append({'name':name,'signature':signature,'body':'\n'.join(lines[start:end]).rstrip()+'\n'})
               return result
 
-          package_metadata = {}
-          function_inventory = []
-          entity_constructor_sites = []
-          hot_potato_sites = []
-          security_sites = []
+          package_rows = {}
+          entity_structs = []
+          candidate_functions = []
+          receive_functions = []
+          constructor_functions = []
 
-          package_query = '''query P($address:SuiAddress!){object(address:$address){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}modules{nodes{name fileFormatVersion disassembly functions(first:100){nodes{name visibility isEntry parameters{repr}return{repr}typeParameters{constraints}}}structs(first:100){nodes{name abilities fields{name type{repr}}typeParameters{constraints}}}}}}}}'''
+          query = '''query P($address:SuiAddress!){object(address:$address){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}modules{nodes{name fileFormatVersion disassembly functions(first:50){nodes{name visibility isEntry parameters{repr}return{repr}}}structs(first:50){nodes{name abilities fields{name type{repr}}}}}}}}}'''
 
           for label, package_id in PACKAGES.items():
-              response = gql(package_query, {'address': package_id})
+              response = gql(query, {'address':package_id})
               dump(RAW / f'{label}.package.json', response)
               package = response['data']['object']['asMovePackage']
-              package_metadata[label] = {
-                  'package_id': package_id,
-                  'version': package.get('version'),
-                  'linkage': package.get('linkage'),
-                  'type_origins': package.get('typeOrigins'),
-                  'previous_transaction': response['data']['object'].get('previousTransaction'),
+              package_rows[label] = {
+                  'package_id':package_id,
+                  'version':package.get('version'),
+                  'linkage':package.get('linkage'),
+                  'type_origins':package.get('typeOrigins'),
+                  'previous_transaction':response['data']['object'].get('previousTransaction'),
               }
+              entity_name = ENTITY_NAMES[label]
               for module in package['modules']['nodes']:
                   module_name = module['name']
                   disassembly = module.get('disassembly') or ''
                   (ASM / f'{label}__{module_name}.asm').write_text(disassembly)
-                  gql_functions = {f['name']:f for f in (module.get('functions') or {}).get('nodes', [])}
-                  gql_structs = {s['name']:s for s in (module.get('structs') or {}).get('nodes', [])}
-                  for function in split_functions(disassembly):
-                      meta = gql_functions.get(function['name'], {})
+                  metas = {x['name']:x for x in (module.get('functions') or {}).get('nodes', [])}
+                  structs = {x['name']:x for x in (module.get('structs') or {}).get('nodes', [])}
+                  if entity_name in structs:
+                      entity_structs.append({'package_label':label,'module':module_name,**structs[entity_name]})
+                  for fn in functions(disassembly):
+                      meta = metas.get(fn['name'], {})
                       row = {
-                          'package_label': label,
-                          'package_id': package_id,
-                          'module': module_name,
-                          'name': function['name'],
-                          'signature': function['signature'],
-                          'visibility': meta.get('visibility'),
-                          'is_entry': meta.get('isEntry'),
-                          'parameters': [x.get('repr') for x in meta.get('parameters', [])],
-                          'returns': [x.get('repr') for x in meta.get('return', [])],
+                          'package_label':label,
+                          'package_id':package_id,
+                          'module':module_name,
+                          'name':fn['name'],
+                          'signature':fn['signature'],
+                          'visibility':meta.get('visibility'),
+                          'is_entry':meta.get('isEntry'),
+                          'parameters':[x.get('repr') for x in meta.get('parameters', [])],
+                          'returns':[x.get('repr') for x in meta.get('return', [])],
+                          'body':fn['body'],
                       }
-                      function_inventory.append(row)
-                      body = function['body']
-                      entity_name = ENTITY_NAMES.get(label)
-                      if entity_name and (
-                          f'Pack[' in body and entity_name in json.dumps(gql_structs)
-                          or entity_name in function['signature']
-                          or entity_name in body
-                      ):
-                          entity_constructor_sites.append({**row, 'body': body})
-                      if any(term in body for term in (
-                          'sheet::receive', 'sheet::pay', 'sheet::collect', 'sheet::lend',
-                          'vault::loan', 'request_repayment', 'collect_repayment',
-                          'Loan<', 'Request<',
-                      )):
-                          hot_potato_sites.append({**row, 'body': body})
-                      if any(term in function['signature'] + '\n' + body for term in (
-                          'AdminCap', 'ManagerCap', 'OwnerCap', 'Witness', 'Entity',
-                          'sender', 'assert', 'whitelist', 'blacklist', 'clock',
-                      )):
-                          security_sites.append({**row, 'body': body})
+                      text = fn['signature'] + '\n' + fn['body']
+                      if entity_name in text or any(term in text for term in ('sheet::receive','sheet::pay','Loan<','Request<','vault::loan','request_repayment','collect_repayment')):
+                          candidate_functions.append(row)
+                      if 'sheet::receive' in text or 'Loan<' in fn['signature']:
+                          receive_functions.append(row)
+                      if entity_name in text and 'Pack[' in fn['body']:
+                          constructor_functions.append(row)
 
-                  for struct_name, struct_meta in gql_structs.items():
-                      if struct_name == ENTITY_NAMES.get(label):
-                          dump(ANALYSIS / f'{label}.entity_struct.json', struct_meta)
-
-              normalized = rpc('sui_getNormalizedMoveModulesByPackage', [package_id])
-              dump(RAW / f'{label}.normalized.json', normalized)
-
-              live_objects_query = '''query O($type:String!){objects(first:50,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+              dump(RAW / f'{label}.normalized.json', rpc('sui_getNormalizedMoveModulesByPackage', [package_id]))
+              object_query = '''query O($type:String!){objects(first:50,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
               try:
-                  live_objects = gql(live_objects_query, {'type': package_id})
+                  live_objects = gql(object_query, {'type':package_id})
               except Exception as exc:
                   live_objects = {'error':type(exc).__name__,'message':str(exc)}
               dump(RAW / f'{label}.live_objects.json', live_objects)
 
-              recent_calls = rpc('suix_queryTransactionBlocks', [
-                  {
-                      'filter': {'MoveFunction': {'package': package_id}},
-                      'options': {
-                          'showInput': True,
-                          'showRawInput': False,
-                          'showEffects': True,
-                          'showEvents': True,
-                          'showObjectChanges': True,
-                          'showBalanceChanges': True,
-                      },
-                  },
-                  None,
-                  50,
-                  True,
-              ])
-              dump(RAW / f'{label}.recent_calls.json', recent_calls)
+          def stripped(rows):
+              return [{k:v for k,v in row.items() if k != 'body'} for row in rows]
 
-          dump(ANALYSIS / 'function_inventory.json', function_inventory)
-          dump(ANALYSIS / 'entity_constructor_sites.json', entity_constructor_sites)
-          dump(ANALYSIS / 'hot_potato_sites.json', hot_potato_sites)
-          dump(ANALYSIS / 'security_sites.json', security_sites)
+          dump(ANALYSIS / 'entity_structs.json', entity_structs)
+          dump(ANALYSIS / 'candidate_functions.json', candidate_functions)
+          dump(ANALYSIS / 'receive_functions.json', receive_functions)
+          dump(ANALYSIS / 'constructor_functions.json', constructor_functions)
 
-          public_entity_factories = []
-          permissionless_receive_candidates = []
-          for row in entity_constructor_sites:
-              visible = str(row.get('visibility') or '').upper() == 'PUBLIC'
-              if visible or row.get('is_entry'):
-                  public_entity_factories.append({k:v for k,v in row.items() if k != 'body'})
-          for row in hot_potato_sites:
-              visible = str(row.get('visibility') or '').upper() == 'PUBLIC'
-              body = row.get('body','')
-              if (visible or row.get('is_entry')) and ('sheet::receive' in body or 'Loan<' in row.get('signature','')):
-                  permissionless_receive_candidates.append({k:v for k,v in row.items() if k != 'body'})
-
+          public_receivers = [row for row in receive_functions if str(row.get('visibility')).upper() == 'PUBLIC' or row.get('is_entry')]
+          public_constructors = [row for row in constructor_functions if str(row.get('visibility')).upper() == 'PUBLIC' or row.get('is_entry')]
           summary = {
-              'network': 'sui-mainnet',
-              'packages': package_metadata,
-              'function_count': len(function_inventory),
-              'entity_constructor_site_count': len(entity_constructor_sites),
-              'hot_potato_site_count': len(hot_potato_sites),
-              'public_or_entry_entity_factory_candidates': public_entity_factories,
-              'public_or_entry_receive_candidates': permissionless_receive_candidates,
-              'writes': 0,
-              'transactions_constructed': 0,
-              'generated_unix': int(time.time()),
+              'network':'sui-mainnet',
+              'packages':package_rows,
+              'entity_structs':entity_structs,
+              'candidate_function_count':len(candidate_functions),
+              'receive_function_count':len(receive_functions),
+              'constructor_function_count':len(constructor_functions),
+              'public_or_entry_receive_functions':stripped(public_receivers),
+              'public_or_entry_entity_constructors':stripped(public_constructors),
+              'writes':0,
+              'transactions_constructed':0,
+              'generated_unix':int(time.time()),
           }
           dump(OUT / 'SUMMARY.json', summary)
           print(json.dumps(summary, indent=2))
@@ -244,14 +198,14 @@ jobs:
           s=json.load(open('bucket-debtor-audit/SUMMARY.json'))
           assert s['writes'] == 0
           assert s['transactions_constructed'] == 0
-          assert s['function_count'] > 0
+          assert len(s['entity_structs']) == 2
           print('BUCKET_DEBTOR_RECEIVER_READ_ONLY_PASS')
           PY
 
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-live-debtor-receiver-audit
+          name: bucket-live-debtor-receiver-audit-v2
           path: bucket-debtor-audit
           if-no-files-found: error
           retention-days: 7
