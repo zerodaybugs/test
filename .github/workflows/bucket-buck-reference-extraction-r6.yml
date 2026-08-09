@@ -1,0 +1,207 @@
+name: Bucket BUCK Oracle and PSM Reference Extraction R6
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch successful BUCK removal transactions and distill exact object refs
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-buck-refs-r6
+          mkdir -p bucket-buck-refs-r6/raw
+          cat > bucket-buck-refs-r6/extract.py <<'PY'
+          import json
+          import pathlib
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-buck-refs-r6')
+          RAW = OUT / 'raw'
+          RPCS = [
+              'https://fullnode.mainnet.sui.io:443',
+              'https://sui-mainnet-endpoint.blockvision.org',
+          ]
+          DIGESTS = {
+              'momentum_buck_remove': '4diZM1NDqZgWYbUzjLUKR6BXuo2iSDwpiwJMFDDdcnnw',
+              'bluefin_buck_remove': 'HZB5G2KoyjdyK5ePz7VFNYGFLVfSuk16WrBothZzv5AA',
+              'cetus_usdc_remove': '5PYbdjxPconZ3wh6EQpQ1Kudp9LwiMUjZ8Q9iTJ3Bpbd',
+          }
+          EXTRA_OBJECTS = [
+              '0x4fef507f41f5b141625f0f193283820fbee26e883f24212d149e4220320ae321',
+              '0x7a0abae43a864801894c29d72c387ce7681ba752dd331492b32c3c5e1672c973',
+              '0x891532c633c2f86dbdd595cc006112866f1122cfe9e915f58a8ba37440a2541c',
+          ]
+
+          def post(url, payload, retries=6, timeout=120):
+              data = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      request = urllib.request.Request(
+                          url,
+                          data=data,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-buck-refs-r6/1',
+                          },
+                      )
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2 ** attempt)
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': str(exc)})
+              return {'failures': failures}
+
+          def result(wrapper):
+              return wrapper.get('result') if isinstance(wrapper, dict) else None
+
+          def dump(name, value):
+              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def resolve_argument(argument, inputs):
+              if not isinstance(argument, dict):
+                  return {'argument': argument}
+              if 'Input' in argument:
+                  index = argument['Input']
+                  value = inputs[index] if index < len(inputs) else None
+                  return {'argument': argument, 'resolved_input': value}
+              return {'argument': argument}
+
+          summaries = {}
+          surfaced_objects = set(EXTRA_OBJECTS)
+          for label, digest in DIGESTS.items():
+              wrapper = rpc('sui_getTransactionBlock', [digest, {
+                  'showInput': True,
+                  'showRawInput': True,
+                  'showEffects': True,
+                  'showEvents': True,
+                  'showObjectChanges': True,
+                  'showBalanceChanges': True,
+              }])
+              dump(f'{label}_transaction.json', wrapper)
+              tx = result(wrapper) or {}
+              data = ((tx.get('transaction') or {}).get('data') or {})
+              transaction = data.get('transaction') or {}
+              inputs = transaction.get('inputs') or []
+              commands = transaction.get('transactions') or []
+              calls = []
+              for index, command in enumerate(commands):
+                  move = command.get('MoveCall') if isinstance(command, dict) else None
+                  if not move:
+                      continue
+                  resolved_arguments = [resolve_argument(argument, inputs) for argument in move.get('arguments') or []]
+                  calls.append({
+                      'index': index,
+                      'package': move.get('package'),
+                      'module': move.get('module'),
+                      'function': move.get('function'),
+                      'type_arguments': move.get('type_arguments'),
+                      'arguments': resolved_arguments,
+                  })
+                  for row in resolved_arguments:
+                      value = row.get('resolved_input')
+                      if isinstance(value, dict):
+                          object_id = value.get('objectId')
+                          if object_id:
+                              surfaced_objects.add(object_id)
+              summaries[label] = {
+                  'digest': digest,
+                  'endpoint': wrapper.get('endpoint'),
+                  'sender': data.get('sender'),
+                  'input_count': len(inputs),
+                  'command_count': len(commands),
+                  'calls': calls,
+                  'status': (tx.get('effects') or {}).get('status'),
+              }
+
+          object_rows = {}
+          for object_id in sorted(surfaced_objects):
+              wrapper = rpc('sui_getObject', [object_id, {
+                  'showType': True,
+                  'showOwner': True,
+                  'showPreviousTransaction': True,
+                  'showDisplay': False,
+                  'showContent': True,
+                  'showBcs': True,
+              }])
+              object_rows[object_id] = wrapper
+          dump('objects.json', object_rows)
+
+          summary = {
+              'schema': 'bucket-buck-reference-extraction-r6/v1',
+              'network': 'sui-mainnet',
+              'transactions': summaries,
+              'objects': object_rows,
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'transactions': summaries,
+              'extra_objects': {
+                  object_id: {
+                      'endpoint': wrapper.get('endpoint') if isinstance(wrapper, dict) else None,
+                      'type': (((result(wrapper) or {}).get('data') or {}).get('type')) if isinstance(wrapper, dict) else None,
+                      'owner': (((result(wrapper) or {}).get('data') or {}).get('owner')) if isinstance(wrapper, dict) else None,
+                  }
+                  for object_id, wrapper in object_rows.items()
+                  if object_id in EXTRA_OBJECTS
+              },
+          }, indent=2))
+          PY
+          python3 bucket-buck-refs-r6/extract.py | tee bucket-buck-refs-r6/run.log
+          find bucket-buck-refs-r6 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-buck-refs-r6/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-buck-refs-r6 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-buck-refs-r6/SUMMARY.json'))
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          print('BUCKET_BUCK_REFS_R6_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-buck-refs-r6
+          path: bucket-buck-refs-r6
+          if-no-files-found: error
+          retention-days: 7
