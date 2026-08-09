@@ -1,4 +1,4 @@
-name: Bucket Object-Owned Account Authorization Audit R6
+name: Bucket Object-Owned Account Authorization Audit R6B
 
 on:
   pull_request:
@@ -17,15 +17,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Trace object-owned Account parents, package ABIs and live call paths
+      - name: Trace object-owned Account parents and public authorization surfaces
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf bucket-account-parent-r6
-          mkdir -p bucket-account-parent-r6/{raw,asm,analysis}
-          cat > bucket-account-parent-r6/audit.py <<'PY'
+          rm -rf bucket-account-parent-r6b
+          mkdir -p bucket-account-parent-r6b/raw
+          cat > bucket-account-parent-r6b/audit.py <<'PY'
           import json, pathlib, re, time, urllib.request
-          OUT=pathlib.Path('bucket-account-parent-r6'); RAW=OUT/'raw'; ASM=OUT/'asm'; ANALYSIS=OUT/'analysis'
+          OUT=pathlib.Path('bucket-account-parent-r6b'); RAW=OUT/'raw'
           GQL='https://graphql.mainnet.sui.io/graphql'
           RPCS=['https://sui-mainnet-endpoint.blockvision.org','https://fullnode.mainnet.sui.io:443']
           ACCOUNT_TYPE='0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc::account::Account'
@@ -35,9 +35,10 @@ jobs:
               data=json.dumps(payload).encode(); last=None
               for n in range(retries):
                   try:
-                      req=urllib.request.Request(url,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-account-parent-r6/1'})
+                      req=urllib.request.Request(url,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-account-parent-r6b/1'})
                       with urllib.request.urlopen(req,timeout=timeout) as r: return json.loads(r.read().decode())
-                  except Exception as exc: last=exc; time.sleep(2**n)
+                  except Exception as exc:
+                      last=exc; time.sleep(2**n)
               raise RuntimeError(f'POST failed {url}: {last}')
           def gql(query,variables=None):
               body=post(GQL,{'query':query,'variables':variables or {}})
@@ -53,93 +54,106 @@ jobs:
                   except Exception as exc: failures.append({'endpoint':endpoint,'error':type(exc).__name__,'message':str(exc)})
               return {'failures':failures}
           def result(w): return w.get('result') if isinstance(w,dict) else None
-          def dump(path,value): path.write_text(json.dumps(value,indent=2,sort_keys=True)+'\n')
+          def dump(name,value): (RAW/name).write_text(json.dumps(value,indent=2,sort_keys=True)+'\n')
 
-          q_accounts='''query A($after:String){objects(first:50,after:$after,filter:{type:"'''+ACCOUNT_TYPE+'''"}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+          query='''query A($after:String){objects(first:50,after:$after,filter:{type:"'''+ACCOUNT_TYPE+'''"}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
           accounts=[]; after=None
           while True:
-              body=gql(q_accounts,{'after':after}); conn=body['data']['objects']; accounts.extend(conn.get('nodes') or [])
+              body=gql(query,{'after':after}); conn=body['data']['objects']; accounts.extend(conn.get('nodes') or [])
               page=conn.get('pageInfo') or {}
               if not page.get('hasNextPage'): break
               after=page.get('endCursor')
-          object_owned=[]
-          for a in accounts:
-              owner=a.get('owner') or {}
-              if owner.get('__typename')=='ObjectOwner':
-                  object_owned.append({'account':a.get('address'),'parent':((owner.get('address') or {}).get('address')),'account_version':a.get('version')})
-          dump(RAW/'accounts.json',accounts)
+          dump('accounts.json',accounts)
 
-          parents={}; package_ids=set()
-          for row in object_owned:
-              parent=row['parent']; w=rpc('sui_getObject',[parent,{'showType':True,'showOwner':True,'showPreviousTransaction':True,'showDisplay':True,'showContent':True,'showBcs':True}]); parents[parent]=w
-              r=result(w); data=(r or {}).get('data') if isinstance(r,dict) else None
-              typ=(data or {}).get('type') if isinstance(data,dict) else None
-              row['parent_type']=typ; row['parent_owner']=(data or {}).get('owner') if isinstance(data,dict) else None
+          object_owned=[]; parents={}; package_ids=set()
+          for account in accounts:
+              owner=account.get('owner') or {}
+              if owner.get('__typename')!='ObjectOwner': continue
+              parent=((owner.get('address') or {}).get('address'))
+              row={'account':account.get('address'),'account_version':account.get('version'),'parent':parent}
+              wrapper=rpc('sui_getObject',[parent,{'showType':True,'showOwner':True,'showPreviousTransaction':True,'showDisplay':True,'showContent':True,'showBcs':True}])
+              parents[parent]=wrapper
+              data=(result(wrapper) or {}).get('data') if isinstance(result(wrapper),dict) else None
+              row['parent_type']=(data or {}).get('type') if isinstance(data,dict) else None
+              row['parent_owner']=(data or {}).get('owner') if isinstance(data,dict) else None
+              typ=row['parent_type']
               if isinstance(typ,str) and '::' in typ: package_ids.add('0x'+typ.split('::')[0].removeprefix('0x'))
-          dump(RAW/'parents.json',parents)
+              object_owned.append(row)
+          dump('parents.json',parents)
 
-          q_pkg='''query P($a:SuiAddress!){object(address:$a){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}modules{nodes{name disassembly functions(first:100){nodes{name visibility isEntry parameters{repr}return{repr}typeParameters{constraints}}}structs(first:100){nodes{name abilities fields{name type{repr}}}}}}}}}}'''
-          packages={}; candidates=[]
-          sensitive=re.compile(r'account|request_with_account|borrow|withdraw|claim|redeem|transfer|owner|sender|auth|cap|admin|manager|position|debt|collateral',re.I)
-          for pid in sorted(package_ids):
-              body=gql(q_pkg,{'a':pid}); dump(RAW/f'package_{pid[2:]}.json',body)
-              obj=body['data']['object']; pkg=(obj or {}).get('asMovePackage')
-              if not pkg: continue
-              packages[pid]={'version':pkg.get('version'),'linkage':pkg.get('linkage'),'type_origins':pkg.get('typeOrigins'),'previous_transaction':obj.get('previousTransaction')}
-              d=ASM/pid[2:]; d.mkdir(parents=True,exist_ok=True)
-              for mod in pkg['modules']['nodes']:
-                  text=mod.get('disassembly') or ''; (d/f"{mod['name']}.asm").write_text(text)
-                  for fn in (mod.get('functions') or {}).get('nodes',[]):
-                      params=[x.get('repr') for x in fn.get('parameters',[])]; returns=[x.get('repr') for x in fn.get('return',[])]
-                      row={'package':pid,'module':mod['name'],'function':fn.get('name'),'visibility':fn.get('visibility'),'is_entry':fn.get('isEntry'),'parameters':params,'returns':returns}
-                      public=str(fn.get('visibility')).upper()=='PUBLIC' or fn.get('isEntry')
-                      account_related=ACCOUNT_ORIGIN in json.dumps(row) or 'Account' in json.dumps(row) or 'request_with_account' in text
-                      if public and account_related and sensitive.search(json.dumps(row)+' '+text): candidates.append(row)
-          dump(ANALYSIS/'candidate_functions.json',candidates)
+          modules={}; candidates=[]
+          sensitive=re.compile(r'account|request|borrow|withdraw|claim|redeem|transfer|owner|sender|auth|cap|admin|manager|position|debt|collateral',re.I)
+          for package in sorted(package_ids):
+              wrapper=rpc('sui_getNormalizedMoveModulesByPackage',[package]); modules[package]=wrapper
+              normalized=result(wrapper)
+              if not isinstance(normalized,dict): continue
+              for module_name,module in normalized.items():
+                  functions=module.get('exposedFunctions') or {}
+                  for function_name,function in functions.items():
+                      visibility=str(function.get('visibility') or '')
+                      is_entry=bool(function.get('isEntry'))
+                      parameters=function.get('parameters') or []
+                      returns=function.get('return') or []
+                      serialized=json.dumps({'module':module_name,'function':function_name,'parameters':parameters,'returns':returns})
+                      public=visibility.lower()=='public' or is_entry
+                      account_related=ACCOUNT_ORIGIN in serialized or 'Account' in serialized or sensitive.search(function_name)
+                      if public and account_related:
+                          candidates.append({'package':package,'module':module_name,'function':function_name,'visibility':visibility,'is_entry':is_entry,'parameters':parameters,'returns':returns})
+          dump('normalized_modules.json',modules); dump('candidate_functions.json',candidates)
 
-          activity={}; calls=[]
           opts={'showInput':True,'showRawInput':False,'showEffects':True,'showEvents':True,'showObjectChanges':True,'showBalanceChanges':True}
+          activity={}; calls=[]
           for row in object_owned:
-              parent=row['parent']; cursor=None; txs=[]
-              for _ in range(10):
-                  w=rpc('suix_queryTransactionBlocks',[{'filter':{'InputObject':parent},'options':opts},cursor,50,True]); r=result(w)
-                  if not isinstance(r,dict): break
-                  txs.extend(r.get('data') or [])
-                  if not r.get('hasNextPage'): break
-                  cursor=r.get('nextCursor')
-              activity[parent]=txs
-              for tx in txs:
-                  try: commands=tx['transaction']['data']['transaction']['transactions']
-                  except Exception: commands=[]
-                  for index,c in enumerate(commands or []):
-                      mc=c.get('MoveCall') if isinstance(c,dict) else None
-                      if mc: calls.append({'parent':parent,'account':row['account'],'digest':tx.get('digest'),'sender':((tx.get('transaction') or {}).get('data') or {}).get('sender'),'status':((tx.get('effects') or {}).get('status')),'index':index,'package':mc.get('package'),'module':mc.get('module'),'function':mc.get('function'),'type_arguments':mc.get('type_arguments')})
-          dump(RAW/'parent_activity.json',activity); dump(ANALYSIS/'move_calls.json',calls)
+              for label,oid in [('parent',row['parent']),('account',row['account'])]:
+                  cursor=None; txs=[]
+                  for _ in range(10):
+                      wrapper=rpc('suix_queryTransactionBlocks',[{'filter':{'InputObject':oid},'options':opts},cursor,50,True]); page=result(wrapper)
+                      if not isinstance(page,dict): break
+                      txs.extend(page.get('data') or [])
+                      if not page.get('hasNextPage'): break
+                      cursor=page.get('nextCursor')
+                  activity[f'{label}:{oid}']=txs
+                  for tx in txs:
+                      try: commands=tx['transaction']['data']['transaction']['transactions']
+                      except Exception: commands=[]
+                      for index,command in enumerate(commands or []):
+                          move=command.get('MoveCall') if isinstance(command,dict) else None
+                          if move:
+                              calls.append({'input_kind':label,'input_object':oid,'account':row['account'],'parent':row['parent'],'digest':tx.get('digest'),'sender':((tx.get('transaction') or {}).get('data') or {}).get('sender'),'status':((tx.get('effects') or {}).get('status')),'index':index,'package':move.get('package'),'module':move.get('module'),'function':move.get('function'),'type_arguments':move.get('type_arguments')})
+          dump('activity.json',activity); dump('move_calls.json',calls)
 
-          shared_parent_count=sum(1 for r in object_owned if isinstance(r.get('parent_owner'),dict) and ('Shared' in r['parent_owner'] or r['parent_owner'].get('__typename')=='Shared'))
-          summary={'network':'sui-mainnet','account_count':len(accounts),'object_owned_account_count':len(object_owned),'object_owned_accounts':object_owned,'parent_package_count':len(package_ids),'packages':packages,'candidate_function_count':len(candidates),'candidate_functions':candidates,'parent_move_call_count':len(calls),'shared_parent_count':shared_parent_count,'writes':0,'transactions_constructed':0,'generated_unix':int(time.time())}
+          def owner_kind(owner):
+              if not isinstance(owner,dict): return 'unknown'
+              if 'Shared' in owner: return 'shared'
+              if 'AddressOwner' in owner: return 'address'
+              if 'ObjectOwner' in owner: return 'object'
+              if 'Immutable' in owner: return 'immutable'
+              return 'unknown'
+          for row in object_owned: row['parent_owner_kind']=owner_kind(row.get('parent_owner'))
+          shared=[row for row in object_owned if row['parent_owner_kind']=='shared']
+          summary={'network':'sui-mainnet','account_count':len(accounts),'object_owned_account_count':len(object_owned),'object_owned_accounts':object_owned,'shared_parent_count':len(shared),'shared_parent_accounts':shared,'parent_package_count':len(package_ids),'candidate_function_count':len(candidates),'candidate_functions':candidates,'move_call_count':len(calls),'writes':0,'transactions_constructed':0,'generated_unix':int(time.time())}
           (OUT/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
-          print(json.dumps({'object_owned_accounts':object_owned,'candidate_function_count':len(candidates),'candidate_functions':candidates,'shared_parent_count':shared_parent_count,'parent_move_call_count':len(calls)},indent=2))
+          print(json.dumps(summary,indent=2))
           PY
-          python3 bucket-account-parent-r6/audit.py | tee bucket-account-parent-r6/run.log
-          find bucket-account-parent-r6 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-account-parent-r6/SHA256SUMS.txt
+          python3 bucket-account-parent-r6b/audit.py | tee bucket-account-parent-r6b/run.log
+          find bucket-account-parent-r6b -type f -print0 | sort -z | xargs -0 sha256sum > bucket-account-parent-r6b/SHA256SUMS.txt
 
       - name: Validate read-only boundary
         shell: bash
         run: |
           set -euo pipefail
-          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-account-parent-r6 && exit 1 || true
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-account-parent-r6b && exit 1 || true
           python3 - <<'PY'
           import json
-          s=json.load(open('bucket-account-parent-r6/SUMMARY.json'))
+          s=json.load(open('bucket-account-parent-r6b/SUMMARY.json'))
           assert s['writes']==0 and s['transactions_constructed']==0
-          print('BUCKET_ACCOUNT_PARENT_R6_READ_ONLY_PASS')
+          print('BUCKET_ACCOUNT_PARENT_R6B_READ_ONLY_PASS')
           PY
 
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-account-parent-r6
-          path: bucket-account-parent-r6
+          name: bucket-account-parent-r6b
+          path: bucket-account-parent-r6b
           if-no-files-found: error
           retention-days: 7
