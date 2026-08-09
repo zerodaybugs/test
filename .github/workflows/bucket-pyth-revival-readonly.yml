@@ -1,4 +1,4 @@
-name: Bucket Credit ACL Domain Census
+name: Bucket Legacy Package Bytecode Census
 
 on:
   pull_request:
@@ -11,53 +11,57 @@ permissions:
   contents: read
 
 jobs:
-  census:
+  fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
-      - name: Query live AccessControl objects by defining type
+      - name: Fetch exact package bytecode and upgrade metadata
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf bucket-credit-acl-census
-          mkdir -p bucket-credit-acl-census
-          cat > bucket-credit-acl-census/query.py <<'PY'
+          rm -rf bucket-legacy-packages
+          mkdir -p bucket-legacy-packages/{json,mv}
+          cat > bucket-legacy-packages/fetch.py <<'PY'
+          import base64
           import json
           import pathlib
           import time
           import urllib.request
 
-          OUT = pathlib.Path('bucket-credit-acl-census')
+          OUT = pathlib.Path('bucket-legacy-packages')
           ENDPOINT = 'https://graphql.mainnet.sui.io/graphql'
-          TYPES = {
-              'cdp_credit_acl': '0xc1dd29778f3fccd19a4ac79d1c35a14bf9d65a0b48f1c5bba98a949cacc53e26::vault::AccessControl',
-              'psm_credit_acl': '0x5a77b4e1c6f108047c9c75c3abfddb89cabdea1c1dc7291d7a47f60007259c34::pool::AccessControl',
+          PACKAGES = {
+              'framework_original': '0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc',
+              'framework_current': '0xe2d49d67ff42dc500275f2d84841bf35632aa6c1abdb70af66a10e1de93a4400',
+              'flash_original': '0x0f51f9eb63574a1d12b62295599ac4f8231197f95b3cce9a516daba64f419d06',
+              'flash_current': '0xca00bbb7ecfe11dbb527efab6145b358f2a95aa11a8aae9b9f475176430cf42a',
+              'psm_original': '0xc2ae6693383e4a81285136effc8190c7baaf0e75aafa36d1c69cd2170cfc3803',
+              'psm_current': '0x8a46afe6ab0b972e2ee3923f5669104ae9465c12b84cd5e78ea1ff6404e4bfaf',
           }
 
           QUERY = '''
-          query LiveObjects($filter: ObjectFilter!, $first: Int, $after: String) {
-            objects(filter: $filter, first: $first, after: $after) {
-              pageInfo { hasNextPage endCursor }
-              nodes {
+          query Package($address: SuiAddress!) {
+            object(address: $address) {
+              address
+              version
+              digest
+              owner { __typename }
+              previousTransaction { digest sender { address } }
+              asMovePackage {
                 address
                 version
-                digest
-                owner {
-                  __typename
-                  ... on AddressOwner { address { address } }
-                  ... on ObjectOwner { address { address } }
-                }
-                previousTransaction { digest sender { address } }
-                asMoveObject { contents { type { repr } json bcs } }
+                modules { nodes { name bytes } }
+                linkage { originalId upgradedId version }
+                typeOrigins { module struct definingId }
               }
             }
           }
           '''
 
-          def post(variables, retries=5):
-              payload = json.dumps({'query': QUERY, 'variables': variables}).encode()
+          def post(address, retries=5):
+              payload = json.dumps({'query': QUERY, 'variables': {'address': address}}).encode()
               last = None
               for attempt in range(retries):
                   try:
@@ -65,84 +69,71 @@ jobs:
                           ENDPOINT,
                           data=payload,
                           method='POST',
-                          headers={'Content-Type': 'application/json', 'User-Agent': 'bucket-credit-acl-census/1'},
+                          headers={'Content-Type': 'application/json', 'User-Agent': 'bucket-legacy-bytecode/1'},
                       )
                       with urllib.request.urlopen(req, timeout=90) as response:
                           body = json.loads(response.read().decode())
                       if body.get('errors'):
                           raise RuntimeError(json.dumps(body['errors']))
-                      return body['data']['objects']
+                      return body['data']['object']
                   except Exception as exc:
                       last = exc
                       time.sleep(2 ** attempt)
               raise RuntimeError(f'GraphQL failed: {last}')
 
-          results = {}
-          summary = {}
-          for label, type_name in TYPES.items():
-              nodes = []
-              cursor = None
-              while True:
-                  page = post({'filter': {'type': type_name}, 'first': 50, 'after': cursor})
-                  nodes.extend(page['nodes'])
-                  if not page['pageInfo']['hasNextPage']:
-                      break
-                  cursor = page['pageInfo']['endCursor']
-              results[label] = nodes
-              parsed = []
-              for node in nodes:
-                  contents = ((node.get('asMoveObject') or {}).get('contents') or {})
-                  value = contents.get('json') or {}
-                  managers = value.get('managers') or {}
-                  if isinstance(managers, dict):
-                      managers = managers.get('contents', [])
-                  parsed.append({
-                      'object_id': node.get('address'),
-                      'version': node.get('version'),
-                      'owner': node.get('owner'),
-                      'previous_transaction': node.get('previousTransaction'),
-                      'type': ((contents.get('type') or {}).get('repr')),
-                      'managers': managers or [],
-                  })
-              manager_sets = [sorted(str(x).lower() for x in row['managers']) for row in parsed]
-              summary[label] = {
-                  'type': type_name,
-                  'object_count': len(parsed),
-                  'objects': parsed,
-                  'distinct_manager_sets': sorted({tuple(x) for x in manager_sets}),
-              }
-
-          evidence = {
-              'captured_unix': int(time.time()),
+          summary = {
               'network': 'sui-mainnet',
               'writes': 0,
               'transactions_constructed': 0,
-              'summary': summary,
+              'packages': {},
           }
-          (OUT / 'RAW.json').write_text(json.dumps(results, indent=2, sort_keys=True) + '\n')
-          (OUT / 'SUMMARY.json').write_text(json.dumps(evidence, indent=2, sort_keys=True) + '\n')
-          print(json.dumps(evidence, indent=2))
+          for label, address in PACKAGES.items():
+              obj = post(address)
+              (OUT / 'json' / f'{label}.json').write_text(json.dumps(obj, indent=2, sort_keys=True) + '\n')
+              package = obj.get('asMovePackage') or {}
+              module_dir = OUT / 'mv' / label
+              module_dir.mkdir(parents=True, exist_ok=True)
+              modules = []
+              for node in ((package.get('modules') or {}).get('nodes') or []):
+                  raw = base64.b64decode(node['bytes'])
+                  path = module_dir / f"{node['name']}.mv"
+                  path.write_bytes(raw)
+                  modules.append({'name': node['name'], 'bytes': len(raw), 'magic': raw[:4].hex()})
+              summary['packages'][label] = {
+                  'requested_address': address,
+                  'object_version': obj.get('version'),
+                  'package_version': package.get('version'),
+                  'digest': obj.get('digest'),
+                  'previous_transaction': obj.get('previousTransaction'),
+                  'linkage': package.get('linkage'),
+                  'type_origins': package.get('typeOrigins'),
+                  'modules': modules,
+              }
+
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps(summary, indent=2))
           PY
-          python3 bucket-credit-acl-census/query.py | tee bucket-credit-acl-census/run.log
-          find bucket-credit-acl-census -type f -print0 | sort -z | xargs -0 sha256sum > bucket-credit-acl-census/SHA256SUMS.txt
+          python3 bucket-legacy-packages/fetch.py | tee bucket-legacy-packages/run.log
+          find bucket-legacy-packages -type f -print0 | sort -z | xargs -0 sha256sum > bucket-legacy-packages/SHA256SUMS.txt
 
       - name: Verify read-only boundary
         shell: bash
         run: |
           set -euo pipefail
-          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-credit-acl-census && exit 1 || true
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-legacy-packages && exit 1 || true
           python3 - <<'PY'
           import json
-          evidence = json.load(open('bucket-credit-acl-census/SUMMARY.json'))
-          assert evidence['writes'] == 0
-          assert evidence['transactions_constructed'] == 0
-          print('BUCKET_CREDIT_ACL_CENSUS_READ_ONLY_PASS')
+          summary = json.load(open('bucket-legacy-packages/SUMMARY.json'))
+          assert summary['writes'] == 0
+          assert summary['transactions_constructed'] == 0
+          assert all(v['modules'] for v in summary['packages'].values())
+          print('BUCKET_LEGACY_PACKAGE_FETCH_READ_ONLY_PASS')
           PY
 
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-credit-acl-domain-census
-          path: bucket-credit-acl-census
+          name: bucket-legacy-package-bytecode-census
+          path: bucket-legacy-packages
           if-no-files-found: error
           retention-days: 7
