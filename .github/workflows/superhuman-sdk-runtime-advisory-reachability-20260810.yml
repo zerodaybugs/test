@@ -1,0 +1,139 @@
+name: Superhuman SDK runtime advisory reachability
+
+on:
+  push:
+    branches: [research/superhuman-sdk-source-20260809]
+    paths: [.github/workflows/superhuman-sdk-runtime-advisory-reachability-20260810.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+
+      - name: Install exact stable SDK and collect advisories
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf runtime-advisory
+          mkdir -p runtime-advisory/evidence public-intake-status
+          cd runtime-advisory
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund @codahq/packs-sdk@1.17.1
+          npm audit --omit=dev --json > evidence/NPM_AUDIT.json || true
+
+      - name: Build runtime-only reachability map
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd runtime-advisory
+          cat > audit.py <<'PY'
+          import json, pathlib, re
+          root = pathlib.Path('node_modules/@codahq/packs-sdk')
+          audit_path = pathlib.Path('evidence/NPM_AUDIT.json')
+          try:
+              audit = json.loads(audit_path.read_text())
+          except Exception:
+              audit = {}
+
+          risky_modules = {
+              'jsonpath-plus': ['JSONPath(', 'jsonpath-plus'],
+              'xml2js': ['xml2js', 'parseString', 'Parser('],
+              'handlebars': ['handlebars', 'Handlebars.compile', '.compile('],
+              'clone': ["from 'clone'", "require('clone')", 'clone('],
+              'qs': ["from 'qs'", "require('qs')", 'qs.parse'],
+              'source-map': ['SourceMapConsumer'],
+              'url-parse': ['url-parse'],
+              'node-fetch': ['node-fetch'],
+          }
+          runtime_files=[]
+          for p in root.rglob('*'):
+              if not p.is_file() or p.suffix not in {'.js','.ts','.cjs','.mjs'}:
+                  continue
+              rel=str(p.relative_to(root))
+              if not (rel.startswith('runtime/') or rel.startswith('dist/runtime/') or rel.startswith('testing/') or rel.startswith('dist/testing/') or rel.startswith('helpers/') or rel.startswith('dist/helpers/')):
+                  continue
+              if p.stat().st_size > 8_000_000:
+                  continue
+              runtime_files.append((rel,p.read_text(errors='ignore')))
+
+          reachability={}
+          for module,needles in risky_modules.items():
+              hits=[]
+              for rel,text in runtime_files:
+                  for needle in needles:
+                      for m in re.finditer(re.escape(needle),text):
+                          line=text.count('\n',0,m.start())+1
+                          snippet=text[max(0,m.start()-180):m.start()+420].replace('\n',' ')
+                          hits.append({'file':rel,'line':line,'needle':needle,'snippet':snippet})
+                          if len(hits)>=80: break
+                      if len(hits)>=80: break
+                  if len(hits)>=80: break
+              reachability[module]=hits
+
+          vulns=[]
+          for name,v in (audit.get('vulnerabilities') or {}).items():
+              severity=v.get('severity')
+              if severity not in ('high','critical'):
+                  continue
+              via=[]
+              for item in v.get('via') or []:
+                  if isinstance(item,dict):
+                      via.append({k:item.get(k) for k in ('source','name','title','url','severity','range')})
+                  else:
+                      via.append(item)
+              vulns.append({
+                  'name':name,'severity':severity,'isDirect':v.get('isDirect'),'range':v.get('range'),
+                  'nodes':v.get('nodes'),'via':via,'runtimeHitCount':len(reachability.get(name,[])),
+              })
+
+          result={
+              'sdkVersion':json.loads((root/'package.json').read_text())['version'],
+              'nodeVersion':None,
+              'highCriticalAdvisoryCount':len(vulns),
+              'highCriticalAdvisories':vulns,
+              'runtimeReachability':{k:{'count':len(v),'hits':v[:12]} for k,v in reachability.items()},
+              'productionRequestCount':0,
+              'syntheticOnly':True,
+          }
+          exploitable=[]
+          for v in vulns:
+              if v['runtimeHitCount'] and v['name'] in {'jsonpath-plus','xml2js','handlebars','clone','qs','source-map','node-fetch','url-parse'}:
+                  exploitable.append(v['name'])
+          result['runtimeReachableHighCriticalPackages']=sorted(set(exploitable))
+          result['securityDecision']='REVIEW_RUNTIME_REACHABLE_ADVISORIES' if exploitable else 'NO_RUNTIME_REACHABLE_HIGH_CRITICAL_ADVISORY'
+          pathlib.Path('evidence/RESULT.json').write_text(json.dumps(result,indent=2)+'\n')
+          PY
+          python3 audit.py
+          node -e 'const fs=require("fs");const p="evidence/RESULT.json";const j=JSON.parse(fs.readFileSync(p));j.nodeVersion=process.version;fs.writeFileSync(p,JSON.stringify(j,null,2)+"\n")'
+          cat evidence/RESULT.json
+          sha256sum audit.py package.json package-lock.json evidence/NPM_AUDIT.json evidence/RESULT.json > evidence/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: superhuman-sdk-runtime-advisory-reachability
+          path: runtime-advisory/evidence/
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: Commit compact result
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp runtime-advisory/evidence/RESULT.json public-intake-status/superhuman-sdk-runtime-advisory-result.json
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-sdk-runtime-advisory-result.json
+          git commit -m 'chore: record runtime advisory reachability'
+          git push
