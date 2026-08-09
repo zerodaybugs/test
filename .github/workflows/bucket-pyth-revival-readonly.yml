@@ -1,4 +1,4 @@
-name: Bucket Legacy Package Bytecode Census
+name: Bucket Legacy Liquidation Simulation Gate
 
 on:
   pull_request:
@@ -11,129 +11,236 @@ permissions:
   contents: read
 
 jobs:
-  fetch:
+  legacy-liquidation-gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch exact package bytecode and upgrade metadata
+      - name: Collect deployed bytecode and normalized ABI
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf bucket-legacy-packages
-          mkdir -p bucket-legacy-packages/{json,mv}
-          cat > bucket-legacy-packages/fetch.py <<'PY'
+          rm -rf bucket-legacy-liquidation
+          mkdir -p bucket-legacy-liquidation/{json,mv}
+          cat > bucket-legacy-liquidation/fetch.py <<'PY'
           import base64
           import json
           import pathlib
           import time
           import urllib.request
 
-          OUT = pathlib.Path('bucket-legacy-packages')
-          ENDPOINT = 'https://graphql.mainnet.sui.io/graphql'
+          OUT = pathlib.Path('bucket-legacy-liquidation')
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+          RPCS = [
+              'https://sui-mainnet-endpoint.blockvision.org',
+              'https://fullnode.mainnet.sui.io:443',
+          ]
           PACKAGES = {
-              'framework_original': '0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc',
-              'framework_current': '0xe2d49d67ff42dc500275f2d84841bf35632aa6c1abdb70af66a10e1de93a4400',
-              'flash_original': '0x0f51f9eb63574a1d12b62295599ac4f8231197f95b3cce9a516daba64f419d06',
-              'flash_current': '0xca00bbb7ecfe11dbb527efab6145b358f2a95aa11a8aae9b9f475176430cf42a',
-              'psm_original': '0xc2ae6693383e4a81285136effc8190c7baaf0e75aafa36d1c69cd2170cfc3803',
-              'psm_current': '0x8a46afe6ab0b972e2ee3923f5669104ae9465c12b84cd5e78ea1ff6404e4bfaf',
+              'cdp_v1_original': '0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e',
+              'cdp_v2_current': '0xc1dd29778f3fccd19a4ac79d1c35a14bf9d65a0b48f1c5bba98a949cacc53e26',
+              'liquidation_rule': '0xbe1457c92f8e8c39e85fa4f77bfcd8cfbda30d1861286ba64c76a94773138b5d',
+              'borrow_incentive': '0xef9719a3392d3742ae09c42ebf01030d88b1a75651430932be1eb017b79fb372',
+              'blacklist': '0x6d7b711a5e614f99f87fdbfbf915fea0fa96af769130ac226c3cbcf07efb90f3',
+          }
+          OBJECTS = {
+              'treasury': '0x4de1c29a89d6888ebf8f7ae20364571dce4e1e42b9c9221f7df924ad6f9e617d',
+              'btc_vault': '0x755c54dd718d350afd03314fe6ccc71e0ab36a974caf6721f1e03b7675dfaba1',
+              'wbtc_vault': '0x94f785bda085beb012e9e96d16a36cf16b6729f776e620ef8c3b37d1e06c2d82',
+              'xbtc_vault': '0xee2d62b04abd9064a5526043395e09b0481e89fa3309d428fcb271ac53ce3103',
+              'bfbtc_vault': '0x1f32b8b587b69a97cb779b2df1e2aa90f6fbb43edcc887f11a8f4a6de0944937',
           }
 
-          QUERY = '''
-          query Package($address: SuiAddress!) {
-            object(address: $address) {
-              address
-              version
-              digest
-              owner { __typename }
-              previousTransaction { digest sender { address } }
-              asMovePackage {
-                address
-                version
-                modules { nodes { name bytes } }
-                linkage { originalId upgradedId version }
-                typeOrigins { module struct definingId }
-              }
-            }
-          }
-          '''
-
-          def post(address, retries=5):
-              payload = json.dumps({'query': QUERY, 'variables': {'address': address}}).encode()
+          def post(url, payload, timeout=90):
+              data = json.dumps(payload).encode()
               last = None
-              for attempt in range(retries):
+              for n in range(4):
                   try:
                       req = urllib.request.Request(
-                          ENDPOINT,
-                          data=payload,
+                          url,
+                          data=data,
                           method='POST',
-                          headers={'Content-Type': 'application/json', 'User-Agent': 'bucket-legacy-bytecode/1'},
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-legacy-liquidation-gate/2',
+                          },
                       )
-                      with urllib.request.urlopen(req, timeout=90) as response:
-                          body = json.loads(response.read().decode())
-                      if body.get('errors'):
-                          raise RuntimeError(json.dumps(body['errors']))
-                      return body['data']['object']
+                      with urllib.request.urlopen(req, timeout=timeout) as r:
+                          raw = r.read().decode('utf-8', errors='replace')
+                      return {'ok': True, 'body': json.loads(raw)}
                   except Exception as exc:
                       last = exc
-                      time.sleep(2 ** attempt)
-              raise RuntimeError(f'GraphQL failed: {last}')
+                      time.sleep(2 ** n)
+              return {'ok': False, 'error': type(last).__name__, 'message': str(last)}
 
-          summary = {
+          def write(name, value):
+              (OUT / 'json' / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          for label, package_id in PACKAGES.items():
+              query = f'''{{ object(address: "{package_id}") {{ address version digest previousTransaction {{ digest sender {{ address }} }} asMovePackage {{ address version linkage {{ originalId upgradedId version }} typeOrigins {{ module struct definingId }} modules {{ nodes {{ name bytes fileFormatVersion }} }} }} }} }}'''
+              result = post(GQL, {'query': query})
+              write(f'{label}.graphql.json', result)
+              try:
+                  nodes = result['body']['data']['object']['asMovePackage']['modules']['nodes']
+                  target = OUT / 'mv' / label
+                  target.mkdir(parents=True, exist_ok=True)
+                  manifest = []
+                  for node in nodes:
+                      raw = base64.b64decode(node['bytes'])
+                      (target / f"{node['name']}.mv").write_bytes(raw)
+                      manifest.append({'name': node['name'], 'bytes': len(raw), 'magic': raw[:4].hex()})
+                  write(f'{label}.decoded.json', manifest)
+              except Exception as exc:
+                  write(f'{label}.decode_error.json', {'error': type(exc).__name__, 'message': str(exc)})
+
+          object_query = '''query O($keys:[ObjectKey!]!){multiGetObjects(keys:$keys){address version digest owner{__typename} previousTransaction{digest sender{address}} asMoveObject{contents{type{repr} json bcs}} asMovePackage{address version linkage{originalId upgradedId version} typeOrigins{module struct definingId}}}}'''
+          write('live_objects.graphql.json', post(GQL, {
+              'query': object_query,
+              'variables': {'keys': [{'address': value} for value in OBJECTS.values()]},
+          }))
+
+          normalized = {}
+          for endpoint in RPCS:
+              provider = {}
+              for label, package_id in PACKAGES.items():
+                  provider[label] = post(endpoint, {
+                      'jsonrpc': '2.0',
+                      'id': 1,
+                      'method': 'sui_getNormalizedMoveModulesByPackage',
+                      'params': [package_id],
+                  })
+              normalized[endpoint] = provider
+          write('normalized_modules.rpc.json', normalized)
+          write('FETCH_SUMMARY.json', {
               'network': 'sui-mainnet',
+              'packages': PACKAGES,
+              'objects': OBJECTS,
               'writes': 0,
-              'transactions_constructed': 0,
-              'packages': {},
-          }
-          for label, address in PACKAGES.items():
-              obj = post(address)
-              (OUT / 'json' / f'{label}.json').write_text(json.dumps(obj, indent=2, sort_keys=True) + '\n')
-              package = obj.get('asMovePackage') or {}
-              module_dir = OUT / 'mv' / label
-              module_dir.mkdir(parents=True, exist_ok=True)
-              modules = []
-              for node in ((package.get('modules') or {}).get('nodes') or []):
-                  raw = base64.b64decode(node['bytes'])
-                  path = module_dir / f"{node['name']}.mv"
-                  path.write_bytes(raw)
-                  modules.append({'name': node['name'], 'bytes': len(raw), 'magic': raw[:4].hex()})
-              summary['packages'][label] = {
-                  'requested_address': address,
-                  'object_version': obj.get('version'),
-                  'package_version': package.get('version'),
-                  'digest': obj.get('digest'),
-                  'previous_transaction': obj.get('previousTransaction'),
-                  'linkage': package.get('linkage'),
-                  'type_origins': package.get('typeOrigins'),
-                  'modules': modules,
-              }
-
-          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
-          print(json.dumps(summary, indent=2))
+              'signatures': 0,
+              'generated_unix': int(time.time()),
+          })
           PY
-          python3 bucket-legacy-packages/fetch.py | tee bucket-legacy-packages/run.log
-          find bucket-legacy-packages -type f -print0 | sort -z | xargs -0 sha256sum > bucket-legacy-packages/SHA256SUMS.txt
+          python3 bucket-legacy-liquidation/fetch.py | tee bucket-legacy-liquidation/fetch.log
 
-      - name: Verify read-only boundary
+      - name: Simulate v1 and v2 calls against the same current BTC vault
         shell: bash
         run: |
           set -euo pipefail
-          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-legacy-packages && exit 1 || true
+          cd bucket-legacy-liquidation
+          npm init -y >/dev/null 2>&1
+          npm install --no-audit --no-fund @mysten/sui@1.45.2 >/dev/null
+          cat > simulate.mjs <<'JS'
+          import fs from 'node:fs';
+          import { SuiClient } from '@mysten/sui/client';
+          import { Transaction } from '@mysten/sui/transactions';
+
+          const endpoints = [
+            'https://sui-mainnet-endpoint.blockvision.org',
+            'https://fullnode.mainnet.sui.io:443',
+          ];
+          const legacy = '0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e';
+          const current = '0xc1dd29778f3fccd19a4ac79d1c35a14bf9d65a0b48f1c5bba98a949cacc53e26';
+          const btc = '0xaafb102dd0902f5055cadecd687fb5b71ca82ef0e0285d90afde828ec58ca96b::btc::BTC';
+          const vault = '0x755c54dd718d350afd03314fe6ccc71e0ab36a974caf6721f1e03b7675dfaba1';
+          const treasury = '0x4de1c29a89d6888ebf8f7ae20364571dce4e1e42b9c9221f7df924ad6f9e617d';
+          const sender = '0x0000000000000000000000000000000000000000000000000000000000000ace';
+
+          function plain(value) {
+            return JSON.parse(JSON.stringify(value, (_, v) => typeof v === 'bigint' ? v.toString() : v));
+          }
+
+          async function inspect(client, packageId, label) {
+            const tx = new Transaction();
+            tx.moveCall({
+              target: `${packageId}::vault::collect_interest`,
+              typeArguments: [btc],
+              arguments: [tx.object(vault), tx.object(treasury), tx.object.clock()],
+            });
+            tx.setSender(sender);
+            try {
+              const result = await client.devInspectTransactionBlock({ sender, transactionBlock: tx });
+              return { label, transport: 'ok', result: plain(result) };
+            } catch (error) {
+              return { label, transport: 'error', error: String(error), stack: error?.stack ?? null };
+            }
+          }
+
+          const attempts = [];
+          for (const endpoint of endpoints) {
+            const client = new SuiClient({ url: endpoint });
+            const legacyResult = await inspect(client, legacy, 'legacy_v1');
+            const currentResult = await inspect(client, current, 'current_v2_control');
+            attempts.push({ endpoint, legacyResult, currentResult });
+            if (legacyResult.transport === 'ok' || currentResult.transport === 'ok') break;
+          }
+
+          const output = {
+            network: 'sui-mainnet',
+            operation: 'devInspect only',
+            signed: false,
+            writes: 0,
+            attempts,
+          };
+          fs.writeFileSync('json/collect_interest_devinspect.json', JSON.stringify(output, null, 2) + '\n');
+          console.log(JSON.stringify(attempts.map((attempt) => ({
+            endpoint: attempt.endpoint,
+            legacy_transport: attempt.legacyResult.transport,
+            legacy_status: attempt.legacyResult.result?.effects?.status ?? null,
+            legacy_error: attempt.legacyResult.error ?? null,
+            current_transport: attempt.currentResult.transport,
+            current_status: attempt.currentResult.result?.effects?.status ?? null,
+            current_error: attempt.currentResult.error ?? null,
+          })), null, 2));
+          JS
+          node simulate.mjs | tee simulate.log
+          rm -rf node_modules package.json package-lock.json
+          cd ..
+
+      - name: Calculate strict promotion decision
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 - <<'PY'
           import json
-          summary = json.load(open('bucket-legacy-packages/SUMMARY.json'))
-          assert summary['writes'] == 0
-          assert summary['transactions_constructed'] == 0
-          assert all(v['modules'] for v in summary['packages'].values())
-          print('BUCKET_LEGACY_PACKAGE_FETCH_READ_ONLY_PASS')
+          import pathlib
+
+          base = pathlib.Path('bucket-legacy-liquidation')
+          simulations = json.load(open(base / 'json' / 'collect_interest_devinspect.json'))
+
+          def successful(item):
+              if item.get('transport') != 'ok':
+                  return False
+              status = ((item.get('result') or {}).get('effects') or {}).get('status')
+              if isinstance(status, str):
+                  return status.lower() == 'success'
+              if isinstance(status, dict):
+                  return str(status.get('status', '')).lower() == 'success'
+              return False
+
+          legacy_success = any(successful(x.get('legacyResult', {})) for x in simulations.get('attempts', []))
+          current_success = any(successful(x.get('currentResult', {})) for x in simulations.get('attempts', []))
+
+          normalized = json.load(open(base / 'json' / 'normalized_modules.rpc.json'))
+          normalized_text = json.dumps(normalized)
+          markers = [value for value in ['LiquidationRule', 'liquidation_rule', 'liquidate', 'witness'] if value in normalized_text]
+
+          decision = {
+              'legacy_v1_can_mutate_current_vault_in_devinspect': legacy_success,
+              'current_v2_control_success': current_success,
+              'normalized_abi_markers': markers,
+              'writes': 0,
+              'next_gate': 'EXACT_LIQUIDATION_POC' if legacy_success else 'LEGACY_REVIVAL_NOT_PROVEN',
+          }
+          (base / 'PROMOTION_GATE.json').write_text(json.dumps(decision, indent=2, sort_keys=True) + '\n')
+          print(json.dumps(decision, indent=2))
           PY
+          grep -RniE 'executeTransactionBlock|signAndExecute|private.?key|mnemonic|suiprivkey' bucket-legacy-liquidation && exit 1 || true
+          find bucket-legacy-liquidation -type f -print0 | sort -z | xargs -0 sha256sum > bucket-legacy-liquidation/SHA256SUMS.txt
 
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-legacy-package-bytecode-census
-          path: bucket-legacy-packages
+          name: bucket-legacy-liquidation-simulation-gate
+          path: bucket-legacy-liquidation
           if-no-files-found: error
           retention-days: 7
