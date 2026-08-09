@@ -1,4 +1,4 @@
-name: Bucket Non-CDP Package Security Diff
+name: Bucket Scoped Source Snapshot R4
 
 on:
   pull_request:
@@ -11,248 +11,76 @@ permissions:
   contents: read
 
 jobs:
-  package-diff:
+  snapshot:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch deployed packages, disassembly, ABI, and function-level diffs
+      - name: Fetch exact current scoped source
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf bucket-noncdp-diff
-          mkdir -p bucket-noncdp-diff/{raw,asm,functions,diffs}
-          cat > bucket-noncdp-diff/analyze.py <<'PY'
-          import hashlib
-          import json
-          import pathlib
-          import re
-          import time
-          import urllib.request
-
-          OUT = pathlib.Path('bucket-noncdp-diff')
-          RAW = OUT / 'raw'
-          ASM = OUT / 'asm'
-          FUNCTIONS = OUT / 'functions'
-          DIFFS = OUT / 'diffs'
-          GQL = 'https://graphql.mainnet.sui.io/graphql'
-
-          PACKAGES = {
-              'framework_v1': '0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc',
-              'framework_v2': '0xe2d49d67ff42dc500275f2d84841bf35632aa6c1abdb70af66a10e1de93a4400',
-              'usdb_v1_config_target': '0xe14726c336e81b32328e92afc37345d159f5b550b09fa92bd43640cfdd0a0cfd',
-              'usdb_v2_linkage_target': '0x524a37ec411ba112f284508d9cd98265b796bea85db9450c84a42c8b5268885d',
-              'psm_v1': '0xc2ae6693383e4a81285136effc8190c7baaf0e75aafa36d1c69cd2170cfc3803',
-              'psm_v2': '0x8a46afe6ab0b972e2ee3923f5669104ae9465c12b84cd5e78ea1ff6404e4bfaf',
-              'flash_v1': '0x0f51f9eb63574a1d12b62295599ac4f8231197f95b3cce9a516daba64f419d06',
-              'flash_v2': '0xca00bbb7ecfe11dbb527efab6145b358f2a95aa11a8aae9b9f475176430cf42a',
-              'saving_v1': '0x872d08a70db3db498aa7853276acea8091fdd9871b2d86bc8dcb8524526df622',
-              'saving_v2': '0x5b60c3cdbb9ee31b856f7f8a6d4d6c8b91e3c0036a138fb9927529b05fd00373',
-              'saving_incentive_v1': '0x39692320d6fc01c27315a7972ed4717e4fd32eed43531ad6f55fd7f24b74e207',
-              'saving_incentive_v2': '0xd419027a4b92b1916c62c08da27520576bcf34d0a8c40884491dca2f5d992719',
-              'borrow_incentive_v1': '0x8cc2eed1b1012881a623e9bafd58ff0f17a8c5f807662631e623acf7779a78ee',
-              'borrow_incentive_v2': '0xef9719a3392d3742ae09c42ebf01030d88b1a75651430932be1eb017b79fb372',
-              'blacklist_v1': '0x6d7b711a5e614f99f87fdbfbf915fea0fa96af769130ac226c3cbcf07efb90f3',
-              'blacklist_v2': '0xca8749b4c503302f69a3f026e493679076f725732d81de963a10cc7fd6720caa',
+          rm -rf bucket-scoped-source-r4
+          mkdir -p bucket-scoped-source-r4
+          git clone --filter=blob:none --no-checkout https://github.com/hackenproof-public/bucket-protocol.git bucket-scoped-source-r4/repo
+          cd bucket-scoped-source-r4/repo
+          git checkout main
+          git rev-parse HEAD | tee ../HEAD.txt
+          git log -20 --date=iso-strict --pretty='format:%H%x09%ad%x09%s' > ../RECENT_COMMITS.tsv
+          git status --porcelain=v1 > ../WORKTREE_STATUS.txt
+          git ls-tree -r --name-only HEAD | sort > ../FILE_TREE.txt
+          git ls-files -z | sort -z | xargs -0 sha256sum > ../SOURCE_SHA256SUMS.txt
+          git bundle create ../SOURCE.bundle --all
+          cd ..
+          python3 - <<'PY'
+          import json, pathlib, subprocess, time
+          out=pathlib.Path('bucket-scoped-source-r4')
+          head=(out/'HEAD.txt').read_text().strip()
+          pinned='74b28e1912e9b134af9a36f0e0052e2bf1c79bd7'
+          repo=out/'repo'
+          pinned_exists=subprocess.run(['git','-C',str(repo),'cat-file','-e',pinned+'^{commit}']).returncode == 0
+          diff=[]
+          if pinned_exists:
+              text=subprocess.check_output(['git','-C',str(repo),'diff','--name-status',pinned+'..'+head],text=True)
+              diff=[line.split('\t') for line in text.splitlines() if line.strip()]
+          summary={
+              'target':'https://github.com/hackenproof-public/bucket-protocol',
+              'branch':'main',
+              'head':head,
+              'prior_pinned_revision':pinned,
+              'prior_pinned_revision_present':pinned_exists,
+              'changed_paths_since_prior_pin':diff,
+              'changed_path_count':len(diff),
+              'writes_to_chain':0,
+              'transactions_constructed':0,
+              'generated_unix':int(time.time()),
           }
-          PAIRS = [
-              ('framework_v1', 'framework_v2'),
-              ('usdb_v1_config_target', 'usdb_v2_linkage_target'),
-              ('psm_v1', 'psm_v2'),
-              ('flash_v1', 'flash_v2'),
-              ('saving_v1', 'saving_v2'),
-              ('saving_incentive_v1', 'saving_incentive_v2'),
-              ('borrow_incentive_v1', 'borrow_incentive_v2'),
-              ('blacklist_v1', 'blacklist_v2'),
-          ]
-
-          def gql(query, variables=None, retries=5):
-              payload = json.dumps({'query': query, 'variables': variables or {}}).encode()
-              last = None
-              for n in range(retries):
-                  try:
-                      req = urllib.request.Request(
-                          GQL,
-                          data=payload,
-                          method='POST',
-                          headers={'Content-Type':'application/json','User-Agent':'bucket-noncdp-diff/1'},
-                      )
-                      with urllib.request.urlopen(req, timeout=150) as response:
-                          body = json.loads(response.read().decode())
-                      if body.get('errors'):
-                          raise RuntimeError(json.dumps(body['errors']))
-                      return body
-                  except Exception as exc:
-                      last = exc
-                      time.sleep(2 ** n)
-              raise RuntimeError(f'GraphQL failure: {last}')
-
-          def dump(path, value):
-              path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
-
-          def split_functions(disassembly):
-              lines = disassembly.splitlines()
-              starts = []
-              pattern = re.compile(r'^(entry\s+)?(public(?:\([^)]*\))?\s+)?(?:fun\s+)?([^\s<(]+)(?:<[^>]*>)?\(')
-              for index, line in enumerate(lines):
-                  match = pattern.match(line)
-                  if match and not line.startswith(('B', 'L')):
-                      starts.append((index, match.group(3), line))
-              rows = {}
-              for position, (start, name, signature) in enumerate(starts):
-                  end = starts[position + 1][0] if position + 1 < len(starts) else len(lines)
-                  body = '\n'.join(lines[start:end]).rstrip() + '\n'
-                  key = name
-                  suffix = 2
-                  while key in rows:
-                      key = f'{name}#{suffix}'
-                      suffix += 1
-                  rows[key] = {
-                      'name': name,
-                      'signature': signature,
-                      'body': body,
-                      'sha256': hashlib.sha256(body.encode()).hexdigest(),
-                  }
-              return rows
-
-          package_rows = {}
-          function_maps = {}
-          public_inventory = []
-          sensitive_inventory = []
-          query = '''query P($address:SuiAddress!){object(address:$address){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}modules{nodes{name fileFormatVersion disassembly functions(first:50){nodes{name visibility isEntry parameters{repr}return{repr}typeParameters{constraints}}}structs(first:50){nodes{name abilities fields{name type{repr}}}}}}}}}'''
-          sensitive_re = re.compile(r'mint|burn|flash|swap|withdraw|claim|reward|interest|fee|collect|supply|treasury|beneficiary|balance|rate|price|admin|manager|cap|blacklist|deposit|unstake|stake|saving', re.I)
-
-          for label, address in PACKAGES.items():
-              response = gql(query, {'address': address})
-              dump(RAW / f'{label}.json', response)
-              package = response['data']['object']['asMovePackage']
-              package_rows[label] = {
-                  'address': address,
-                  'version': package.get('version'),
-                  'digest': response['data']['object'].get('digest'),
-                  'previous_transaction': response['data']['object'].get('previousTransaction'),
-                  'linkage': package.get('linkage'),
-                  'type_origins': package.get('typeOrigins'),
-              }
-              function_maps[label] = {}
-              for module in package['modules']['nodes']:
-                  module_name = module['name']
-                  disassembly = module.get('disassembly') or ''
-                  (ASM / f'{label}__{module_name}.asm').write_text(disassembly)
-                  meta = {row['name']: row for row in (module.get('functions') or {}).get('nodes', [])}
-                  functions = split_functions(disassembly)
-                  function_maps[label][module_name] = functions
-                  for key, row in functions.items():
-                      info = meta.get(row['name'], {})
-                      inventory = {
-                          'package_label': label,
-                          'package_id': address,
-                          'package_version': package.get('version'),
-                          'module': module_name,
-                          'function_key': key,
-                          'name': row['name'],
-                          'signature': row['signature'],
-                          'visibility': info.get('visibility'),
-                          'is_entry': info.get('isEntry'),
-                          'parameters': [x.get('repr') for x in info.get('parameters', [])],
-                          'returns': [x.get('repr') for x in info.get('return', [])],
-                          'sha256': row['sha256'],
-                      }
-                      if str(info.get('visibility')).upper() == 'PUBLIC' or info.get('isEntry'):
-                          public_inventory.append(inventory)
-                      if sensitive_re.search(f'{module_name} {row["name"]} {row["signature"]} {row["body"]}'):
-                          sensitive_inventory.append({**inventory, 'body': row['body']})
-                      target = FUNCTIONS / label / module_name
-                      target.mkdir(parents=True, exist_ok=True)
-                      (target / f'{key}.asm').write_text(row['body'])
-
-          changed = []
-          for old_label, new_label in PAIRS:
-              old_modules = function_maps.get(old_label, {})
-              new_modules = function_maps.get(new_label, {})
-              for module in sorted(set(old_modules) | set(new_modules)):
-                  old_functions = old_modules.get(module, {})
-                  new_functions = new_modules.get(module, {})
-                  for key in sorted(set(old_functions) | set(new_functions)):
-                      old = old_functions.get(key)
-                      new = new_functions.get(key)
-                      if old and new and old['sha256'] == new['sha256']:
-                          continue
-                      row = {
-                          'pair': f'{old_label}__{new_label}',
-                          'old_package': old_label,
-                          'new_package': new_label,
-                          'module': module,
-                          'function_key': key,
-                          'name': (new or old)['name'],
-                          'old_present': bool(old),
-                          'new_present': bool(new),
-                          'old_signature': old['signature'] if old else None,
-                          'new_signature': new['signature'] if new else None,
-                          'old_sha256': old['sha256'] if old else None,
-                          'new_sha256': new['sha256'] if new else None,
-                          'security_shaped': bool(sensitive_re.search(f'{module} {key} {(old or {}).get("body", "")} {(new or {}).get("body", "")}')),
-                      }
-                      changed.append(row)
-                      target = DIFFS / f'{old_label}__{new_label}'
-                      target.mkdir(parents=True, exist_ok=True)
-                      if old:
-                          (target / f'{module}__{key}__old.asm').write_text(old['body'])
-                      if new:
-                          (target / f'{module}__{key}__new.asm').write_text(new['body'])
-
-          dump(OUT / 'PUBLIC_FUNCTIONS.json', public_inventory)
-          dump(OUT / 'SENSITIVE_FUNCTIONS.json', sensitive_inventory)
-          dump(OUT / 'CHANGED_FUNCTIONS.json', changed)
-          summary = {
-              'network': 'sui-mainnet',
-              'packages': package_rows,
-              'pairs': PAIRS,
-              'public_function_count': len(public_inventory),
-              'sensitive_function_count': len(sensitive_inventory),
-              'changed_function_count': len(changed),
-              'security_shaped_change_count': len([x for x in changed if x['security_shaped']]),
-              'security_shaped_changes': [x for x in changed if x['security_shaped']],
-              'writes': 0,
-              'transactions_constructed': 0,
-              'generated_unix': int(time.time()),
-          }
-          dump(OUT / 'SUMMARY.json', summary)
-          print(json.dumps({
-              'package_versions': {k:v['version'] for k,v in package_rows.items()},
-              'public_function_count': len(public_inventory),
-              'changed_function_count': len(changed),
-              'security_shaped_changes': summary['security_shaped_changes'],
-          }, indent=2))
+          (out/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(summary,indent=2))
           PY
-          python3 bucket-noncdp-diff/analyze.py | tee bucket-noncdp-diff/run.log
-          for old in bucket-noncdp-diff/diffs/*/*__old.asm; do
-            new="${old%__old.asm}__new.asm"
-            if [ -f "$new" ]; then
-              diff -u "$old" "$new" > "${old%__old.asm}.patch" || true
-            fi
-          done
-          find bucket-noncdp-diff -type f -print0 | sort -z | xargs -0 sha256sum > bucket-noncdp-diff/SHA256SUMS.txt
+          rm -rf repo/.git/objects/pack/*.keep || true
+          find . -maxdepth 2 -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
 
-      - name: Validate read-only boundary
+      - name: Validate source snapshot boundary
         shell: bash
         run: |
           set -euo pipefail
-          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-noncdp-diff && exit 1 || true
+          test -s bucket-scoped-source-r4/HEAD.txt
+          test -s bucket-scoped-source-r4/SOURCE.bundle
+          test ! -s bucket-scoped-source-r4/WORKTREE_STATUS.txt
           python3 - <<'PY'
           import json
-          s=json.load(open('bucket-noncdp-diff/SUMMARY.json'))
-          assert s['writes'] == 0
+          s=json.load(open('bucket-scoped-source-r4/SUMMARY.json'))
+          assert s['writes_to_chain'] == 0
           assert s['transactions_constructed'] == 0
-          assert len(s['packages']) == 16
-          print('BUCKET_NONCDP_SECURITY_DIFF_PASS')
+          print('BUCKET_SCOPED_SOURCE_R4_PASS')
           PY
 
-      - name: Upload evidence
+      - name: Upload scoped source snapshot
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-noncdp-package-security-diff
-          path: bucket-noncdp-diff
+          name: bucket-scoped-source-r4
+          path: bucket-scoped-source-r4
           if-no-files-found: error
           retention-days: 7
