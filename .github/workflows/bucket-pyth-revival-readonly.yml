@@ -1,4 +1,4 @@
-name: Bucket Oracle Topology and Source Audit R4
+name: Bucket Oracle Live Package Diff and Config Census R4
 
 on:
   pull_request:
@@ -11,215 +11,195 @@ permissions:
   contents: read
 
 jobs:
-  oracle-audit:
+  oracle-diff:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
-      - name: Enumerate live aggregators, configured sources, source bytecode, and recent call chains
+      - name: Fetch live rule package versions and configuration objects
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf bucket-oracle-audit-r4
-          mkdir -p bucket-oracle-audit-r4/{raw,asm,analysis}
-          cat > bucket-oracle-audit-r4/audit.py <<'PY'
+          rm -rf bucket-oracle-live-diff-r4
+          mkdir -p bucket-oracle-live-diff-r4/{raw,asm,diff,analysis}
+          cat > bucket-oracle-live-diff-r4/audit.py <<'PY'
+          import difflib
+          import hashlib
           import json
           import pathlib
           import re
           import time
           import urllib.request
 
-          OUT=pathlib.Path('bucket-oracle-audit-r4')
-          RAW=OUT/'raw'
-          ASM=OUT/'asm'
-          ANALYSIS=OUT/'analysis'
+          OUT=pathlib.Path('bucket-oracle-live-diff-r4')
+          RAW=OUT/'raw'; ASM=OUT/'asm'; DIFF=OUT/'diff'; ANALYSIS=OUT/'analysis'
           GQL='https://graphql.mainnet.sui.io/graphql'
-          RPCS=['https://sui-mainnet-endpoint.blockvision.org','https://fullnode.mainnet.sui.io:443']
-          ORACLE='0xf2ab9aa60c5e879675351a1a89f47131de9dea7cc927327dd0e7282e295c7f5e'
-          AGG_TYPE=ORACLE+'::aggregator::PriceAggregator'
+          PACKAGES={
+              'pyth_origin':'0x6ee87742e673749a97f5fbe576b92d8dd294a482307d3a3fb2c6f73a56b906a0',
+              'pyth_live':'0x5bc4f912b59c5cfcc86dfc90419837b9c3f9d3a3a94cef7a198838fa196bac4a',
+              'scoin_origin':'0x18f4f3cd05ab7ff6dc0c41c692e3caae925927cc096f1de3de81d85a89f87aca',
+              'scoin_live_a':'0x2252a1cc5a16a0c9f4530005908cced53783d96b4932ca3fa15b1fe9d5935972',
+              'scoin_live_b':'0xb7c0792630fe4b028437a5554e5c0bef16edaf793210ef32a88fcea443e4d76b',
+              'gcoin':'0xba3c970933047c6e235424d7040a9a4e89d8fc1200d780a69b2666434f3a7313',
+              'tlp':'0x499b930751ecbbfbbc3b76cde04486787a6e99752df3b5d765bd5f1f441934b8',
+              'bfbtc':'0x6043cfb7e941a06526ed11e396d305ea547f55c55ae0e140d78652e8637ff60e',
+          }
+          CONFIG_TYPES={
+              'pyth_config':'0x6ee87742e673749a97f5fbe576b92d8dd294a482307d3a3fb2c6f73a56b906a0::pyth_rule::Config',
+              'scoin_config':'0x18f4f3cd05ab7ff6dc0c41c692e3caae925927cc096f1de3de81d85a89f87aca::scoin_rule::Config',
+              'gcoin_config':'0xba3c970933047c6e235424d7040a9a4e89d8fc1200d780a69b2666434f3a7313::gcoin_rule::Config',
+              'tlp_index_map':'0x499b930751ecbbfbbc3b76cde04486787a6e99752df3b5d765bd5f1f441934b8::tlp_rule::IndexMap',
+          }
 
-          def post(url,payload,retries=5,timeout=150):
+          def post(payload,retries=5,timeout=150):
               data=json.dumps(payload).encode(); last=None
               for n in range(retries):
                   try:
-                      req=urllib.request.Request(url,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-oracle-audit-r4/1'})
+                      req=urllib.request.Request(GQL,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-oracle-live-diff-r4/1'})
                       with urllib.request.urlopen(req,timeout=timeout) as response:
                           return json.loads(response.read().decode())
                   except Exception as exc:
                       last=exc; time.sleep(2**n)
-              raise RuntimeError(f'POST failure {url}: {last}')
+              raise RuntimeError(f'GraphQL POST failure: {last}')
 
           def gql(query,variables=None):
-              body=post(GQL,{'query':query,'variables':variables or {}})
+              body=post({'query':query,'variables':variables or {}})
               if body.get('errors'): raise RuntimeError(json.dumps(body['errors']))
               return body
 
-          def rpc(method,params):
-              failures=[]
-              for endpoint in RPCS:
-                  try:
-                      body=post(endpoint,{'jsonrpc':'2.0','id':1,'method':method,'params':params},timeout=100)
-                      if body.get('error'): raise RuntimeError(json.dumps(body['error']))
-                      return {'endpoint':endpoint,'result':body.get('result')}
-                  except Exception as exc:
-                      failures.append({'endpoint':endpoint,'error':type(exc).__name__,'message':str(exc)})
-              return {'failures':failures}
-
           def dump(path,value): path.write_text(json.dumps(value,indent=2,sort_keys=True)+'\n')
 
-          q_objects='''query O($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
-          aggregators=[]; after=None
-          while True:
-              body=gql(q_objects,{'type':AGG_TYPE,'after':after})
-              conn=body['data']['objects']; aggregators.extend(conn.get('nodes') or [])
-              page=conn.get('pageInfo') or {}
-              if not page.get('hasNextPage'): break
-              after=page.get('endCursor')
-          dump(RAW/'aggregators.json',aggregators)
+          QPKG='''query P($address:SuiAddress!){object(address:$address){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}modules{nodes{name fileFormatVersion disassembly functions(first:50){nodes{name visibility isEntry parameters{repr}return{repr}typeParameters{constraints}}}structs(first:50){nodes{name abilities fields{name type{repr}}typeParameters{constraints}}}}}}}}'''
+          QOBJ='''query O($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
 
-          source_types=[]; aggregator_rows=[]
-          for row in aggregators:
-              contents=((row.get('asMoveObject') or {}).get('contents') or {})
-              data=contents.get('json') or {}
-              weights=(data.get('weights') or {}).get('contents',[])
-              parsed=[]
-              for item in weights:
-                  key=item.get('key') if isinstance(item,dict) else None
-                  val=item.get('value') if isinstance(item,dict) else None
-                  if isinstance(key,dict):
-                      key=key.get('name') or key.get('value') or key.get('bytes') or str(key)
-                  if key:
-                      key=str(key)
-                      source_types.append(key)
-                      parsed.append({'source_type':key,'weight':val})
-              aggregator_rows.append({
-                  'id':row.get('address'),
-                  'version':row.get('version'),
-                  'owner':row.get('owner'),
-                  'coin_type':(contents.get('type') or {}).get('repr'),
-                  'weight_threshold':data.get('weight_threshold'),
-                  'outlier_tolerance':data.get('outlier_tolerance'),
-                  'weights':parsed,
-                  'previous_transaction':row.get('previousTransaction'),
-              })
-          source_types=sorted(set(source_types))
+          package_meta={}; functions={}
+          for label,address in PACKAGES.items():
+              response=gql(QPKG,{'address':address}); dump(RAW/f'{label}.json',response)
+              obj=response['data']['object']; package=(obj or {}).get('asMovePackage')
+              if not package:
+                  package_meta[label]={'address':address,'error':'not_package'}; continue
+              package_meta[label]={
+                  'address':address,'object_version':obj.get('version'),'digest':obj.get('digest'),
+                  'package_version':package.get('version'),'previous_transaction':obj.get('previousTransaction'),
+                  'linkage':package.get('linkage'),'type_origins':package.get('typeOrigins'),
+              }
+              functions[label]={}
+              target=ASM/label; target.mkdir(parents=True,exist_ok=True)
+              for module in package['modules']['nodes']:
+                  name=module['name']; dis=module.get('disassembly') or ''
+                  (target/f'{name}.asm').write_text(dis)
+                  functions[label][name]={f['name']:f for f in (module.get('functions') or {}).get('nodes',[])}
 
-          hex64=re.compile(r'(?:0x)?([0-9a-fA-F]{64})::')
-          source_packages={}
-          for source in source_types:
-              m=hex64.search(source)
-              if m:
-                  source_packages.setdefault('0x'+m.group(1).lower(),[]).append(source)
+          # Extract disassembled function bodies with a conservative signature splitter.
+          sig=re.compile(r'^(?:entry\s+)?(?:public(?:\([^)]*\))?\s+|fun\s+)?([^\s<(]+)(?:<[^>]*>)?\(')
+          def split_fns(text):
+              lines=text.splitlines(); starts=[]
+              for i,line in enumerate(lines):
+                  m=sig.match(line)
+                  if m and not line.startswith(('B','L')):
+                      starts.append((i,m.group(1)))
+              out={}
+              for n,(start,name) in enumerate(starts):
+                  end=starts[n+1][0] if n+1<len(starts) else len(lines)
+                  body='\n'.join(lines[start:end]).rstrip()+'\n'
+                  out[name]=body
+              return out
 
-          q_pkg='''query P($address:SuiAddress!){object(address:$address){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}modules{nodes{name fileFormatVersion disassembly functions(first:50){nodes{name visibility isEntry parameters{repr}return{repr}typeParameters{constraints}}}structs(first:50){nodes{name abilities fields{name type{repr}}typeParameters{constraints}}}}}}}}'''
-          package_rows={}; public_functions=[]; suspicious_functions=[]
-          terms=re.compile(r'price|oracle|pyth|supra|switchboard|stale|timestamp|clock|confidence|deviation|feed|update|extract|convert|decimal|expo|aggregate|collect',re.I)
-          for pkg,sources in source_packages.items():
-              try:
-                  response=gql(q_pkg,{'address':pkg})
-                  dump(RAW/f'package_{pkg[2:]}.json',response)
-                  obj=response['data']['object']; package=obj.get('asMovePackage')
-                  if not package:
-                      package_rows[pkg]={'sources':sources,'error':'not a Move package'}; continue
-                  package_rows[pkg]={
-                      'sources':sources,'version':package.get('version'),'digest':obj.get('digest'),
-                      'previous_transaction':obj.get('previousTransaction'),'linkage':package.get('linkage'),
-                      'type_origins':package.get('typeOrigins'),
-                  }
-                  target=ASM/pkg[2:]; target.mkdir(parents=True,exist_ok=True)
-                  for module in package['modules']['nodes']:
-                      name=module['name']; dis=module.get('disassembly') or ''
-                      (target/f'{name}.asm').write_text(dis)
-                      for fn in (module.get('functions') or {}).get('nodes',[]):
-                          item={
-                              'package':pkg,'module':name,'name':fn.get('name'),'visibility':fn.get('visibility'),
-                              'is_entry':fn.get('isEntry'),'parameters':[x.get('repr') for x in fn.get('parameters',[])],
-                              'returns':[x.get('repr') for x in fn.get('return',[])],
-                          }
-                          if str(fn.get('visibility')).upper()=='PUBLIC' or fn.get('isEntry'):
-                              public_functions.append(item)
-                              if terms.search(json.dumps(item)):
-                                  suspicious_functions.append(item)
-              except Exception as exc:
-                  package_rows[pkg]={'sources':sources,'error':type(exc).__name__,'message':str(exc)}
+          bodies={}
+          for label in PACKAGES:
+              bodies[label]={}
+              for p in (ASM/label).glob('*.asm') if (ASM/label).exists() else []:
+                  bodies[label][p.stem]=split_fns(p.read_text())
 
-          activity={}; call_rows=[]
-          for agg in aggregator_rows:
-              oid=agg['id']
-              wrapper=rpc('suix_queryTransactionBlocks',[{
-                  'filter':{'InputObject':oid},
-                  'options':{'showInput':True,'showRawInput':False,'showEffects':True,'showEvents':True,'showObjectChanges':True,'showBalanceChanges':True},
-              },None,50,True])
-              activity[oid]=wrapper
-              result=wrapper.get('result') if isinstance(wrapper,dict) else None
-              txs=(result or {}).get('data',[]) if isinstance(result,dict) else []
-              for tx in txs:
-                  try: commands=tx['transaction']['data']['transaction']['transactions']
-                  except Exception: commands=[]
-                  for index,command in enumerate(commands or []):
-                      mc=command.get('MoveCall') if isinstance(command,dict) else None
-                      if mc:
-                          call_rows.append({
-                              'aggregator':oid,'digest':tx.get('digest'),'command_index':index,
-                              'sender':((tx.get('transaction') or {}).get('data') or {}).get('sender'),
-                              'status':((tx.get('effects') or {}).get('status')),
-                              'package':mc.get('package'),'module':mc.get('module'),'function':mc.get('function'),
-                              'type_arguments':mc.get('type_arguments'),
+          comparisons=[
+              ('pyth_origin','pyth_live','pyth_rule','feed'),
+              ('pyth_origin','pyth_live','pyth_rule','set_identifier'),
+              ('pyth_origin','pyth_live','pyth_rule','set_tolerance_sec'),
+              ('scoin_origin','scoin_live_a','scoin_rule','feed'),
+              ('scoin_origin','scoin_live_b','scoin_rule','feed'),
+              ('scoin_live_a','scoin_live_b','scoin_rule','feed'),
+          ]
+          diff_rows=[]
+          for left,right,module,fn in comparisons:
+              a=bodies.get(left,{}).get(module,{}).get(fn)
+              b=bodies.get(right,{}).get(module,{}).get(fn)
+              row={'left':left,'right':right,'module':module,'function':fn,'left_present':a is not None,'right_present':b is not None}
+              if a is not None: row['left_sha256']=hashlib.sha256(a.encode()).hexdigest()
+              if b is not None: row['right_sha256']=hashlib.sha256(b.encode()).hexdigest()
+              row['identical']=a==b and a is not None
+              if a is not None and b is not None:
+                  patch=''.join(difflib.unified_diff(a.splitlines(True),b.splitlines(True),fromfile=left,tofile=right))
+                  (DIFF/f'{left}__{right}__{module}__{fn}.patch').write_text(patch)
+                  row['patch_lines']=len(patch.splitlines())
+              diff_rows.append(row)
+
+          configs={}
+          for label,type_ in CONFIG_TYPES.items():
+              rows=[]; after=None
+              while True:
+                  body=gql(QOBJ,{'type':type_,'after':after}); conn=body['data']['objects']; rows.extend(conn.get('nodes') or [])
+                  page=conn.get('pageInfo') or {}
+                  if not page.get('hasNextPage'): break
+                  after=page.get('endCursor')
+              configs[label]={'type':type_,'rows':rows}
+              dump(RAW/f'{label}.objects.json',configs[label])
+
+          # Public functions that can mutate pricing dependencies/config without an obvious capability parameter.
+          capability_terms=('Cap','Witness','Admin','Owner','ListingCap')
+          mutators=[]
+          for label,mods in functions.items():
+              for module,fns in mods.items():
+                  for name,meta in fns.items():
+                      visible=str(meta.get('visibility')).upper()=='PUBLIC' or meta.get('isEntry')
+                      params=[x.get('repr') for x in meta.get('parameters',[])]
+                      text=' '.join(params)
+                      if visible and any(x in name.lower() for x in ('set','update','feed','deposit','withdraw','mint','burn','sync','collect','add','remove')):
+                          mutators.append({
+                              'package_label':label,'package':PACKAGES[label],'module':module,'function':name,
+                              'visibility':meta.get('visibility'),'is_entry':meta.get('isEntry'),'parameters':params,
+                              'returns':[x.get('repr') for x in meta.get('return',[])],
+                              'has_capability_shaped_parameter':any(term in text for term in capability_terms),
                           })
-          dump(RAW/'activity.json',activity)
-          dump(ANALYSIS/'aggregator_rows.json',aggregator_rows)
-          dump(ANALYSIS/'source_packages.json',package_rows)
-          dump(ANALYSIS/'public_functions.json',public_functions)
-          dump(ANALYSIS/'suspicious_functions.json',suspicious_functions)
-          dump(ANALYSIS/'recent_move_calls.json',call_rows)
+          dump(ANALYSIS/'mutators.json',mutators)
+          dump(ANALYSIS/'diff_rows.json',diff_rows)
+          dump(ANALYSIS/'package_meta.json',package_meta)
+          dump(ANALYSIS/'configs.json',configs)
 
-          unweighted=[]
-          for agg in aggregator_rows:
-              for w in agg['weights']:
-                  try: val=int(w['weight'])
-                  except Exception: val=None
-                  if val is not None and val<=0: unweighted.append({'aggregator':agg['id'],**w})
           summary={
-              'network':'sui-mainnet','oracle_package':ORACLE,
-              'aggregator_count':len(aggregator_rows),'aggregators':aggregator_rows,
-              'source_type_count':len(source_types),'source_types':source_types,
-              'source_package_count':len(source_packages),'source_packages':package_rows,
-              'public_source_function_count':len(public_functions),
-              'suspicious_source_functions':suspicious_functions,
-              'recent_move_call_count':len(call_rows),'recent_move_calls':call_rows,
-              'nonpositive_configured_weights':unweighted,
+              'network':'sui-mainnet','packages':package_meta,'function_diffs':diff_rows,
+              'config_object_counts':{k:len(v['rows']) for k,v in configs.items()},
+              'config_objects':configs,'public_mutator_candidates':mutators,
               'writes':0,'transactions_constructed':0,'generated_unix':int(time.time()),
           }
           dump(OUT/'SUMMARY.json',summary)
           print(json.dumps({
-              'aggregator_count':summary['aggregator_count'],
-              'source_types':source_types,
-              'source_packages':package_rows,
-              'suspicious_source_functions':suspicious_functions,
-              'recent_move_call_count':len(call_rows),
+              'package_versions':{k:v.get('package_version') for k,v in package_meta.items()},
+              'function_diffs':diff_rows,
+              'config_object_counts':summary['config_object_counts'],
+              'mutator_count':len(mutators),
           },indent=2))
           PY
-          python3 bucket-oracle-audit-r4/audit.py | tee bucket-oracle-audit-r4/run.log
-          find bucket-oracle-audit-r4 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-oracle-audit-r4/SHA256SUMS.txt
+          python3 bucket-oracle-live-diff-r4/audit.py | tee bucket-oracle-live-diff-r4/run.log
+          find bucket-oracle-live-diff-r4 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-oracle-live-diff-r4/SHA256SUMS.txt
 
       - name: Validate read-only boundary
         shell: bash
         run: |
           set -euo pipefail
-          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-oracle-audit-r4 && exit 1 || true
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-oracle-live-diff-r4 && exit 1 || true
           python3 - <<'PY'
           import json
-          s=json.load(open('bucket-oracle-audit-r4/SUMMARY.json'))
+          s=json.load(open('bucket-oracle-live-diff-r4/SUMMARY.json'))
           assert s['writes']==0 and s['transactions_constructed']==0
-          assert s['aggregator_count']>0
-          print('BUCKET_ORACLE_AUDIT_R4_READ_ONLY_PASS')
+          assert 'pyth_live' in s['packages']
+          print('BUCKET_ORACLE_LIVE_DIFF_R4_READ_ONLY_PASS')
           PY
 
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-oracle-audit-r4
-          path: bucket-oracle-audit-r4
+          name: bucket-oracle-live-diff-r4
+          path: bucket-oracle-live-diff-r4
           if-no-files-found: error
           retention-days: 7
