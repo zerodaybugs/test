@@ -1,4 +1,4 @@
-name: Bucket Liquidator Trust Domain Probe
+name: Bucket CDP V3 Bytecode Gate
 
 on:
   pull_request:
@@ -11,236 +11,125 @@ permissions:
   contents: read
 
 jobs:
-  probe:
+  bytecode-gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
-      - name: Query liquidator ownership and transaction history
+      - name: Fetch v1, v3, and v4 package bytecode and metadata
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf bucket-liquidator-domain
-          mkdir -p bucket-liquidator-domain/raw
-          cat > bucket-liquidator-domain/probe.py <<'PY'
+          rm -rf bucket-cdp-v3-gate
+          mkdir -p bucket-cdp-v3-gate/{json,mv}
+          cat > bucket-cdp-v3-gate/fetch.py <<'PY'
+          import base64
+          import hashlib
           import json
           import pathlib
           import time
           import urllib.request
 
-          OUT = pathlib.Path('bucket-liquidator-domain')
-          RAW = OUT / 'raw'
-          ENDPOINTS = [
-              'https://sui-mainnet-endpoint.blockvision.org',
-              'https://fullnode.mainnet.sui.io:443',
-          ]
-          ADDRESSES = {
-              'liquidator_a': '0x26266b1381bcf03ab3acc37c1e87beffb52d49f345248bc3efb9114176990ae4',
-              'liquidator_b': '0xb05747d4b5af0ba8cfeacbbf8fc8ab0c37d13b2244c9d9622befbd1e70872fc6',
-              'liquidation_admin': '0x19f528ccf2c1ff204b61f9958517c26fcf0950a6034a20f8c342cc142fb0f5f5',
-              'config_last_updater': '0x938884d43de2bcf13a2f8f5886ea6382994ba49dcf7b3d08203acdd508778b6b',
+          OUT = pathlib.Path('bucket-cdp-v3-gate')
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+          PACKAGES = {
+              'cdp_v1': '0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e',
+              'cdp_v3_wrapper_link': '0x1a9ed525e699c5716923d36ac02f554368a7f52b83bc59679eef1f99efee324a',
+              'cdp_v4_current': '0xc1dd29778f3fccd19a4ac79d1c35a14bf9d65a0b48f1c5bba98a949cacc53e26',
+              'liquidation_wrapper': '0xbe1457c92f8e8c39e85fa4f77bfcd8cfbda30d1861286ba64c76a94773138b5d',
           }
-          CONFIG_TX = 'coWCfh9dNo1sA9yRj6Jo3GGcpjY6kxTC9srAuEpcguW'
 
-          def post(endpoint, method, params, retries=5):
-              payload = json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
+          def post(payload, retries=5):
+              data = json.dumps(payload).encode()
               last = None
               for n in range(retries):
                   try:
                       req = urllib.request.Request(
-                          endpoint,
-                          data=payload,
+                          GQL,
+                          data=data,
                           method='POST',
-                          headers={'Content-Type':'application/json','User-Agent':'bucket-liquidator-domain/1'},
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-cdp-v3-bytecode-gate/1',
+                          },
                       )
                       with urllib.request.urlopen(req, timeout=90) as response:
                           body = json.loads(response.read().decode())
-                      if body.get('error'):
-                          raise RuntimeError(json.dumps(body['error']))
-                      return body.get('result')
+                      if body.get('errors'):
+                          raise RuntimeError(json.dumps(body['errors']))
+                      return body
                   except Exception as exc:
                       last = exc
                       time.sleep(2 ** n)
-              raise RuntimeError(f'{method} failed: {last}')
+              raise RuntimeError(f'GraphQL failure: {last}')
 
-          def call(method, params):
-              failures = []
-              for endpoint in ENDPOINTS:
-                  try:
-                      return {'endpoint':endpoint,'result':post(endpoint,method,params)}
-                  except Exception as exc:
-                      failures.append({'endpoint':endpoint,'error':type(exc).__name__,'message':str(exc)})
-              return {'failures':failures}
+          def write_json(name, value):
+              (OUT / 'json' / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
 
-          def dump(name, value):
-              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
-
-          collected = {}
-          for label, address in ADDRESSES.items():
-              balances = call('suix_getAllBalances', [address])
-              owned = call('suix_getOwnedObjects', [
-                  address,
-                  {'options': {
-                      'showType': True,
-                      'showOwner': True,
-                      'showPreviousTransaction': True,
-                      'showContent': True,
-                      'showDisplay': False,
-                  }},
-                  None,
-                  50,
-              ])
-              sent = call('suix_queryTransactionBlocks', [
-                  {'filter': {'FromAddress': address}, 'options': {
-                      'showInput': True,
-                      'showRawInput': False,
-                      'showEffects': True,
-                      'showEvents': True,
-                      'showObjectChanges': True,
-                      'showBalanceChanges': True,
-                  }},
-                  None,
-                  50,
-                  True,
-              ])
-              collected[label] = {
-                  'address': address,
-                  'balances': balances,
-                  'owned_objects': owned,
-                  'sent_transactions': sent,
-              }
-              dump(f'{label}.json', collected[label])
-
-          config_tx = call('sui_getTransactionBlock', [CONFIG_TX, {
-              'showInput': True,
-              'showRawInput': False,
-              'showEffects': True,
-              'showEvents': True,
-              'showObjectChanges': True,
-              'showBalanceChanges': True,
-          }])
-          dump('config_last_update_tx.json', config_tx)
-
-          def result(wrapper):
-              return wrapper.get('result') if isinstance(wrapper, dict) else None
-
-          def move_calls(tx):
-              calls = []
-              try:
-                  commands = tx['transaction']['data']['transaction']['transactions']
-              except Exception:
-                  return calls
-              for command in commands or []:
-                  mc = command.get('MoveCall') if isinstance(command, dict) else None
-                  if mc:
-                      calls.append({
-                          'package': mc.get('package'),
-                          'module': mc.get('module'),
-                          'function': mc.get('function'),
-                          'type_arguments': mc.get('type_arguments'),
-                      })
-              return calls
-
-          def summarize(label, data):
-              balances = result(data['balances']) or []
-              owned_result = result(data['owned_objects']) or {}
-              owned = owned_result.get('data', []) if isinstance(owned_result, dict) else []
-              sent_result = result(data['sent_transactions']) or {}
-              txs = sent_result.get('data', []) if isinstance(sent_result, dict) else []
-              owned_types = []
-              for row in owned:
-                  item = row.get('data') or {}
-                  type_ = item.get('type')
-                  if type_:
-                      owned_types.append(type_)
-              call_rows = []
-              sponsors = []
-              gas_owners = []
-              for tx in txs:
-                  call_rows.extend(move_calls(tx))
-                  transaction = tx.get('transaction') or {}
-                  data0 = transaction.get('data') or {}
-                  gas = data0.get('gasData') or {}
-                  owner = gas.get('owner')
-                  if owner:
-                      gas_owners.append(owner)
-                  sponsor = data0.get('sender')
-                  if sponsor:
-                      sponsors.append(sponsor)
-              return {
-                  'label': label,
-                  'address': data['address'],
-                  'balance_coin_types': sorted({x.get('coinType') for x in balances if isinstance(x, dict) and x.get('coinType')}),
-                  'owned_object_count_returned': len(owned),
-                  'owned_types': sorted(set(owned_types)),
-                  'sent_tx_count_returned': len(txs),
-                  'unique_gas_owners': sorted(set(gas_owners)),
-                  'unique_senders': sorted(set(sponsors)),
-                  'move_calls': call_rows,
-                  'has_more_sent_transactions': bool(sent_result.get('hasNextPage')) if isinstance(sent_result, dict) else None,
+          manifest = {}
+          for label, package_id in PACKAGES.items():
+              query = f'''{{ object(address: "{package_id}") {{ address version digest previousTransaction {{ digest sender {{ address }} }} asMovePackage {{ address version linkage {{ originalId upgradedId version }} typeOrigins {{ module struct definingId }} modules {{ nodes {{ name bytes fileFormatVersion }} }} }} }} }}'''
+              result = post({'query': query})
+              write_json(f'{label}.graphql.json', result)
+              package = result['data']['object']['asMovePackage']
+              target = OUT / 'mv' / label
+              target.mkdir(parents=True, exist_ok=True)
+              rows = []
+              for module in package['modules']['nodes']:
+                  raw = base64.b64decode(module['bytes'])
+                  path = target / f"{module['name']}.mv"
+                  path.write_bytes(raw)
+                  rows.append({
+                      'name': module['name'],
+                      'bytes': len(raw),
+                      'sha256': hashlib.sha256(raw).hexdigest(),
+                      'magic': raw[:4].hex(),
+                      'file_format_version': module.get('fileFormatVersion'),
+                  })
+              manifest[label] = {
+                  'package_id': package_id,
+                  'package_version': package.get('version'),
+                  'linkage': package.get('linkage'),
+                  'type_origins': package.get('typeOrigins'),
+                  'modules': rows,
               }
 
-          summaries = {label:summarize(label,data) for label,data in collected.items()}
-          liquidator_calls = []
-          for label in ('liquidator_a','liquidator_b'):
-              liquidator_calls.extend(summaries[label]['move_calls'])
-          bucket_calls = [x for x in liquidator_calls if str(x.get('package','')).lower() in {
-              '0xbe1457c92f8e8c39e85fa4f77bfcd8cfbda30d1861286ba64c76a94773138b5d',
-              '0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e',
-              '0xc1dd29778f3fccd19a4ac79d1c35a14bf9d65a0b48f1c5bba98a949cacc53e26',
-          }]
-          gas_owner_sets = {
-              label: set(value['unique_gas_owners'])
-              for label, value in summaries.items()
-          }
-          overlaps = {}
-          labels = list(gas_owner_sets)
-          for i, left in enumerate(labels):
-              for right in labels[i+1:]:
-                  overlaps[f'{left}__{right}'] = sorted(gas_owner_sets[left] & gas_owner_sets[right])
-
+          write_json('MANIFEST.json', manifest)
           summary = {
               'network': 'sui-mainnet',
-              'addresses': ADDRESSES,
-              'address_summaries': summaries,
-              'liquidator_bucket_move_calls': bucket_calls,
-              'gas_owner_overlaps': overlaps,
-              'config_update_transaction': config_tx,
+              'packages': PACKAGES,
+              'v3_vault_present': any(x['name'] == 'vault' for x in manifest['cdp_v3_wrapper_link']['modules']),
               'writes': 0,
               'transactions_constructed': 0,
               'generated_unix': int(time.time()),
           }
-          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
-          print(json.dumps({
-              'addresses': ADDRESSES,
-              'sent_tx_counts': {k:v['sent_tx_count_returned'] for k,v in summaries.items()},
-              'owned_types': {k:v['owned_types'] for k,v in summaries.items()},
-              'gas_owner_overlaps': overlaps,
-              'liquidator_bucket_move_calls': bucket_calls,
-              'writes': 0,
-          }, indent=2))
+          write_json('SUMMARY.json', summary)
+          print(json.dumps(summary, indent=2))
           PY
-          python3 bucket-liquidator-domain/probe.py | tee bucket-liquidator-domain/run.log
-          find bucket-liquidator-domain -type f -print0 | sort -z | xargs -0 sha256sum > bucket-liquidator-domain/SHA256SUMS.txt
+          python3 bucket-cdp-v3-gate/fetch.py | tee bucket-cdp-v3-gate/run.log
+          find bucket-cdp-v3-gate -type f -print0 | sort -z | xargs -0 sha256sum > bucket-cdp-v3-gate/SHA256SUMS.txt
 
-      - name: Verify read-only boundary
+      - name: Validate evidence
         shell: bash
         run: |
           set -euo pipefail
-          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-liquidator-domain && exit 1 || true
           python3 - <<'PY'
           import json
-          s=json.load(open('bucket-liquidator-domain/SUMMARY.json'))
+          s=json.load(open('bucket-cdp-v3-gate/json/SUMMARY.json'))
           assert s['writes'] == 0
           assert s['transactions_constructed'] == 0
-          print('BUCKET_LIQUIDATOR_DOMAIN_READ_ONLY_PASS')
+          assert s['v3_vault_present']
+          print('BUCKET_CDP_V3_BYTECODE_GATE_PASS')
           PY
+          for f in bucket-cdp-v3-gate/mv/*/*.mv; do
+            test "$(head -c 4 "$f" | xxd -p)" = "a11ceb0b"
+          done
 
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-liquidator-trust-domain
-          path: bucket-liquidator-domain
+          name: bucket-cdp-v3-bytecode-gate
+          path: bucket-cdp-v3-gate
           if-no-files-found: error
           retention-days: 7
