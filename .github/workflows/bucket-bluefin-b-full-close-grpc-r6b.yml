@@ -1,0 +1,295 @@
+name: Bucket Bluefin B Full-Close Wrong-Vector gRPC R6B
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install official Mysten SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-bluefin-full-close-r6b
+          mkdir -p bucket-bluefin-full-close-r6b/raw
+          cd bucket-bluefin-full-close-r6b
+          npm init -y >/dev/null
+          npm pkg set type=module >/dev/null
+          npm install --no-audit --no-fund @mysten/sui@2.23.2
+          npm list @mysten/sui | tee SDK_VERSION.txt
+
+      - name: Resolve canonical source inputs and simulate 99-vs-100 control pair
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > bucket-bluefin-full-close-r6b/probe.mjs <<'JS'
+          import fs from 'node:fs';
+          import { Transaction, Inputs } from '@mysten/sui/transactions';
+          import { SuiGrpcClient } from '@mysten/sui/grpc';
+
+          const SOURCE_RPC = 'https://sui-mainnet-endpoint.blockvision.org';
+          const GRPC = 'https://fullnode.mainnet.sui.io:443';
+          const client = new SuiGrpcClient({ network: 'mainnet', baseUrl: GRPC });
+
+          const DIGEST = 'EVq3gRwx2uMpjYEbF88kbJWQ66sEhxiqx7yzpiMqGhw3';
+          const PACKAGE = '0x266588b4ade88033ebe61e158ca25504b772fb7c1cdb89294a2c25c9073c3ecf';
+          const MANAGER = '0xbb7e63ea8820707968c5c9879c5e3a8ac6ffe59337c7e307490089b8c6caf6ef';
+          const NON_MANAGER = '0x1111111111111111111111111111111111111111111111111111111111111111';
+          const USDC = '0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC';
+
+          async function rpc(method, params) {
+            const response = await fetch(SOURCE_RPC, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+            });
+            const body = await response.json();
+            if (body.error) throw new Error(JSON.stringify(body.error));
+            return body.result;
+          }
+
+          const source = await rpc('sui_getTransactionBlock', [DIGEST, {
+            showInput: true,
+            showRawInput: true,
+            showEffects: true,
+            showEvents: true,
+            showObjectChanges: true,
+            showBalanceChanges: true,
+          }]);
+          fs.writeFileSync('raw/source_transaction.json', JSON.stringify(source, null, 2));
+
+          const programmable = source?.transaction?.data?.transaction;
+          const inputs = programmable?.inputs ?? [];
+          const commands = programmable?.transactions ?? [];
+          const targetIndex = commands.findIndex((command) => {
+            const call = command?.MoveCall;
+            return call?.package === PACKAGE
+              && call?.module === 'bluefin_lp_provider'
+              && call?.function === 'remove_usdb_b_liquidity';
+          });
+          if (targetIndex < 0) throw new Error('remove_usdb_b_liquidity not found in source transaction');
+          const target = commands[targetIndex].MoveCall;
+
+          function inputIndex(argument) {
+            if (argument && typeof argument === 'object' && argument.Input !== undefined) return Number(argument.Input);
+            throw new Error(`Expected Input argument, got ${JSON.stringify(argument)}`);
+          }
+
+          function inputAt(argument) {
+            const index = inputIndex(argument);
+            const value = inputs[index];
+            if (!value) throw new Error(`Missing input ${index}`);
+            return value;
+          }
+
+          function sharedRef(argument, mutableOverride = null) {
+            const value = inputAt(argument);
+            const objectId = value.objectId ?? value.Shared?.objectId ?? value.sharedObject?.objectId;
+            const initial = value.initialSharedVersion
+              ?? value.initial_shared_version
+              ?? value.Shared?.initialSharedVersion
+              ?? value.Shared?.initial_shared_version
+              ?? value.sharedObject?.initialSharedVersion;
+            const mutable = mutableOverride
+              ?? value.mutable
+              ?? value.Shared?.mutable
+              ?? value.sharedObject?.mutable;
+            if (!objectId || initial === undefined || initial === null) {
+              throw new Error(`Input is not a shared-object ref: ${JSON.stringify(value)}`);
+            }
+            return { objectId, initialSharedVersion: String(initial), mutable: Boolean(mutable) };
+          }
+
+          function typeArgs(call) {
+            return call.type_arguments ?? call.typeArguments ?? [];
+          }
+
+          const oracleCalls = commands
+            .slice(0, targetIndex)
+            .filter((command) => command?.MoveCall)
+            .map((command) => command.MoveCall);
+          const collectorNew = oracleCalls.find((call) => call.module === 'collector' && call.function === 'new');
+          const pythFeed = oracleCalls.find((call) => call.module === 'pyth_rule' && call.function === 'feed');
+          const aggregate = oracleCalls.find((call) => call.module === 'aggregator' && call.function === 'aggregate');
+          if (!collectorNew || !pythFeed || !aggregate) throw new Error('Oracle prelude not found');
+
+          const refs = {
+            provider: sharedRef(target.arguments[0], true),
+            bluefinConfig: sharedRef(target.arguments[1], false),
+            bluefinPool: sharedRef(target.arguments[2], true),
+            clock: sharedRef(target.arguments[3], false),
+            treasury: sharedRef(target.arguments[5], true),
+            psmPool: sharedRef(target.arguments[6], true),
+            pythConfig: sharedRef(pythFeed.arguments[1], false),
+            pythState: sharedRef(pythFeed.arguments[3], false),
+            priceInfo: sharedRef(pythFeed.arguments[4], true),
+            aggregator: sharedRef(aggregate.arguments[0], false),
+          };
+          fs.writeFileSync('raw/refs.json', JSON.stringify(refs, null, 2));
+          fs.writeFileSync('raw/source_calls.json', JSON.stringify({ collectorNew, pythFeed, aggregate, target }, null, 2));
+          fs.writeFileSync('raw/source_inputs.json', JSON.stringify(inputs, null, 2));
+
+          const obj = (tx, ref) => tx.object(Inputs.SharedObjectRef(ref));
+
+          function build(sender, ratio) {
+            const tx = new Transaction();
+            tx.setSender(sender);
+            const collector = tx.moveCall({
+              target: `${collectorNew.package}::${collectorNew.module}::${collectorNew.function}`,
+              typeArguments: typeArgs(collectorNew).length ? typeArgs(collectorNew) : [USDC],
+            });
+            tx.moveCall({
+              target: `${pythFeed.package}::${pythFeed.module}::${pythFeed.function}`,
+              typeArguments: typeArgs(pythFeed).length ? typeArgs(pythFeed) : [USDC],
+              arguments: [
+                collector,
+                obj(tx, refs.pythConfig),
+                obj(tx, refs.clock),
+                obj(tx, refs.pythState),
+                obj(tx, refs.priceInfo),
+              ],
+            });
+            const priceResult = tx.moveCall({
+              target: `${aggregate.package}::${aggregate.module}::${aggregate.function}`,
+              typeArguments: typeArgs(aggregate).length ? typeArgs(aggregate) : [USDC],
+              arguments: [obj(tx, refs.aggregator), collector],
+            });
+            tx.moveCall({
+              target: `${PACKAGE}::bluefin_lp_provider::remove_usdb_b_liquidity`,
+              typeArguments: [USDC],
+              arguments: [
+                obj(tx, refs.provider),
+                obj(tx, refs.bluefinConfig),
+                obj(tx, refs.bluefinPool),
+                obj(tx, refs.clock),
+                tx.pure.u64(0),
+                obj(tx, refs.treasury),
+                obj(tx, refs.psmPool),
+                priceResult,
+                tx.pure.u64(ratio),
+              ],
+            });
+            return tx;
+          }
+
+          function classify(result) {
+            if (result?.$kind === 'Transaction') {
+              return { success: true, error: null, payload: result.Transaction };
+            }
+            if (result?.$kind === 'FailedTransaction') {
+              const payload = result.FailedTransaction;
+              return { success: false, error: payload?.status?.error ?? payload?.effects?.status?.error ?? null, payload };
+            }
+            if (result?.Transaction) return { success: true, error: null, payload: result.Transaction };
+            if (result?.FailedTransaction) {
+              const payload = result.FailedTransaction;
+              return { success: false, error: payload?.status?.error ?? payload?.effects?.status?.error ?? null, payload };
+            }
+            return { success: false, error: { message: 'unknown result shape', keys: Object.keys(result ?? {}) }, payload: result };
+          }
+
+          async function simulate(sender, ratio, label) {
+            let result;
+            try {
+              result = await client.core.simulateTransaction({
+                transaction: build(sender, ratio),
+                checksEnabled: false,
+                include: { commandResults: true, effects: true, balanceChanges: true, objectTypes: true },
+              });
+            } catch (error) {
+              result = { thrown: { name: error?.name, message: error?.message, stack: error?.stack, cause: error?.cause } };
+            }
+            fs.writeFileSync(`raw/${label}.json`, JSON.stringify(result, null, 2));
+            const classified = classify(result);
+            const error = classified.error;
+            return {
+              label,
+              sender,
+              ratio: String(ratio),
+              success: classified.success,
+              errorKind: error?.$kind ?? null,
+              errorMessage: error?.message ?? JSON.stringify(error),
+              abortCode: error?.MoveAbort?.abortCode ?? null,
+              abortLocation: error?.MoveAbort?.location ?? null,
+              balanceChanges: classified.payload?.balanceChanges ?? null,
+              objectChanges: classified.payload?.objectChanges ?? null,
+              effects: classified.payload?.effects ?? null,
+            };
+          }
+
+          const cases = [];
+          for (const ratio of [1n, 50n, 90n, 99n, 100n]) {
+            cases.push(await simulate(MANAGER, ratio, `manager_${ratio}`));
+            cases.push(await simulate(NON_MANAGER, ratio, `non_manager_${ratio}`));
+          }
+          const at = (label) => cases.find((row) => row.label === label);
+          const manager99 = at('manager_99');
+          const manager100 = at('manager_100');
+          const nonManagerRejected = cases
+            .filter((row) => row.label.startsWith('non_manager_'))
+            .every((row) => !row.success && /sender_is_not_manager/i.test(row.errorMessage ?? ''));
+          const exactBoundaryConfirmed = manager99?.success === true && manager100?.success === false;
+          const summary = {
+            schema: 'bucket-bluefin-b-full-close-wrong-vector-grpc-r6b/v1',
+            network: 'sui-mainnet',
+            readOnly: true,
+            sourceTransaction: DIGEST,
+            package: PACKAGE,
+            manager: MANAGER,
+            nonManager: NON_MANAGER,
+            refs,
+            cases,
+            controls: {
+              manager99Success: manager99?.success === true,
+              manager100Success: manager100?.success === true,
+              nonManagerRejected,
+              exactBoundaryConfirmed,
+            },
+            externallyTriggerableByUnprivilegedAttacker: false,
+            productionTransactionsSubmitted: 0,
+            generatedUnix: Math.floor(Date.now() / 1000),
+          };
+          fs.writeFileSync('SUMMARY.json', JSON.stringify(summary, null, 2));
+          console.log(JSON.stringify(summary, null, 2));
+          JS
+          cd bucket-bluefin-full-close-r6b
+          node probe.mjs | tee run.log
+          find . -type f ! -path './node_modules/*' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-bluefin-full-close-r6b/probe.mjs bucket-bluefin-full-close-r6b/SUMMARY.json && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-bluefin-full-close-r6b/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['productionTransactionsSubmitted'] == 0
+          print('BUCKET_BLUEFIN_FULL_CLOSE_R6B_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-bluefin-full-close-r6b
+          path: |
+            bucket-bluefin-full-close-r6b/SUMMARY.json
+            bucket-bluefin-full-close-r6b/SDK_VERSION.txt
+            bucket-bluefin-full-close-r6b/probe.mjs
+            bucket-bluefin-full-close-r6b/run.log
+            bucket-bluefin-full-close-r6b/SHA256SUMS.txt
+            bucket-bluefin-full-close-r6b/raw
+          if-no-files-found: error
+          retention-days: 7
