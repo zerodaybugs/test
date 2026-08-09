@@ -1,4 +1,4 @@
-name: Bucket Shared Account and Production Object Census R4
+name: Bucket Oracle Topology and Source Audit R4
 
 on:
   pull_request:
@@ -11,206 +11,215 @@ permissions:
   contents: read
 
 jobs:
-  census:
+  oracle-audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Enumerate Bucket account and protocol objects on Sui mainnet
+      - name: Enumerate live aggregators, configured sources, source bytecode, and recent call chains
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf bucket-account-census-r4
-          mkdir -p bucket-account-census-r4/raw
-          cat > bucket-account-census-r4/census.py <<'PY'
+          rm -rf bucket-oracle-audit-r4
+          mkdir -p bucket-oracle-audit-r4/{raw,asm,analysis}
+          cat > bucket-oracle-audit-r4/audit.py <<'PY'
           import json
           import pathlib
+          import re
           import time
           import urllib.request
 
-          OUT = pathlib.Path('bucket-account-census-r4')
-          RAW = OUT / 'raw'
-          GQL = 'https://graphql.mainnet.sui.io/graphql'
-          RPCS = [
-              'https://sui-mainnet-endpoint.blockvision.org',
-              'https://fullnode.mainnet.sui.io:443',
-          ]
-          TYPES = {
-              'account': '0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc::account::Account',
-              'saving_pool': '0x872d08a70db3db498aa7853276acea8091fdd9871b2d86bc8dcb8524526df622::saving::SavingPool',
-              'saving_reward_manager': '0x39692320d6fc01c27315a7972ed4717e4fd32eed43531ad6f55fd7f24b74e207::saving_incentive::RewardManager',
-              'psm_pool': '0xc2ae6693383e4a81285136effc8190c7baaf0e75aafa36d1c69cd2170cfc3803::pool::Pool',
-              'flash_global_config': '0x0f51f9eb63574a1d12b62295599ac4f8231197f95b3cce9a516daba64f419d06::config::GlobalConfig',
-              'blacklist': '0x6d7b711a5e614f99f87fdbfbf915fea0fa96af769130ac226c3cbcf07efb90f3::blacklist_rule::Blacklist',
-              'cdp_vault': '0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e::vault::Vault',
-              'treasury': '0xe14726c336e81b32328e92afc37345d159f5b550b09fa92bd43640cfdd0a0cfd::usdb::Treasury',
-          }
+          OUT=pathlib.Path('bucket-oracle-audit-r4')
+          RAW=OUT/'raw'
+          ASM=OUT/'asm'
+          ANALYSIS=OUT/'analysis'
+          GQL='https://graphql.mainnet.sui.io/graphql'
+          RPCS=['https://sui-mainnet-endpoint.blockvision.org','https://fullnode.mainnet.sui.io:443']
+          ORACLE='0xf2ab9aa60c5e879675351a1a89f47131de9dea7cc927327dd0e7282e295c7f5e'
+          AGG_TYPE=ORACLE+'::aggregator::PriceAggregator'
 
-          def post(url, payload, retries=5, timeout=120):
-              data = json.dumps(payload).encode()
-              last = None
+          def post(url,payload,retries=5,timeout=150):
+              data=json.dumps(payload).encode(); last=None
               for n in range(retries):
                   try:
-                      req = urllib.request.Request(url, data=data, method='POST', headers={
-                          'Content-Type':'application/json',
-                          'User-Agent':'bucket-account-census-r4/1',
-                      })
-                      with urllib.request.urlopen(req, timeout=timeout) as response:
+                      req=urllib.request.Request(url,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-oracle-audit-r4/1'})
+                      with urllib.request.urlopen(req,timeout=timeout) as response:
                           return json.loads(response.read().decode())
                   except Exception as exc:
-                      last = exc
-                      time.sleep(2 ** n)
+                      last=exc; time.sleep(2**n)
               raise RuntimeError(f'POST failure {url}: {last}')
 
-          def gql(query, variables=None):
-              body = post(GQL, {'query':query, 'variables':variables or {}})
-              if body.get('errors'):
-                  raise RuntimeError(json.dumps(body['errors']))
+          def gql(query,variables=None):
+              body=post(GQL,{'query':query,'variables':variables or {}})
+              if body.get('errors'): raise RuntimeError(json.dumps(body['errors']))
               return body
 
-          def rpc(method, params):
+          def rpc(method,params):
               failures=[]
               for endpoint in RPCS:
                   try:
-                      body=post(endpoint, {'jsonrpc':'2.0','id':1,'method':method,'params':params}, timeout=90)
-                      if body.get('error'):
-                          raise RuntimeError(json.dumps(body['error']))
+                      body=post(endpoint,{'jsonrpc':'2.0','id':1,'method':method,'params':params},timeout=100)
+                      if body.get('error'): raise RuntimeError(json.dumps(body['error']))
                       return {'endpoint':endpoint,'result':body.get('result')}
                   except Exception as exc:
                       failures.append({'endpoint':endpoint,'error':type(exc).__name__,'message':str(exc)})
               return {'failures':failures}
 
-          QUERY='''query O($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+          def dump(path,value): path.write_text(json.dumps(value,indent=2,sort_keys=True)+'\n')
 
-          results={}
-          for label,type_ in TYPES.items():
-              rows=[]
-              after=None
-              error=None
-              pages=0
-              try:
-                  while True:
-                      body=gql(QUERY, {'type':type_, 'after':after})
-                      connection=body['data']['objects']
-                      rows.extend(connection.get('nodes') or [])
-                      pages += 1
-                      page=connection.get('pageInfo') or {}
-                      if not page.get('hasNextPage') or pages >= 100:
-                          break
-                      after=page.get('endCursor')
-              except Exception as exc:
-                  error={'error':type(exc).__name__,'message':str(exc)}
-              results[label]={'query_type':type_,'rows':rows,'error':error,'pages':pages}
-              (RAW/f'{label}.json').write_text(json.dumps(results[label],indent=2,sort_keys=True)+'\n')
+          q_objects='''query O($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+          aggregators=[]; after=None
+          while True:
+              body=gql(q_objects,{'type':AGG_TYPE,'after':after})
+              conn=body['data']['objects']; aggregators.extend(conn.get('nodes') or [])
+              page=conn.get('pageInfo') or {}
+              if not page.get('hasNextPage'): break
+              after=page.get('endCursor')
+          dump(RAW/'aggregators.json',aggregators)
 
-          accounts=results['account']['rows']
-          shared=[]
-          address_owned=[]
-          other=[]
-          for row in accounts:
-              owner=row.get('owner') or {}
-              typ=owner.get('__typename')
-              compact={
-                  'address':row.get('address'),
+          source_types=[]; aggregator_rows=[]
+          for row in aggregators:
+              contents=((row.get('asMoveObject') or {}).get('contents') or {})
+              data=contents.get('json') or {}
+              weights=(data.get('weights') or {}).get('contents',[])
+              parsed=[]
+              for item in weights:
+                  key=item.get('key') if isinstance(item,dict) else None
+                  val=item.get('value') if isinstance(item,dict) else None
+                  if isinstance(key,dict):
+                      key=key.get('name') or key.get('value') or key.get('bytes') or str(key)
+                  if key:
+                      key=str(key)
+                      source_types.append(key)
+                      parsed.append({'source_type':key,'weight':val})
+              aggregator_rows.append({
+                  'id':row.get('address'),
                   'version':row.get('version'),
-                  'digest':row.get('digest'),
-                  'owner':owner,
+                  'owner':row.get('owner'),
+                  'coin_type':(contents.get('type') or {}).get('repr'),
+                  'weight_threshold':data.get('weight_threshold'),
+                  'outlier_tolerance':data.get('outlier_tolerance'),
+                  'weights':parsed,
                   'previous_transaction':row.get('previousTransaction'),
-                  'has_public_transfer':((row.get('asMoveObject') or {}).get('hasPublicTransfer')),
-                  'json':(((row.get('asMoveObject') or {}).get('contents') or {}).get('json')),
-              }
-              if typ == 'Shared': shared.append(compact)
-              elif typ == 'AddressOwner': address_owned.append(compact)
-              else: other.append(compact)
+              })
+          source_types=sorted(set(source_types))
 
-          shared_activity={}
-          for row in shared:
-              oid=row['address']
-              shared_activity[oid]=rpc('suix_queryTransactionBlocks', [{
+          hex64=re.compile(r'(?:0x)?([0-9a-fA-F]{64})::')
+          source_packages={}
+          for source in source_types:
+              m=hex64.search(source)
+              if m:
+                  source_packages.setdefault('0x'+m.group(1).lower(),[]).append(source)
+
+          q_pkg='''query P($address:SuiAddress!){object(address:$address){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}modules{nodes{name fileFormatVersion disassembly functions(first:50){nodes{name visibility isEntry parameters{repr}return{repr}typeParameters{constraints}}}structs(first:50){nodes{name abilities fields{name type{repr}}typeParameters{constraints}}}}}}}}'''
+          package_rows={}; public_functions=[]; suspicious_functions=[]
+          terms=re.compile(r'price|oracle|pyth|supra|switchboard|stale|timestamp|clock|confidence|deviation|feed|update|extract|convert|decimal|expo|aggregate|collect',re.I)
+          for pkg,sources in source_packages.items():
+              try:
+                  response=gql(q_pkg,{'address':pkg})
+                  dump(RAW/f'package_{pkg[2:]}.json',response)
+                  obj=response['data']['object']; package=obj.get('asMovePackage')
+                  if not package:
+                      package_rows[pkg]={'sources':sources,'error':'not a Move package'}; continue
+                  package_rows[pkg]={
+                      'sources':sources,'version':package.get('version'),'digest':obj.get('digest'),
+                      'previous_transaction':obj.get('previousTransaction'),'linkage':package.get('linkage'),
+                      'type_origins':package.get('typeOrigins'),
+                  }
+                  target=ASM/pkg[2:]; target.mkdir(parents=True,exist_ok=True)
+                  for module in package['modules']['nodes']:
+                      name=module['name']; dis=module.get('disassembly') or ''
+                      (target/f'{name}.asm').write_text(dis)
+                      for fn in (module.get('functions') or {}).get('nodes',[]):
+                          item={
+                              'package':pkg,'module':name,'name':fn.get('name'),'visibility':fn.get('visibility'),
+                              'is_entry':fn.get('isEntry'),'parameters':[x.get('repr') for x in fn.get('parameters',[])],
+                              'returns':[x.get('repr') for x in fn.get('return',[])],
+                          }
+                          if str(fn.get('visibility')).upper()=='PUBLIC' or fn.get('isEntry'):
+                              public_functions.append(item)
+                              if terms.search(json.dumps(item)):
+                                  suspicious_functions.append(item)
+              except Exception as exc:
+                  package_rows[pkg]={'sources':sources,'error':type(exc).__name__,'message':str(exc)}
+
+          activity={}; call_rows=[]
+          for agg in aggregator_rows:
+              oid=agg['id']
+              wrapper=rpc('suix_queryTransactionBlocks',[{
                   'filter':{'InputObject':oid},
-                  'options':{
-                      'showInput':True,
-                      'showRawInput':False,
-                      'showEffects':True,
-                      'showEvents':True,
-                      'showObjectChanges':True,
-                      'showBalanceChanges':True,
-                  },
+                  'options':{'showInput':True,'showRawInput':False,'showEffects':True,'showEvents':True,'showObjectChanges':True,'showBalanceChanges':True},
               },None,50,True])
-          (RAW/'shared_account_activity.json').write_text(json.dumps(shared_activity,indent=2,sort_keys=True)+'\n')
-
-          def type_summary(label):
-              rows=results[label]['rows']
-              return {
-                  'query_type':results[label]['query_type'],
-                  'count':len(rows),
-                  'shared_count':sum(1 for r in rows if (r.get('owner') or {}).get('__typename')=='Shared'),
-                  'address_owned_count':sum(1 for r in rows if (r.get('owner') or {}).get('__typename')=='AddressOwner'),
-                  'error':results[label]['error'],
-                  'object_ids':[r.get('address') for r in rows],
-              }
-
-          activity_counts={}
-          bucket_calls=[]
-          for oid,wrapper in shared_activity.items():
+              activity[oid]=wrapper
               result=wrapper.get('result') if isinstance(wrapper,dict) else None
               txs=(result or {}).get('data',[]) if isinstance(result,dict) else []
-              activity_counts[oid]=len(txs)
               for tx in txs:
-                  try:
-                      commands=tx['transaction']['data']['transaction']['transactions']
-                  except Exception:
-                      commands=[]
-                  for command in commands or []:
+                  try: commands=tx['transaction']['data']['transaction']['transactions']
+                  except Exception: commands=[]
+                  for index,command in enumerate(commands or []):
                       mc=command.get('MoveCall') if isinstance(command,dict) else None
                       if mc:
-                          bucket_calls.append({
-                              'account_object':oid,
-                              'digest':tx.get('digest'),
+                          call_rows.append({
+                              'aggregator':oid,'digest':tx.get('digest'),'command_index':index,
                               'sender':((tx.get('transaction') or {}).get('data') or {}).get('sender'),
-                              'package':mc.get('package'),
-                              'module':mc.get('module'),
-                              'function':mc.get('function'),
+                              'status':((tx.get('effects') or {}).get('status')),
+                              'package':mc.get('package'),'module':mc.get('module'),'function':mc.get('function'),
                               'type_arguments':mc.get('type_arguments'),
                           })
+          dump(RAW/'activity.json',activity)
+          dump(ANALYSIS/'aggregator_rows.json',aggregator_rows)
+          dump(ANALYSIS/'source_packages.json',package_rows)
+          dump(ANALYSIS/'public_functions.json',public_functions)
+          dump(ANALYSIS/'suspicious_functions.json',suspicious_functions)
+          dump(ANALYSIS/'recent_move_calls.json',call_rows)
 
+          unweighted=[]
+          for agg in aggregator_rows:
+              for w in agg['weights']:
+                  try: val=int(w['weight'])
+                  except Exception: val=None
+                  if val is not None and val<=0: unweighted.append({'aggregator':agg['id'],**w})
           summary={
-              'network':'sui-mainnet',
-              'type_summaries':{label:type_summary(label) for label in TYPES},
-              'account_count':len(accounts),
-              'shared_account_count':len(shared),
-              'shared_accounts':shared,
-              'shared_account_recent_input_tx_counts':activity_counts,
-              'shared_account_move_calls':bucket_calls,
-              'shared_account_gate':'LIVE_SHARED_ACCOUNT_FOUND' if shared else 'NO_LIVE_SHARED_ACCOUNT_FOUND',
-              'writes':0,
-              'transactions_constructed':0,
-              'generated_unix':int(time.time()),
+              'network':'sui-mainnet','oracle_package':ORACLE,
+              'aggregator_count':len(aggregator_rows),'aggregators':aggregator_rows,
+              'source_type_count':len(source_types),'source_types':source_types,
+              'source_package_count':len(source_packages),'source_packages':package_rows,
+              'public_source_function_count':len(public_functions),
+              'suspicious_source_functions':suspicious_functions,
+              'recent_move_call_count':len(call_rows),'recent_move_calls':call_rows,
+              'nonpositive_configured_weights':unweighted,
+              'writes':0,'transactions_constructed':0,'generated_unix':int(time.time()),
           }
-          (OUT/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
-          print(json.dumps(summary,indent=2))
+          dump(OUT/'SUMMARY.json',summary)
+          print(json.dumps({
+              'aggregator_count':summary['aggregator_count'],
+              'source_types':source_types,
+              'source_packages':package_rows,
+              'suspicious_source_functions':suspicious_functions,
+              'recent_move_call_count':len(call_rows),
+          },indent=2))
           PY
-          python3 bucket-account-census-r4/census.py | tee bucket-account-census-r4/run.log
-          find bucket-account-census-r4 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-account-census-r4/SHA256SUMS.txt
+          python3 bucket-oracle-audit-r4/audit.py | tee bucket-oracle-audit-r4/run.log
+          find bucket-oracle-audit-r4 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-oracle-audit-r4/SHA256SUMS.txt
 
       - name: Validate read-only boundary
         shell: bash
         run: |
           set -euo pipefail
-          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-account-census-r4 && exit 1 || true
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-oracle-audit-r4 && exit 1 || true
           python3 - <<'PY'
           import json
-          s=json.load(open('bucket-account-census-r4/SUMMARY.json'))
-          assert s['writes'] == 0
-          assert s['transactions_constructed'] == 0
-          print('BUCKET_ACCOUNT_CENSUS_R4_READ_ONLY_PASS')
+          s=json.load(open('bucket-oracle-audit-r4/SUMMARY.json'))
+          assert s['writes']==0 and s['transactions_constructed']==0
+          assert s['aggregator_count']>0
+          print('BUCKET_ORACLE_AUDIT_R4_READ_ONLY_PASS')
           PY
 
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-account-census-r4
-          path: bucket-account-census-r4
+          name: bucket-oracle-audit-r4
+          path: bucket-oracle-audit-r4
           if-no-files-found: error
           retention-days: 7
