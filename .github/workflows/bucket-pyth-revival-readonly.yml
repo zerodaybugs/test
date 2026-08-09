@@ -1,4 +1,4 @@
-name: Bucket Oracle Live Package Diff and Config Census R4
+name: Bucket PSM Historical Pyth Age Audit R4
 
 on:
   pull_request:
@@ -11,195 +11,241 @@ permissions:
   contents: read
 
 jobs:
-  oracle-diff:
+  age-audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch live rule package versions and configuration objects
+      - name: Reconstruct exact Pyth object ages used by successful PSM swaps
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf bucket-oracle-live-diff-r4
-          mkdir -p bucket-oracle-live-diff-r4/{raw,asm,diff,analysis}
-          cat > bucket-oracle-live-diff-r4/audit.py <<'PY'
-          import difflib
-          import hashlib
+          rm -rf bucket-psm-pyth-age-r4
+          mkdir -p bucket-psm-pyth-age-r4/raw
+          cat > bucket-psm-pyth-age-r4/audit.py <<'PY'
+          import csv
           import json
           import pathlib
-          import re
           import time
+          import urllib.parse
           import urllib.request
 
-          OUT=pathlib.Path('bucket-oracle-live-diff-r4')
-          RAW=OUT/'raw'; ASM=OUT/'asm'; DIFF=OUT/'diff'; ANALYSIS=OUT/'analysis'
-          GQL='https://graphql.mainnet.sui.io/graphql'
-          PACKAGES={
-              'pyth_origin':'0x6ee87742e673749a97f5fbe576b92d8dd294a482307d3a3fb2c6f73a56b906a0',
-              'pyth_live':'0x5bc4f912b59c5cfcc86dfc90419837b9c3f9d3a3a94cef7a198838fa196bac4a',
-              'scoin_origin':'0x18f4f3cd05ab7ff6dc0c41c692e3caae925927cc096f1de3de81d85a89f87aca',
-              'scoin_live_a':'0x2252a1cc5a16a0c9f4530005908cced53783d96b4932ca3fa15b1fe9d5935972',
-              'scoin_live_b':'0xb7c0792630fe4b028437a5554e5c0bef16edaf793210ef32a88fcea443e4d76b',
-              'gcoin':'0xba3c970933047c6e235424d7040a9a4e89d8fc1200d780a69b2666434f3a7313',
-              'tlp':'0x499b930751ecbbfbbc3b76cde04486787a6e99752df3b5d765bd5f1f441934b8',
-              'bfbtc':'0x6043cfb7e941a06526ed11e396d305ea547f55c55ae0e140d78652e8637ff60e',
+          OUT=pathlib.Path('bucket-psm-pyth-age-r4')
+          RAW=OUT/'raw'
+          RPCS=['https://sui-mainnet-endpoint.blockvision.org','https://fullnode.mainnet.sui.io:443']
+          HERMES='https://hermes.pyth.network'
+          AGGS={
+              'USDC':'0x4b612d4d2039d90f596a362f15346a95149728613ca9d2e2c7e471b72b86c105',
+              'BUCK':'0xe7683cdd76af3f80da4f022afa2c31b554a45d23dcd1f418d11eff8cd5c9bf82',
           }
-          CONFIG_TYPES={
-              'pyth_config':'0x6ee87742e673749a97f5fbe576b92d8dd294a482307d3a3fb2c6f73a56b906a0::pyth_rule::Config',
-              'scoin_config':'0x18f4f3cd05ab7ff6dc0c41c692e3caae925927cc096f1de3de81d85a89f87aca::scoin_rule::Config',
-              'gcoin_config':'0xba3c970933047c6e235424d7040a9a4e89d8fc1200d780a69b2666434f3a7313::gcoin_rule::Config',
-              'tlp_index_map':'0x499b930751ecbbfbbc3b76cde04486787a6e99752df3b5d765bd5f1f441934b8::tlp_rule::IndexMap',
+          PSM_PACKAGES={
+              '0xc2ae6693383e4a81285136effc8190c7baaf0e75aafa36d1c69cd2170cfc3803',
+              '0x8a46afe6ab0b972e2ee3923f5669104ae9465c12b84cd5e78ea1ff6404e4bfaf',
+          }
+          PYTH_FEED_PACKAGES={
+              '0x6ee87742e673749a97f5fbe576b92d8dd294a482307d3a3fb2c6f73a56b906a0',
+              '0x5bc4f912b59c5cfcc86dfc90419837b9c3f9d3a3a94cef7a198838fa196bac4a',
           }
 
-          def post(payload,retries=5,timeout=150):
+          def post(url,payload,retries=5,timeout=120):
               data=json.dumps(payload).encode(); last=None
               for n in range(retries):
                   try:
-                      req=urllib.request.Request(GQL,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-oracle-live-diff-r4/1'})
+                      req=urllib.request.Request(url,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-psm-pyth-age-r4/1'})
                       with urllib.request.urlopen(req,timeout=timeout) as response:
                           return json.loads(response.read().decode())
                   except Exception as exc:
                       last=exc; time.sleep(2**n)
-              raise RuntimeError(f'GraphQL POST failure: {last}')
+              raise RuntimeError(f'POST failure {url}: {last}')
 
-          def gql(query,variables=None):
-              body=post({'query':query,'variables':variables or {}})
-              if body.get('errors'): raise RuntimeError(json.dumps(body['errors']))
-              return body
+          def rpc(method,params):
+              failures=[]
+              for endpoint in RPCS:
+                  try:
+                      body=post(endpoint,{'jsonrpc':'2.0','id':1,'method':method,'params':params},timeout=90)
+                      if body.get('error'): raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint':endpoint,'result':body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint':endpoint,'error':type(exc).__name__,'message':str(exc)})
+              return {'failures':failures}
 
-          def dump(path,value): path.write_text(json.dumps(value,indent=2,sort_keys=True)+'\n')
+          def get(url,retries=5,timeout=90):
+              last=None
+              for n in range(retries):
+                  try:
+                      req=urllib.request.Request(url,headers={'User-Agent':'bucket-psm-pyth-age-r4/1'})
+                      with urllib.request.urlopen(req,timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last=exc; time.sleep(2**n)
+              return {'error':type(last).__name__,'message':str(last)}
 
-          QPKG='''query P($address:SuiAddress!){object(address:$address){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}modules{nodes{name fileFormatVersion disassembly functions(first:50){nodes{name visibility isEntry parameters{repr}return{repr}typeParameters{constraints}}}structs(first:50){nodes{name abilities fields{name type{repr}}typeParameters{constraints}}}}}}}}'''
-          QOBJ='''query O($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+          def obj_id(arg,inputs):
+              if not isinstance(arg,dict) or 'Input' not in arg: return None
+              try: inp=inputs[arg['Input']]
+              except Exception: return None
+              return inp.get('objectId') if isinstance(inp,dict) else None
 
-          package_meta={}; functions={}
-          for label,address in PACKAGES.items():
-              response=gql(QPKG,{'address':address}); dump(RAW/f'{label}.json',response)
-              obj=response['data']['object']; package=(obj or {}).get('asMovePackage')
-              if not package:
-                  package_meta[label]={'address':address,'error':'not_package'}; continue
-              package_meta[label]={
-                  'address':address,'object_version':obj.get('version'),'digest':obj.get('digest'),
-                  'package_version':package.get('version'),'previous_transaction':obj.get('previousTransaction'),
-                  'linkage':package.get('linkage'),'type_origins':package.get('typeOrigins'),
-              }
-              functions[label]={}
-              target=ASM/label; target.mkdir(parents=True,exist_ok=True)
-              for module in package['modules']['nodes']:
-                  name=module['name']; dis=module.get('disassembly') or ''
-                  (target/f'{name}.asm').write_text(dis)
-                  functions[label][name]={f['name']:f for f in (module.get('functions') or {}).get('nodes',[])}
-
-          # Extract disassembled function bodies with a conservative signature splitter.
-          sig=re.compile(r'^(?:entry\s+)?(?:public(?:\([^)]*\))?\s+|fun\s+)?([^\s<(]+)(?:<[^>]*>)?\(')
-          def split_fns(text):
-              lines=text.splitlines(); starts=[]
-              for i,line in enumerate(lines):
-                  m=sig.match(line)
-                  if m and not line.startswith(('B','L')):
-                      starts.append((i,m.group(1)))
-              out={}
-              for n,(start,name) in enumerate(starts):
-                  end=starts[n+1][0] if n+1<len(starts) else len(lines)
-                  body='\n'.join(lines[start:end]).rstrip()+'\n'
-                  out[name]=body
+          def find_values(value,path=()):
+              out=[]
+              if isinstance(value,dict):
+                  for k,v in value.items():
+                      p=path+(str(k),)
+                      if any(term in str(k).lower() for term in ('timestamp','publish','attestation','arrival','price','conf','expo','identifier')):
+                          if not isinstance(v,(dict,list)): out.append(('.'.join(p),v))
+                      out.extend(find_values(v,p))
+              elif isinstance(value,list):
+                  for i,v in enumerate(value): out.extend(find_values(v,path+(str(i),)))
               return out
 
-          bodies={}
-          for label in PACKAGES:
-              bodies[label]={}
-              for p in (ASM/label).glob('*.asm') if (ASM/label).exists() else []:
-                  bodies[label][p.stem]=split_fns(p.read_text())
+          def extract_publish_time(content):
+              candidates=[]
+              for path,value in find_values(content):
+                  lp=path.lower()
+                  if any(term in lp for term in ('publish_time','publish-time','timestamp')):
+                      try: candidates.append((path,int(value)))
+                      except Exception: pass
+              # Pyth PriceInfoObject nests the actual current price timestamp below price_info.price_feed.price.
+              preferred=[x for x in candidates if '.price.' in x[0].lower() and 'ema' not in x[0].lower()]
+              if preferred: return preferred[0][1],candidates
+              return (candidates[0][1] if candidates else None),candidates
 
-          comparisons=[
-              ('pyth_origin','pyth_live','pyth_rule','feed'),
-              ('pyth_origin','pyth_live','pyth_rule','set_identifier'),
-              ('pyth_origin','pyth_live','pyth_rule','set_tolerance_sec'),
-              ('scoin_origin','scoin_live_a','scoin_rule','feed'),
-              ('scoin_origin','scoin_live_b','scoin_rule','feed'),
-              ('scoin_live_a','scoin_live_b','scoin_rule','feed'),
-          ]
-          diff_rows=[]
-          for left,right,module,fn in comparisons:
-              a=bodies.get(left,{}).get(module,{}).get(fn)
-              b=bodies.get(right,{}).get(module,{}).get(fn)
-              row={'left':left,'right':right,'module':module,'function':fn,'left_present':a is not None,'right_present':b is not None}
-              if a is not None: row['left_sha256']=hashlib.sha256(a.encode()).hexdigest()
-              if b is not None: row['right_sha256']=hashlib.sha256(b.encode()).hexdigest()
-              row['identical']=a==b and a is not None
-              if a is not None and b is not None:
-                  patch=''.join(difflib.unified_diff(a.splitlines(True),b.splitlines(True),fromfile=left,tofile=right))
-                  (DIFF/f'{left}__{right}__{module}__{fn}.patch').write_text(patch)
-                  row['patch_lines']=len(patch.splitlines())
-              diff_rows.append(row)
+          def tx_pages(oid,max_pages=8):
+              cursor=None; rows=[]
+              for _ in range(max_pages):
+                  wrapper=rpc('suix_queryTransactionBlocks',[{
+                      'filter':{'InputObject':oid},
+                      'options':{'showInput':True,'showRawInput':False,'showEffects':True,'showEvents':True,'showObjectChanges':True,'showBalanceChanges':True},
+                  },cursor,50,True])
+                  result=wrapper.get('result') if isinstance(wrapper,dict) else None
+                  if not isinstance(result,dict): break
+                  rows.extend(result.get('data') or [])
+                  if not result.get('hasNextPage'): break
+                  cursor=result.get('nextCursor')
+              return rows
 
-          configs={}
-          for label,type_ in CONFIG_TYPES.items():
-              rows=[]; after=None
-              while True:
-                  body=gql(QOBJ,{'type':type_,'after':after}); conn=body['data']['objects']; rows.extend(conn.get('nodes') or [])
-                  page=conn.get('pageInfo') or {}
-                  if not page.get('hasNextPage'): break
-                  after=page.get('endCursor')
-              configs[label]={'type':type_,'rows':rows}
-              dump(RAW/f'{label}.objects.json',configs[label])
+          all_rows=[]; raw_txs={}; past_cache={}
+          for asset,agg in AGGS.items():
+              txs=tx_pages(agg)
+              raw_txs[asset]=txs
+              for tx in txs:
+                  status=((tx.get('effects') or {}).get('status') or {}).get('status')
+                  if status!='success': continue
+                  txdata=(((tx.get('transaction') or {}).get('data') or {}).get('transaction') or {})
+                  inputs=txdata.get('inputs') or []
+                  commands=txdata.get('transactions') or []
+                  psm=[]; updates=[]; feeds=[]
+                  for index,command in enumerate(commands):
+                      mc=command.get('MoveCall') if isinstance(command,dict) else None
+                      if not mc: continue
+                      package=str(mc.get('package') or '').lower()
+                      module=mc.get('module'); function=mc.get('function')
+                      if package in PSM_PACKAGES and module=='pool' and function in ('swap_in','swap_out'):
+                          psm.append((index,mc))
+                      if module=='pyth' and function and 'update' in function:
+                          updates.append((index,mc))
+                      if package in PYTH_FEED_PACKAGES and module=='pyth_rule' and function=='feed':
+                          feeds.append((index,mc))
+                  if not psm or not feeds: continue
+                  feed_index,feed=feeds[0]
+                  args=feed.get('arguments') or []
+                  # Deployed PythRule feed arguments: collector, config, clock, PythState, PriceInfoObject.
+                  price_oid=obj_id(args[-1],inputs) if args else None
+                  state_oid=obj_id(args[-2],inputs) if len(args)>=2 else None
+                  config_oid=obj_id(args[1],inputs) if len(args)>=2 else None
+                  shared_version=None; shared_digest=None
+                  for ref in (tx.get('effects') or {}).get('sharedObjects') or []:
+                      if str(ref.get('objectId')).lower()==str(price_oid).lower():
+                          shared_version=int(ref.get('version')); shared_digest=ref.get('digest'); break
+                  past=None; publish_time=None; timestamp_candidates=[]; object_type=None
+                  if price_oid and shared_version is not None:
+                      key=(price_oid,shared_version)
+                      if key not in past_cache:
+                          past_cache[key]=rpc('sui_tryGetPastObject',[price_oid,str(shared_version),{
+                              'showType':True,'showOwner':True,'showPreviousTransaction':True,
+                              'showDisplay':False,'showContent':True,'showBcs':True,
+                          }])
+                      past=past_cache[key]
+                      result=past.get('result') if isinstance(past,dict) else None
+                      details=(result or {}).get('details') if isinstance(result,dict) else None
+                      data=(details or {}).get('data') if isinstance(details,dict) else None
+                      if not data and isinstance(details,dict): data=details
+                      object_type=(data or {}).get('type') if isinstance(data,dict) else None
+                      content=(data or {}).get('content') if isinstance(data,dict) else None
+                      publish_time,timestamp_candidates=extract_publish_time(content)
+                  tx_ms=int(tx.get('timestampMs')) if tx.get('timestampMs') is not None else None
+                  age_sec=(tx_ms//1000-publish_time) if tx_ms is not None and publish_time is not None else None
+                  event=None
+                  for e in tx.get('events') or []:
+                      if 'PsmSwap' in str(e.get('type')): event=e.get('parsedJson'); break
+                  all_rows.append({
+                      'asset':asset,'aggregator':agg,'digest':tx.get('digest'),'tx_timestamp_ms':tx_ms,
+                      'tx_timestamp_sec':tx_ms//1000 if tx_ms else None,'psm_function':psm[0][1].get('function'),
+                      'psm_package':psm[0][1].get('package'),'pyth_feed_package':feed.get('package'),
+                      'same_ptb_pyth_update':bool(updates),'price_info_object':price_oid,
+                      'price_info_version':shared_version,'price_info_digest':shared_digest,
+                      'pyth_state_object':state_oid,'bucket_pyth_config_object':config_oid,
+                      'publish_time':publish_time,'age_sec':age_sec,'object_type':object_type,
+                      'timestamp_candidates':timestamp_candidates,'psm_event':event,
+                  })
+          (RAW/'transactions.json').write_text(json.dumps(raw_txs,indent=2,sort_keys=True)+'\n')
+          (RAW/'past_objects.json').write_text(json.dumps({f'{k[0]}@{k[1]}':v for k,v in past_cache.items()},indent=2,sort_keys=True)+'\n')
+          (OUT/'ROWS.json').write_text(json.dumps(all_rows,indent=2,sort_keys=True)+'\n')
+          with open(OUT/'ROWS.csv','w',newline='') as f:
+              fields=['asset','digest','tx_timestamp_sec','psm_function','same_ptb_pyth_update','price_info_object','price_info_version','publish_time','age_sec','pyth_feed_package']
+              w=csv.DictWriter(f,fieldnames=fields); w.writeheader()
+              for row in all_rows: w.writerow({k:row.get(k) for k in fields})
 
-          # Public functions that can mutate pricing dependencies/config without an obvious capability parameter.
-          capability_terms=('Cap','Witness','Admin','Owner','ListingCap')
-          mutators=[]
-          for label,mods in functions.items():
-              for module,fns in mods.items():
-                  for name,meta in fns.items():
-                      visible=str(meta.get('visibility')).upper()=='PUBLIC' or meta.get('isEntry')
-                      params=[x.get('repr') for x in meta.get('parameters',[])]
-                      text=' '.join(params)
-                      if visible and any(x in name.lower() for x in ('set','update','feed','deposit','withdraw','mint','burn','sync','collect','add','remove')):
-                          mutators.append({
-                              'package_label':label,'package':PACKAGES[label],'module':module,'function':name,
-                              'visibility':meta.get('visibility'),'is_entry':meta.get('isEntry'),'parameters':params,
-                              'returns':[x.get('repr') for x in meta.get('return',[])],
-                              'has_capability_shaped_parameter':any(term in text for term in capability_terms),
-                          })
-          dump(ANALYSIS/'mutators.json',mutators)
-          dump(ANALYSIS/'diff_rows.json',diff_rows)
-          dump(ANALYSIS/'package_meta.json',package_meta)
-          dump(ANALYSIS/'configs.json',configs)
-
-          summary={
-              'network':'sui-mainnet','packages':package_meta,'function_diffs':diff_rows,
-              'config_object_counts':{k:len(v['rows']) for k,v in configs.items()},
-              'config_objects':configs,'public_mutator_candidates':mutators,
-              'writes':0,'transactions_constructed':0,'generated_unix':int(time.time()),
+          # Hermes metadata/current feed state for the two actual feed IDs.
+          feed_ids={
+              'USDC':'eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a',
+              'BUCK':'fdf28a46570252b25fd31cb257973f865afc5ca2f320439e45d95e0394bc7382',
           }
-          dump(OUT/'SUMMARY.json',summary)
-          print(json.dumps({
-              'package_versions':{k:v.get('package_version') for k,v in package_meta.items()},
-              'function_diffs':diff_rows,
-              'config_object_counts':summary['config_object_counts'],
-              'mutator_count':len(mutators),
-          },indent=2))
+          hermes={}
+          for asset,fid in feed_ids.items():
+              q=urllib.parse.urlencode([('ids[]',fid),('parsed','true')])
+              hermes[asset]={
+                  'latest':get(HERMES+'/v2/updates/price/latest?'+q),
+                  'metadata':get(HERMES+'/v2/price_feeds?'+urllib.parse.urlencode({'query':fid})),
+              }
+          (RAW/'hermes.json').write_text(json.dumps(hermes,indent=2,sort_keys=True)+'\n')
+
+          ages={asset:[r['age_sec'] for r in all_rows if r['asset']==asset and r['age_sec'] is not None] for asset in AGGS}
+          summary={
+              'network':'sui-mainnet','successful_psm_rows':len(all_rows),
+              'asset_counts':{asset:sum(1 for r in all_rows if r['asset']==asset) for asset in AGGS},
+              'same_ptb_update_counts':{asset:sum(1 for r in all_rows if r['asset']==asset and r['same_ptb_pyth_update']) for asset in AGGS},
+              'no_same_ptb_update_counts':{asset:sum(1 for r in all_rows if r['asset']==asset and not r['same_ptb_pyth_update']) for asset in AGGS},
+              'age_stats':{asset:{
+                  'count':len(values),'min':min(values) if values else None,
+                  'max':max(values) if values else None,'average':sum(values)/len(values) if values else None,
+              } for asset,values in ages.items()},
+              'hermes':hermes,'writes':0,'transactions_constructed':0,'generated_unix':int(time.time()),
+          }
+          (OUT/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(summary,indent=2))
           PY
-          python3 bucket-oracle-live-diff-r4/audit.py | tee bucket-oracle-live-diff-r4/run.log
-          find bucket-oracle-live-diff-r4 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-oracle-live-diff-r4/SHA256SUMS.txt
+          python3 bucket-psm-pyth-age-r4/audit.py | tee bucket-psm-pyth-age-r4/run.log
+          find bucket-psm-pyth-age-r4 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-psm-pyth-age-r4/SHA256SUMS.txt
 
       - name: Validate read-only boundary
         shell: bash
         run: |
           set -euo pipefail
-          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-oracle-live-diff-r4 && exit 1 || true
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-psm-pyth-age-r4 && exit 1 || true
           python3 - <<'PY'
           import json
-          s=json.load(open('bucket-oracle-live-diff-r4/SUMMARY.json'))
+          s=json.load(open('bucket-psm-pyth-age-r4/SUMMARY.json'))
           assert s['writes']==0 and s['transactions_constructed']==0
-          assert 'pyth_live' in s['packages']
-          print('BUCKET_ORACLE_LIVE_DIFF_R4_READ_ONLY_PASS')
+          assert s['successful_psm_rows']>0
+          print('BUCKET_PSM_PYTH_AGE_R4_READ_ONLY_PASS')
           PY
 
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-oracle-live-diff-r4
-          path: bucket-oracle-live-diff-r4
+          name: bucket-psm-pyth-age-r4
+          path: bucket-psm-pyth-age-r4
           if-no-files-found: error
           retention-days: 7
