@@ -1,0 +1,137 @@
+name: build-aspnetcore-passkey-uv-fix-10010-20260809
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-aspnetcore-passkey-uv-fix-10010-20260809.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out exact ASP.NET Core 10.0.10 source
+        uses: actions/checkout@v4
+        with:
+          repository: dotnet/aspnetcore
+          ref: v10.0.10
+          path: aspnetcore
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Apply minimal current-assertion UV patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path('aspnetcore/src/Identity/Core/src')
+
+          result = root / 'PasskeyAssertionResult.cs'
+          text = result.read_text(encoding='utf-8-sig')
+          old = '''    public PasskeyException? Failure { get; }
+
+    internal PasskeyAssertionResult(UserPasskeyInfo passkey, TUser user)
+    {
+        Succeeded = true;
+        Passkey = passkey;
+        User = user;
+    }
+'''
+          new = '''    public PasskeyException? Failure { get; }
+
+    // The UV bit from the current assertion. This is intentionally distinct from the
+    // registration-time UserPasskeyInfo.IsUserVerified value.
+    internal bool IsUserVerified { get; }
+
+    internal PasskeyAssertionResult(UserPasskeyInfo passkey, TUser user)
+        : this(passkey, user, passkey.IsUserVerified)
+    {
+    }
+
+    internal PasskeyAssertionResult(UserPasskeyInfo passkey, TUser user, bool isUserVerified)
+    {
+        Succeeded = true;
+        Passkey = passkey;
+        User = user;
+        IsUserVerified = isUserVerified;
+    }
+'''
+          if old not in text:
+              raise SystemExit('PasskeyAssertionResult anchor not found')
+          result.write_text(text.replace(old, new), encoding='utf-8')
+
+          handler = root / 'PasskeyHandler.cs'
+          text = handler.read_text(encoding='utf-8-sig')
+          old = '        return PasskeyAssertionResult.Success(storedPasskey, user);'
+          new = '        return new PasskeyAssertionResult<TUser>(storedPasskey, user, authenticatorData.IsUserVerified);'
+          if text.count(old) != 1:
+              raise SystemExit(f'PasskeyHandler anchor count={text.count(old)}')
+          handler.write_text(text.replace(old, new), encoding='utf-8')
+
+          manager = root / 'SignInManager.cs'
+          text = manager.read_text(encoding='utf-8-sig')
+          old = '        return await SignInOrTwoFactorAsync(assertionResult.User, isPersistent: false, bypassTwoFactor: true);'
+          new = '''        // A passkey assertion may replace the configured application second factor only when
+        // this assertion actually performed WebAuthn user verification. Under the supported
+        // preferred/discouraged modes a valid assertion can have UV=0 and is possession-only.
+        return await SignInOrTwoFactorAsync(
+            assertionResult.User,
+            isPersistent: false,
+            bypassTwoFactor: assertionResult.IsUserVerified);'''
+          if text.count(old) != 1:
+              raise SystemExit(f'SignInManager anchor count={text.count(old)}')
+          manager.write_text(text.replace(old, new), encoding='utf-8')
+          PY
+          git -C aspnetcore diff --check
+          git -C aspnetcore diff -- src/Identity/Core/src | tee /tmp/passkey-uv-fix.patch
+
+      - name: Restore repository toolchain
+        shell: bash
+        working-directory: aspnetcore
+        run: |
+          set -euo pipefail
+          ./restore.sh
+
+      - name: Build exact patched Identity assembly
+        shell: bash
+        working-directory: aspnetcore
+        run: |
+          set -euo pipefail
+          source ./activate.sh
+          dotnet build src/Identity/Core/src/Microsoft.AspNetCore.Identity.csproj \
+            --configuration Release \
+            --no-restore \
+            /p:UseSharedCompilation=false
+
+      - name: Package build evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT=/tmp/passkey-uv-build-evidence
+          mkdir -p "$OUT"
+          cp /tmp/passkey-uv-fix.patch "$OUT/"
+          git -C aspnetcore rev-parse HEAD | tee "$OUT/SOURCE_COMMIT.txt"
+          find aspnetcore/artifacts -type f -name Microsoft.AspNetCore.Identity.dll -print | sort | tee "$OUT/ASSEMBLIES.txt"
+          test -s "$OUT/ASSEMBLIES.txt"
+          while IFS= read -r assembly; do
+            cp "$assembly" "$OUT/Microsoft.AspNetCore.Identity.patched.dll"
+            break
+          done < "$OUT/ASSEMBLIES.txt"
+          sha256sum "$OUT/Microsoft.AspNetCore.Identity.patched.dll" "$OUT/passkey-uv-fix.patch" | tee "$OUT/SHA256SUMS.txt"
+          dotnet --info > "$OUT/dotnet-info.txt"
+
+      - name: Upload exact patched build evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: aspnetcore-10.0.10-passkey-current-uv-fix-build
+          path: /tmp/passkey-uv-build-evidence/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
