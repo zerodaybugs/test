@@ -1,4 +1,4 @@
-name: Bucket Scoped Source Snapshot R4
+name: Bucket Shared Account and Production Object Census R4
 
 on:
   pull_request:
@@ -11,76 +11,206 @@ permissions:
   contents: read
 
 jobs:
-  snapshot:
+  census:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch exact current scoped source
+      - name: Enumerate Bucket account and protocol objects on Sui mainnet
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf bucket-scoped-source-r4
-          mkdir -p bucket-scoped-source-r4
-          git clone --filter=blob:none --no-checkout https://github.com/hackenproof-public/bucket-protocol.git bucket-scoped-source-r4/repo
-          cd bucket-scoped-source-r4/repo
-          git checkout main
-          git rev-parse HEAD | tee ../HEAD.txt
-          git log -20 --date=iso-strict --pretty='format:%H%x09%ad%x09%s' > ../RECENT_COMMITS.tsv
-          git status --porcelain=v1 > ../WORKTREE_STATUS.txt
-          git ls-tree -r --name-only HEAD | sort > ../FILE_TREE.txt
-          git ls-files -z | sort -z | xargs -0 sha256sum > ../SOURCE_SHA256SUMS.txt
-          git bundle create ../SOURCE.bundle --all
-          cd ..
-          python3 - <<'PY'
-          import json, pathlib, subprocess, time
-          out=pathlib.Path('bucket-scoped-source-r4')
-          head=(out/'HEAD.txt').read_text().strip()
-          pinned='74b28e1912e9b134af9a36f0e0052e2bf1c79bd7'
-          repo=out/'repo'
-          pinned_exists=subprocess.run(['git','-C',str(repo),'cat-file','-e',pinned+'^{commit}']).returncode == 0
-          diff=[]
-          if pinned_exists:
-              text=subprocess.check_output(['git','-C',str(repo),'diff','--name-status',pinned+'..'+head],text=True)
-              diff=[line.split('\t') for line in text.splitlines() if line.strip()]
+          rm -rf bucket-account-census-r4
+          mkdir -p bucket-account-census-r4/raw
+          cat > bucket-account-census-r4/census.py <<'PY'
+          import json
+          import pathlib
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-account-census-r4')
+          RAW = OUT / 'raw'
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+          RPCS = [
+              'https://sui-mainnet-endpoint.blockvision.org',
+              'https://fullnode.mainnet.sui.io:443',
+          ]
+          TYPES = {
+              'account': '0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc::account::Account',
+              'saving_pool': '0x872d08a70db3db498aa7853276acea8091fdd9871b2d86bc8dcb8524526df622::saving::SavingPool',
+              'saving_reward_manager': '0x39692320d6fc01c27315a7972ed4717e4fd32eed43531ad6f55fd7f24b74e207::saving_incentive::RewardManager',
+              'psm_pool': '0xc2ae6693383e4a81285136effc8190c7baaf0e75aafa36d1c69cd2170cfc3803::pool::Pool',
+              'flash_global_config': '0x0f51f9eb63574a1d12b62295599ac4f8231197f95b3cce9a516daba64f419d06::config::GlobalConfig',
+              'blacklist': '0x6d7b711a5e614f99f87fdbfbf915fea0fa96af769130ac226c3cbcf07efb90f3::blacklist_rule::Blacklist',
+              'cdp_vault': '0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e::vault::Vault',
+              'treasury': '0xe14726c336e81b32328e92afc37345d159f5b550b09fa92bd43640cfdd0a0cfd::usdb::Treasury',
+          }
+
+          def post(url, payload, retries=5, timeout=120):
+              data = json.dumps(payload).encode()
+              last = None
+              for n in range(retries):
+                  try:
+                      req = urllib.request.Request(url, data=data, method='POST', headers={
+                          'Content-Type':'application/json',
+                          'User-Agent':'bucket-account-census-r4/1',
+                      })
+                      with urllib.request.urlopen(req, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2 ** n)
+              raise RuntimeError(f'POST failure {url}: {last}')
+
+          def gql(query, variables=None):
+              body = post(GQL, {'query':query, 'variables':variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body
+
+          def rpc(method, params):
+              failures=[]
+              for endpoint in RPCS:
+                  try:
+                      body=post(endpoint, {'jsonrpc':'2.0','id':1,'method':method,'params':params}, timeout=90)
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint':endpoint,'result':body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint':endpoint,'error':type(exc).__name__,'message':str(exc)})
+              return {'failures':failures}
+
+          QUERY='''query O($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+
+          results={}
+          for label,type_ in TYPES.items():
+              rows=[]
+              after=None
+              error=None
+              pages=0
+              try:
+                  while True:
+                      body=gql(QUERY, {'type':type_, 'after':after})
+                      connection=body['data']['objects']
+                      rows.extend(connection.get('nodes') or [])
+                      pages += 1
+                      page=connection.get('pageInfo') or {}
+                      if not page.get('hasNextPage') or pages >= 100:
+                          break
+                      after=page.get('endCursor')
+              except Exception as exc:
+                  error={'error':type(exc).__name__,'message':str(exc)}
+              results[label]={'query_type':type_,'rows':rows,'error':error,'pages':pages}
+              (RAW/f'{label}.json').write_text(json.dumps(results[label],indent=2,sort_keys=True)+'\n')
+
+          accounts=results['account']['rows']
+          shared=[]
+          address_owned=[]
+          other=[]
+          for row in accounts:
+              owner=row.get('owner') or {}
+              typ=owner.get('__typename')
+              compact={
+                  'address':row.get('address'),
+                  'version':row.get('version'),
+                  'digest':row.get('digest'),
+                  'owner':owner,
+                  'previous_transaction':row.get('previousTransaction'),
+                  'has_public_transfer':((row.get('asMoveObject') or {}).get('hasPublicTransfer')),
+                  'json':(((row.get('asMoveObject') or {}).get('contents') or {}).get('json')),
+              }
+              if typ == 'Shared': shared.append(compact)
+              elif typ == 'AddressOwner': address_owned.append(compact)
+              else: other.append(compact)
+
+          shared_activity={}
+          for row in shared:
+              oid=row['address']
+              shared_activity[oid]=rpc('suix_queryTransactionBlocks', [{
+                  'filter':{'InputObject':oid},
+                  'options':{
+                      'showInput':True,
+                      'showRawInput':False,
+                      'showEffects':True,
+                      'showEvents':True,
+                      'showObjectChanges':True,
+                      'showBalanceChanges':True,
+                  },
+              },None,50,True])
+          (RAW/'shared_account_activity.json').write_text(json.dumps(shared_activity,indent=2,sort_keys=True)+'\n')
+
+          def type_summary(label):
+              rows=results[label]['rows']
+              return {
+                  'query_type':results[label]['query_type'],
+                  'count':len(rows),
+                  'shared_count':sum(1 for r in rows if (r.get('owner') or {}).get('__typename')=='Shared'),
+                  'address_owned_count':sum(1 for r in rows if (r.get('owner') or {}).get('__typename')=='AddressOwner'),
+                  'error':results[label]['error'],
+                  'object_ids':[r.get('address') for r in rows],
+              }
+
+          activity_counts={}
+          bucket_calls=[]
+          for oid,wrapper in shared_activity.items():
+              result=wrapper.get('result') if isinstance(wrapper,dict) else None
+              txs=(result or {}).get('data',[]) if isinstance(result,dict) else []
+              activity_counts[oid]=len(txs)
+              for tx in txs:
+                  try:
+                      commands=tx['transaction']['data']['transaction']['transactions']
+                  except Exception:
+                      commands=[]
+                  for command in commands or []:
+                      mc=command.get('MoveCall') if isinstance(command,dict) else None
+                      if mc:
+                          bucket_calls.append({
+                              'account_object':oid,
+                              'digest':tx.get('digest'),
+                              'sender':((tx.get('transaction') or {}).get('data') or {}).get('sender'),
+                              'package':mc.get('package'),
+                              'module':mc.get('module'),
+                              'function':mc.get('function'),
+                              'type_arguments':mc.get('type_arguments'),
+                          })
+
           summary={
-              'target':'https://github.com/hackenproof-public/bucket-protocol',
-              'branch':'main',
-              'head':head,
-              'prior_pinned_revision':pinned,
-              'prior_pinned_revision_present':pinned_exists,
-              'changed_paths_since_prior_pin':diff,
-              'changed_path_count':len(diff),
-              'writes_to_chain':0,
+              'network':'sui-mainnet',
+              'type_summaries':{label:type_summary(label) for label in TYPES},
+              'account_count':len(accounts),
+              'shared_account_count':len(shared),
+              'shared_accounts':shared,
+              'shared_account_recent_input_tx_counts':activity_counts,
+              'shared_account_move_calls':bucket_calls,
+              'shared_account_gate':'LIVE_SHARED_ACCOUNT_FOUND' if shared else 'NO_LIVE_SHARED_ACCOUNT_FOUND',
+              'writes':0,
               'transactions_constructed':0,
               'generated_unix':int(time.time()),
           }
-          (out/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          (OUT/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
           print(json.dumps(summary,indent=2))
           PY
-          rm -rf repo/.git/objects/pack/*.keep || true
-          find . -maxdepth 2 -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+          python3 bucket-account-census-r4/census.py | tee bucket-account-census-r4/run.log
+          find bucket-account-census-r4 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-account-census-r4/SHA256SUMS.txt
 
-      - name: Validate source snapshot boundary
+      - name: Validate read-only boundary
         shell: bash
         run: |
           set -euo pipefail
-          test -s bucket-scoped-source-r4/HEAD.txt
-          test -s bucket-scoped-source-r4/SOURCE.bundle
-          test ! -s bucket-scoped-source-r4/WORKTREE_STATUS.txt
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-account-census-r4 && exit 1 || true
           python3 - <<'PY'
           import json
-          s=json.load(open('bucket-scoped-source-r4/SUMMARY.json'))
-          assert s['writes_to_chain'] == 0
+          s=json.load(open('bucket-account-census-r4/SUMMARY.json'))
+          assert s['writes'] == 0
           assert s['transactions_constructed'] == 0
-          print('BUCKET_SCOPED_SOURCE_R4_PASS')
+          print('BUCKET_ACCOUNT_CENSUS_R4_READ_ONLY_PASS')
           PY
 
-      - name: Upload scoped source snapshot
+      - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-scoped-source-r4
-          path: bucket-scoped-source-r4
+          name: bucket-account-census-r4
+          path: bucket-account-census-r4
           if-no-files-found: error
           retention-days: 7
