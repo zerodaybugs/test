@@ -1,0 +1,191 @@
+name: Bucket Pyth Revival Read-Only Gate
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  readonly-chain-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch package bytecode, ancestry metadata, and live objects
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p bucket-gate/{json,mv}
+          cat > bucket-gate/query.py <<'PY'
+          import base64
+          import json
+          import pathlib
+          import time
+          import urllib.error
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-gate')
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+          RPCS = [
+              'https://fullnode.mainnet.sui.io:443',
+              'https://sui-mainnet-endpoint.blockvision.org',
+          ]
+
+          packages = {
+              'pyth_rule_current': '0x5bc4f912b59c5cfcc86dfc90419837b9c3f9d3a3a94cef7a198838fa196bac4a',
+              'oracle_core': '0xf2ab9aa60c5e879675351a1a89f47131de9dea7cc927327dd0e7282e295c7f5e',
+              'cdp_original': '0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e',
+              'cdp_call_target_202603': '0xc1dd29778f3fccd19a4ac79d1c35a14bf9d65a0b48f1c5bba98a949cacc53e26',
+          }
+
+          objects = {
+              'entry_config': '0x03e79aa64ac007d200aefdcb445e31e24f460279bab6c73babfb031b7464072e',
+              'pyth_rule_config': '0x00aea60b799575ae4203bcc80c16844c4d514d5af661200c4565f6d5a6deac1f',
+              'treasury': '0x4de1c29a89d6888ebf8f7ae20364571dce4e1e42b9c9221f7df924ad6f9e617d',
+              'sui_vault': '0x542eff36534bc5d7d07808953ebb8c580c23f047b41c094601d40a0fc7e99238',
+              'hasui_vault': '0x83367e510389536e2041d50b3faabc2d1b1c8194ca5570a2a3a3e460d6113e86',
+          }
+
+          def post(url, payload, timeout=60):
+              data = json.dumps(payload).encode()
+              req = urllib.request.Request(
+                  url,
+                  data=data,
+                  headers={'Content-Type': 'application/json', 'User-Agent': 'bucket-readonly-gate/1'},
+                  method='POST',
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as r:
+                      body = r.read().decode('utf-8', errors='replace')
+                      try:
+                          return {'http_status': r.status, 'body': json.loads(body)}
+                      except json.JSONDecodeError:
+                          return {'http_status': r.status, 'raw_body': body}
+              except Exception as exc:
+                  return {'transport_error': type(exc).__name__, 'message': str(exc)}
+
+          def gql(query):
+              return post(GQL, {'query': query})
+
+          def write_json(name, value):
+              p = OUT / 'json' / name
+              p.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+              return p
+
+          def safe_label(value):
+              return ''.join(c if c.isalnum() or c in '-_.' else '_' for c in value)
+
+          def fetch_package(label, package_id):
+              label = safe_label(label)
+              byte_query = f'''{{ object(address: "{package_id}") {{ asMovePackage {{ modules {{ nodes {{ name bytes }} }} }} }} }}'''
+              byte_res = gql(byte_query)
+              write_json(f'{label}.bytes.json', byte_res)
+
+              meta_query = f'''{{ object(address: "{package_id}") {{ asMovePackage {{ address version modules {{ nodes {{ name friends {{ nodes {{ name }} }} }} }} linkage {{ originalId upgradedId version }} typeOrigins {{ module struct definingId }} }} }} }}'''
+              meta_res = gql(meta_query)
+              write_json(f'{label}.metadata.json', meta_res)
+
+              basic_query = f'''{{ object(address: "{package_id}") {{ address version digest previousTransactionBlock {{ digest }} owner {{ __typename }} }} }}'''
+              write_json(f'{label}.object.json', gql(basic_query))
+
+              decoded = []
+              try:
+                  nodes = byte_res['body']['data']['object']['asMovePackage']['modules']['nodes']
+                  out_dir = OUT / 'mv' / label
+                  out_dir.mkdir(parents=True, exist_ok=True)
+                  for node in nodes:
+                      name = node['name']
+                      raw = base64.b64decode(node['bytes'])
+                      (out_dir / f'{name}.mv').write_bytes(raw)
+                      decoded.append({'name': name, 'bytes': len(raw), 'magic': raw[:4].hex()})
+              except Exception as exc:
+                  decoded.append({'decode_error': type(exc).__name__, 'message': str(exc)})
+              write_json(f'{label}.decoded.json', decoded)
+              return meta_res
+
+          metadata_results = {}
+          for label, package_id in packages.items():
+              metadata_results[label] = fetch_package(label, package_id)
+              time.sleep(0.3)
+
+          discovered = {}
+          for label, response in metadata_results.items():
+              try:
+                  origins = response['body']['data']['object']['asMovePackage']['typeOrigins']
+              except Exception:
+                  continue
+              for origin in origins:
+                  defining_id = origin.get('definingId')
+                  if defining_id and defining_id not in packages.values():
+                      discovered[f'{label}__{origin.get("module", "module")}__{origin.get("struct", "struct")}'] = defining_id
+          write_json('discovered_defining_ids.json', discovered)
+
+          for label, package_id in sorted(discovered.items()):
+              fetch_package('origin__' + label, package_id)
+              time.sleep(0.3)
+
+          rpc_log = {}
+          for rpc_url in RPCS:
+              provider_key = safe_label(rpc_url)
+              provider = {}
+              for label, object_id in {**objects, **packages}.items():
+                  provider[f'getObject__{label}'] = post(rpc_url, {
+                      'jsonrpc': '2.0', 'id': 1, 'method': 'sui_getObject',
+                      'params': [object_id, {
+                          'showType': True, 'showOwner': True, 'showPreviousTransaction': True,
+                          'showDisplay': False, 'showContent': True, 'showBcs': True,
+                          'showStorageRebate': True,
+                      }],
+                  })
+                  time.sleep(0.15)
+              for label, package_id in packages.items():
+                  provider[f'normalizedModules__{label}'] = post(rpc_url, {
+                      'jsonrpc': '2.0', 'id': 2,
+                      'method': 'sui_getNormalizedMoveModulesByPackage',
+                      'params': [package_id],
+                  })
+                  time.sleep(0.15)
+              rpc_log[provider_key] = provider
+          write_json('rpc_results.json', rpc_log)
+
+          summary = {
+              'network': 'sui-mainnet',
+              'writes': 0,
+              'transactions_constructed': 0,
+              'packages_requested': packages,
+              'objects_requested': objects,
+              'discovered_defining_ids': discovered,
+              'generated_at_unix': int(time.time()),
+          }
+          write_json('SUMMARY.json', summary)
+          print(json.dumps(summary, indent=2))
+          PY
+          python3 bucket-gate/query.py | tee bucket-gate/run.log
+          find bucket-gate -type f -maxdepth 5 -print0 | sort -z | xargs -0 sha256sum > bucket-gate/SHA256SUMS.txt
+
+      - name: Validate no write-capable operation was used
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'sui_executeTransactionBlock|executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-gate && exit 1 || true
+          python3 - <<'PY'
+          import json
+          x=json.load(open('bucket-gate/json/SUMMARY.json'))
+          assert x['writes'] == 0
+          assert x['transactions_constructed'] == 0
+          print('READ_ONLY_BOUNDARY_PASS')
+          PY
+
+      - name: Upload Bucket gate evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-pyth-revival-readonly-gate
+          path: bucket-gate
+          if-no-files-found: error
+          retention-days: 7
