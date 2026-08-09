@@ -1,0 +1,194 @@
+name: Temporary Superhuman Pack gallery metadata gate
+
+on:
+  push:
+    branches: [research/superhuman-pack-gallery-20260809]
+    paths: [.github/workflows/superhuman-pack-gallery-public-metadata-gate.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+
+      - name: Query public Pack listing surfaces and scan public metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf pack-gallery-gate
+          mkdir -p pack-gallery-gate/raw pack-gallery-gate/evidence public-intake-status
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, urllib.error, urllib.parse, urllib.request
+
+          root = pathlib.Path('pack-gallery-gate')
+          raw = root / 'raw'
+          ev = root / 'evidence'
+          ua = 'Mozilla/5.0 Superhuman authorized bug-bounty public-metadata gate'
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          def fetch(name, url, follow=True, max_bytes=20_000_000):
+              opener = urllib.request.build_opener() if follow else urllib.request.build_opener(NoRedirect)
+              req = urllib.request.Request(url, headers={
+                  'User-Agent': ua,
+                  'Accept': 'application/json,text/html;q=0.9,*/*;q=0.8',
+              })
+              meta = {'name': name, 'url': url, 'follow_redirects': follow}
+              body = b''
+              try:
+                  with opener.open(req, timeout=35) as r:
+                      body = r.read(max_bytes)
+                      meta.update(status=r.status, final_url=r.geturl(), headers=dict(r.headers.items()))
+              except urllib.error.HTTPError as e:
+                  body = e.read(max_bytes)
+                  meta.update(status=e.code, final_url=e.geturl(), headers=dict(e.headers.items()) if e.headers else {}, error=str(e))
+              except Exception as e:
+                  meta.update(status=0, error=repr(e))
+              meta.update(size=len(body), sha256=hashlib.sha256(body).hexdigest())
+              (raw / f'{name}.body').write_bytes(body)
+              (raw / f'{name}.json').write_text(json.dumps(meta, indent=2) + '\n')
+              return meta, body
+
+          probes = [
+              ('coda_listings', 'https://coda.io/apis/v1/packs/listings?limit=100'),
+              ('docs_listings', 'https://docs.superhuman.com/apis/v1/packs/listings?limit=100'),
+              ('coda_packs', 'https://coda.io/packs'),
+              ('docs_packs', 'https://docs.superhuman.com/packs'),
+              ('coda_gallery', 'https://coda.io/gallery'),
+              ('docs_gallery', 'https://docs.superhuman.com/gallery'),
+              ('coda_sitemap', 'https://coda.io/sitemap.xml'),
+              ('docs_sitemap', 'https://docs.superhuman.com/sitemap.xml'),
+          ]
+          fetched = {}
+          for name, url in probes:
+              fetched[name] = fetch(name, url)
+
+          listing_items = []
+          source_listing = None
+          for name in ('coda_listings', 'docs_listings'):
+              meta, body = fetched[name]
+              try:
+                  obj = json.loads(body)
+              except Exception:
+                  continue
+              if isinstance(obj, dict) and isinstance(obj.get('items'), list):
+                  listing_items.extend(x for x in obj['items'] if isinstance(x, dict))
+                  source_listing = name
+
+          # Extract public metadata URLs and Pack IDs from any HTML/JSON surface.
+          discovered_metadata_urls = set()
+          discovered_pack_ids = set()
+          for name, (meta, body) in fetched.items():
+              text = body.decode('utf-8', 'replace')
+              for m in re.finditer(r'https://[^"\'<>\\\s]+(?:metadata|manifest)[^"\'<>\\\s]*', text, re.I):
+                  discovered_metadata_urls.add(m.group(0).replace('&amp;', '&'))
+              for m in re.finditer(r'"externalMetadataUrl"\s*:\s*"([^"]+)"', text):
+                  discovered_metadata_urls.add(bytes(m.group(1), 'utf-8').decode('unicode_escape'))
+              for m in re.finditer(r'"packId"\s*:\s*(\d+)', text):
+                  discovered_pack_ids.add(int(m.group(1)))
+
+          for item in listing_items:
+              if isinstance(item.get('externalMetadataUrl'), str):
+                  discovered_metadata_urls.add(item['externalMetadataUrl'])
+              try:
+                  discovered_pack_ids.add(int(item['packId']))
+              except Exception:
+                  pass
+
+          # Public listing detail may expose metadata even if the collection endpoint is gated.
+          listing_details = []
+          for pack_id in sorted(discovered_pack_ids)[:250]:
+              for host in ('https://coda.io', 'https://docs.superhuman.com'):
+                  name = f'listing_{urllib.parse.urlparse(host).hostname}_{pack_id}'
+                  meta, body = fetch(name, f'{host}/apis/v1/packs/{pack_id}/listing')
+                  try:
+                      obj = json.loads(body)
+                  except Exception:
+                      continue
+                  if isinstance(obj, dict) and isinstance(obj.get('externalMetadataUrl'), str):
+                      listing_details.append(obj)
+                      discovered_metadata_urls.add(obj['externalMetadataUrl'])
+                      break
+
+          metadata_results = []
+          sensitive_matches = []
+          for idx, url in enumerate(sorted(discovered_metadata_urls)[:500]):
+              if not url.startswith('https://'):
+                  continue
+              meta, body = fetch(f'metadata_{idx}', url)
+              try:
+                  obj = json.loads(body)
+              except Exception:
+                  continue
+              canonical = json.dumps(obj, sort_keys=True)
+              flags = {
+                  'allowedAuthenticationNames': 'allowedAuthenticationNames' in canonical,
+                  'adminAuthentications': 'adminAuthentications' in canonical,
+                  'systemConnectionAuthentication': 'systemConnectionAuthentication' in canonical,
+                  'autocomplete': 'autocomplete' in canonical,
+                  'validateParameters': 'validateParameters' in canonical,
+                  'namedPropertyOptions': 'namedPropertyOptions' in canonical,
+                  'listDynamicUrls': 'listDynamicUrls' in canonical,
+                  'getSchema': 'getSchema' in canonical,
+                  'MailAndCalendar': 'MailAndCalendar' in canonical,
+              }
+              row = {
+                  'url': url,
+                  'status': meta.get('status'),
+                  'size': meta.get('size'),
+                  'sha256': meta.get('sha256'),
+                  'flags': flags,
+              }
+              metadata_results.append(row)
+              if flags['allowedAuthenticationNames'] and any(flags[x] for x in ('autocomplete','validateParameters','namedPropertyOptions','listDynamicUrls','getSchema')):
+                  sensitive_matches.append(row)
+
+          result = {
+              'workflow_run_id': int(os.environ['GITHUB_RUN_ID']),
+              'source_commit': os.environ['GITHUB_SHA'],
+              'probe_statuses': {name: meta.get('status') for name, (meta, _body) in fetched.items()},
+              'source_listing': source_listing,
+              'listing_item_count': len(listing_items),
+              'discovered_pack_id_count': len(discovered_pack_ids),
+              'listing_detail_count': len(listing_details),
+              'discovered_metadata_url_count': len(discovered_metadata_urls),
+              'fetched_json_metadata_count': len(metadata_results),
+              'deployed_allowed_auth_metadata_hook_matches': sensitive_matches,
+              'deployed_match_count': len(sensitive_matches),
+              'submit_ready': False,
+              'decision': 'DEPLOYED_REACHABILITY_FOUND' if sensitive_matches else 'NO_PUBLIC_DEPLOYED_MATCH_FOUND',
+          }
+          (ev / 'RESULT.json').write_text(json.dumps(result, indent=2) + '\n')
+          (ev / 'METADATA_RESULTS.json').write_text(json.dumps(metadata_results, indent=2) + '\n')
+          (ev / 'LISTING_ITEMS.json').write_text(json.dumps(listing_items, indent=2) + '\n')
+          (ev / 'LISTING_DETAILS.json').write_text(json.dumps(listing_details, indent=2) + '\n')
+          pathlib.Path('public-intake-status/superhuman-pack-gallery-metadata-result.json').write_text(json.dumps(result, indent=2) + '\n')
+          PY
+          find pack-gallery-gate/evidence -type f -print0 | sort -z | xargs -0 sha256sum > pack-gallery-gate/evidence/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-pack-gallery-public-metadata-gate
+          path: pack-gallery-gate/evidence/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Commit compact result
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-pack-gallery-metadata-result.json
+          git commit -m 'chore: record public Superhuman Pack metadata gate'
+          git push
