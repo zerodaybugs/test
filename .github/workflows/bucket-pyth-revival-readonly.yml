@@ -1,4 +1,4 @@
-name: Bucket Frozen HASUI Liquidation Impact Gate R6B
+name: Bucket V2 Public Audit Duplicate Scan R6
 
 on:
   pull_request:
@@ -11,276 +11,101 @@ permissions:
   contents: read
 
 jobs:
-  impact-gate:
+  audit-scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Capture frozen positions, live price, liquidation thresholds, and recovery surface
+      - name: Download, inspect, extract, and render public V2 audit reports
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf bucket-frozen-hasui-impact-r6b
-          mkdir -p bucket-frozen-hasui-impact-r6b/raw
-          cat > bucket-frozen-hasui-impact-r6b/gate.py <<'PY'
-          import datetime
+          rm -rf bucket-audit-duplicate-r6
+          mkdir -p bucket-audit-duplicate-r6/{pdf,text,pages,renders}
+          base='https://raw.githubusercontent.com/Bucket-Protocol/Audit/main/BucketV2'
+          files=(
+            Movebit_Bucket_V2_Report_Final_Report.pdf
+            Hashlock_Bucket_V2_Report_Final_Report.pdf
+            Quantstamp_Bucket_V2_Final_Report.pdf
+          )
+          for name in "${files[@]}"; do
+            curl -fL "$base/$name" -o "bucket-audit-duplicate-r6/pdf/$name"
+            pdfinfo "bucket-audit-duplicate-r6/pdf/$name" > "bucket-audit-duplicate-r6/text/$name.pdfinfo.txt"
+            pdftotext -layout "bucket-audit-duplicate-r6/pdf/$name" "bucket-audit-duplicate-r6/text/$name.txt"
+          done
+
+          cat > bucket-audit-duplicate-r6/scan.py <<'PY'
           import json
           import pathlib
-          import time
-          import urllib.parse
-          import urllib.request
+          import re
+          import subprocess
 
-          OUT = pathlib.Path('bucket-frozen-hasui-impact-r6b')
-          RAW = OUT / 'raw'
-          GQL = 'https://graphql.mainnet.sui.io/graphql'
-          RPC = 'https://sui-mainnet-endpoint.blockvision.org'
-          HERMES = 'https://hermes.pyth.network'
-
-          HASUI_VAULT = '0x83367e510389536e2041d50b3faabc2d1b1c8194ca5570a2a3a3e460d6113e86'
-          BLACKLIST = '0x10ac2a1f47aaf8afac17d5ed3c869e5f3b932e8d4ae233932c6c7c686ca02ec2'
-          PRICE_INFO = '0x4c1d831576b60fec657e0c310943eff8c1f28197c552e57d1fefdc55edddb263'
-          POSITION_FIELDS = {
-              '0xe54a304524adca781d8e78faf759c1f18b1cfbe20ecf5dc82724050bec459f5c':
-                  '0x5b25330ae02eb158f1808f39f1e5a4ef8bfc7021c956ba0369a06cae4d4bf837',
-              '0x5939b998325f79f0bf600ea355558e908d6fba739e0d97eb39725636f4ab8192':
-                  '0x77c4c933cdf83f1e4bb4f3a7d6d99e46d4d41957c2f902a99749402b13e12dba',
-          }
-          ADMIN_CAP_TYPE = (
-              '0xe14726c336e81b32328e92afc37345d159f5b550b09fa92bd43640cfdd0a0cfd'
-              '::admin::AdminCap'
+          root = pathlib.Path('bucket-audit-duplicate-r6')
+          terms = re.compile(
+              r'blacklist|blacklisted|freeze|frozen|sanction|liquidat|withdraw|bad debt|insolven',
+              re.I,
           )
-          FEED_ID = '6120ffcf96395c70aa77e72dcb900bf9d40dccab228efca59a17b90ce423d5e8'
-          DOUBLE = 10**18
-          ONE_YEAR_MS = 31_536_000_000
-
-          def fetch(url, payload=None, retries=6, timeout=120):
-              last = None
-              for attempt in range(retries):
-                  try:
-                      data = None if payload is None else json.dumps(payload).encode()
-                      request = urllib.request.Request(
-                          url,
-                          data=data,
-                          method='GET' if payload is None else 'POST',
-                          headers={
-                              'Content-Type': 'application/json',
-                              'User-Agent': 'bucket-frozen-hasui-impact-r6b/1',
-                          },
+          specific = re.compile(
+              r'(blacklist|blacklisted|freeze|frozen|sanction).{0,220}(liquidat|withdraw)|'
+              r'(liquidat|withdraw).{0,220}(blacklist|blacklisted|freeze|frozen|sanction)',
+              re.I | re.S,
+          )
+          reports = []
+          for pdf in sorted((root / 'pdf').glob('*.pdf')):
+              info = (root / 'text' / f'{pdf.name}.pdfinfo.txt').read_text(errors='replace')
+              match = re.search(r'^Pages:\s+(\d+)', info, re.M)
+              pages = int(match.group(1)) if match else 0
+              page_hits = []
+              for page in range(1, pages + 1):
+                  page_txt = root / 'pages' / f'{pdf.stem}.page-{page:03d}.txt'
+                  subprocess.run(
+                      ['pdftotext', '-layout', '-f', str(page), '-l', str(page), str(pdf), str(page_txt)],
+                      check=True,
+                  )
+                  text = page_txt.read_text(errors='replace')
+                  matches = []
+                  for line_number, line in enumerate(text.splitlines(), 1):
+                      if terms.search(line):
+                          matches.append({'line': line_number, 'text': line.strip()})
+                  if matches:
+                      page_hits.append({'page': page, 'matches': matches})
+                      prefix = root / 'renders' / f'{pdf.stem}.page-{page:03d}'
+                      subprocess.run(
+                          ['pdftoppm', '-f', str(page), '-l', str(page), '-r', '130', '-png', '-singlefile', str(pdf), str(prefix)],
+                          check=True,
                       )
-                      with urllib.request.urlopen(request, timeout=timeout) as response:
-                          return json.loads(response.read().decode())
-                  except Exception as exc:
-                      last = exc
-                      time.sleep(2**attempt)
-              raise RuntimeError(f'request failed for {url}: {last}')
-
-          def gql(query, variables=None):
-              body = fetch(GQL, {'query': query, 'variables': variables or {}})
-              if body.get('errors'):
-                  raise RuntimeError(json.dumps(body['errors']))
-              return body['data']
-
-          def rpc(method, params):
-              body = fetch(RPC, {'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params})
-              if body.get('error'):
-                  raise RuntimeError(json.dumps(body['error']))
-              return body.get('result')
-
-          def dump(name, value):
-              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
-
-          def integer(value):
-              if isinstance(value, bool) or value is None:
-                  raise ValueError(value)
-              if isinstance(value, int):
-                  return value
-              if isinstance(value, str) and (value.isdigit() or (value.startswith('-') and value[1:].isdigit())):
-                  return int(value)
-              if isinstance(value, dict):
-                  if 'value' in value:
-                      return integer(value['value'])
-                  if 'magnitude' in value:
-                      magnitude = integer(value['magnitude'])
-                      negative = value.get('negative') or value.get('is_negative')
-                      return -magnitude if negative else magnitude
-                  nested = value.get('fields')
-                  if isinstance(nested, dict):
-                      return integer(nested)
-              raise ValueError(value)
-
-          def find_key(value, key):
-              if isinstance(value, dict):
-                  if key in value:
-                      return value[key]
-                  for child in value.values():
-                      found = find_key(child, key)
-                      if found is not None:
-                          return found
-              elif isinstance(value, list):
-                  for child in value:
-                      found = find_key(child, key)
-                      if found is not None:
-                          return found
-              return None
-
-          def get_object(object_id):
-              return rpc('sui_getObject', [object_id, {
-                  'showType': True,
-                  'showOwner': True,
-                  'showPreviousTransaction': True,
-                  'showDisplay': False,
-                  'showContent': True,
-                  'showBcs': True,
-              }])
-
-          def object_fields(obj):
-              return ((((obj or {}).get('data') or {}).get('content') or {}).get('fields') or {})
-
-          checkpoint = gql('query { checkpoint { sequenceNumber timestamp } }')['checkpoint']
-          now_ms = int(
-              datetime.datetime.fromisoformat(checkpoint['timestamp'].replace('Z', '+00:00')).timestamp()
-              * 1000
-          )
-
-          object_ids = [HASUI_VAULT, BLACKLIST, PRICE_INFO, *POSITION_FIELDS.values()]
-          objects = {object_id: get_object(object_id) for object_id in object_ids}
-          dump('objects.json', objects)
-
-          vault = object_fields(objects[HASUI_VAULT])
-          blacklist = object_fields(objects[BLACKLIST])
-
-          hermes_query = urllib.parse.urlencode([('ids[]', FEED_ID), ('parsed', 'true')])
-          hermes = fetch(f'{HERMES}/v2/updates/price/latest?{hermes_query}')
-          dump('hermes_latest.json', hermes)
-          parsed = (hermes.get('parsed') or [None])[0] or {}
-          price_row = parsed.get('price') or {}
-          price_raw = integer(price_row.get('price'))
-          exponent = integer(price_row.get('expo'))
-          hasui_price = price_raw * (10**exponent)
-          publish_time = integer(price_row.get('publish_time'))
-
-          interest_unit = integer(vault['interest_unit'])
-          annual_rate = integer(vault['interest_rate'])
-          vault_timestamp_ms = integer(vault['timestamp'])
-          elapsed_ms = max(0, now_ms - vault_timestamp_ms)
-          elapsed_double = elapsed_ms * DOUBLE // ONE_YEAR_MS
-          current_interest_unit = interest_unit + annual_rate * elapsed_double // DOUBLE
-          mcr = integer(vault['min_collateral_ratio']) / 1_000_000_000
-
-          positions = []
-          for debtor, field_object in POSITION_FIELDS.items():
-              value = object_fields(objects[field_object]).get('value') or object_fields(objects[field_object])
-              collateral_raw = integer(find_key(value, 'coll_amount'))
-              debt_raw = integer(find_key(value, 'debt_amount'))
-              position_interest = integer(find_key(value, 'interest_unit'))
-              interest_delta = max(0, current_interest_unit - position_interest)
-              accrued_raw = (interest_delta * debt_raw + DOUBLE - 1) // DOUBLE
-              current_debt_raw = debt_raw + accrued_raw
-              collateral_hasui = collateral_raw / 1_000_000_000
-              current_debt_usdb = current_debt_raw / 1_000_000
-              threshold = mcr * current_debt_usdb / collateral_hasui
-              collateral_ratio = collateral_hasui * hasui_price / current_debt_usdb
-              positions.append({
-                  'debtor': debtor,
-                  'fieldObject': field_object,
-                  'collateralRaw': collateral_raw,
-                  'collateralHASUI': collateral_hasui,
-                  'rawDebtRaw': debt_raw,
-                  'accruedInterestRaw': accrued_raw,
-                  'currentDebtRaw': current_debt_raw,
-                  'currentDebtUSDB': current_debt_usdb,
-                  'liquidationThresholdUSDBPerHASUI': threshold,
-                  'currentCollateralRatio': collateral_ratio,
-                  'currentPriceAboveThresholdPercent': (hasui_price / threshold - 1) * 100,
-                  'currentlyLiquidatableAtHermesPrice': collateral_ratio < mcr,
+                  else:
+                      page_txt.unlink(missing_ok=True)
+              full_text = (root / 'text' / f'{pdf.name}.txt').read_text(errors='replace')
+              reports.append({
+                  'file': pdf.name,
+                  'pages': pages,
+                  'page_hits': page_hits,
+                  'specific_blacklist_liquidation_overlap': bool(specific.search(full_text)),
+                  'specific_overlap_snippets': [
+                      ' '.join(m.group(0).split())[:800]
+                      for m in list(specific.finditer(full_text))[:20]
+                  ],
               })
-
-          object_query = '''query O($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{contents{type{repr}json bcs}}}}}'''
-          admin_caps = []
-          cursor = None
-          while True:
-              connection = gql(object_query, {'type': ADMIN_CAP_TYPE, 'after': cursor})['objects']
-              admin_caps.extend(connection.get('nodes') or [])
-              page = connection.get('pageInfo') or {}
-              if not page.get('hasNextPage'):
-                  break
-              cursor = page.get('endCursor')
-          dump('admin_caps.json', admin_caps)
-
-          position_table = vault.get('position_table') or {}
-          try:
-              position_count = integer(position_table.get('size')) if isinstance(position_table, dict) else None
-          except Exception:
-              position_count = None
-
-          frozen_addresses = find_key(blacklist, 'frozen_addresses')
           summary = {
-              'schema': 'bucket-frozen-hasui-impact-r6b/v1',
-              'network': 'sui-mainnet',
-              'readOnly': True,
-              'checkpoint': checkpoint,
-              'hasuiPriceHermes': hasui_price,
-              'hasuiPriceRaw': price_raw,
-              'hasuiPriceExpo': exponent,
-              'hermesPublishTime': publish_time,
-              'vault': {
-                  'id': HASUI_VAULT,
-                  'mcr': mcr,
-                  'interestRateRaw': annual_rate,
-                  'interestUnitRaw': interest_unit,
-                  'timestampMs': vault_timestamp_ms,
-                  'currentInterestUnitRaw': current_interest_unit,
-                  'requestChecklist': vault.get('request_checklist'),
-                  'positionCount': position_count,
-              },
-              'blacklist': {
-                  'id': BLACKLIST,
-                  'frozenAddresses': frozen_addresses,
-                  'managerSet': find_key(blacklist, 'managers'),
-              },
-              'positions': positions,
-              'combinedCurrentDebtUSDB': sum(row['currentDebtUSDB'] for row in positions),
-              'combinedCollateralHASUI': sum(row['collateralHASUI'] for row in positions),
-              'currentlyLiquidatableCount': sum(
-                  1 for row in positions if row['currentlyLiquidatableAtHermesPrice']
+              'schema': 'bucket-v2-public-audit-duplicate-scan-r6/v1',
+              'reports': reports,
+              'exact_or_near_blacklist_liquidation_overlap_count': sum(
+                  1 for report in reports if report['specific_blacklist_liquidation_overlap']
               ),
-              'adminCaps': admin_caps,
-              'recoverySurface': {
-                  'unblacklistRequiresAdminCap': True,
-                  'permissionlessRecoveryFound': False,
-                  'adminCapObjectCount': len(admin_caps),
-              },
-              'writes': 0,
-              'transactionsConstructed': 0,
-              'generatedUnix': int(time.time()),
+              'search_terms': terms.pattern,
           }
-          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          (root / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
           print(json.dumps(summary, indent=2))
           PY
-          python3 bucket-frozen-hasui-impact-r6b/gate.py | tee bucket-frozen-hasui-impact-r6b/run.log
-          find bucket-frozen-hasui-impact-r6b -type f -print0 | sort -z | xargs -0 sha256sum > bucket-frozen-hasui-impact-r6b/SHA256SUMS.txt
-
-      - name: Validate read-only boundary and material binding
-        shell: bash
-        run: |
-          set -euo pipefail
-          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-frozen-hasui-impact-r6b && exit 1 || true
-          python3 - <<'PY'
-          import json
-          summary = json.load(open('bucket-frozen-hasui-impact-r6b/SUMMARY.json'))
-          assert summary['readOnly'] is True
-          assert summary['writes'] == 0
-          assert summary['transactionsConstructed'] == 0
-          assert len(summary['positions']) == 2
-          assert summary['combinedCurrentDebtUSDB'] > 1_000_000
-          print('BUCKET_FROZEN_HASUI_IMPACT_R6B_PASS')
-          PY
+          python3 bucket-audit-duplicate-r6/scan.py | tee bucket-audit-duplicate-r6/run.log
+          find bucket-audit-duplicate-r6 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-audit-duplicate-r6/SHA256SUMS.txt
 
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-frozen-hasui-impact-r6b
-          path: bucket-frozen-hasui-impact-r6b
+          name: bucket-audit-duplicate-r6
+          path: bucket-audit-duplicate-r6
           if-no-files-found: error
           retention-days: 7
