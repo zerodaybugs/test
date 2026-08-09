@@ -1,4 +1,4 @@
-name: Bucket Liquidation Allowlist Census
+name: Bucket Liquidator Trust Domain Probe
 
 on:
   pull_request:
@@ -11,131 +11,236 @@ permissions:
   contents: read
 
 jobs:
-  census:
+  probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
-      - name: Query live liquidation config and liquidator domains
+      - name: Query liquidator ownership and transaction history
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf bucket-liquidation-allowlist
-          mkdir -p bucket-liquidation-allowlist/raw
-          cat > bucket-liquidation-allowlist/census.py <<'PY'
+          rm -rf bucket-liquidator-domain
+          mkdir -p bucket-liquidator-domain/raw
+          cat > bucket-liquidator-domain/probe.py <<'PY'
           import json
           import pathlib
-          import re
           import time
           import urllib.request
 
-          OUT = pathlib.Path('bucket-liquidation-allowlist')
+          OUT = pathlib.Path('bucket-liquidator-domain')
           RAW = OUT / 'raw'
-          GQL = 'https://graphql.mainnet.sui.io/graphql'
-          CONFIG_TYPE = '0xbe1457c92f8e8c39e85fa4f77bfcd8cfbda30d1861286ba64c76a94773138b5d::liquidation_rule::Config'
-          ADMIN = '0x19f528ccf2c1ff204b61f9958517c26fcf0950a6034a20f8c342cc142fb0f5f5'
-          HEX = re.compile(r'^0x[0-9a-fA-F]{64}$')
+          ENDPOINTS = [
+              'https://sui-mainnet-endpoint.blockvision.org',
+              'https://fullnode.mainnet.sui.io:443',
+          ]
+          ADDRESSES = {
+              'liquidator_a': '0x26266b1381bcf03ab3acc37c1e87beffb52d49f345248bc3efb9114176990ae4',
+              'liquidator_b': '0xb05747d4b5af0ba8cfeacbbf8fc8ab0c37d13b2244c9d9622befbd1e70872fc6',
+              'liquidation_admin': '0x19f528ccf2c1ff204b61f9958517c26fcf0950a6034a20f8c342cc142fb0f5f5',
+              'config_last_updater': '0x938884d43de2bcf13a2f8f5886ea6382994ba49dcf7b3d08203acdd508778b6b',
+          }
+          CONFIG_TX = 'coWCfh9dNo1sA9yRj6Jo3GGcpjY6kxTC9srAuEpcguW'
 
-          def gql(query, variables=None, retries=5):
-              payload = json.dumps({'query': query, 'variables': variables or {}}).encode()
+          def post(endpoint, method, params, retries=5):
+              payload = json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
               last = None
               for n in range(retries):
                   try:
                       req = urllib.request.Request(
-                          GQL,
+                          endpoint,
                           data=payload,
                           method='POST',
-                          headers={'Content-Type':'application/json','User-Agent':'bucket-liquidation-allowlist/1'},
+                          headers={'Content-Type':'application/json','User-Agent':'bucket-liquidator-domain/1'},
                       )
                       with urllib.request.urlopen(req, timeout=90) as response:
                           body = json.loads(response.read().decode())
-                      if body.get('errors'):
-                          raise RuntimeError(json.dumps(body['errors']))
-                      return body
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return body.get('result')
                   except Exception as exc:
                       last = exc
                       time.sleep(2 ** n)
-              raise RuntimeError(f'GraphQL failure: {last}')
+              raise RuntimeError(f'{method} failed: {last}')
+
+          def call(method, params):
+              failures = []
+              for endpoint in ENDPOINTS:
+                  try:
+                      return {'endpoint':endpoint,'result':post(endpoint,method,params)}
+                  except Exception as exc:
+                      failures.append({'endpoint':endpoint,'error':type(exc).__name__,'message':str(exc)})
+              return {'failures':failures}
 
           def dump(name, value):
               (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
 
-          q_configs = '''query C($type:String!){objects(first:50,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{contents{type{repr}json bcs}}}}}'''
-          configs = gql(q_configs, {'type': CONFIG_TYPE})
-          dump('01_configs.json', configs)
-          nodes = configs['data']['objects']['nodes']
+          collected = {}
+          for label, address in ADDRESSES.items():
+              balances = call('suix_getAllBalances', [address])
+              owned = call('suix_getOwnedObjects', [
+                  address,
+                  {'options': {
+                      'showType': True,
+                      'showOwner': True,
+                      'showPreviousTransaction': True,
+                      'showContent': True,
+                      'showDisplay': False,
+                  }},
+                  None,
+                  50,
+              ])
+              sent = call('suix_queryTransactionBlocks', [
+                  {'filter': {'FromAddress': address}, 'options': {
+                      'showInput': True,
+                      'showRawInput': False,
+                      'showEffects': True,
+                      'showEvents': True,
+                      'showObjectChanges': True,
+                      'showBalanceChanges': True,
+                  }},
+                  None,
+                  50,
+                  True,
+              ])
+              collected[label] = {
+                  'address': address,
+                  'balances': balances,
+                  'owned_objects': owned,
+                  'sent_transactions': sent,
+              }
+              dump(f'{label}.json', collected[label])
 
-          liquidators = []
-          config_rows = []
-          for node in nodes:
-              contents = (node.get('asMoveObject') or {}).get('contents') or {}
-              data = contents.get('json') or {}
-              raw_liquidators = (data.get('liquidators') or {}).get('contents', [])
-              raw_versions = (data.get('versions') or {}).get('contents', [])
-              raw_protected = (data.get('protected_debtors') or {}).get('contents', [])
-              raw_unswappable = (data.get('unswappable_coin_types') or {}).get('contents', [])
-              for value in raw_liquidators:
-                  if isinstance(value, str) and HEX.match(value):
-                      liquidators.append(value.lower())
-              config_rows.append({
-                  'id': node.get('address'),
-                  'version': node.get('version'),
-                  'owner': node.get('owner'),
-                  'previous_transaction': node.get('previousTransaction'),
-                  'liquidators': raw_liquidators,
-                  'versions': raw_versions,
-                  'protected_debtors': raw_protected,
-                  'unswappable_coin_types': raw_unswappable,
-              })
+          config_tx = call('sui_getTransactionBlock', [CONFIG_TX, {
+              'showInput': True,
+              'showRawInput': False,
+              'showEffects': True,
+              'showEvents': True,
+              'showObjectChanges': True,
+              'showBalanceChanges': True,
+          }])
+          dump('config_last_update_tx.json', config_tx)
 
-          liquidators = sorted(set(liquidators))
-          q_addr = '''query A($address:SuiAddress!){address(address:$address){address balances(first:50){nodes{coinType coinObjectCount totalBalance}} objects(first:50){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}contents{type{repr}json bcs}}}transactions(first:20,relation:SENT){nodes{digest sender{address}effects{status errors}kind{__typename}}}}}'''
-          address_results = {}
-          for address in liquidators + [ADMIN]:
+          def result(wrapper):
+              return wrapper.get('result') if isinstance(wrapper, dict) else None
+
+          def move_calls(tx):
+              calls = []
               try:
-                  address_results[address] = gql(q_addr, {'address': address})
-              except Exception as exc:
-                  address_results[address] = {'error': type(exc).__name__, 'message': str(exc)}
-          dump('02_liquidator_addresses.json', address_results)
+                  commands = tx['transaction']['data']['transaction']['transactions']
+              except Exception:
+                  return calls
+              for command in commands or []:
+                  mc = command.get('MoveCall') if isinstance(command, dict) else None
+                  if mc:
+                      calls.append({
+                          'package': mc.get('package'),
+                          'module': mc.get('module'),
+                          'function': mc.get('function'),
+                          'type_arguments': mc.get('type_arguments'),
+                      })
+              return calls
+
+          def summarize(label, data):
+              balances = result(data['balances']) or []
+              owned_result = result(data['owned_objects']) or {}
+              owned = owned_result.get('data', []) if isinstance(owned_result, dict) else []
+              sent_result = result(data['sent_transactions']) or {}
+              txs = sent_result.get('data', []) if isinstance(sent_result, dict) else []
+              owned_types = []
+              for row in owned:
+                  item = row.get('data') or {}
+                  type_ = item.get('type')
+                  if type_:
+                      owned_types.append(type_)
+              call_rows = []
+              sponsors = []
+              gas_owners = []
+              for tx in txs:
+                  call_rows.extend(move_calls(tx))
+                  transaction = tx.get('transaction') or {}
+                  data0 = transaction.get('data') or {}
+                  gas = data0.get('gasData') or {}
+                  owner = gas.get('owner')
+                  if owner:
+                      gas_owners.append(owner)
+                  sponsor = data0.get('sender')
+                  if sponsor:
+                      sponsors.append(sponsor)
+              return {
+                  'label': label,
+                  'address': data['address'],
+                  'balance_coin_types': sorted({x.get('coinType') for x in balances if isinstance(x, dict) and x.get('coinType')}),
+                  'owned_object_count_returned': len(owned),
+                  'owned_types': sorted(set(owned_types)),
+                  'sent_tx_count_returned': len(txs),
+                  'unique_gas_owners': sorted(set(gas_owners)),
+                  'unique_senders': sorted(set(sponsors)),
+                  'move_calls': call_rows,
+                  'has_more_sent_transactions': bool(sent_result.get('hasNextPage')) if isinstance(sent_result, dict) else None,
+              }
+
+          summaries = {label:summarize(label,data) for label,data in collected.items()}
+          liquidator_calls = []
+          for label in ('liquidator_a','liquidator_b'):
+              liquidator_calls.extend(summaries[label]['move_calls'])
+          bucket_calls = [x for x in liquidator_calls if str(x.get('package','')).lower() in {
+              '0xbe1457c92f8e8c39e85fa4f77bfcd8cfbda30d1861286ba64c76a94773138b5d',
+              '0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e',
+              '0xc1dd29778f3fccd19a4ac79d1c35a14bf9d65a0b48f1c5bba98a949cacc53e26',
+          }]
+          gas_owner_sets = {
+              label: set(value['unique_gas_owners'])
+              for label, value in summaries.items()
+          }
+          overlaps = {}
+          labels = list(gas_owner_sets)
+          for i, left in enumerate(labels):
+              for right in labels[i+1:]:
+                  overlaps[f'{left}__{right}'] = sorted(gas_owner_sets[left] & gas_owner_sets[right])
 
           summary = {
               'network': 'sui-mainnet',
-              'config_type': CONFIG_TYPE,
-              'config_count': len(config_rows),
-              'configs': config_rows,
-              'liquidator_count': len(liquidators),
-              'liquidators': liquidators,
-              'admin_reference': ADMIN,
-              'liquidator_equals_admin': [x for x in liquidators if x == ADMIN.lower()],
+              'addresses': ADDRESSES,
+              'address_summaries': summaries,
+              'liquidator_bucket_move_calls': bucket_calls,
+              'gas_owner_overlaps': overlaps,
+              'config_update_transaction': config_tx,
               'writes': 0,
               'transactions_constructed': 0,
               'generated_unix': int(time.time()),
           }
           (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
-          print(json.dumps(summary, indent=2))
+          print(json.dumps({
+              'addresses': ADDRESSES,
+              'sent_tx_counts': {k:v['sent_tx_count_returned'] for k,v in summaries.items()},
+              'owned_types': {k:v['owned_types'] for k,v in summaries.items()},
+              'gas_owner_overlaps': overlaps,
+              'liquidator_bucket_move_calls': bucket_calls,
+              'writes': 0,
+          }, indent=2))
           PY
-          python3 bucket-liquidation-allowlist/census.py | tee bucket-liquidation-allowlist/run.log
-          find bucket-liquidation-allowlist -type f -print0 | sort -z | xargs -0 sha256sum > bucket-liquidation-allowlist/SHA256SUMS.txt
+          python3 bucket-liquidator-domain/probe.py | tee bucket-liquidator-domain/run.log
+          find bucket-liquidator-domain -type f -print0 | sort -z | xargs -0 sha256sum > bucket-liquidator-domain/SHA256SUMS.txt
 
       - name: Verify read-only boundary
         shell: bash
         run: |
           set -euo pipefail
-          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-liquidation-allowlist && exit 1 || true
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-liquidator-domain && exit 1 || true
           python3 - <<'PY'
           import json
-          s=json.load(open('bucket-liquidation-allowlist/SUMMARY.json'))
+          s=json.load(open('bucket-liquidator-domain/SUMMARY.json'))
           assert s['writes'] == 0
           assert s['transactions_constructed'] == 0
-          assert s['config_count'] >= 1
-          print('BUCKET_LIQUIDATION_ALLOWLIST_READ_ONLY_PASS')
+          print('BUCKET_LIQUIDATOR_DOMAIN_READ_ONLY_PASS')
           PY
 
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-liquidation-allowlist-census
-          path: bucket-liquidation-allowlist
+          name: bucket-liquidator-trust-domain
+          path: bucket-liquidator-domain
           if-no-files-found: error
           retention-days: 7
