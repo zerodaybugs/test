@@ -1,4 +1,4 @@
-name: Bucket CDP V3 Bytecode Gate
+name: Bucket CDP V3 V4 Security Diff
 
 on:
   pull_request:
@@ -11,50 +11,45 @@ permissions:
   contents: read
 
 jobs:
-  bytecode-gate:
+  security-diff:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch v1, v3, and v4 package bytecode and metadata
+      - name: Fetch deployed disassembly and derive function-level diff
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf bucket-cdp-v3-gate
-          mkdir -p bucket-cdp-v3-gate/{json,mv}
-          cat > bucket-cdp-v3-gate/fetch.py <<'PY'
-          import base64
+          rm -rf bucket-cdp-security-diff
+          mkdir -p bucket-cdp-security-diff/{raw,asm,diff}
+          cat > bucket-cdp-security-diff/diff.py <<'PY'
           import hashlib
           import json
           import pathlib
+          import re
           import time
           import urllib.request
 
-          OUT = pathlib.Path('bucket-cdp-v3-gate')
+          OUT = pathlib.Path('bucket-cdp-security-diff')
           GQL = 'https://graphql.mainnet.sui.io/graphql'
           PACKAGES = {
-              'cdp_v1': '0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e',
-              'cdp_v3_wrapper_link': '0x1a9ed525e699c5716923d36ac02f554368a7f52b83bc59679eef1f99efee324a',
-              'cdp_v4_current': '0xc1dd29778f3fccd19a4ac79d1c35a14bf9d65a0b48f1c5bba98a949cacc53e26',
-              'liquidation_wrapper': '0xbe1457c92f8e8c39e85fa4f77bfcd8cfbda30d1861286ba64c76a94773138b5d',
+              'v3': '0x1a9ed525e699c5716923d36ac02f554368a7f52b83bc59679eef1f99efee324a',
+              'v4': '0xc1dd29778f3fccd19a4ac79d1c35a14bf9d65a0b48f1c5bba98a949cacc53e26',
           }
 
-          def post(payload, retries=5):
-              data = json.dumps(payload).encode()
+          def gql(query, retries=5):
+              payload = json.dumps({'query': query}).encode()
               last = None
               for n in range(retries):
                   try:
                       req = urllib.request.Request(
                           GQL,
-                          data=data,
+                          data=payload,
                           method='POST',
-                          headers={
-                              'Content-Type': 'application/json',
-                              'User-Agent': 'bucket-cdp-v3-bytecode-gate/1',
-                          },
+                          headers={'Content-Type':'application/json','User-Agent':'bucket-cdp-security-diff/1'},
                       )
-                      with urllib.request.urlopen(req, timeout=90) as response:
+                      with urllib.request.urlopen(req, timeout=120) as response:
                           body = json.loads(response.read().decode())
                       if body.get('errors'):
                           raise RuntimeError(json.dumps(body['errors']))
@@ -64,72 +59,122 @@ jobs:
                       time.sleep(2 ** n)
               raise RuntimeError(f'GraphQL failure: {last}')
 
-          def write_json(name, value):
-              (OUT / 'json' / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+          def split_functions(text):
+              starts = []
+              lines = text.splitlines()
+              pattern = re.compile(r'^(?:entry\s+)?(?:public(?:\([^)]*\))?\s+|fun\s+)([^\s<(]+)')
+              for index, line in enumerate(lines):
+                  match = pattern.match(line)
+                  if match:
+                      starts.append((index, match.group(1), line))
+              result = {}
+              for pos, (start, name, signature) in enumerate(starts):
+                  end = starts[pos + 1][0] if pos + 1 < len(starts) else len(lines)
+                  body = '\n'.join(lines[start:end]).rstrip() + '\n'
+                  key = name
+                  suffix = 2
+                  while key in result:
+                      key = f'{name}#{suffix}'
+                      suffix += 1
+                  result[key] = {
+                      'signature': signature,
+                      'body': body,
+                      'sha256': hashlib.sha256(body.encode()).hexdigest(),
+                  }
+              return result
 
-          manifest = {}
+          package_data = {}
+          function_maps = {}
           for label, package_id in PACKAGES.items():
-              query = f'''{{ object(address: "{package_id}") {{ address version digest previousTransaction {{ digest sender {{ address }} }} asMovePackage {{ address version linkage {{ originalId upgradedId version }} typeOrigins {{ module struct definingId }} modules {{ nodes {{ name bytes fileFormatVersion }} }} }} }} }}'''
-              result = post({'query': query})
-              write_json(f'{label}.graphql.json', result)
-              package = result['data']['object']['asMovePackage']
-              target = OUT / 'mv' / label
-              target.mkdir(parents=True, exist_ok=True)
-              rows = []
-              for module in package['modules']['nodes']:
-                  raw = base64.b64decode(module['bytes'])
-                  path = target / f"{module['name']}.mv"
-                  path.write_bytes(raw)
-                  rows.append({
-                      'name': module['name'],
-                      'bytes': len(raw),
-                      'sha256': hashlib.sha256(raw).hexdigest(),
-                      'magic': raw[:4].hex(),
-                      'file_format_version': module.get('fileFormatVersion'),
-                  })
-              manifest[label] = {
-                  'package_id': package_id,
-                  'package_version': package.get('version'),
+              query = f'''{{ object(address: "{package_id}") {{ address version digest asMovePackage {{ address version linkage {{ originalId upgradedId version }} modules {{ nodes {{ name disassembly }} }} }} }} }}'''
+              response = gql(query)
+              (OUT / 'raw' / f'{label}.json').write_text(json.dumps(response, indent=2, sort_keys=True) + '\n')
+              package = response['data']['object']['asMovePackage']
+              package_data[label] = {
+                  'address': package.get('address'),
+                  'version': package.get('version'),
                   'linkage': package.get('linkage'),
-                  'type_origins': package.get('typeOrigins'),
-                  'modules': rows,
               }
+              function_maps[label] = {}
+              for module in package['modules']['nodes']:
+                  name = module['name']
+                  disassembly = module.get('disassembly') or ''
+                  (OUT / 'asm' / f'{label}_{name}.asm').write_text(disassembly)
+                  function_maps[label][name] = split_functions(disassembly)
 
-          write_json('MANIFEST.json', manifest)
+          changed = []
+          modules = sorted(set(function_maps['v3']) | set(function_maps['v4']))
+          security_terms = re.compile(r'liquid|interest|security|manager|admin|request|response|mint|burn|debt|collateral|supply|position|withdraw|repay|borrow|lock|limit|price', re.I)
+          for module in modules:
+              left = function_maps['v3'].get(module, {})
+              right = function_maps['v4'].get(module, {})
+              names = sorted(set(left) | set(right))
+              for name in names:
+                  a = left.get(name)
+                  b = right.get(name)
+                  if a and b and a['sha256'] == b['sha256']:
+                      continue
+                  row = {
+                      'module': module,
+                      'function': name,
+                      'v3_present': bool(a),
+                      'v4_present': bool(b),
+                      'v3_sha256': a['sha256'] if a else None,
+                      'v4_sha256': b['sha256'] if b else None,
+                      'v3_signature': a['signature'] if a else None,
+                      'v4_signature': b['signature'] if b else None,
+                      'security_shaped': bool(security_terms.search(f'{module} {name}')),
+                  }
+                  changed.append(row)
+                  if a:
+                      (OUT / 'diff' / f'{module}__{name}__v3.asm').write_text(a['body'])
+                  if b:
+                      (OUT / 'diff' / f'{module}__{name}__v4.asm').write_text(b['body'])
+
           summary = {
               'network': 'sui-mainnet',
-              'packages': PACKAGES,
-              'v3_vault_present': any(x['name'] == 'vault' for x in manifest['cdp_v3_wrapper_link']['modules']),
+              'packages': package_data,
+              'changed_function_count': len(changed),
+              'security_shaped_changes': [x for x in changed if x['security_shaped']],
+              'all_changes': changed,
               'writes': 0,
               'transactions_constructed': 0,
               'generated_unix': int(time.time()),
           }
-          write_json('SUMMARY.json', summary)
-          print(json.dumps(summary, indent=2))
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'packages': package_data,
+              'changed_function_count': len(changed),
+              'security_shaped_changes': summary['security_shaped_changes'],
+          }, indent=2))
           PY
-          python3 bucket-cdp-v3-gate/fetch.py | tee bucket-cdp-v3-gate/run.log
-          find bucket-cdp-v3-gate -type f -print0 | sort -z | xargs -0 sha256sum > bucket-cdp-v3-gate/SHA256SUMS.txt
+          python3 bucket-cdp-security-diff/diff.py | tee bucket-cdp-security-diff/run.log
+          for pair in bucket-cdp-security-diff/diff/*__v3.asm; do
+            base="${pair%__v3.asm}"
+            if [ -f "${base}__v4.asm" ]; then
+              diff -u "$pair" "${base}__v4.asm" > "${base}.patch" || true
+            fi
+          done
+          find bucket-cdp-security-diff -type f -print0 | sort -z | xargs -0 sha256sum > bucket-cdp-security-diff/SHA256SUMS.txt
 
-      - name: Validate evidence
+      - name: Validate read-only boundary
         shell: bash
         run: |
           set -euo pipefail
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-cdp-security-diff && exit 1 || true
           python3 - <<'PY'
           import json
-          s=json.load(open('bucket-cdp-v3-gate/json/SUMMARY.json'))
+          s=json.load(open('bucket-cdp-security-diff/SUMMARY.json'))
           assert s['writes'] == 0
           assert s['transactions_constructed'] == 0
-          assert s['v3_vault_present']
-          print('BUCKET_CDP_V3_BYTECODE_GATE_PASS')
+          assert s['changed_function_count'] > 0
+          print('BUCKET_CDP_SECURITY_DIFF_PASS')
           PY
-          for f in bucket-cdp-v3-gate/mv/*/*.mv; do
-            test "$(head -c 4 "$f" | xxd -p)" = "a11ceb0b"
-          done
 
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-cdp-v3-bytecode-gate
-          path: bucket-cdp-v3-gate
+          name: bucket-cdp-v3-v4-security-diff
+          path: bucket-cdp-security-diff
           if-no-files-found: error
           retention-days: 7
