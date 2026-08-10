@@ -1,0 +1,349 @@
+name: Bucket Saving Claim Interleaving gRPC R7B
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install official Mysten SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-saving-claim-interleaving-r7b
+          mkdir -p bucket-saving-claim-interleaving-r7b/raw
+          cd bucket-saving-claim-interleaving-r7b
+          npm init -y >/dev/null
+          npm pkg set type=module >/dev/null
+          npm install --no-audit --no-fund @mysten/sui@2.23.2
+          npm list @mysten/sui | tee SDK_VERSION.txt
+
+      - name: Run current-lock and old-linkage controls on an active live position
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > bucket-saving-claim-interleaving-r7b/probe.mjs <<'JS'
+          import fs from 'node:fs';
+          import { Transaction, Inputs } from '@mysten/sui/transactions';
+          import { SuiGrpcClient } from '@mysten/sui/grpc';
+
+          const client = new SuiGrpcClient({
+            network: 'mainnet',
+            baseUrl: 'https://fullnode.mainnet.sui.io:443',
+          });
+
+          const PKG = {
+            account: '0xe2d49d67ff42dc500275f2d84841bf35632aa6c1abdb70af66a10e1de93a4400',
+            savingCurrent: '0x5b60c3cdbb9ee31b856f7f8a6d4d6c8b91e3c0036a138fb9927529b05fd00373',
+            incentiveOrigin: '0x39692320d6fc01c27315a7972ed4717e4fd32eed43531ad6f55fd7f24b74e207',
+            incentiveCurrent: '0xd419027a4b92b1916c62c08da27520576bcf34d0a8c40884491dca2f5d992719',
+          };
+
+          const TYPES = {
+            savingToken: '0x38f61c75fa8407140294c84167dd57684580b55c3066883b48dedc344b1cde1e::susdb::SUSDB',
+            reward: '0x2::sui::SUI',
+          };
+
+          // This address successfully deposited in mainnet tx
+          // CtCi64kMk2u4TesDj1DSsfwPyaZjNK5Swj93Bx5EPZhJ immediately before the census.
+          const SENDER = '0xaa3f912fe367c683001161ce16e040b606437f03c30c346fd17548425783a9a6';
+          // Deliberately distinct from SENDER so the old claimant-local lock check,
+          // if executable, would not match the pending deposit account.
+          const DEPOSIT_TARGET = '0x1111111111111111111111111111111111111111111111111111111111111111';
+
+          const REFS = {
+            pool: {
+              objectId: '0xa0bfd8f31cc869c5f91cc23cb24414f3e225f015d269803279dc8a2179ce964f',
+              initialSharedVersion: '610893718',
+              mutable: true,
+            },
+            treasury: {
+              objectId: '0x4de1c29a89d6888ebf8f7ae20364571dce4e1e42b9c9221f7df924ad6f9e617d',
+              initialSharedVersion: '610893687',
+              mutable: true,
+            },
+            clock: {
+              objectId: '0x0000000000000000000000000000000000000000000000000000000000000006',
+              initialSharedVersion: '1',
+              mutable: false,
+            },
+            rewardManager: {
+              objectId: '0x79c753c1512a0eaeae0aedc623e620c599915e5855e27ee5d292d5bf95192578',
+              initialSharedVersion: '610893721',
+              mutable: true,
+            },
+            incentiveConfig: {
+              objectId: '0x50ffe3535b157841e9ff0470fff722192c90b86b4dee521de0b27b03b44b20f5',
+              initialSharedVersion: '606028576',
+              mutable: false,
+            },
+          };
+
+          const obj = (tx, ref) => tx.object(Inputs.SharedObjectRef(ref));
+
+          function accountRequest(tx) {
+            return tx.moveCall({ target: `${PKG.account}::account::request` });
+          }
+
+          function claim(tx, request, packageId) {
+            return tx.moveCall({
+              target: `${packageId}::saving_incentive::claim`,
+              typeArguments: [TYPES.savingToken, TYPES.reward],
+              arguments: [
+                obj(tx, REFS.rewardManager),
+                obj(tx, REFS.incentiveConfig),
+                obj(tx, REFS.pool),
+                request,
+                obj(tx, REFS.clock),
+              ],
+            });
+          }
+
+          function settleWithdraw(tx, response) {
+            const checker = tx.moveCall({
+              target: `${PKG.incentiveCurrent}::saving_incentive::new_checker_for_withdraw_action`,
+              typeArguments: [TYPES.savingToken],
+              arguments: [obj(tx, REFS.rewardManager), obj(tx, REFS.incentiveConfig), response],
+            });
+            tx.moveCall({
+              target: `${PKG.incentiveCurrent}::saving_incentive::update_withdraw_action`,
+              typeArguments: [TYPES.savingToken, TYPES.reward],
+              arguments: [checker, obj(tx, REFS.incentiveConfig), obj(tx, REFS.rewardManager), obj(tx, REFS.pool), obj(tx, REFS.clock)],
+            });
+            const checked = tx.moveCall({
+              target: `${PKG.incentiveCurrent}::saving_incentive::destroy_withdraw_checker`,
+              typeArguments: [TYPES.savingToken],
+              arguments: [checker, obj(tx, REFS.incentiveConfig)],
+            });
+            tx.moveCall({
+              target: `${PKG.savingCurrent}::saving::check_withdraw_response`,
+              typeArguments: [TYPES.savingToken],
+              arguments: [checked, obj(tx, REFS.pool), obj(tx, REFS.treasury)],
+            });
+          }
+
+          function settleDeposit(tx, response) {
+            const checker = tx.moveCall({
+              target: `${PKG.incentiveCurrent}::saving_incentive::new_checker_for_deposit_action`,
+              typeArguments: [TYPES.savingToken],
+              arguments: [obj(tx, REFS.rewardManager), obj(tx, REFS.incentiveConfig), response],
+            });
+            tx.moveCall({
+              target: `${PKG.incentiveCurrent}::saving_incentive::update_deposit_action`,
+              typeArguments: [TYPES.savingToken, TYPES.reward],
+              arguments: [checker, obj(tx, REFS.incentiveConfig), obj(tx, REFS.rewardManager), obj(tx, REFS.pool), obj(tx, REFS.clock)],
+            });
+            const checked = tx.moveCall({
+              target: `${PKG.incentiveCurrent}::saving_incentive::destroy_deposit_checker`,
+              typeArguments: [TYPES.savingToken],
+              arguments: [checker, obj(tx, REFS.incentiveConfig)],
+            });
+            tx.moveCall({
+              target: `${PKG.savingCurrent}::saving::check_deposit_response`,
+              typeArguments: [TYPES.savingToken],
+              arguments: [checked, obj(tx, REFS.pool), obj(tx, REFS.treasury)],
+            });
+          }
+
+          function openPendingDeposit(tx, request, amount) {
+            const [coin, withdrawResponse] = tx.moveCall({
+              target: `${PKG.savingCurrent}::saving::withdraw`,
+              typeArguments: [TYPES.savingToken],
+              arguments: [
+                obj(tx, REFS.pool),
+                obj(tx, REFS.treasury),
+                request,
+                tx.pure.u64(amount),
+                obj(tx, REFS.clock),
+              ],
+            });
+            settleWithdraw(tx, withdrawResponse);
+            return tx.moveCall({
+              target: `${PKG.savingCurrent}::saving::deposit`,
+              typeArguments: [TYPES.savingToken],
+              arguments: [
+                obj(tx, REFS.pool),
+                obj(tx, REFS.treasury),
+                tx.pure.address(DEPOSIT_TARGET),
+                coin,
+                obj(tx, REFS.clock),
+              ],
+            });
+          }
+
+          function build(mode, amount = 1n) {
+            const tx = new Transaction();
+            tx.setSender(SENDER);
+            const request = accountRequest(tx);
+
+            if (mode === 'current_claim_only') {
+              const reward = claim(tx, request, PKG.incentiveCurrent);
+              tx.transferObjects([reward], tx.pure.address(SENDER));
+              return tx;
+            }
+            if (mode === 'old_claim_only') {
+              const reward = claim(tx, request, PKG.incentiveOrigin);
+              tx.transferObjects([reward], tx.pure.address(SENDER));
+              return tx;
+            }
+
+            const depositResponse = openPendingDeposit(tx, request, amount);
+            if (mode === 'current_during') {
+              const reward = claim(tx, request, PKG.incentiveCurrent);
+              tx.transferObjects([reward], tx.pure.address(SENDER));
+              settleDeposit(tx, depositResponse);
+              return tx;
+            }
+            if (mode === 'current_after') {
+              settleDeposit(tx, depositResponse);
+              const reward = claim(tx, request, PKG.incentiveCurrent);
+              tx.transferObjects([reward], tx.pure.address(SENDER));
+              return tx;
+            }
+            if (mode === 'old_during') {
+              const reward = claim(tx, request, PKG.incentiveOrigin);
+              tx.transferObjects([reward], tx.pure.address(SENDER));
+              settleDeposit(tx, depositResponse);
+              return tx;
+            }
+            throw new Error(`unknown mode ${mode}`);
+          }
+
+          function parse(result) {
+            if (result?.$kind === 'Transaction') {
+              return { success: true, payload: result.Transaction, error: null };
+            }
+            if (result?.$kind === 'FailedTransaction') {
+              const payload = result.FailedTransaction;
+              return { success: false, payload, error: payload?.status?.error ?? payload?.effects?.status?.error ?? null };
+            }
+            if (result?.Transaction) return { success: true, payload: result.Transaction, error: null };
+            if (result?.FailedTransaction) {
+              const payload = result.FailedTransaction;
+              return { success: false, payload, error: payload?.status?.error ?? payload?.effects?.status?.error ?? null };
+            }
+            return { success: false, payload: result, error: result?.thrown ?? { message: 'unknown result shape' } };
+          }
+
+          async function simulate(mode, amount = 1n) {
+            let result;
+            try {
+              result = await client.core.simulateTransaction({
+                transaction: build(mode, amount),
+                checksEnabled: false,
+                include: { commandResults: true, effects: true, balanceChanges: true, objectTypes: true },
+              });
+            } catch (error) {
+              result = { thrown: { name: error?.name, message: error?.message, stack: error?.stack, cause: error?.cause } };
+            }
+            const label = `${mode}_${amount}`;
+            fs.writeFileSync(`raw/${label}.json`, JSON.stringify(result, null, 2));
+            const parsed = parse(result);
+            const error = parsed.error;
+            return {
+              label,
+              mode,
+              amount: String(amount),
+              success: parsed.success,
+              resultKind: result?.$kind ?? null,
+              errorKind: error?.$kind ?? null,
+              errorMessage: error?.message ?? JSON.stringify(error),
+              abortCode: error?.MoveAbort?.abortCode ?? null,
+              abortLocation: error?.MoveAbort?.location ?? null,
+              balanceChanges: parsed.payload?.balanceChanges ?? null,
+            };
+          }
+
+          const cases = [];
+          cases.push(await simulate('current_claim_only'));
+          cases.push(await simulate('old_claim_only'));
+          for (const amount of [1n, 10n, 1000n]) {
+            cases.push(await simulate('current_during', amount));
+            cases.push(await simulate('current_after', amount));
+            cases.push(await simulate('old_during', amount));
+          }
+
+          const currentClaimOnly = cases.find((row) => row.mode === 'current_claim_only');
+          const oldClaimOnly = cases.find((row) => row.mode === 'old_claim_only');
+          const currentDuring = cases.filter((row) => row.mode === 'current_during');
+          const currentAfter = cases.filter((row) => row.mode === 'current_after');
+          const oldDuring = cases.filter((row) => row.mode === 'old_during');
+
+          const currentBaselineWorks = currentClaimOnly?.success === true;
+          const currentLockWorks = currentDuring.length > 0 && currentDuring.every(
+            (row) => !row.success && /ongoing_action/i.test(row.errorMessage ?? ''),
+          );
+          const currentSettlementWorks = currentAfter.some((row) => row.success);
+          const oldClaimInvalidLinkage = oldClaimOnly?.success === false
+            && /InvalidLinkage/i.test(oldClaimOnly?.errorMessage ?? '');
+          const allOldInterleavingsInvalidLinkage = oldDuring.length > 0 && oldDuring.every(
+            (row) => !row.success && /InvalidLinkage/i.test(row.errorMessage ?? ''),
+          );
+
+          const legacyBypassReachable = oldDuring.some((row) => row.success);
+          const summary = {
+            schema: 'bucket-saving-claim-interleaving-grpc-r7b/v1',
+            network: 'sui-mainnet',
+            readOnly: true,
+            activePositionSourceTransaction: 'CtCi64kMk2u4TesDj1DSsfwPyaZjNK5Swj93Bx5EPZhJ',
+            sender: SENDER,
+            depositTarget: DEPOSIT_TARGET,
+            cases,
+            controls: {
+              currentBaselineWorks,
+              currentLockWorks,
+              currentSettlementWorks,
+              oldClaimInvalidLinkage,
+              allOldInterleavingsInvalidLinkage,
+            },
+            legacyBypassReachable,
+            exploitConfirmed: false,
+            verdict: currentBaselineWorks && currentLockWorks && currentSettlementWorks
+              && oldClaimInvalidLinkage && allOldInterleavingsInvalidLinkage
+              ? 'LEGACY_CLAIM_UNREACHABLE_CURRENT_LOCK_ENFORCED'
+              : 'INCONCLUSIVE',
+            productionTransactionsSubmitted: 0,
+            generatedUnix: Math.floor(Date.now() / 1000),
+          };
+          fs.writeFileSync('SUMMARY.json', JSON.stringify(summary, null, 2));
+          console.log(JSON.stringify(summary, null, 2));
+          JS
+          cd bucket-saving-claim-interleaving-r7b
+          node probe.mjs | tee run.log
+          find . -type f ! -path './node_modules/*' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-saving-claim-interleaving-r7b/probe.mjs bucket-saving-claim-interleaving-r7b/SUMMARY.json && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-saving-claim-interleaving-r7b/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['productionTransactionsSubmitted'] == 0
+          print('BUCKET_SAVING_CLAIM_INTERLEAVING_R7B_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-saving-claim-interleaving-r7b
+          path: |
+            bucket-saving-claim-interleaving-r7b/SUMMARY.json
+            bucket-saving-claim-interleaving-r7b/SDK_VERSION.txt
+            bucket-saving-claim-interleaving-r7b/probe.mjs
+            bucket-saving-claim-interleaving-r7b/run.log
+            bucket-saving-claim-interleaving-r7b/SHA256SUMS.txt
+            bucket-saving-claim-interleaving-r7b/raw
+          if-no-files-found: error
+          retention-days: 7
