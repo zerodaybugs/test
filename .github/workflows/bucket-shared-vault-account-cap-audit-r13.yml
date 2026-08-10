@@ -1,0 +1,367 @@
+name: Bucket Shared Vault Account Capability Audit R13
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch and audit three shared USDC vault packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-shared-vault-account-cap-r13
+          mkdir -p bucket-shared-vault-account-cap-r13/{raw,asm,analysis}
+
+          cat > bucket-shared-vault-account-cap-r13/audit.py <<'PY'
+          import json
+          import pathlib
+          import re
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-shared-vault-account-cap-r13')
+          RAW = OUT / 'raw'
+          ASM = OUT / 'asm'
+          ANALYSIS = OUT / 'analysis'
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+          RPCS = [
+              'https://fullnode.mainnet.sui.io:443',
+              'https://sui-mainnet-endpoint.blockvision.org',
+          ]
+          ACCOUNT = '0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc::account::Account'
+          ACCOUNT_REQUEST = '0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc::account::AccountRequest'
+          PACKAGES = {
+              'vault_a': {
+                  'package': '0x75ecf86d06f900ceaa979339965b5f9fa4e8a43a60816e58cbbfa37762bba5b7',
+                  'vault': '0x5ee16dbdf0fde4c0699db409957f5e1b0c7cc4e1b0b28921728b9251fab169b0',
+                  'account': '0x0bd4c9887129746355e0b44552fc2c92787a4fa418249ce1f92e84ab47e28b54',
+              },
+              'vault_b': {
+                  'package': '0x2f567f02e37a7e97cf603a7118e3b44f58401d4970cac2dda04d6bc71a25d9f5',
+                  'vault': '0xa8d05be9b464568dce0dd5fb947c7581179fa8c8770086ae0c4504af46b6c706',
+                  'account': '0x3d3ea407522b697303737f6fd736ef71672af6fdbac6e8a2478245082145d712',
+              },
+              'vault_c': {
+                  'package': '0x6ff4dc407e25a940b345dceca99fc50e8ba27d4de5eec5050100b8036bb0eced',
+                  'vault': '0x51ef46c1dfacd3cb3b7b0e2faa426d4aabcfd0a285c1c42953db7bf0431dde27',
+                  'account': '0xb4ec04eacb8e070cf372796f2f311d16105dc15a2ecda547acd5e5b7465b69ed',
+              },
+          }
+
+          def post(url, payload, retries=6, timeout=180):
+              data = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      req = urllib.request.Request(
+                          url,
+                          data=data,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-shared-vault-account-cap-r13/1',
+                          },
+                      )
+                      with urllib.request.urlopen(req, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2 ** attempt, 30))
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def gql(query, variables=None):
+              body = post(GQL, {'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body.get('data')
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': str(exc)})
+              return {'failures': failures}
+
+          def dump(path, value):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def canonical(value):
+              return json.dumps(value, sort_keys=True, separators=(',', ':'))
+
+          package_query = '''query Package($address:SuiAddress!) {
+            object(address:$address) {
+              address version digest
+              previousTransaction { digest sender { address } }
+              asMovePackage {
+                address version
+                linkage { originalId upgradedId version }
+                typeOrigins { module struct definingId }
+                modules { nodes { name disassembly } }
+              }
+            }
+          }'''
+
+          object_options = {
+              'showType': True,
+              'showOwner': True,
+              'showPreviousTransaction': True,
+              'showDisplay': True,
+              'showContent': True,
+              'showBcs': True,
+          }
+          tx_options = {
+              'showInput': True,
+              'showRawInput': False,
+              'showEffects': True,
+              'showEvents': True,
+              'showObjectChanges': True,
+              'showBalanceChanges': True,
+          }
+
+          patterns = {
+              'account_request': re.compile(r'account::request_with_account|AccountRequest|request_with_account', re.I),
+              'protocol_cap': re.compile(r'protocol.?cap|capabilit|dynamic_object_field|dynamic_field', re.I),
+              'borrow_return': re.compile(r'borrow|return|take|remove|extract|get_', re.I),
+              'auth': re.compile(r'AdminCap|ManagerCap|OwnerCap|tx_context::sender|assert.*owner|authorized|whitelist', re.I),
+              'bucket_call': re.compile(r'bucket|saving_incentive|borrow_incentive|flash|psm|usdb', re.I),
+              'callback': re.compile(r'callback|execute|strategy|rebalance|harvest|claim|collect|fee', re.I),
+          }
+
+          packages = []
+          functions = []
+          hits = []
+          recent_calls = []
+          object_rows = []
+
+          for label, info in PACKAGES.items():
+              package_id = info['package']
+              graph = gql(package_query, {'address': package_id})
+              graph_obj = (graph or {}).get('object')
+              normalized_wrapper = rpc('sui_getNormalizedMoveModulesByPackage', [package_id])
+              normalized = normalized_wrapper.get('result') if isinstance(normalized_wrapper, dict) else None
+              dump(RAW / f'{label}_package.json', graph_obj)
+              dump(RAW / f'{label}_normalized.json', normalized_wrapper)
+
+              move_package = (graph_obj or {}).get('asMovePackage')
+              package_row = {
+                  'label': label,
+                  'package': package_id,
+                  'vault': info['vault'],
+                  'account': info['account'],
+                  'exists': move_package is not None,
+                  'version': (move_package or {}).get('version'),
+                  'linkage': (move_package or {}).get('linkage'),
+                  'typeOrigins': (move_package or {}).get('typeOrigins'),
+                  'modules': [],
+              }
+              if move_package:
+                  directory = ASM / label
+                  directory.mkdir(parents=True, exist_ok=True)
+                  for module in (move_package.get('modules') or {}).get('nodes', []):
+                      module_name = module.get('name')
+                      text = module.get('disassembly') or ''
+                      package_row['modules'].append(module_name)
+                      (directory / f'{module_name}.asm').write_text(text)
+                      lines = text.splitlines()
+                      for line_index, line in enumerate(lines):
+                          for kind, pattern in patterns.items():
+                              if pattern.search(line):
+                                  hits.append({
+                                      'label': label,
+                                      'package': package_id,
+                                      'module': module_name,
+                                      'kind': kind,
+                                      'line': line_index + 1,
+                                      'text': line.strip(),
+                                      'context': '\n'.join(lines[max(0, line_index - 30):min(len(lines), line_index + 50)]),
+                                  })
+              packages.append(package_row)
+
+              if isinstance(normalized, dict):
+                  for module_name, module in normalized.items():
+                      for function_name, function in (module.get('exposedFunctions') or {}).items():
+                          row = {
+                              'label': label,
+                              'package': package_id,
+                              'module': module_name,
+                              'function': function_name,
+                              'visibility': function.get('visibility'),
+                              'isEntry': function.get('isEntry'),
+                              'parameters': function.get('parameters') or [],
+                              'returns': function.get('return') or [],
+                              'typeParameters': function.get('typeParameters') or [],
+                          }
+                          blob = canonical(row)
+                          row['mentionsAccount'] = ACCOUNT.split('0x')[-1] in blob or '::account::Account' in blob
+                          row['mentionsAccountRequest'] = 'AccountRequest' in blob
+                          row['securitySensitive'] = any(word in blob.lower() for word in (
+                              'protocol', 'cap', 'borrow', 'take', 'remove', 'claim', 'fee', 'execute',
+                              'strategy', 'rebalance', 'harvest', 'withdraw', 'deposit', 'admin', 'owner',
+                          ))
+                          functions.append(row)
+
+              for kind, object_id in [('vault', info['vault']), ('account', info['account'])]:
+                  wrapper = rpc('sui_getObject', [object_id, object_options])
+                  dump(RAW / f'{label}_{kind}_object.json', wrapper)
+                  result = wrapper.get('result') if isinstance(wrapper, dict) else None
+                  data = (result or {}).get('data') if isinstance(result, dict) else None
+                  object_rows.append({
+                      'label': label,
+                      'kind': kind,
+                      'id': object_id,
+                      'type': data.get('type') if data else None,
+                      'owner': data.get('owner') if data else None,
+                      'version': data.get('version') if data else None,
+                      'previousTransaction': data.get('previousTransaction') if data else None,
+                      'content': data.get('content') if data else None,
+                  })
+
+              cursor = None
+              for _ in range(12):
+                  wrapper = rpc('suix_queryTransactionBlocks', [{
+                      'filter': {'InputObject': info['vault']},
+                      'options': tx_options,
+                  }, cursor, 50, True])
+                  page = wrapper.get('result') if isinstance(wrapper, dict) else None
+                  if not isinstance(page, dict):
+                      recent_calls.append({'label': label, 'queryFailure': wrapper})
+                      break
+                  for tx in page.get('data') or []:
+                      commands = ((((tx.get('transaction') or {}).get('data') or {}).get('transaction') or {}).get('transactions') or [])
+                      for index, command in enumerate(commands):
+                          call = command.get('MoveCall') if isinstance(command, dict) else None
+                          if not call:
+                              continue
+                          recent_calls.append({
+                              'label': label,
+                              'digest': tx.get('digest'),
+                              'timestampMs': tx.get('timestampMs'),
+                              'sender': (((tx.get('transaction') or {}).get('data') or {}).get('sender')),
+                              'status': (tx.get('effects') or {}).get('status'),
+                              'index': index,
+                              'package': call.get('package'),
+                              'module': call.get('module'),
+                              'function': call.get('function'),
+                              'typeArguments': call.get('type_arguments') or call.get('typeArguments'),
+                              'arguments': call.get('arguments'),
+                          })
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('nextCursor')
+              dump(RAW / f'{label}_recent_calls.json', [row for row in recent_calls if row.get('label') == label])
+
+          public_functions = [
+              row for row in functions
+              if str(row.get('visibility')).lower() == 'public' or row.get('isEntry')
+          ]
+          account_functions = [row for row in public_functions if row['mentionsAccount'] or row['mentionsAccountRequest']]
+          sensitive_functions = [row for row in public_functions if row['securitySensitive']]
+          direct_request_hits = [row for row in hits if row['kind'] == 'account_request']
+          account_dynamic_field_hits = [
+              row for row in hits
+              if row['kind'] == 'protocol_cap' and ('Account' in row['context'] or 'protocol_cap' in row['context'])
+          ]
+          account_related_calls = [
+              row for row in recent_calls
+              if row.get('function') and any(term in str(row.get('function')).lower() for term in (
+                  'protocol', 'cap', 'fee', 'claim', 'harvest', 'rebalance', 'execute', 'withdraw',
+              ))
+          ]
+
+          dump(ANALYSIS / 'functions.json', functions)
+          dump(ANALYSIS / 'public_functions.json', public_functions)
+          dump(ANALYSIS / 'account_functions.json', account_functions)
+          dump(ANALYSIS / 'sensitive_functions.json', sensitive_functions)
+          dump(ANALYSIS / 'hits.json', hits)
+          dump(ANALYSIS / 'account_dynamic_field_hits.json', account_dynamic_field_hits)
+          dump(ANALYSIS / 'account_related_calls.json', account_related_calls)
+
+          summary = {
+              'schema': 'bucket-shared-vault-account-cap-r13/v1',
+              'network': 'sui-mainnet',
+              'readOnly': True,
+              'accountType': ACCOUNT,
+              'accountRequestType': ACCOUNT_REQUEST,
+              'packages': packages,
+              'objects': object_rows,
+              'publicFunctionCount': len(public_functions),
+              'accountFunctionCount': len(account_functions),
+              'accountFunctions': account_functions,
+              'sensitiveFunctionCount': len(sensitive_functions),
+              'directRequestWithAccountHitCount': len(direct_request_hits),
+              'directRequestWithAccountHits': direct_request_hits,
+              'accountDynamicFieldHitCount': len(account_dynamic_field_hits),
+              'accountDynamicFieldHits': account_dynamic_field_hits,
+              'accountRelatedCallCount': len(account_related_calls),
+              'accountRelatedCalls': account_related_calls[:500],
+              'gates': {
+                  'anyPublicAccountBorrowOrReturn': any(
+                      (row['mentionsAccount'] or row['mentionsAccountRequest'])
+                      and any(term in row['function'].lower() for term in ('borrow', 'get', 'take', 'remove', 'request', 'execute'))
+                      for row in public_functions
+                  ),
+                  'anyDirectRequestWithAccountCall': bool(direct_request_hits),
+                  'anyAccountCapabilityExposureSignal': bool(account_functions or direct_request_hits or account_dynamic_field_hits),
+              },
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'productionTransactionsSubmitted': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'packages': [{'label': row['label'], 'modules': row['modules']} for row in packages],
+              'publicFunctionCount': summary['publicFunctionCount'],
+              'accountFunctionCount': summary['accountFunctionCount'],
+              'accountFunctions': account_functions,
+              'directRequestWithAccountHitCount': summary['directRequestWithAccountHitCount'],
+              'accountDynamicFieldHitCount': summary['accountDynamicFieldHitCount'],
+              'gates': summary['gates'],
+          }, indent=2))
+          PY
+
+          python3 bucket-shared-vault-account-cap-r13/audit.py | tee bucket-shared-vault-account-cap-r13/run.log
+          find bucket-shared-vault-account-cap-r13 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-shared-vault-account-cap-r13/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-shared-vault-account-cap-r13 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-shared-vault-account-cap-r13/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          assert summary['productionTransactionsSubmitted'] == 0
+          print('BUCKET_SHARED_VAULT_ACCOUNT_CAP_R13_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-shared-vault-account-cap-r13
+          path: bucket-shared-vault-account-cap-r13
+          if-no-files-found: error
+          retention-days: 7
