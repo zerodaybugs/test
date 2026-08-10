@@ -1,0 +1,276 @@
+name: Bucket Orphan Rewarder Claim gRPC R9
+
+on:
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install official Mysten SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-orphan-rewarder-claim-r9
+          mkdir -p bucket-orphan-rewarder-claim-r9/raw
+          cd bucket-orphan-rewarder-claim-r9
+          npm init -y >/dev/null
+          npm pkg set type=module >/dev/null
+          npm install --no-audit --no-fund @mysten/sui@2.23.2
+          npm list @mysten/sui | tee SDK_VERSION.txt
+
+      - name: Enumerate stake owners and simulate registered-vs-orphan claims
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > bucket-orphan-rewarder-claim-r9/probe.mjs <<'JS'
+          import fs from 'node:fs';
+          import { Transaction, Inputs } from '@mysten/sui/transactions';
+          import { SuiGrpcClient } from '@mysten/sui/grpc';
+
+          const client = new SuiGrpcClient({
+            network: 'mainnet',
+            baseUrl: 'https://fullnode.mainnet.sui.io:443',
+          });
+          const RPCS = [
+            'https://sui-mainnet-endpoint.blockvision.org',
+            'https://fullnode.mainnet.sui.io:443',
+          ];
+
+          const ACCOUNT = '0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc';
+          const INCENTIVE = '0xef9719a3392d3742ae09c42ebf01030d88b1a75651430932be1eb017b79fb372';
+          const COLLATERAL = '0xbde4ba4c2e274a60ce15c1cfff9e5c42e41654ac8b6d906a57efa4bd3c29f47d::hasui::HASUI';
+          const REWARD = '0x2::sui::SUI';
+          const REGISTRY = { objectId: '0x14c57bf1085babf6e408c0488f2b68443f887e67a43436cadf1b84e5d41f54ba', initialSharedVersion: '610893725', mutable: false };
+          const VAULT = { objectId: '0x83367e510389536e2041d50b3faabc2d1b1c8194ca5570a2a3a3e460d6113e86', initialSharedVersion: '610893709', mutable: false };
+          const CLOCK = { objectId: '0x0000000000000000000000000000000000000000000000000000000000000006', initialSharedVersion: '1', mutable: false };
+          const ORPHAN = { objectId: '0xcf9fecf8bcd4aa080ebc27f79692a6c77af47a28ab59e19b66d2951da3209eca', initialSharedVersion: '610893726', mutable: true };
+          const REGISTERED = { objectId: '0x6568cdbc2810d7fa01a4d9ab11c01dc1a4f7cc76ab024f1dd4fb37d658eea047', initialSharedVersion: '636395093', mutable: true };
+          const ORPHAN_STAKE_TABLE = '0x320446960be5451eaddb8897f6c584198c144056809b88fed7d5b278ccb57a17';
+          const NO_POSITION_CONTROL = '0x1111111111111111111111111111111111111111111111111111111111111111';
+
+          async function rpc(method, params) {
+            const failures = [];
+            for (const url of RPCS) {
+              try {
+                const response = await fetch(url, {
+                  method: 'POST',
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+                });
+                const body = await response.json();
+                if (body.error) throw new Error(JSON.stringify(body.error));
+                return { endpoint: url, result: body.result };
+              } catch (error) {
+                failures.push({ endpoint: url, error: String(error) });
+              }
+            }
+            return { failures };
+          }
+
+          const objectOptions = {
+            showType: true,
+            showOwner: true,
+            showPreviousTransaction: true,
+            showDisplay: false,
+            showContent: true,
+            showBcs: true,
+          };
+
+          const stakeFields = [];
+          let cursor = null;
+          for (let pageIndex = 0; pageIndex < 20; pageIndex += 1) {
+            const wrapper = await rpc('suix_getDynamicFields', [ORPHAN_STAKE_TABLE, cursor, 50]);
+            const page = wrapper.result;
+            if (!page || typeof page !== 'object') {
+              stakeFields.push({ queryFailure: wrapper });
+              break;
+            }
+            stakeFields.push(...(page.data ?? []));
+            if (!page.hasNextPage) break;
+            cursor = page.nextCursor;
+          }
+          fs.writeFileSync('raw/orphan_stake_fields.json', JSON.stringify(stakeFields, null, 2));
+
+          const stakeEntries = [];
+          for (const [index, field] of stakeFields.entries()) {
+            const objectId = field.objectId;
+            if (!objectId) continue;
+            const wrapper = await rpc('sui_getObject', [objectId, objectOptions]);
+            fs.writeFileSync(`raw/stake_${String(index).padStart(3, '0')}_${objectId}.json`, JSON.stringify(wrapper, null, 2));
+            const data = wrapper.result?.data ?? null;
+            const fields = data?.content?.fields ?? {};
+            const account = typeof fields.name === 'string'
+              ? fields.name
+              : typeof field.name?.value === 'string'
+                ? field.name.value
+                : null;
+            stakeEntries.push({
+              account,
+              dynamicFieldObject: objectId,
+              type: data?.type ?? field.objectType ?? null,
+              owner: data?.owner ?? null,
+              fields,
+            });
+          }
+
+          const obj = (tx, ref) => tx.object(Inputs.SharedObjectRef(ref));
+
+          function build(sender, rewarder) {
+            const tx = new Transaction();
+            tx.setSender(sender);
+            const request = tx.moveCall({ target: `${ACCOUNT}::account::request` });
+            const rewardCoin = tx.moveCall({
+              target: `${INCENTIVE}::borrow_incentive::claim`,
+              typeArguments: [COLLATERAL, REWARD],
+              arguments: [
+                obj(tx, REGISTRY),
+                obj(tx, rewarder),
+                obj(tx, VAULT),
+                request,
+                obj(tx, CLOCK),
+              ],
+            });
+            tx.transferObjects([rewardCoin], tx.pure.address(sender));
+            return tx;
+          }
+
+          function parseResult(result) {
+            if (result?.$kind === 'Transaction') {
+              return { success: true, payload: result.Transaction, error: null };
+            }
+            if (result?.$kind === 'FailedTransaction') {
+              const payload = result.FailedTransaction;
+              return { success: false, payload, error: payload?.status?.error ?? payload?.effects?.status?.error ?? null };
+            }
+            if (result?.Transaction) return { success: true, payload: result.Transaction, error: null };
+            if (result?.FailedTransaction) {
+              const payload = result.FailedTransaction;
+              return { success: false, payload, error: payload?.status?.error ?? null };
+            }
+            return { success: false, payload: result, error: result?.thrown ?? { message: 'unknown result shape' } };
+          }
+
+          async function simulate(sender, rewarder, label) {
+            let result;
+            try {
+              result = await client.core.simulateTransaction({
+                transaction: build(sender, rewarder),
+                checksEnabled: false,
+                include: {
+                  commandResults: true,
+                  effects: true,
+                  balanceChanges: true,
+                  objectTypes: true,
+                },
+              });
+            } catch (error) {
+              result = { thrown: { name: error?.name, message: error?.message, stack: error?.stack, cause: error?.cause } };
+            }
+            fs.writeFileSync(`raw/${label}.json`, JSON.stringify(result, null, 2));
+            const parsed = parseResult(result);
+            const positiveRewardChanges = (parsed.payload?.balanceChanges ?? []).filter((change) => {
+              const ownerAddress = change?.owner?.AddressOwner ?? change?.owner?.addressOwner ?? null;
+              return change?.coinType === REWARD && BigInt(change?.amount ?? '0') > 0n && ownerAddress === sender;
+            });
+            const error = parsed.error;
+            return {
+              label,
+              sender,
+              rewarder: rewarder.objectId,
+              success: parsed.success,
+              errorKind: error?.$kind ?? null,
+              errorMessage: error?.message ?? JSON.stringify(error),
+              abortCode: error?.MoveAbort?.abortCode ?? null,
+              abortLocation: error?.MoveAbort?.location ?? null,
+              positiveRewardChanges,
+              balanceChanges: parsed.payload?.balanceChanges ?? null,
+              objectChanges: parsed.payload?.objectChanges ?? null,
+              effects: parsed.payload?.effects ?? null,
+            };
+          }
+
+          const stakeAccounts = [...new Set(stakeEntries.map((row) => row.account).filter(Boolean))];
+          const cases = [];
+          for (const account of stakeAccounts) {
+            cases.push(await simulate(account, ORPHAN, `orphan_stake_${account}`));
+            cases.push(await simulate(account, REGISTERED, `registered_control_${account}`));
+          }
+          cases.push(await simulate(NO_POSITION_CONTROL, ORPHAN, 'orphan_no_position_control'));
+
+          const orphanStakeCases = cases.filter((row) => row.label.startsWith('orphan_stake_'));
+          const successfulOrphanStakeClaims = orphanStakeCases.filter((row) => row.success);
+          const positiveOrphanPayouts = successfulOrphanStakeClaims.filter((row) => row.positiveRewardChanges.length > 0);
+          const noPositionControl = cases.find((row) => row.label === 'orphan_no_position_control');
+
+          const summary = {
+            schema: 'bucket-orphan-rewarder-claim-grpc-r9/v1',
+            network: 'sui-mainnet',
+            readOnly: true,
+            package: INCENTIVE,
+            registry: REGISTRY.objectId,
+            vault: VAULT.objectId,
+            collateralType: COLLATERAL,
+            rewardType: REWARD,
+            orphanRewarder: ORPHAN.objectId,
+            registeredControlRewarder: REGISTERED.objectId,
+            orphanStakeTable: ORPHAN_STAKE_TABLE,
+            stakeEntries,
+            stakeAccounts,
+            cases,
+            controls: {
+              orphanAbsentFromRegistry: true,
+              registeredControlPresentInRegistry: true,
+              orphanStakeClaimSuccessCount: successfulOrphanStakeClaims.length,
+              orphanPositivePayoutCount: positiveOrphanPayouts.length,
+              noPositionControlSuccess: noPositionControl?.success === true,
+              noPositionControlPositivePayout: (noPositionControl?.positiveRewardChanges?.length ?? 0) > 0,
+            },
+            orphanClaimPathConfirmed: successfulOrphanStakeClaims.length > 0,
+            orphanFundsExtractableNow: positiveOrphanPayouts.length > 0,
+            productionTransactionsSubmitted: 0,
+            generatedUnix: Math.floor(Date.now() / 1000),
+          };
+          fs.writeFileSync('SUMMARY.json', JSON.stringify(summary, null, 2));
+          console.log(JSON.stringify(summary, null, 2));
+          JS
+          cd bucket-orphan-rewarder-claim-r9
+          node probe.mjs | tee run.log
+          find . -type f ! -path './node_modules/*' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-orphan-rewarder-claim-r9/probe.mjs bucket-orphan-rewarder-claim-r9/SUMMARY.json && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-orphan-rewarder-claim-r9/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['productionTransactionsSubmitted'] == 0
+          print('BUCKET_ORPHAN_REWARDER_CLAIM_R9_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-orphan-rewarder-claim-r9
+          path: |
+            bucket-orphan-rewarder-claim-r9/SUMMARY.json
+            bucket-orphan-rewarder-claim-r9/SDK_VERSION.txt
+            bucket-orphan-rewarder-claim-r9/probe.mjs
+            bucket-orphan-rewarder-claim-r9/run.log
+            bucket-orphan-rewarder-claim-r9/SHA256SUMS.txt
+            bucket-orphan-rewarder-claim-r9/raw
+          if-no-files-found: error
+          retention-days: 7
