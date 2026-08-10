@@ -1,0 +1,161 @@
+name: Bucket Account Owner GraphQL R9B
+
+on:
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enumerate canonical Account objects and owner classes
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-account-owner-graphql-r9b
+          mkdir -p bucket-account-owner-graphql-r9b/raw
+          cat > bucket-account-owner-graphql-r9b/census.py <<'PY'
+          import json
+          import pathlib
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-account-owner-graphql-r9b')
+          RAW = OUT / 'raw'
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+          TYPES = [
+              '0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc::account::Account',
+              '0xe2d49d67ff42dc500275f2d84841bf35632aa6c1abdb70af66a10e1de93a4400::account::Account',
+          ]
+
+          def post(payload, retries=6, timeout=180):
+              body = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      request = urllib.request.Request(
+                          GQL,
+                          data=body,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-account-owner-graphql-r9b/1',
+                          },
+                      )
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2 ** attempt, 30))
+              raise RuntimeError(f'GraphQL failed: {last}')
+
+          def gql(query, variables=None):
+              body = post({'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          def dump(name, value):
+              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          query = '''query Objects($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}} ... on Shared{initialSharedVersion} ... on Immutable{_dummy:__typename}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+
+          rows_by_id = {}
+          by_type = {}
+          for type_name in TYPES:
+              rows = []
+              cursor = None
+              while True:
+                  connection = gql(query, {'type': type_name, 'after': cursor})['objects']
+                  page_rows = connection.get('nodes') or []
+                  rows.extend(page_rows)
+                  for row in page_rows:
+                      rows_by_id[row['address']] = row
+                  page = connection.get('pageInfo') or {}
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('endCursor')
+              by_type[type_name] = rows
+              dump(f'objects_{type_name.split("::")[0]}.json', rows)
+
+          accounts = []
+          for row in rows_by_id.values():
+              owner = row.get('owner') or {}
+              owner_type = owner.get('__typename')
+              accounts.append({
+                  'id': row.get('address'),
+                  'version': row.get('version'),
+                  'digest': row.get('digest'),
+                  'owner': owner,
+                  'ownerType': owner_type,
+                  'previousTransaction': row.get('previousTransaction'),
+                  'hasPublicTransfer': (row.get('asMoveObject') or {}).get('hasPublicTransfer'),
+                  'state': (((row.get('asMoveObject') or {}).get('contents') or {}).get('json') or {}),
+                  'type': ((((row.get('asMoveObject') or {}).get('contents') or {}).get('type') or {}).get('repr')),
+              })
+          accounts.sort(key=lambda row: row['id'])
+          public_accounts = [row for row in accounts if row['ownerType'] in ('Shared', 'Immutable')]
+          object_owned = [row for row in accounts if row['ownerType'] == 'ObjectOwner']
+          address_owned = [row for row in accounts if row['ownerType'] == 'AddressOwner']
+
+          summary = {
+              'schema': 'bucket-account-owner-graphql-r9b/v1',
+              'network': 'sui-mainnet',
+              'readOnly': True,
+              'types': TYPES,
+              'typeCounts': {key: len(value) for key, value in by_type.items()},
+              'accountCount': len(accounts),
+              'accounts': accounts,
+              'ownerCounts': {
+                  'SharedOrImmutable': len(public_accounts),
+                  'ObjectOwner': len(object_owned),
+                  'AddressOwner': len(address_owned),
+              },
+              'publiclyBorrowableAccounts': public_accounts,
+              'sharedAccountClaimTheftCandidate': bool(public_accounts),
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'typeCounts': summary['typeCounts'],
+              'accountCount': summary['accountCount'],
+              'ownerCounts': summary['ownerCounts'],
+              'publiclyBorrowableAccounts': public_accounts,
+              'sharedAccountClaimTheftCandidate': summary['sharedAccountClaimTheftCandidate'],
+          }, indent=2))
+          PY
+          python3 bucket-account-owner-graphql-r9b/census.py | tee bucket-account-owner-graphql-r9b/run.log
+          find bucket-account-owner-graphql-r9b -type f -print0 | sort -z | xargs -0 sha256sum > bucket-account-owner-graphql-r9b/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-account-owner-graphql-r9b && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-account-owner-graphql-r9b/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          print('BUCKET_ACCOUNT_OWNER_GRAPHQL_R9B_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-account-owner-graphql-r9b
+          path: bucket-account-owner-graphql-r9b
+          if-no-files-found: error
+          retention-days: 7
