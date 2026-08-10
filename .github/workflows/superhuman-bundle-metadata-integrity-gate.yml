@@ -1,0 +1,280 @@
+name: Superhuman bundle-metadata integrity exact gate
+
+on:
+  push:
+    branches: [research/superhuman-bundle-metadata-integrity-20260810]
+    paths: [.github/workflows/superhuman-bundle-metadata-integrity-gate.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+
+      - name: Install exact stable Superhuman Packs SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bundle-metadata-gate
+          mkdir -p bundle-metadata-gate/evidence public-intake-status
+          cd bundle-metadata-gate
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund @codahq/packs-sdk@1.17.1
+          node -e "const p=require('./node_modules/@codahq/packs-sdk/package.json'); if(p.version!=='1.17.1') process.exit(1); console.log(p.version)" > evidence/sdk-version.txt
+
+      - name: Compile one bundle, validate benign metadata, execute divergent runtime manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd bundle-metadata-gate
+          cat > pack.ts <<'PACK'
+          import * as sdk from '@codahq/packs-sdk';
+
+          const DEFAULT_AUTH = 'defaultUserAuthentication';
+          const runtimeHasTrustedThunk = Boolean(
+            (globalThis as any).coda &&
+            typeof (globalThis as any).coda.findAndExecutePackFunction === 'function'
+          );
+
+          export const pack = sdk.newPack();
+          pack.setVersion('1.0.0');
+          pack.addNetworkDomain('127.0.0.1:32123');
+          pack.setUserAuthentication({type: sdk.AuthenticationType.HeaderBearerToken});
+          pack.setSystemAuthentication({type: sdk.AuthenticationType.HeaderBearerToken});
+
+          pack.addFormula({
+            name: 'RestrictedAction',
+            description: 'Reads a synthetic private value; metadata restricts this formula to a personal user connection.',
+            parameters: [],
+            resultType: sdk.ValueType.String,
+            connectionRequirement: sdk.ConnectionRequirement.Required,
+            // During CLI/server metadata extraction the trusted thunk is absent, so this restriction is validated.
+            // During canonical runtime loading the thunk is already present, so the exact same bundle omits it.
+            allowedAuthenticationNames: runtimeHasTrustedThunk ? undefined : [DEFAULT_AUTH],
+            execute: async function (_params, context) {
+              const response = await context.fetcher.fetch({
+                method: 'GET',
+                url: 'http://127.0.0.1:32123/private',
+              });
+              return response.body.sentinel;
+            },
+          });
+          PACK
+
+          cat > gate.js <<'NODE'
+          'use strict';
+          const assert = require('assert');
+          const crypto = require('crypto');
+          const fs = require('fs');
+          const http = require('http');
+          const path = require('path');
+
+          const sdkRoot = path.dirname(require.resolve('@codahq/packs-sdk/package.json'));
+          const {compilePackBundle} = require(path.join(sdkRoot, 'dist/testing/compile.js'));
+          const {compilePackMetadata} = require(path.join(sdkRoot, 'dist/helpers/metadata.js'));
+          const {validatePackVersionMetadata} = require(path.join(sdkRoot, 'dist/testing/upload_validation.js'));
+          const {importManifest} = require(path.join(sdkRoot, 'dist/cli/helpers.js'));
+          const {findFormula} = require(path.join(sdkRoot, 'dist/runtime/common/helpers.js'));
+          const bootstrap = require(path.join(sdkRoot, 'dist/runtime/bootstrap/index.js'));
+          const {AuthenticatingFetcher} = require(path.join(sdkRoot, 'dist/testing/fetcher.js'));
+
+          const DEFAULT = 'defaultUserAuthentication';
+          const SYSTEM = 'systemAuthentication';
+          const SYSTEM_TOKEN = 'LAB_SYSTEM_BEARER_20260810';
+          const PRIVATE_SENTINEL = 'LAB_SYSTEM_PRIVATE_DATA_20260810';
+          const PORT = 32123;
+          const captured = [];
+          let server;
+
+          function listen(server) {
+            return new Promise((resolve, reject) => {
+              server.once('error', reject);
+              server.listen(PORT, '127.0.0.1', () => resolve());
+            });
+          }
+          function close(server) {
+            return new Promise(resolve => server.close(() => resolve()));
+          }
+          const logger = {trace(){}, debug(){}, info(){}, warn(){}, error(){}};
+          const blob = {
+            async storeUrl() { throw new Error('not used'); },
+            async storeBlob() { throw new Error('not used'); },
+          };
+
+          async function main() {
+            server = http.createServer((req, res) => {
+              const authorization = req.headers.authorization || '';
+              captured.push({method: req.method, url: req.url, authorization});
+              const authorized = authorization === `Bearer ${SYSTEM_TOKEN}`;
+              res.writeHead(authorized ? 200 : 403, {'content-type': 'application/json'});
+              res.end(JSON.stringify({sentinel: authorized ? PRIVATE_SENTINEL : 'DENIED'}));
+            });
+            await listen(server);
+
+            const outputDir = path.resolve('compiled');
+            const {bundlePath, bundleSourceMapPath} = await compilePackBundle({
+              manifestPath: path.resolve('pack.ts'),
+              outputDirectory: outputDir,
+              intermediateOutputDirectory: path.resolve('intermediate'),
+              minify: false,
+            });
+
+            const bundleBytes = fs.readFileSync(bundlePath);
+            const bundleSha256 = crypto.createHash('sha256').update(bundleBytes).digest('hex');
+
+            // This is the exact path used by the official upload CLI to produce the metadata object.
+            const uploadManifest = await importManifest(bundlePath);
+            const uploadMetadata = compilePackMetadata(uploadManifest);
+            const validatedMetadata = await validatePackVersionMetadata(uploadMetadata, '1.17.1');
+
+            assert.deepEqual(
+              validatedMetadata.formulas[0].allowedAuthenticationNames,
+              [DEFAULT],
+              'validated upload metadata did not retain the default-only restriction',
+            );
+            assert.equal(validatedMetadata.systemConnectionAuthentication.type, 'HeaderBearerToken');
+
+            // Negative control: the exact manifest seen by metadata extraction rejects system auth.
+            let safeManifestError;
+            try {
+              findFormula(uploadManifest, 'RestrictedAction', SYSTEM);
+            } catch (error) {
+              safeManifestError = error;
+            }
+            assert(safeManifestError, 'upload manifest unexpectedly allows system authentication');
+            assert.match(safeManifestError.message, /not allowed for connection with authentication/);
+
+            const isolate = bootstrap.createIsolate({memoryLimit: 64});
+            const context = await bootstrap.createIsolateContext(isolate);
+            await bootstrap.registerBundles(isolate, context, bundlePath, bootstrap.getThunkPath(), true);
+
+            // Prove the runtime loaded a divergent policy from the same bundle bytes.
+            const runtimePolicy = await context.eval(`({
+              allowedAuthenticationNames: pack.pack.formulas[0].allowedAuthenticationNames,
+              trustedThunkPresent: typeof coda.findAndExecutePackFunction === 'function'
+            })`, {copy: true});
+            assert.equal(runtimePolicy.trustedThunkPresent, true);
+            assert.equal(runtimePolicy.allowedAuthenticationNames, undefined);
+
+            const fetcher = new AuthenticatingFetcher(
+              () => {},
+              {type: 'HeaderBearerToken'},
+              [`127.0.0.1:${PORT}`],
+              {token: SYSTEM_TOKEN},
+              'LAB_INVOCATION_20260810',
+            );
+            await bootstrap.injectExecutionContext({
+              context,
+              fetcher,
+              temporaryBlobStorage: blob,
+              syncStateService: undefined,
+              logger,
+              endpoint: undefined,
+              invocationLocation: {protocolAndHost: 'https://coda.io'},
+              timezone: 'UTC',
+              invocationToken: 'LAB_INVOCATION_20260810',
+              sync: undefined,
+              authenticationName: SYSTEM,
+              executionId: 'LAB_EXECUTION_20260810',
+              previousAttemptError: undefined,
+            });
+
+            const result = await bootstrap.executeThunk(
+              context,
+              {params: [], formulaSpec: {type: 'Standard', formulaName: 'RestrictedAction'}},
+              bundlePath,
+              bundleSourceMapPath,
+            );
+            assert.equal(result, PRIVATE_SENTINEL);
+            assert.equal(captured.length, 1);
+            assert.equal(captured[0].authorization, `Bearer ${SYSTEM_TOKEN}`);
+
+            // Patched-design control: runtime and validated metadata must agree on security fields.
+            const uploadPolicy = validatedMetadata.formulas[0].allowedAuthenticationNames;
+            const runtimePolicyValue = runtimePolicy.allowedAuthenticationNames;
+            const securityPolicyEquivalent = JSON.stringify(uploadPolicy) === JSON.stringify(runtimePolicyValue);
+            assert.equal(securityPolicyEquivalent, false);
+
+            const uploadPayload = JSON.stringify({
+              metadata: uploadMetadata,
+              sdkVersion: '1.17.1',
+              bundle: bundleBytes.toString(),
+              sourceMap: fs.readFileSync(bundleSourceMapPath, 'utf8'),
+            });
+
+            const evidence = {
+              pass: true,
+              sdkVersion: require(path.join(sdkRoot, 'package.json')).version,
+              isolatedVmVersion: require('isolated-vm/package.json').version,
+              nodeVersion: process.version,
+              bundleSha256,
+              uploadPayloadSha256: crypto.createHash('sha256').update(uploadPayload).digest('hex'),
+              sameBundleUsedForMetadataAndRuntime: true,
+              officialUploadValidationAccepted: true,
+              validatedUploadPolicy: uploadPolicy,
+              runtimePolicy: runtimePolicyValue === undefined ? null : runtimePolicyValue,
+              runtimeTrustedThunkPresent: runtimePolicy.trustedThunkPresent,
+              safeManifestNegativeControl: safeManifestError.message,
+              runtimeResult: result,
+              capturedRequests: captured,
+              systemCredentialApplied: captured[0].authorization === `Bearer ${SYSTEM_TOKEN}`,
+              securityPolicyEquivalent,
+              rootCause: 'The upload pipeline validates metadata extracted before the trusted thunk exists, while runtime executes pack.pack from the same bundle after coda.findAndExecutePackFunction is installed. A bundle can therefore expose different security policy to validation and execution.',
+              canonicalRuntimePath: 'createIsolateContext -> registerBundles(thunk, pack) -> injectExecutionContext -> executeThunk',
+              productionRequestCount: 0,
+              syntheticOnly: true,
+            };
+            fs.mkdirSync('evidence', {recursive: true});
+            fs.writeFileSync('evidence/RESULT.json', JSON.stringify(evidence, null, 2) + '\n');
+            fs.writeFileSync('evidence/VALIDATED_METADATA.json', JSON.stringify(validatedMetadata, null, 2) + '\n');
+            fs.writeFileSync('evidence/UPLOAD_PAYLOAD_SUMMARY.json', JSON.stringify({
+              sdkVersion: '1.17.1',
+              bundleSha256,
+              metadataSha256: crypto.createHash('sha256').update(JSON.stringify(uploadMetadata)).digest('hex'),
+              uploadPayloadSha256: evidence.uploadPayloadSha256,
+            }, null, 2) + '\n');
+            isolate.dispose();
+          }
+
+          main().then(async () => {
+            await close(server);
+            console.log(fs.readFileSync('evidence/RESULT.json', 'utf8'));
+          }).catch(async error => {
+            try { if (server) await close(server); } catch (_) {}
+            console.error(error && error.stack || error);
+            process.exit(1);
+          });
+          NODE
+
+          node gate.js | tee evidence/TEST_OUTPUT.txt
+          jq -e '.pass == true and .officialUploadValidationAccepted == true and .sameBundleUsedForMetadataAndRuntime == true and .systemCredentialApplied == true and .securityPolicyEquivalent == false' evidence/RESULT.json >/dev/null
+          sha256sum pack.ts gate.js package.json package-lock.json compiled/bundle.js compiled/bundle.js.map evidence/RESULT.json evidence/VALIDATED_METADATA.json evidence/UPLOAD_PAYLOAD_SUMMARY.json evidence/TEST_OUTPUT.txt evidence/sdk-version.txt > evidence/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: superhuman-bundle-metadata-integrity-exact-gate
+          path: bundle-metadata-gate/evidence/
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: Commit compact result for polling
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq '{pass,sdkVersion,isolatedVmVersion,nodeVersion,bundleSha256,uploadPayloadSha256,sameBundleUsedForMetadataAndRuntime,officialUploadValidationAccepted,validatedUploadPolicy,runtimePolicy,runtimeTrustedThunkPresent,safeManifestNegativeControl,runtimeResult,systemCredentialApplied,securityPolicyEquivalent,rootCause,canonicalRuntimePath,productionRequestCount,syntheticOnly}' bundle-metadata-gate/evidence/RESULT.json > public-intake-status/superhuman-bundle-metadata-integrity-result.json
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-bundle-metadata-integrity-result.json
+          git commit -m 'chore: record Superhuman bundle-metadata integrity gate'
+          git push
