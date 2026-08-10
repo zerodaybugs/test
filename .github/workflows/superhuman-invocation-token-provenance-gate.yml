@@ -1,0 +1,120 @@
+name: Superhuman invocation-token provenance gate
+
+on:
+  push:
+    branches: [research/superhuman-invocation-token-20260810]
+    paths: [.github/workflows/superhuman-invocation-token-provenance-gate.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  provenance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+      - uses: actions/checkout@v4
+        with:
+          repository: coda/packs-sdk
+          ref: v1.17.1
+          path: upstream
+          fetch-depth: 0
+
+      - name: Build exact source and history map
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf invocation-token-provenance
+          mkdir -p invocation-token-provenance/evidence public-intake-status
+          cd upstream
+          python3 - <<'PY'
+          import json, os, pathlib, re, subprocess
+
+          root = pathlib.Path('.')
+          ev = pathlib.Path('../invocation-token-provenance/evidence')
+          needles = ['invocationToken', 'CodaApiHeaderBearerToken']
+          occurrences = []
+          for p in root.rglob('*'):
+              if not p.is_file() or '.git' in p.parts:
+                  continue
+              try:
+                  if p.stat().st_size > 5_000_000:
+                      continue
+                  lines = p.read_text(errors='ignore').splitlines()
+              except Exception:
+                  continue
+              for i, line in enumerate(lines):
+                  if any(n in line for n in needles):
+                      s, e = max(0, i-12), min(len(lines), i+16)
+                      occurrences.append({
+                          'path': str(p),
+                          'line': i+1,
+                          'text': line.strip(),
+                          'context': '\n'.join(f'{j+1:05d}: {lines[j]}' for j in range(s,e)),
+                          'under_docs': p.parts and p.parts[0] in {'docs','documentation'},
+                      })
+
+          def git(*args):
+              return subprocess.run(['git', *args], text=True, capture_output=True, check=True).stdout
+
+          history = git('log', '--all', '--date=iso-strict', '--pretty=format:%H%x09%ad%x09%s', '-S', 'invocationToken').splitlines()
+          history_detail = []
+          for row in history[:30]:
+              sha = row.split('\t',1)[0]
+              detail = git('show', '--format=fuller', '--stat', '--oneline', sha)
+              patch = git('show', '--format=', '--unified=20', sha, '--', ':!dist', ':!bundles')
+              history_detail.append({'summary': row, 'detail': detail[:20000], 'patch': patch[:100000]})
+
+          docs_count = sum(1 for x in occurrences if x['under_docs'] and 'invocationToken' in x['context'])
+          api_contexts = [x for x in occurrences if x['path'].endswith(('api_types.ts','api.ts','types.ts')) and 'invocationToken' in x['context']]
+          hidden_nearby = any('@hidden' in x['context'] for x in api_contexts)
+          bearer_contexts = [x for x in occurrences if 'CodaApiHeaderBearerToken' in x['context'] or ('Authorization' in x['context'] and 'invocationToken' in x['context'])]
+          bootstrap_contexts = [x for x in occurrences if 'injectExecutionContext' in x['context'] and 'invocationToken' in x['context']]
+
+          result = {
+              'workflow_run_id': int(os.environ['GITHUB_RUN_ID']),
+              'source_commit': git('rev-parse','HEAD').strip(),
+              'source_tag': 'v1.17.1',
+              'occurrence_count': len(occurrences),
+              'public_docs_occurrence_count': docs_count,
+              'api_context_count': len(api_contexts),
+              'hidden_annotation_near_api_context': hidden_nearby,
+              'bearer_use_context_count': len(bearer_contexts),
+              'bootstrap_injection_context_count': len(bootstrap_contexts),
+              'history_commit_count': len(history),
+              'history': history,
+              'classification': (
+                  'HIDDEN_INTERNAL_BEARER_EXPOSED_TO_PACK_RUNTIME'
+                  if hidden_nearby and docs_count == 0 and bearer_contexts and bootstrap_contexts
+                  else 'REQUIRES_MANUAL_INTENT_REVIEW'
+              ),
+          }
+          (ev/'RESULT.json').write_text(json.dumps(result,indent=2)+'\n')
+          (ev/'OCCURRENCES.json').write_text(json.dumps(occurrences,indent=2)+'\n')
+          (ev/'HISTORY.json').write_text(json.dumps(history_detail,indent=2)+'\n')
+          pathlib.Path('../public-intake-status/superhuman-invocation-token-provenance-result.json').write_text(json.dumps(result,indent=2)+'\n')
+          PY
+          cd ..
+          find invocation-token-provenance/evidence -type f -print0 | sort -z | xargs -0 sha256sum > invocation-token-provenance/evidence/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-invocation-token-provenance-gate
+          path: invocation-token-provenance/evidence/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Commit compact provenance result
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-invocation-token-provenance-result.json
+          git commit -m 'chore: record invocation-token provenance gate'
+          git push
