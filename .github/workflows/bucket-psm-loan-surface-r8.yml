@@ -1,0 +1,402 @@
+name: Bucket PSM and Loan Surface Map R8
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enumerate live PSM, loan, repayment, reward and claim surfaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-psm-loan-surface-r8
+          mkdir -p bucket-psm-loan-surface-r8/{raw,asm}
+          cat > bucket-psm-loan-surface-r8/map.py <<'PY'
+          import json
+          import pathlib
+          import re
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-psm-loan-surface-r8')
+          RAW = OUT / 'raw'
+          ASM = OUT / 'asm'
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+          RPCS = [
+              'https://sui-mainnet-endpoint.blockvision.org',
+              'https://fullnode.mainnet.sui.io:443',
+          ]
+          OBJECTS = {
+              'treasury': '0x4de1c29a89d6888ebf8f7ae20364571dce4e1e42b9c9221f7df924ad6f9e617d',
+              'cetus_provider': '0x891532c633c2f86dbdd595cc006112866f1122cfe9e915f58a8ba37440a2541c',
+              'psm_usdc': '0x37721762186721fb6eaf053f249aaf594503a6ad98dbcc998916be78d20a2df4',
+              'psm_buck': '0x4fef507f41f5b141625f0f193283820fbee26e883f24212d149e4220320ae321',
+              'usdc_price_info': '0x5dec622733a204ca27f5a90d8c2fad453cc6665186fd5dff13a83d0b6c9027ab',
+              'buck_price_info': '0x3ef821a54dbdfe3f211b2ff7261dea0f0330c72fd292422ce586e21f43809a56',
+              'usdc_aggregator': '0x4b612d4d2039d90f596a362f15346a95149728613ca9d2e2c7e471b72b86c105',
+              'buck_aggregator': '0xe7683cdd76af3f80da4f022afa2c31b554a45d23dcd1f418d11eff8cd5c9bf82',
+          }
+          SEED_PACKAGES = {
+              'usdb_current': '0xe14726c336e81b32328e92afc37345d159f5b550b09fa92bd43640cfdd0a0cfd',
+              'cetus_provider_current': '0x2aa4b78126f4f838e330fa29efab2d2720185f7036cbbc4b5b0ab9815d80a302',
+              'collector': '0xf2ab9aa60c5e879675351a1a89f47131de9dea7cc927327dd0e7282e295c7f5e',
+              'pyth_rule': '0x5bc4f912b59c5cfcc86dfc90419837b9c3f9d3a3a94cef7a198838fa196bac4a',
+          }
+          TERMS = re.compile(
+              r'loan|borrow|repay|flash|receipt|debt|mint|burn|psm|swap|redeem|withdraw|deposit|claim|reward|fee|unlock|lock|liquidat|collateral|treasury',
+              re.I,
+          )
+          AUTH = re.compile(
+              r'assert_sender|is_manager|admin|capability|cap\b|owner|sender\(|tx_context::sender|witness|authorized|permission',
+              re.I,
+          )
+
+          def post(url, payload, retries=6, timeout=180):
+              data = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      req = urllib.request.Request(
+                          url,
+                          data=data,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-psm-loan-surface-r8/1',
+                          },
+                      )
+                      with urllib.request.urlopen(req, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2 ** attempt)
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      if body.get('result') is None:
+                          raise RuntimeError('null result')
+                      return {'endpoint': endpoint, 'result': body['result']}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': str(exc)})
+              return {'failures': failures}
+
+          def gql(query, variables=None):
+              body = post(GQL, {'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          def dump(path, value):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def result(wrapper):
+              return wrapper.get('result') if isinstance(wrapper, dict) else None
+
+          def package_from_type(type_name):
+              if not isinstance(type_name, str) or not type_name.startswith('0x'):
+                  return None
+              return type_name.split('::', 1)[0]
+
+          def scan_addresses(value):
+              out = set()
+              if isinstance(value, dict):
+                  for child in value.values():
+                      out.update(scan_addresses(child))
+              elif isinstance(value, list):
+                  for child in value:
+                      out.update(scan_addresses(child))
+              elif isinstance(value, str):
+                  for match in re.findall(r'0x[0-9a-fA-F]{64}', value):
+                      out.add(match.lower())
+              return out
+
+          object_rows = []
+          package_ids = set(SEED_PACKAGES.values())
+          for label, object_id in OBJECTS.items():
+              wrapper = rpc('sui_getObject', [object_id, {
+                  'showType': True,
+                  'showOwner': True,
+                  'showPreviousTransaction': True,
+                  'showContent': True,
+                  'showBcs': True,
+              }])
+              dump(RAW / f'object_{label}.json', wrapper)
+              data = (result(wrapper) or {}).get('data') or {}
+              type_name = data.get('type')
+              package_id = package_from_type(type_name)
+              if package_id:
+                  package_ids.add(package_id)
+              object_rows.append({
+                  'label': label,
+                  'id': object_id,
+                  'endpoint': wrapper.get('endpoint'),
+                  'type': type_name,
+                  'package': package_id,
+                  'owner': data.get('owner'),
+                  'version': data.get('version'),
+                  'digest': data.get('digest'),
+                  'previousTransaction': data.get('previousTransaction'),
+                  'content': data.get('content'),
+              })
+
+          tx_options = {
+              'showInput': True,
+              'showRawInput': False,
+              'showEffects': True,
+              'showEvents': True,
+              'showObjectChanges': True,
+              'showBalanceChanges': True,
+          }
+          tx_rows = []
+          seen_digests = set()
+          for label, object_id in OBJECTS.items():
+              cursor = None
+              pages = []
+              for _ in range(8):
+                  wrapper = rpc('suix_queryTransactionBlocks', [
+                      {'filter': {'InputObject': object_id}, 'options': tx_options},
+                      cursor,
+                      50,
+                      True,
+                  ])
+                  page = result(wrapper)
+                  pages.append(wrapper)
+                  if not isinstance(page, dict):
+                      break
+                  for tx in page.get('data') or []:
+                      digest = tx.get('digest')
+                      if not digest or digest in seen_digests:
+                          continue
+                      seen_digests.add(digest)
+                      programmable = (((tx.get('transaction') or {}).get('data') or {}).get('transaction') or {})
+                      inputs = programmable.get('inputs') or []
+                      commands = programmable.get('transactions') or []
+                      calls = []
+                      for index, command in enumerate(commands):
+                          move = command.get('MoveCall') if isinstance(command, dict) else None
+                          if not move:
+                              continue
+                          package_id = move.get('package')
+                          if package_id:
+                              package_ids.add(package_id)
+                          resolved = []
+                          for argument in move.get('arguments') or []:
+                              row = {'argument': argument}
+                              if isinstance(argument, dict) and 'Input' in argument:
+                                  input_index = int(argument['Input'])
+                                  if input_index < len(inputs):
+                                      row['input_index'] = input_index
+                                      row['input'] = inputs[input_index]
+                              resolved.append(row)
+                          calls.append({
+                              'index': index,
+                              'package': package_id,
+                              'module': move.get('module'),
+                              'function': move.get('function'),
+                              'type_arguments': move.get('type_arguments') or move.get('typeArguments'),
+                              'arguments': resolved,
+                          })
+                      interesting = [
+                          call for call in calls
+                          if TERMS.search(f"{call.get('module')}::{call.get('function')}")
+                      ]
+                      tx_rows.append({
+                          'sourceObject': label,
+                          'sourceObjectId': object_id,
+                          'digest': digest,
+                          'timestampMs': tx.get('timestampMs'),
+                          'sender': ((tx.get('transaction') or {}).get('data') or {}).get('sender'),
+                          'status': (tx.get('effects') or {}).get('status'),
+                          'inputs': inputs,
+                          'calls': calls,
+                          'interestingCalls': interesting,
+                          'balanceChanges': tx.get('balanceChanges'),
+                          'objectChanges': tx.get('objectChanges'),
+                          'events': tx.get('events'),
+                      })
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('nextCursor')
+              dump(RAW / f'transactions_{label}.json', pages)
+
+          # Restrict package fetches to directly observed packages plus object packages. This is
+          # deliberately broad enough to discover the actual PSM and loan implementation while
+          # remaining bounded on public mainnet data.
+          package_query = '''query Package($address:SuiAddress!){object(address:$address){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}modules{nodes{name disassembly}}}}}'''
+          package_rows = []
+          function_rows = []
+          for package_id in sorted(package_ids):
+              try:
+                  graph = gql(package_query, {'address': package_id})['object']
+              except Exception as exc:
+                  package_rows.append({'package': package_id, 'error': str(exc)})
+                  continue
+              dump(RAW / f'package_{package_id[2:18]}.json', graph)
+              package = (graph or {}).get('asMovePackage')
+              if not package:
+                  package_rows.append({'package': package_id, 'exists': False})
+                  continue
+              modules = (package.get('modules') or {}).get('nodes') or []
+              module_names = []
+              for module in modules:
+                  name = module.get('name')
+                  text = module.get('disassembly') or ''
+                  module_names.append(name)
+                  directory = ASM / package_id
+                  directory.mkdir(parents=True, exist_ok=True)
+                  (directory / f'{name}.asm').write_text(text)
+                  headers = list(re.finditer(r'(?m)^(public(?:\([^)]*\))?\s+(?:entry\s+)?(?:fun\s+)?[^\n{]+\{)', text))
+                  for index, match in enumerate(headers):
+                      end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
+                      block = text[match.start():end]
+                      header = match.group(1).strip()
+                      name_match = re.search(r'(?:entry\s+)?(?:fun\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:<|\()', header)
+                      function_name = name_match.group(1) if name_match else header[:160]
+                      if not TERMS.search(f'{name}::{function_name}\n{block}'):
+                          continue
+                      function_rows.append({
+                          'package': package_id,
+                          'module': name,
+                          'function': function_name,
+                          'header': header,
+                          'authSignals': sorted(set(m.group(0) for m in AUTH.finditer(block))),
+                          'riskTerms': sorted(set(m.group(0).lower() for m in TERMS.finditer(block))),
+                          'mintCalls': len(re.findall(r'::mint\b', block)),
+                          'burnCalls': len(re.findall(r'::burn\b', block)),
+                          'transferCalls': len(re.findall(r'(?:transfer::|public_transfer|public_share_object)', block)),
+                          'senderReads': len(re.findall(r'(?:tx_context::sender|sender\()', block)),
+                          'body': block,
+                      })
+              package_rows.append({
+                  'package': package_id,
+                  'exists': True,
+                  'objectVersion': (graph or {}).get('version'),
+                  'packageVersion': package.get('version'),
+                  'previousTransaction': (graph or {}).get('previousTransaction'),
+                  'linkage': package.get('linkage'),
+                  'modules': module_names,
+              })
+
+          call_counts = {}
+          sender_sets = {}
+          sample_digests = {}
+          for tx in tx_rows:
+              for call in tx['interestingCalls']:
+                  key = f"{call['package']}::{call['module']}::{call['function']}"
+                  call_counts[key] = call_counts.get(key, 0) + 1
+                  sender_sets.setdefault(key, set()).add(tx.get('sender'))
+                  sample_digests.setdefault(key, []).append(tx.get('digest'))
+          call_census = []
+          for key, count in sorted(call_counts.items(), key=lambda item: (-item[1], item[0])):
+              call_census.append({
+                  'target': key,
+                  'count': count,
+                  'uniqueSenders': len({value for value in sender_sets[key] if value}),
+                  'sampleDigests': list(dict.fromkeys(sample_digests[key]))[:10],
+              })
+
+          # Prioritize public functions that move/mint/burn value, use sender-derived authorization,
+          # or expose loan/repay/receipt semantics. This is a candidate map, not a vulnerability claim.
+          candidates = []
+          for row in function_rows:
+              score = 0
+              name = f"{row['module']}::{row['function']}"
+              if re.search(r'loan|borrow|flash|repay|receipt|debt', name, re.I): score += 10
+              if re.search(r'psm|swap|redeem|withdraw|deposit', name, re.I): score += 8
+              if re.search(r'claim|reward|fee|unlock', name, re.I): score += 7
+              score += min(row['mintCalls'] * 4, 12)
+              score += min(row['burnCalls'] * 3, 9)
+              score += min(row['transferCalls'] * 2, 8)
+              if not row['authSignals']: score += 4
+              live = next((item for item in call_census if item['target'].endswith(f"::{row['module']}::{row['function']}")), None)
+              if live:
+                  score += min(live['count'], 10)
+              candidates.append({
+                  **{key: value for key, value in row.items() if key != 'body'},
+                  'score': score,
+                  'liveCalls': live['count'] if live else 0,
+                  'uniqueLiveSenders': live['uniqueSenders'] if live else 0,
+                  'sampleDigests': live['sampleDigests'] if live else [],
+              })
+          candidates.sort(key=lambda row: (-row['score'], -row['liveCalls'], row['package'], row['module'], row['function']))
+
+          checkpoint = gql('query{checkpoint{sequenceNumber timestamp}}')['checkpoint']
+          summary = {
+              'schema': 'bucket-psm-loan-surface-r8/v1',
+              'network': 'sui-mainnet',
+              'checkpoint': checkpoint,
+              'readOnly': True,
+              'objects': object_rows,
+              'packages': package_rows,
+              'functionCount': len(function_rows),
+              'transactionCount': len(tx_rows),
+              'interestingTransactionCount': sum(bool(row['interestingCalls']) for row in tx_rows),
+              'callCensus': call_census,
+              'topCandidates': candidates[:100],
+              'allCandidateCount': len(candidates),
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'generatedUnix': int(time.time()),
+          }
+          dump(OUT / 'FUNCTIONS.json', function_rows)
+          dump(OUT / 'TRANSACTIONS.json', tx_rows)
+          dump(OUT / 'SUMMARY.json', summary)
+
+          print(json.dumps({
+              'checkpoint': checkpoint,
+              'objects': [
+                  {'label': row['label'], 'id': row['id'], 'type': row['type'], 'package': row['package']}
+                  for row in object_rows
+              ],
+              'callCensus': call_census[:60],
+              'topCandidates': candidates[:60],
+          }, indent=2))
+          PY
+          python3 bucket-psm-loan-surface-r8/map.py | tee bucket-psm-loan-surface-r8/run.log
+          find bucket-psm-loan-surface-r8 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-psm-loan-surface-r8/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-psm-loan-surface-r8 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-psm-loan-surface-r8/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          print('BUCKET_PSM_LOAN_SURFACE_R8_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-psm-loan-surface-r8
+          path: bucket-psm-loan-surface-r8
+          if-no-files-found: error
+          retention-days: 7
