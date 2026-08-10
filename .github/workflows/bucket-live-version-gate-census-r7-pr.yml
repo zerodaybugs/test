@@ -1,0 +1,128 @@
+name: Bucket Live Version Gate Census R7 PR
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read exact mainnet config objects
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-live-version-gate-census-r7-pr
+          mkdir -p bucket-live-version-gate-census-r7-pr/raw
+          cat > bucket-live-version-gate-census-r7-pr/census.py <<'PY'
+          import json
+          import pathlib
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-live-version-gate-census-r7-pr')
+          RAW = OUT / 'raw'
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+          TYPES = {
+              'saving_incentive_global_config': '0x39692320d6fc01c27315a7972ed4717e4fd32eed43531ad6f55fd7f24b74e207::incentive_config::GlobalConfig',
+              'saving_incentive_registry': '0x39692320d6fc01c27315a7972ed4717e4fd32eed43531ad6f55fd7f24b74e207::saving_incentive::Registry',
+              'borrow_incentive_registry': '0x8cc2eed1b1012881a623e9bafd58ff0f17a8c5f807662631e623acf7779a78ee::borrow_incentive::VaultRewarderRegistry',
+              'psm_access_control': '0x5a77b4e1c6f108047c9c75c3abfddb89cabdea1c1dc7291d7a47f60007259c34::pool::AccessControl',
+          }
+
+          def post(payload, retries=6, timeout=180):
+              data = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      request = urllib.request.Request(
+                          GQL,
+                          data=data,
+                          method='POST',
+                          headers={
+                              'content-type': 'application/json',
+                              'user-agent': 'bucket-live-version-gate-census-r7-pr/1',
+                          },
+                      )
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2 ** attempt)
+              raise RuntimeError(f'GraphQL failed: {last}')
+
+          def gql(query, variables=None):
+              body = post({'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          query = '''query Objects($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+
+          def objects(type_name):
+              rows = []
+              cursor = None
+              while True:
+                  connection = gql(query, {'type': type_name, 'after': cursor})['objects']
+                  rows.extend(connection.get('nodes') or [])
+                  page = connection.get('pageInfo') or {}
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('endCursor')
+              return rows
+
+          checkpoint = gql('query { checkpoint { sequenceNumber timestamp } }')['checkpoint']
+          exact = {}
+          for label, type_name in TYPES.items():
+              rows = objects(type_name)
+              exact[label] = {'type': type_name, 'objects': rows}
+              (RAW / f'{label}.json').write_text(json.dumps(exact[label], indent=2, sort_keys=True) + '\n')
+
+          summary = {
+              'schema': 'bucket-live-version-gate-census-r7-pr/v1',
+              'network': 'sui-mainnet',
+              'checkpoint': checkpoint,
+              'exact': exact,
+              'readOnly': True,
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'checkpoint': checkpoint,
+              'counts': {label: len(value['objects']) for label, value in exact.items()},
+              'objects': exact,
+          }, indent=2))
+          PY
+          python3 bucket-live-version-gate-census-r7-pr/census.py | tee bucket-live-version-gate-census-r7-pr/run.log
+          find bucket-live-version-gate-census-r7-pr -type f -print0 | sort -z | xargs -0 sha256sum > bucket-live-version-gate-census-r7-pr/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-live-version-gate-census-r7-pr && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-live-version-gate-census-r7-pr/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          print('BUCKET_LIVE_VERSION_GATE_CENSUS_R7_PR_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-live-version-gate-census-r7-pr
+          path: bucket-live-version-gate-census-r7-pr
+          if-no-files-found: error
+          retention-days: 7
