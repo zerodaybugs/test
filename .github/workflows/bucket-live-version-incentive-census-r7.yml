@@ -1,0 +1,257 @@
+name: Bucket Live Version and Incentive Census R7
+
+on:
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enumerate live version gates, saving pools, registries and reward managers
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-live-version-incentive-census-r7
+          mkdir -p bucket-live-version-incentive-census-r7/raw
+          cat > bucket-live-version-incentive-census-r7/census.py <<'PY'
+          import json
+          import pathlib
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-live-version-incentive-census-r7')
+          RAW = OUT / 'raw'
+          RPCS = [
+              'https://fullnode.mainnet.sui.io:443',
+              'https://sui-mainnet-endpoint.blockvision.org',
+          ]
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+
+          TYPES = {
+              'saving_incentive_global_config': '0x39692320d6fc01c27315a7972ed4717e4fd32eed43531ad6f55fd7f24b74e207::incentive_config::GlobalConfig',
+              'saving_incentive_registry': '0x39692320d6fc01c27315a7972ed4717e4fd32eed43531ad6f55fd7f24b74e207::saving_incentive::Registry',
+              'borrow_incentive_registry': '0x8cc2eed1b1012881a623e9bafd58ff0f17a8c5f807662631e623acf7779a78ee::borrow_incentive::VaultRewarderRegistry',
+              'psm_access_control': '0x5a77b4e1c6f108047c9c75c3abfddb89cabdea1c1dc7291d7a47f60007259c34::pool::AccessControl',
+          }
+
+          MODULES = {
+              'saving_objects': {
+                  'package': '0x872d08a70db3db498aa7853276acea8091fdd9871b2d86bc8dcb8524526df622',
+                  'module': 'saving',
+              },
+              'saving_incentive_objects': {
+                  'package': '0x39692320d6fc01c27315a7972ed4717e4fd32eed43531ad6f55fd7f24b74e207',
+                  'module': 'saving_incentive',
+              },
+              'borrow_incentive_objects': {
+                  'package': '0x8cc2eed1b1012881a623e9bafd58ff0f17a8c5f807662631e623acf7779a78ee',
+                  'module': 'borrow_incentive',
+              },
+              'psm_objects': {
+                  'package': '0xc2ae6693383e4a81285136effc8190c7baaf0e75aafa36d1c69cd2170cfc3803',
+                  'module': 'pool',
+              },
+          }
+
+          def post(url, payload, retries=6, timeout=180):
+              data = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      request = urllib.request.Request(
+                          url,
+                          data=data,
+                          method='POST',
+                          headers={
+                              'content-type': 'application/json',
+                              'user-agent': 'bucket-live-version-incentive-census-r7/1',
+                          },
+                      )
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2 ** attempt)
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': str(exc)})
+              return {'failures': failures}
+
+          def gql(query, variables=None):
+              body = post(GQL, {'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          def dump(name, value):
+              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def page_query(filter_value, limit=50, max_pages=100):
+              data = []
+              cursor = None
+              endpoint = None
+              for _ in range(max_pages):
+                  wrapper = rpc('suix_queryObjects', [
+                      {'filter': filter_value, 'options': {
+                          'showType': True,
+                          'showOwner': True,
+                          'showPreviousTransaction': True,
+                          'showDisplay': False,
+                          'showContent': True,
+                          'showBcs': True,
+                      }},
+                      cursor,
+                      limit,
+                  ])
+                  page = wrapper.get('result') if isinstance(wrapper, dict) else None
+                  endpoint = wrapper.get('endpoint') if isinstance(wrapper, dict) else endpoint
+                  if not isinstance(page, dict):
+                      return {'endpoint': endpoint, 'data': data, 'failure': wrapper}
+                  data.extend(page.get('data') or [])
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('nextCursor')
+              return {'endpoint': endpoint, 'data': data}
+
+          def object_id(row):
+              return ((row or {}).get('data') or {}).get('objectId')
+
+          checkpoint = gql('query { checkpoint { sequenceNumber timestamp } }')['checkpoint']
+          exact = {}
+          for label, type_name in TYPES.items():
+              exact[label] = page_query({'StructType': type_name})
+              dump(f'{label}.json', exact[label])
+
+          modules = {}
+          for label, spec in MODULES.items():
+              modules[label] = page_query({'MoveModule': spec})
+              dump(f'{label}.json', modules[label])
+
+          discovered = {}
+          for collection in list(exact.values()) + list(modules.values()):
+              for row in collection.get('data') or []:
+                  oid = object_id(row)
+                  if oid:
+                      discovered[oid] = row
+
+          dynamic_fields = {}
+          dynamic_objects = {}
+          for oid in sorted(discovered):
+              cursor = None
+              fields = []
+              for _ in range(100):
+                  wrapper = rpc('suix_getDynamicFields', [oid, cursor, 50])
+                  page = wrapper.get('result') if isinstance(wrapper, dict) else None
+                  if not isinstance(page, dict):
+                      break
+                  fields.extend(page.get('data') or [])
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('nextCursor')
+              if fields:
+                  dynamic_fields[oid] = fields
+                  for field in fields:
+                      child = field.get('objectId')
+                      if child and child not in dynamic_objects:
+                          dynamic_objects[child] = rpc('sui_getObject', [child, {
+                              'showType': True,
+                              'showOwner': True,
+                              'showPreviousTransaction': True,
+                              'showDisplay': False,
+                              'showContent': True,
+                              'showBcs': True,
+                          }])
+          dump('dynamic_fields.json', dynamic_fields)
+          dump('dynamic_objects.json', dynamic_objects)
+
+          def compact(row):
+              data = (row or {}).get('data') or {}
+              return {
+                  'objectId': data.get('objectId'),
+                  'version': data.get('version'),
+                  'digest': data.get('digest'),
+                  'type': data.get('type'),
+                  'owner': data.get('owner'),
+                  'previousTransaction': data.get('previousTransaction'),
+                  'fields': ((data.get('content') or {}).get('fields')),
+              }
+
+          summary = {
+              'schema': 'bucket-live-version-incentive-census-r7/v1',
+              'network': 'sui-mainnet',
+              'checkpoint': checkpoint,
+              'exact_types': {
+                  label: [compact(row) for row in collection.get('data') or []]
+                  for label, collection in exact.items()
+              },
+              'module_objects': {
+                  label: [compact(row) for row in collection.get('data') or []]
+                  for label, collection in modules.items()
+              },
+              'dynamic_fields': dynamic_fields,
+              'dynamic_objects': dynamic_objects,
+              'readOnly': True,
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+
+          print(json.dumps({
+              'checkpoint': checkpoint,
+              'exact_counts': {k: len(v.get('data') or []) for k, v in exact.items()},
+              'module_counts': {k: len(v.get('data') or []) for k, v in modules.items()},
+              'exact_objects': summary['exact_types'],
+              'saving_types': [row['type'] for row in summary['module_objects']['saving_objects']],
+              'saving_incentive_types': [row['type'] for row in summary['module_objects']['saving_incentive_objects']],
+              'borrow_incentive_types': [row['type'] for row in summary['module_objects']['borrow_incentive_objects']],
+              'dynamic_parent_count': len(dynamic_fields),
+              'dynamic_object_count': len(dynamic_objects),
+          }, indent=2))
+          PY
+          python3 bucket-live-version-incentive-census-r7/census.py | tee bucket-live-version-incentive-census-r7/run.log
+          find bucket-live-version-incentive-census-r7 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-live-version-incentive-census-r7/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-live-version-incentive-census-r7 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-live-version-incentive-census-r7/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          print('BUCKET_LIVE_VERSION_INCENTIVE_CENSUS_R7_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-live-version-incentive-census-r7
+          path: bucket-live-version-incentive-census-r7
+          if-no-files-found: error
+          retention-days: 7
