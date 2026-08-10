@@ -1,0 +1,114 @@
+name: Bucket R20 Decision Publisher
+
+on:
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+    paths:
+      - '.github/workflows/bucket-r20-decision-publisher.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/bucket-pyth-revival-gate-20260809
+          fetch-depth: 0
+
+      - name: Publish strict R20 verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GH_BRANCH: agent/bucket-pyth-revival-gate-20260809
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf analysis-results/bucket-r20 /tmp/bucket-r20-publish
+          mkdir -p analysis-results/bucket-r20 /tmp/bucket-r20-publish
+          python3 - <<'PY'
+          import io, json, os, pathlib, urllib.parse, urllib.request, zipfile, time
+          token=os.environ['GH_TOKEN']; repo=os.environ['GH_REPO']; branch=os.environ['GH_BRANCH']
+          out=pathlib.Path('analysis-results/bucket-r20')
+          headers={'Accept':'application/vnd.github+json','Authorization':f'Bearer {token}','X-GitHub-Api-Version':'2022-11-28','User-Agent':'bucket-r20-publisher/1'}
+          def read(url,accept=None):
+              h=dict(headers)
+              if accept: h['Accept']=accept
+              req=urllib.request.Request(url,headers=h)
+              with urllib.request.urlopen(req,timeout=180) as response: return response.read()
+          query=urllib.parse.urlencode({'branch':branch,'status':'completed','per_page':20})
+          runs=json.loads(read(f'https://api.github.com/repos/{repo}/actions/workflows/bucket-pyth-psm-economic-differential-r20.yml/runs?{query}').decode()).get('workflow_runs') or []
+          run=next((row for row in runs if row.get('conclusion')=='success'),None)
+          summary=None; artifact=None; member=None; error=None
+          try:
+              if not run: raise RuntimeError('no successful R20 run')
+              artifacts=json.loads(read(f'https://api.github.com/repos/{repo}/actions/runs/{run["id"]}/artifacts?per_page=100').decode()).get('artifacts') or []
+              artifact=next((row for row in artifacts if row.get('name')=='bucket-pyth-psm-economic-r20' and not row.get('expired')),None)
+              if not artifact: raise RuntimeError('R20 artifact missing')
+              raw=read(f'https://api.github.com/repos/{repo}/actions/artifacts/{artifact["id"]}/zip','application/octet-stream')
+              with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                  candidates=[name for name in archive.namelist() if name=='SUMMARY.json' or name.endswith('/SUMMARY.json')]
+                  if not candidates: raise RuntimeError('R20 SUMMARY.json missing')
+                  member=sorted(candidates,key=lambda value:(value.count('/'),len(value)))[0]
+                  summary=json.loads(archive.read(member).decode())
+          except Exception as exc:
+              error=f'{type(exc).__name__}: {exc}'
+          summary=summary or {}
+          gates=summary.get('gates') or {}
+          compact={
+              'schema':'bucket-r20-published-decision/v1',
+              'generatedUnix':int(time.time()),
+              'run':None if not run else {'id':run.get('id'),'status':run.get('status'),'conclusion':run.get('conclusion'),'headSha':run.get('head_sha'),'htmlUrl':run.get('html_url')},
+              'artifact':None if not artifact else {'id':artifact.get('id'),'name':artifact.get('name'),'digest':artifact.get('digest'),'size':artifact.get('size_in_bytes')},
+              'summaryMember':member,
+              'error':error,
+              'r19ExactCandidateCount':summary.get('r19ExactCandidateCount',0),
+              'strictGates':{
+                  'prerequisiteExactCandidatesPresent':bool(gates.get('prerequisiteExactCandidatesPresent')),
+                  'anyViableCurrentSourceTransaction':bool(gates.get('anyViableCurrentSourceTransaction')),
+                  'anyCanonicalBaselineSuccess':bool(gates.get('anyCanonicalBaselineSuccess')),
+                  'wrongFeedNegativeControlPass':bool(gates.get('wrongFeedNegativeControlPass')),
+                  'controlledPositiveCaseCount':int(gates.get('controlledPositiveCaseCount') or 0),
+                  'repeatablePositiveCandidateCount':int(gates.get('repeatablePositiveCandidateCount') or 0),
+                  'maxAdvantageBps':gates.get('maxAdvantageBps') or 0,
+              },
+              'promotedCandidates':summary.get('promotedCandidates') or [],
+              'exploitConfirmed':bool(summary.get('exploitConfirmed')),
+              'economicImpactProven':bool(summary.get('economicImpactProven')),
+              'materialHighOrCriticalImpactProven':bool(summary.get('materialHighOrCriticalImpactProven')),
+              'duplicateAndScopeGatePassed':bool(summary.get('duplicateAndScopeGatePassed')),
+              'submissionReady':bool(summary.get('submissionReady')),
+              'nextGate':(
+                  'R21_MATERIALITY_AND_DUPLICATE_SCAN'
+                  if summary.get('exploitConfirmed') and summary.get('economicImpactProven')
+                  else 'KILL_PYTH_REPLAY_PATH'
+                  if summary
+                  else 'DEBUG_R20_INFRASTRUCTURE'
+              ),
+          }
+          (out/'COMPACT.json').write_text(json.dumps(compact,indent=2,sort_keys=True)+'\n')
+          (out/'FULL_SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          (out/'STATUS.txt').write_text(
+              f"submissionReady={str(compact['submissionReady']).lower()}\n"
+              f"exploitConfirmed={str(compact['exploitConfirmed']).lower()}\n"
+              f"economicImpactProven={str(compact['economicImpactProven']).lower()}\n"
+              f"nextGate={compact['nextGate']}\n"
+          )
+          print(json.dumps(compact,indent=2,sort_keys=True))
+          PY
+
+      - name: Commit R20 decision
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'bucket-evidence-bot'
+          git config user.email 'bucket-evidence-bot@users.noreply.github.com'
+          git add analysis-results/bucket-r20
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'evidence: publish Bucket R20 economic verdict'
+          git push origin HEAD:agent/bucket-pyth-revival-gate-20260809
