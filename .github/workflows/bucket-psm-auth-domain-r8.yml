@@ -1,0 +1,356 @@
+name: Bucket PSM Authorization Domain R8
+
+on:
+  push:
+    branches: [agent/bucket-psm-auth-r8-20260810]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enumerate PSM ACLs, managers, partner identities, and debtor domains
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-psm-auth-domain-r8
+          mkdir -p bucket-psm-auth-domain-r8/raw
+          cat > bucket-psm-auth-domain-r8/census.py <<'PY'
+          import json
+          import pathlib
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-psm-auth-domain-r8')
+          RAW = OUT / 'raw'
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+          RPCS = [
+              'https://fullnode.mainnet.sui.io:443',
+              'https://sui-mainnet-endpoint.blockvision.org',
+          ]
+
+          PSM_ORIGIN = '0xc2ae6693383e4a81285136effc8190c7baaf0e75aafa36d1c69cd2170cfc3803'
+          PSM_CURRENT = '0x8a46afe6ab0b972e2ee3923f5669104ae9465c12b84cd5e78ea1ff6404e4bfaf'
+          ACCOUNT_ORIGIN = '0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc'
+          ACL_TYPE = f'{PSM_ORIGIN}::pool::AccessControl'
+          ACCOUNT_TYPE = f'{ACCOUNT_ORIGIN}::account::Account'
+
+          POOLS = {
+              'USDC': '0x37721762186721fb6eaf053f249aaf594503a6ad98dbcc998916be78d20a2df4',
+              'BUCK': '0x4fef507f41f5b141625f0f193283820fbee26e883f24212d149e4220320ae321',
+          }
+
+          PARTNER_KEYS = {
+              'USDC': [
+                  '0xdc56a7a5c0d81e13c5b84affccc4c16cf3429b3da61b28ee301bf7588aa83098',
+                  '0xbb7e63ea8820707968c5c9879c5e3a8ac6ffe59337c7e307490089b8c6caf6ef',
+                  '0xd4b02efa6ae3d3b058c1b80ad2e0b2a983f9452911f88a40a60d862138b2944b',
+                  '0xf8d172640dcd63c7f11f8618f75487448199f2c5e1022d35b0e7855765d3c7aa',
+                  '0xb6dc88096c513bb56d7d9f1c0a4ab6fe5938f39da17847b0a522e2c1bb1ddac2',
+                  '0x8a16a2bbcdb4ccbc2245575b7c56fcb785800db8bb27a37e03eb5ea0d6c92709',
+                  '0xb6c90f44de1b3a07a2a0c531f0846871135ab5ff02b8f1a808e02ffdf2618c5a',
+                  '0xc6d44368977271242307a8e28dfb1823a633387801c07662d31dc0ac29983f4b',
+              ],
+              'BUCK': [
+                  '0xcdc08b716b73e5df62e1d9f4148e5b1521ada4515f83bc21854c23f7996661c7',
+                  '0xdc56a7a5c0d81e13c5b84affccc4c16cf3429b3da61b28ee301bf7588aa83098',
+              ],
+          }
+
+          def post(url, payload, retries=6, timeout=180):
+              body = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      request = urllib.request.Request(
+                          url,
+                          data=body,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-psm-auth-domain-r8/1',
+                          },
+                      )
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2 ** attempt, 30))
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def gql(query, variables=None):
+              body = post(GQL, {'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': str(exc)})
+              return {'failures': failures}
+
+          def dump(name, value):
+              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def walk(value, path=()):
+              if isinstance(value, dict):
+                  for key, child in value.items():
+                      yield from walk(child, path + (str(key),))
+              elif isinstance(value, list):
+                  for index, child in enumerate(value):
+                      yield from walk(child, path + (str(index),))
+              else:
+                  yield '.'.join(path), value
+
+          def addresses_under(value, needle):
+              found = set()
+              for path, scalar in walk(value):
+                  if needle.lower() not in path.lower():
+                      continue
+                  if isinstance(scalar, str) and scalar.startswith('0x') and len(scalar) == 66:
+                      found.add(scalar)
+              return sorted(found)
+
+          def all_addresses(value):
+              found = set()
+              for _, scalar in walk(value):
+                  if isinstance(scalar, str) and scalar.startswith('0x') and len(scalar) == 66:
+                      found.add(scalar)
+              return sorted(found)
+
+          def owner_kind(owner):
+              if not isinstance(owner, dict):
+                  return None
+              if 'Shared' in owner:
+                  return 'Shared'
+              if 'Immutable' in owner:
+                  return 'Immutable'
+              if 'AddressOwner' in owner:
+                  return 'AddressOwner'
+              if 'ObjectOwner' in owner:
+                  return 'ObjectOwner'
+              return next(iter(owner), None)
+
+          object_query = '''query Objects($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+
+          def objects(type_name):
+              rows = []
+              cursor = None
+              while True:
+                  connection = gql(object_query, {'type': type_name, 'after': cursor})['objects']
+                  rows.extend(connection.get('nodes') or [])
+                  page = connection.get('pageInfo') or {}
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('endCursor')
+              return rows
+
+          checkpoint = gql('query { checkpoint { sequenceNumber timestamp } }')['checkpoint']
+
+          acl_objects = objects(ACL_TYPE)
+          dump('acl_objects_graphql.json', acl_objects)
+          acl_rows = []
+          unique_managers = set()
+          for row in acl_objects:
+              move = row.get('asMoveObject') or {}
+              state = ((move.get('contents') or {}).get('json') or {})
+              managers = addresses_under(state, 'managers')
+              if not managers:
+                  managers = all_addresses(state)
+              unique_managers.update(managers)
+              acl_rows.append({
+                  'id': row.get('address'),
+                  'version': row.get('version'),
+                  'digest': row.get('digest'),
+                  'owner': row.get('owner'),
+                  'previousTransaction': row.get('previousTransaction'),
+                  'hasPublicTransfer': move.get('hasPublicTransfer'),
+                  'managers': managers,
+                  'state': state,
+              })
+
+          manager_sets = {tuple(row['managers']) for row in acl_rows}
+          differing_manager_sets = len(manager_sets) > 1
+          manager_membership = {}
+          for manager in sorted(unique_managers):
+              manager_membership[manager] = sorted(
+                  row['id'] for row in acl_rows if manager in row['managers']
+              )
+
+          partner_rows = []
+          for pool_label, keys in PARTNER_KEYS.items():
+              for key in keys:
+                  wrapper = rpc('sui_getObject', [key, {
+                      'showType': True,
+                      'showOwner': True,
+                      'showPreviousTransaction': True,
+                      'showDisplay': False,
+                      'showContent': True,
+                      'showBcs': True,
+                  }])
+                  dump(f'partner_{pool_label}_{key}.json', wrapper)
+                  result = wrapper.get('result') if isinstance(wrapper, dict) else None
+                  data = (result or {}).get('data') if isinstance(result, dict) else None
+                  error = (result or {}).get('error') if isinstance(result, dict) else None
+                  object_type = (data or {}).get('type')
+                  owner = (data or {}).get('owner')
+                  kind = owner_kind(owner)
+                  partner_rows.append({
+                      'pool': pool_label,
+                      'key': key,
+                      'existsAsObject': bool(data),
+                      'objectType': object_type,
+                      'owner': owner,
+                      'ownerKind': kind,
+                      'version': (data or {}).get('version'),
+                      'digest': (data or {}).get('digest'),
+                      'previousTransaction': (data or {}).get('previousTransaction'),
+                      'rpcError': error,
+                      'publiclyBorrowableAccountIdentity': bool(
+                          data
+                          and object_type == ACCOUNT_TYPE
+                          and kind in ('Shared', 'Immutable')
+                      ),
+                      'addressOwnedAccountIdentity': bool(
+                          data
+                          and object_type == ACCOUNT_TYPE
+                          and kind == 'AddressOwner'
+                      ),
+                  })
+
+          pool_rows = []
+          for label, object_id in POOLS.items():
+              wrapper = rpc('sui_getObject', [object_id, {
+                  'showType': True,
+                  'showOwner': True,
+                  'showPreviousTransaction': True,
+                  'showDisplay': False,
+                  'showContent': True,
+                  'showBcs': True,
+              }])
+              dump(f'pool_{label}.json', wrapper)
+              result = wrapper.get('result') if isinstance(wrapper, dict) else None
+              data = (result or {}).get('data') if isinstance(result, dict) else None
+              state = (((data or {}).get('content') or {}).get('fields') or {})
+              pool_rows.append({
+                  'label': label,
+                  'id': object_id,
+                  'type': (data or {}).get('type'),
+                  'owner': (data or {}).get('owner'),
+                  'version': (data or {}).get('version'),
+                  'previousTransaction': (data or {}).get('previousTransaction'),
+                  'stateAddresses': all_addresses(state),
+                  'state': state,
+              })
+
+          public_partner_accounts = [
+              row for row in partner_rows if row['publiclyBorrowableAccountIdentity']
+          ]
+          account_partner_objects = [
+              row for row in partner_rows if row['objectType'] == ACCOUNT_TYPE
+          ]
+
+          # A cross-ACL privilege wedge exists only if multiple live ACLs have distinct
+          # manager sets. Exploitability still requires a manager from one ACL to be a
+          # lower-trust principal than the managers of another ACL.
+          manager_set_differences = []
+          for left_index, left in enumerate(acl_rows):
+              for right in acl_rows[left_index + 1:]:
+                  left_set = set(left['managers'])
+                  right_set = set(right['managers'])
+                  if left_set != right_set:
+                      manager_set_differences.append({
+                          'leftAcl': left['id'],
+                          'rightAcl': right['id'],
+                          'leftOnlyManagers': sorted(left_set - right_set),
+                          'rightOnlyManagers': sorted(right_set - left_set),
+                          'sharedManagers': sorted(left_set & right_set),
+                      })
+
+          summary = {
+              'schema': 'bucket-psm-authorization-domain-r8/v1',
+              'network': 'sui-mainnet',
+              'readOnly': True,
+              'checkpoint': checkpoint,
+              'packages': {
+                  'psmOrigin': PSM_ORIGIN,
+                  'psmCurrent': PSM_CURRENT,
+                  'accountOrigin': ACCOUNT_ORIGIN,
+              },
+              'aclType': ACL_TYPE,
+              'accountType': ACCOUNT_TYPE,
+              'aclCount': len(acl_rows),
+              'acls': acl_rows,
+              'uniqueManagers': sorted(unique_managers),
+              'managerMembership': manager_membership,
+              'differingManagerSets': differing_manager_sets,
+              'managerSetDifferences': manager_set_differences,
+              'crossAclPrivilegeRiskCandidate': bool(
+                  len(acl_rows) > 1 and differing_manager_sets
+              ),
+              'partnerIdentities': partner_rows,
+              'accountPartnerObjects': account_partner_objects,
+              'publiclyBorrowablePartnerAccounts': public_partner_accounts,
+              'publicPartnerFeeBypassCandidate': bool(public_partner_accounts),
+              'pools': pool_rows,
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'aclCount': summary['aclCount'],
+              'acls': [
+                  {'id': row['id'], 'managers': row['managers'], 'owner': row['owner']}
+                  for row in acl_rows
+              ],
+              'differingManagerSets': differing_manager_sets,
+              'managerSetDifferences': manager_set_differences,
+              'crossAclPrivilegeRiskCandidate': summary['crossAclPrivilegeRiskCandidate'],
+              'accountPartnerObjects': account_partner_objects,
+              'publiclyBorrowablePartnerAccounts': public_partner_accounts,
+              'publicPartnerFeeBypassCandidate': summary['publicPartnerFeeBypassCandidate'],
+          }, indent=2))
+          PY
+          python3 bucket-psm-auth-domain-r8/census.py | tee bucket-psm-auth-domain-r8/run.log
+          find bucket-psm-auth-domain-r8 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-psm-auth-domain-r8/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-psm-auth-domain-r8 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-psm-auth-domain-r8/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          print('BUCKET_PSM_AUTH_DOMAIN_R8_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-psm-auth-domain-r8
+          path: bucket-psm-auth-domain-r8
+          if-no-files-found: error
+          retention-days: 7
