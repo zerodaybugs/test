@@ -1,0 +1,185 @@
+name: Temporary Ethereum EIP-7702 Differential Gate V2
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ethereum-eip7702-diff-v2-20260810
+  cancel-in-progress: true
+
+jobs:
+  differential-v2:
+    if: github.head_ref == 'ethereum-eip7702-diff-20260810'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: Checkout research harness
+        uses: actions/checkout@v4
+        with:
+          path: research-repo
+          persist-credentials: false
+
+      - name: Checkout exact execution-specs oracle
+        uses: actions/checkout@v4
+        with:
+          repository: ethereum/execution-specs
+          ref: 343274cc0f43962ff39a648e2b2614bf227f8d1f
+          path: eest
+          persist-credentials: false
+
+      - name: Checkout exact Besu release
+        uses: actions/checkout@v4
+        with:
+          repository: besu-eth/besu
+          ref: 26.7.1
+          path: besu
+          persist-credentials: false
+
+      - name: Checkout exact Nethermind release
+        uses: actions/checkout@v4
+        with:
+          repository: NethermindEth/nethermind
+          ref: 1.39.2
+          path: nethermind
+          persist-credentials: false
+
+      - name: Configure uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: eest/uv.lock
+
+      - name: Configure Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: gradle
+          cache-dependency-path: |
+            besu/**/*.gradle*
+            besu/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Configure .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: nethermind/global.json
+
+      - name: Generate fixtures and run corrected clients
+        shell: bash
+        run: |
+          set -uo pipefail
+          ROOT="$GITHUB_WORKSPACE/research-result"
+          BIN="$RUNNER_TEMP/eth7702-bin"
+          mkdir -p "$ROOT/logs" "$ROOT/meta" "$ROOT/fixtures" "$BIN"
+
+          cp research-repo/research/ethereum/eip7702/test_eip7702_cross_tx_cache.py \
+            eest/tests/prague/eip7702_set_code_tx/test_eip7702_cross_tx_cache.py
+          cp research-repo/research/ethereum/eip7702/test_eip7702_cross_tx_cache.py \
+            "$ROOT/meta/test_eip7702_cross_tx_cache.py"
+
+          {
+            echo "eest=$(git -C eest rev-parse HEAD)"
+            echo "besu=$(git -C besu rev-parse HEAD)"
+            echo "nethermind=$(git -C nethermind rev-parse HEAD)"
+            echo "java=$(java -version 2>&1 | head -1)"
+            echo "dotnet=$(dotnet --version)"
+            echo "uv=$(uv --version)"
+          } > "$ROOT/meta/environment.txt"
+
+          run_capture() {
+            name="$1"; shift
+            set +e
+            timeout 1800s "$@" > "$ROOT/logs/${name}.log" 2>&1
+            rc=$?
+            set -e
+            printf '%s=%s\n' "$name" "$rc" | tee -a "$ROOT/meta/exit-codes.txt"
+          }
+
+          set -e
+          run_capture fill_oracle bash -lc \
+            "cd eest && uv run --frozen fill tests/prague/eip7702_set_code_tx/test_eip7702_cross_tx_cache.py --output='$ROOT/fixtures' --clean --until Osaka -n 1 --no-html -q"
+          printf 'fixture_files=%s\n' "$(find "$ROOT/fixtures" -type f | wc -l)" >> "$ROOT/meta/environment.txt"
+          if find "$ROOT/fixtures" -type f -path '*Amsterdam*' | grep -q .; then
+            echo 'future_fork_fixture_detected=1' >> "$ROOT/meta/exit-codes.txt"
+          else
+            echo 'future_fork_fixture_detected=0' >> "$ROOT/meta/exit-codes.txt"
+          fi
+
+          run_capture build_besu bash -lc \
+            "cd besu && ./gradlew :ethereum:evmtool:installDist --no-daemon --stacktrace"
+          run_capture build_nethermind dotnet publish \
+            nethermind/src/Nethermind/Nethermind.Test.Runner/Nethermind.Test.Runner.csproj \
+            -c Release -o "$BIN/nethermind-publish" --nologo
+
+          BESU_BIN="$GITHUB_WORKSPACE/besu/ethereum/evmtool/build/install/evmtool/bin/evmtool"
+          cat > "$BIN/nethtest" <<EOF
+          #!/bin/sh
+          exec dotnet "$BIN/nethermind-publish/nethtest.dll" "\$@"
+          EOF
+          chmod +x "$BIN/nethtest"
+          NETHERMIND_BIN="$BIN/nethtest"
+
+          if [ -x "$BESU_BIN" ]; then
+            run_capture besu_version "$BESU_BIN" --version
+            run_capture besu_consume bash -lc \
+              "cd eest && uv run --frozen consume direct --input='$ROOT/fixtures' --bin='$BESU_BIN' -m blockchain_test -q"
+          else
+            echo 'besu_consume=127' >> "$ROOT/meta/exit-codes.txt"
+          fi
+
+          if [ -f "$BIN/nethermind-publish/nethtest.dll" ]; then
+            run_capture nethermind_version "$NETHERMIND_BIN" --version
+            run_capture nethermind_consume bash -lc \
+              "cd eest && uv run --frozen consume direct --input='$ROOT/fixtures' --bin='$NETHERMIND_BIN' -m blockchain_test -q"
+          else
+            echo 'nethermind_consume=127' >> "$ROOT/meta/exit-codes.txt"
+          fi
+
+          sha256sum "$ROOT/meta/test_eip7702_cross_tx_cache.py" > "$ROOT/meta/SHA256SUMS.txt"
+          echo MATRIX_COMPLETE > "$ROOT/meta/status.txt"
+
+      - name: Encrypt detailed evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/research-result"
+          OUT="$GITHUB_WORKSPACE/encrypted-artifact"
+          mkdir -p "$ROOT" "$OUT"
+          cat > /tmp/research-public.pem <<'EOF'
+          -----BEGIN PUBLIC KEY-----
+          MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEApvGn1xm0jtBH6PqutVPv
+          GMp0c7xei4ZH4Eqgp7gykg/L0lvKq4UDguy0DvyqkhC/zklHXm4ZL7JKOY1FCFvJ
+          4yo/1UHDY5sHjfmwmubctOVDG+3N8J4hSrijKNyHx1Tc5kd5a/w1CTrkvl6tghmQ
+          lEXTg2lZOqOMnOMEbn1Ult6qCZqc0Dlso5/mE6nkThvpiUtKGroxtcIjS43GvR5J
+          xSNI2XakdnWIgUXAbswo+CWMNmZ4dG9vmsImf+EiDA2HP/gF53YkfZSeLrdfrEY/
+          mzV6VvLFiXXfJXOXDvt2jo+UkgNph50RksCndYaoKaxfptv62wJOfbr9Wbk344iC
+          yxxedPGWiTcGWEcETwiG3H1KNK7nDBFq9hCCAFwfF2OI28uqqsO1pF+LyOmQBNHu
+          MfMeMgJUM4L12deKmQr5gDaLIE1zNQ8dlnzZSvGuhbrE5aEosB1GsJlgr805Q5F6
+          /lKXSchFss4H5pvYAO/0FELZiS30M77M2HB56b/IQlrhAgMBAAE=
+          -----END PUBLIC KEY-----
+          EOF
+          tar -C "$GITHUB_WORKSPACE" -czf /tmp/research-result.tar.gz research-result
+          keyhex="$(openssl rand -hex 32)"; ivhex="$(openssl rand -hex 16)"
+          printf '%s\n%s\n' "$keyhex" "$ivhex" > /tmp/key-material.txt
+          openssl enc -aes-256-cbc -K "$keyhex" -iv "$ivhex" \
+            -in /tmp/research-result.tar.gz -out "$OUT/research-result.tar.gz.enc"
+          openssl pkeyutl -encrypt -pubin -inkey /tmp/research-public.pem \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+            -in /tmp/key-material.txt -out "$OUT/key-material.rsa-oaep.enc"
+          (cd "$OUT" && sha256sum key-material.rsa-oaep.enc research-result.tar.gz.enc > SHA256SUMS.txt)
+          echo ENCRYPTED_RESEARCH_ARTIFACT_V2 > "$OUT/FORMAT.txt"
+          rm -rf "$ROOT" /tmp/research-result.tar.gz /tmp/key-material.txt /tmp/research-public.pem
+
+      - name: Upload encrypted-only result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ethereum-eip7702-differential-v2-encrypted
+          path: encrypted-artifact
+          if-no-files-found: error
+          retention-days: 1
