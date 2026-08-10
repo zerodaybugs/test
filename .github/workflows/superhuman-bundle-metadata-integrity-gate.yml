@@ -36,6 +36,7 @@ jobs:
         run: |
           set -euo pipefail
           cd bundle-metadata-gate
+
           cat > pack.ts <<'PACK'
           import * as sdk from '@codahq/packs-sdk';
 
@@ -53,12 +54,11 @@ jobs:
 
           pack.addFormula({
             name: 'RestrictedAction',
-            description: 'Reads a synthetic private value; metadata restricts this formula to a personal user connection.',
+            description: 'Reads a synthetic private value; upload metadata restricts this formula to a personal user connection.',
             parameters: [],
             resultType: sdk.ValueType.String,
             connectionRequirement: sdk.ConnectionRequirement.Required,
-            // During CLI/server metadata extraction the trusted thunk is absent, so this restriction is validated.
-            // During canonical runtime loading the thunk is already present, so the exact same bundle omits it.
+            // Metadata extraction loads only the Pack bundle. Canonical execution loads the trusted thunk first.
             allowedAuthenticationNames: runtimeHasTrustedThunk ? undefined : [DEFAULT_AUTH],
             execute: async function (_params, context) {
               const response = await context.fetcher.fetch({
@@ -77,12 +77,12 @@ jobs:
           const fs = require('fs');
           const http = require('http');
           const path = require('path');
+          const {pathToFileURL} = require('url');
 
           const sdkRoot = path.dirname(require.resolve('@codahq/packs-sdk/package.json'));
           const {compilePackBundle} = require(path.join(sdkRoot, 'dist/testing/compile.js'));
           const {compilePackMetadata} = require(path.join(sdkRoot, 'dist/helpers/metadata.js'));
           const {validatePackVersionMetadata} = require(path.join(sdkRoot, 'dist/testing/upload_validation.js'));
-          const {importManifest} = require(path.join(sdkRoot, 'dist/cli/helpers.js'));
           const {findFormula} = require(path.join(sdkRoot, 'dist/runtime/common/helpers.js'));
           const bootstrap = require(path.join(sdkRoot, 'dist/runtime/bootstrap/index.js'));
           const {AuthenticatingFetcher} = require(path.join(sdkRoot, 'dist/testing/fetcher.js'));
@@ -95,15 +95,16 @@ jobs:
           const captured = [];
           let server;
 
-          function listen(server) {
+          function listen(value) {
             return new Promise((resolve, reject) => {
-              server.once('error', reject);
-              server.listen(PORT, '127.0.0.1', () => resolve());
+              value.once('error', reject);
+              value.listen(PORT, '127.0.0.1', resolve);
             });
           }
-          function close(server) {
-            return new Promise(resolve => server.close(() => resolve()));
+          function close(value) {
+            return new Promise(resolve => value.close(resolve));
           }
+
           const logger = {trace(){}, debug(){}, info(){}, warn(){}, error(){}};
           const blob = {
             async storeUrl() { throw new Error('not used'); },
@@ -120,30 +121,34 @@ jobs:
             });
             await listen(server);
 
-            const outputDir = path.resolve('compiled');
             const {bundlePath, bundleSourceMapPath} = await compilePackBundle({
               manifestPath: path.resolve('pack.ts'),
-              outputDirectory: outputDir,
+              outputDirectory: path.resolve('compiled'),
               intermediateOutputDirectory: path.resolve('intermediate'),
               minify: false,
             });
 
             const bundleBytes = fs.readFileSync(bundlePath);
+            const sourceMapBytes = fs.readFileSync(bundleSourceMapPath);
             const bundleSha256 = crypto.createHash('sha256').update(bundleBytes).digest('hex');
 
-            // This is the exact path used by the official upload CLI to produce the metadata object.
-            const uploadManifest = await importManifest(bundlePath);
+            // Equivalent to the official CLI importManifest(): dynamic-import the compiled bundle,
+            // then select module.pack || module.manifest. This avoids loading unrelated CLI config modules.
+            const moduleUrl = pathToFileURL(path.resolve(bundlePath)).href + `?metadata=${Date.now()}`;
+            const importedModule = await import(moduleUrl);
+            const uploadManifest =
+              importedModule.pack ||
+              importedModule.manifest ||
+              importedModule.default?.pack ||
+              importedModule.default?.manifest;
+            assert(uploadManifest, 'compiled bundle did not export pack or manifest');
+
             const uploadMetadata = compilePackMetadata(uploadManifest);
             const validatedMetadata = await validatePackVersionMetadata(uploadMetadata, '1.17.1');
-
-            assert.deepEqual(
-              validatedMetadata.formulas[0].allowedAuthenticationNames,
-              [DEFAULT],
-              'validated upload metadata did not retain the default-only restriction',
-            );
+            const validatedPolicy = validatedMetadata.formulas[0].allowedAuthenticationNames;
+            assert.deepEqual(validatedPolicy, [DEFAULT]);
             assert.equal(validatedMetadata.systemConnectionAuthentication.type, 'HeaderBearerToken');
 
-            // Negative control: the exact manifest seen by metadata extraction rejects system auth.
             let safeManifestError;
             try {
               findFormula(uploadManifest, 'RestrictedAction', SYSTEM);
@@ -157,7 +162,6 @@ jobs:
             const context = await bootstrap.createIsolateContext(isolate);
             await bootstrap.registerBundles(isolate, context, bundlePath, bootstrap.getThunkPath(), true);
 
-            // Prove the runtime loaded a divergent policy from the same bundle bytes.
             const runtimePolicy = await context.eval(`({
               allowedAuthenticationNames: pack.pack.formulas[0].allowedAuthenticationNames,
               trustedThunkPresent: typeof coda.findAndExecutePackFunction === 'function'
@@ -188,30 +192,33 @@ jobs:
               previousAttemptError: undefined,
             });
 
-            const result = await bootstrap.executeThunk(
+            const runtimeResult = await bootstrap.executeThunk(
               context,
               {params: [], formulaSpec: {type: 'Standard', formulaName: 'RestrictedAction'}},
               bundlePath,
               bundleSourceMapPath,
             );
-            assert.equal(result, PRIVATE_SENTINEL);
+            assert.equal(runtimeResult, PRIVATE_SENTINEL);
             assert.equal(captured.length, 1);
             assert.equal(captured[0].authorization, `Bearer ${SYSTEM_TOKEN}`);
 
-            // Patched-design control: runtime and validated metadata must agree on security fields.
-            const uploadPolicy = validatedMetadata.formulas[0].allowedAuthenticationNames;
             const runtimePolicyValue = runtimePolicy.allowedAuthenticationNames;
-            const securityPolicyEquivalent = JSON.stringify(uploadPolicy) === JSON.stringify(runtimePolicyValue);
+            const securityPolicyEquivalent =
+              JSON.stringify(validatedPolicy) === JSON.stringify(runtimePolicyValue);
             assert.equal(securityPolicyEquivalent, false);
 
             const uploadPayload = JSON.stringify({
               metadata: uploadMetadata,
               sdkVersion: '1.17.1',
               bundle: bundleBytes.toString(),
-              sourceMap: fs.readFileSync(bundleSourceMapPath, 'utf8'),
+              sourceMap: sourceMapBytes.toString(),
             });
 
-            const evidence = {
+            fs.mkdirSync('evidence', {recursive: true});
+            fs.copyFileSync(bundlePath, 'evidence/EXACT_BUNDLE.js');
+            fs.copyFileSync(bundleSourceMapPath, 'evidence/EXACT_BUNDLE.js.map');
+            fs.writeFileSync('evidence/VALIDATED_METADATA.json', JSON.stringify(validatedMetadata, null, 2) + '\n');
+            fs.writeFileSync('evidence/RESULT.json', JSON.stringify({
               pass: true,
               sdkVersion: require(path.join(sdkRoot, 'package.json')).version,
               isolatedVmVersion: require('isolated-vm/package.json').version,
@@ -220,27 +227,24 @@ jobs:
               uploadPayloadSha256: crypto.createHash('sha256').update(uploadPayload).digest('hex'),
               sameBundleUsedForMetadataAndRuntime: true,
               officialUploadValidationAccepted: true,
-              validatedUploadPolicy: uploadPolicy,
+              validatedUploadPolicy: validatedPolicy,
               runtimePolicy: runtimePolicyValue === undefined ? null : runtimePolicyValue,
               runtimeTrustedThunkPresent: runtimePolicy.trustedThunkPresent,
               safeManifestNegativeControl: safeManifestError.message,
-              runtimeResult: result,
+              runtimeResult,
               capturedRequests: captured,
               systemCredentialApplied: captured[0].authorization === `Bearer ${SYSTEM_TOKEN}`,
               securityPolicyEquivalent,
-              rootCause: 'The upload pipeline validates metadata extracted before the trusted thunk exists, while runtime executes pack.pack from the same bundle after coda.findAndExecutePackFunction is installed. A bundle can therefore expose different security policy to validation and execution.',
+              rootCause: 'Upload validates metadata extracted when the trusted thunk is absent, while canonical runtime evaluates the same bundle after installing the trusted thunk. The bundle can expose different security policy to validation and execution.',
               canonicalRuntimePath: 'createIsolateContext -> registerBundles(thunk, pack) -> injectExecutionContext -> executeThunk',
               productionRequestCount: 0,
               syntheticOnly: true,
-            };
-            fs.mkdirSync('evidence', {recursive: true});
-            fs.writeFileSync('evidence/RESULT.json', JSON.stringify(evidence, null, 2) + '\n');
-            fs.writeFileSync('evidence/VALIDATED_METADATA.json', JSON.stringify(validatedMetadata, null, 2) + '\n');
+            }, null, 2) + '\n');
             fs.writeFileSync('evidence/UPLOAD_PAYLOAD_SUMMARY.json', JSON.stringify({
               sdkVersion: '1.17.1',
               bundleSha256,
               metadataSha256: crypto.createHash('sha256').update(JSON.stringify(uploadMetadata)).digest('hex'),
-              uploadPayloadSha256: evidence.uploadPayloadSha256,
+              uploadPayloadSha256: crypto.createHash('sha256').update(uploadPayload).digest('hex'),
             }, null, 2) + '\n');
             isolate.dispose();
           }
@@ -257,7 +261,7 @@ jobs:
 
           node gate.js | tee evidence/TEST_OUTPUT.txt
           jq -e '.pass == true and .officialUploadValidationAccepted == true and .sameBundleUsedForMetadataAndRuntime == true and .systemCredentialApplied == true and .securityPolicyEquivalent == false' evidence/RESULT.json >/dev/null
-          sha256sum pack.ts gate.js package.json package-lock.json compiled/bundle.js compiled/bundle.js.map evidence/RESULT.json evidence/VALIDATED_METADATA.json evidence/UPLOAD_PAYLOAD_SUMMARY.json evidence/TEST_OUTPUT.txt evidence/sdk-version.txt > evidence/SHA256SUMS.txt
+          sha256sum pack.ts gate.js package.json package-lock.json evidence/EXACT_BUNDLE.js evidence/EXACT_BUNDLE.js.map evidence/RESULT.json evidence/VALIDATED_METADATA.json evidence/UPLOAD_PAYLOAD_SUMMARY.json evidence/TEST_OUTPUT.txt evidence/sdk-version.txt > evidence/SHA256SUMS.txt
 
       - uses: actions/upload-artifact@v4
         if: always()
