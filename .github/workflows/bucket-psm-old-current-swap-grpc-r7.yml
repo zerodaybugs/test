@@ -1,0 +1,386 @@
+name: Bucket PSM Old vs Current Swap gRPC R7
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install official Mysten SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-psm-old-current-swap-r7
+          mkdir -p bucket-psm-old-current-swap-r7/raw
+          cd bucket-psm-old-current-swap-r7
+          npm init -y >/dev/null
+          npm pkg set type=module >/dev/null
+          npm install --no-audit --no-fund @mysten/sui@2.23.2
+          npm list @mysten/sui | tee SDK_VERSION.txt
+
+      - name: Simulate current and legacy USDC swap paths on identical live state
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > bucket-psm-old-current-swap-r7/probe.mjs <<'JS'
+          import fs from 'node:fs';
+          import { Transaction, Inputs } from '@mysten/sui/transactions';
+          import { SuiGrpcClient } from '@mysten/sui/grpc';
+
+          const JSON_RPC = 'https://sui-mainnet-endpoint.blockvision.org';
+          const client = new SuiGrpcClient({
+            network: 'mainnet',
+            baseUrl: 'https://fullnode.mainnet.sui.io:443',
+          });
+
+          const PSM_OLD = '0xc2ae6693383e4a81285136effc8190c7baaf0e75aafa36d1c69cd2170cfc3803';
+          const PSM_CURRENT = '0x8a46afe6ab0b972e2ee3923f5669104ae9465c12b84cd5e78ea1ff6404e4bfaf';
+          const ACCOUNT = '0xe2d49d67ff42dc500275f2d84841bf35632aa6c1abdb70af66a10e1de93a4400';
+          const COLLECTOR = '0xf2ab9aa60c5e879675351a1a89f47131de9dea7cc927327dd0e7282e295c7f5e';
+          const PYTH_RULE = '0x5bc4f912b59c5cfcc86dfc90419837b9c3f9d3a3a94cef7a198838fa196bac4a';
+          const USDC = '0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC';
+          const USDB = '0xe14726c336e81b32328e92afc37345d159f5b550b09fa92bd43640cfdd0a0cfd::usdb::USDB';
+          const SENDER = '0xaa3f912fe367c683001161ce16e040b606437f03c30c346fd17548425783a9a6';
+          const SOURCE_TRANSACTION = 'CtCi64kMk2u4TesDj1DSsfwPyaZjNK5Swj93Bx5EPZhJ';
+
+          const REFS = {
+            pool: {
+              objectId: '0x37721762186721fb6eaf053f249aaf594503a6ad98dbcc998916be78d20a2df4',
+              initialSharedVersion: '610893712',
+              mutable: true,
+            },
+            treasury: {
+              objectId: '0x4de1c29a89d6888ebf8f7ae20364571dce4e1e42b9c9221f7df924ad6f9e617d',
+              initialSharedVersion: '610893687',
+              mutable: true,
+            },
+            clock: {
+              objectId: '0x0000000000000000000000000000000000000000000000000000000000000006',
+              initialSharedVersion: '1',
+              mutable: false,
+            },
+            pythConfig: {
+              objectId: '0x00aea60b799575ae4203bcc80c16844c4d514d5af661200c4565f6d5a6deac1f',
+              initialSharedVersion: '610893693',
+              mutable: false,
+            },
+            pythState: {
+              objectId: '0x1f9310238ee9298fb703c3419030b35b22bb1cc37113e3bb5007c99aec79e5b8',
+              initialSharedVersion: '17589382',
+              mutable: false,
+            },
+            priceInfo: {
+              objectId: '0x5dec622733a204ca27f5a90d8c2fad453cc6665186fd5dff13a83d0b6c9027ab',
+              initialSharedVersion: '20120881',
+              mutable: true,
+            },
+            aggregator: {
+              objectId: '0x4b612d4d2039d90f596a362f15346a95149728613ca9d2e2c7e471b72b86c105',
+              initialSharedVersion: '610893707',
+              mutable: false,
+            },
+          };
+
+          async function rpc(method, params) {
+            const response = await fetch(JSON_RPC, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+            });
+            const body = await response.json();
+            if (body.error) throw new Error(`${method}: ${JSON.stringify(body.error)}`);
+            return body.result;
+          }
+
+          async function selectCoin(minimum) {
+            let cursor = null;
+            const observed = [];
+            for (let pageIndex = 0; pageIndex < 20; pageIndex += 1) {
+              const page = await rpc('suix_getCoins', [SENDER, USDC, cursor, 50]);
+              for (const row of page?.data ?? []) {
+                observed.push({
+                  coinObjectId: row.coinObjectId,
+                  version: String(row.version),
+                  digest: row.digest,
+                  balance: String(row.balance),
+                  previousTransaction: row.previousTransaction,
+                });
+                if (BigInt(row.balance) >= minimum) {
+                  return { selected: observed.at(-1), observed };
+                }
+              }
+              if (!page?.hasNextPage) break;
+              cursor = page.nextCursor;
+            }
+            throw new Error(`No live USDC coin >= ${minimum}; observed=${JSON.stringify(observed)}`);
+          }
+
+          const coinSelection = await selectCoin(1_000_000n);
+          fs.writeFileSync('raw/coin_selection.json', JSON.stringify(coinSelection, null, 2));
+          const coinRef = {
+            objectId: coinSelection.selected.coinObjectId,
+            version: coinSelection.selected.version,
+            digest: coinSelection.selected.digest,
+          };
+
+          const shared = (tx, ref) => tx.object(Inputs.SharedObjectRef(ref));
+          const owned = (tx) => tx.object(Inputs.ObjectRef(coinRef));
+
+          function priceResult(tx) {
+            const collector = tx.moveCall({
+              target: `${COLLECTOR}::collector::new`,
+              typeArguments: [USDC],
+            });
+            tx.moveCall({
+              target: `${PYTH_RULE}::pyth_rule::feed`,
+              typeArguments: [USDC],
+              arguments: [
+                collector,
+                shared(tx, REFS.pythConfig),
+                shared(tx, REFS.clock),
+                shared(tx, REFS.pythState),
+                shared(tx, REFS.priceInfo),
+              ],
+            });
+            return tx.moveCall({
+              target: `${COLLECTOR}::aggregator::aggregate`,
+              typeArguments: [USDC],
+              arguments: [shared(tx, REFS.aggregator), collector],
+            });
+          }
+
+          function noPartner(tx) {
+            return tx.moveCall({
+              target: '0x1::option::none',
+              typeArguments: [`${ACCOUNT}::account::AccountRequest`],
+            });
+          }
+
+          function buildSwapIn(packageId, amount) {
+            const tx = new Transaction();
+            tx.setSender(SENDER);
+            const price = priceResult(tx);
+            const option = noPartner(tx);
+            const [payment] = tx.splitCoins(owned(tx), [tx.pure.u64(amount)]);
+            const output = tx.moveCall({
+              target: `${packageId}::pool::swap_in`,
+              typeArguments: [USDC],
+              arguments: [
+                shared(tx, REFS.pool),
+                shared(tx, REFS.treasury),
+                price,
+                payment,
+                option,
+              ],
+            });
+            tx.transferObjects([output], tx.pure.address(SENDER));
+            return tx;
+          }
+
+          function buildRoundTrip(amount) {
+            const tx = new Transaction();
+            tx.setSender(SENDER);
+            const price = priceResult(tx);
+            const option = noPartner(tx);
+            const [payment] = tx.splitCoins(owned(tx), [tx.pure.u64(amount)]);
+            const usdb = tx.moveCall({
+              target: `${PSM_CURRENT}::pool::swap_in`,
+              typeArguments: [USDC],
+              arguments: [
+                shared(tx, REFS.pool),
+                shared(tx, REFS.treasury),
+                price,
+                payment,
+                option,
+              ],
+            });
+            const returnedUsdc = tx.moveCall({
+              target: `${PSM_CURRENT}::pool::swap_out`,
+              typeArguments: [USDC],
+              arguments: [
+                shared(tx, REFS.pool),
+                shared(tx, REFS.treasury),
+                price,
+                usdb,
+                option,
+              ],
+            });
+            tx.transferObjects([returnedUsdc], tx.pure.address(SENDER));
+            return tx;
+          }
+
+          function parse(result) {
+            if (result?.$kind === 'Transaction') {
+              return { success: true, payload: result.Transaction, error: null };
+            }
+            if (result?.$kind === 'FailedTransaction') {
+              const payload = result.FailedTransaction;
+              return {
+                success: false,
+                payload,
+                error: payload?.status?.error ?? payload?.effects?.status?.error ?? null,
+              };
+            }
+            if (result?.Transaction) return { success: true, payload: result.Transaction, error: null };
+            if (result?.FailedTransaction) {
+              const payload = result.FailedTransaction;
+              return { success: false, payload, error: payload?.status?.error ?? payload?.effects?.status?.error ?? null };
+            }
+            return { success: false, payload: result, error: result?.thrown ?? { message: 'unknown simulation shape' } };
+          }
+
+          function balanceDelta(payload, suffix) {
+            let total = 0n;
+            const rows = [];
+            for (const row of payload?.balanceChanges ?? []) {
+              const coinType = String(row?.coinType ?? '');
+              const address = String(row?.address ?? row?.owner?.AddressOwner ?? '');
+              if (coinType.endsWith(suffix) && address === SENDER) {
+                rows.push(row);
+                try { total += BigInt(row.amount); } catch {}
+              }
+            }
+            return { total: total.toString(), rows };
+          }
+
+          async function simulate(kind, packageId, amount) {
+            let result;
+            try {
+              const transaction = kind === 'roundtrip'
+                ? buildRoundTrip(amount)
+                : buildSwapIn(packageId, amount);
+              result = await client.core.simulateTransaction({
+                transaction,
+                checksEnabled: false,
+                include: {
+                  commandResults: true,
+                  effects: true,
+                  balanceChanges: true,
+                  objectTypes: true,
+                },
+              });
+            } catch (error) {
+              result = { thrown: { name: error?.name, message: error?.message, stack: error?.stack, cause: error?.cause } };
+            }
+            const label = `${kind}_${packageId.slice(0, 10)}_${amount}`;
+            fs.writeFileSync(`raw/${label}.json`, JSON.stringify(result, null, 2));
+            const parsed = parse(result);
+            const error = parsed.error;
+            return {
+              label,
+              kind,
+              packageId,
+              amount: String(amount),
+              success: parsed.success,
+              resultKind: result?.$kind ?? null,
+              errorKind: error?.$kind ?? null,
+              errorMessage: error?.message ?? JSON.stringify(error),
+              abortCode: error?.MoveAbort?.abortCode ?? null,
+              abortLocation: error?.MoveAbort?.location ?? null,
+              usdcDelta: balanceDelta(parsed.payload, '::usdc::USDC'),
+              usdbDelta: balanceDelta(parsed.payload, '::usdb::USDB'),
+            };
+          }
+
+          const maximum = BigInt(coinSelection.selected.balance);
+          const candidates = [1_000n, 100_000n, 1_000_000n]
+            .filter((amount) => amount <= maximum);
+          if (candidates.length === 0) throw new Error(`Selected coin too small: ${maximum}`);
+
+          const cases = [];
+          for (const amount of candidates) {
+            cases.push(await simulate('swap_in', PSM_CURRENT, amount));
+            cases.push(await simulate('swap_in', PSM_OLD, amount));
+            cases.push(await simulate('roundtrip', PSM_CURRENT, amount));
+          }
+
+          const controls = candidates.map((amount) => {
+            const current = cases.find((row) => row.kind === 'swap_in' && row.packageId === PSM_CURRENT && row.amount === String(amount));
+            const legacy = cases.find((row) => row.kind === 'swap_in' && row.packageId === PSM_OLD && row.amount === String(amount));
+            const roundtrip = cases.find((row) => row.kind === 'roundtrip' && row.amount === String(amount));
+            return {
+              amount: String(amount),
+              currentSwapInSuccess: current?.success === true,
+              legacySwapInRejectedByModuleVersion: legacy?.success === false
+                && /invalid_module_version/i.test(legacy?.errorMessage ?? ''),
+              legacyAbortCode: legacy?.abortCode ?? null,
+              currentRoundTripSuccess: roundtrip?.success === true,
+              currentRoundTripUsdcDelta: roundtrip?.usdcDelta?.total ?? null,
+              currentRoundTripNonPositive: roundtrip?.success === true
+                ? BigInt(roundtrip.usdcDelta.total) <= 0n
+                : false,
+            };
+          });
+
+          const currentBaselineWorks = controls.some((row) => row.currentSwapInSuccess);
+          const legacyAlwaysVersionRejected = controls.length > 0
+            && controls.every((row) => row.legacySwapInRejectedByModuleVersion);
+          const roundTripsNonPositive = controls
+            .filter((row) => row.currentRoundTripSuccess)
+            .every((row) => row.currentRoundTripNonPositive);
+          const summary = {
+            schema: 'bucket-psm-old-current-swap-grpc-r7/v1',
+            network: 'sui-mainnet',
+            readOnly: true,
+            sourceTransaction: SOURCE_TRANSACTION,
+            sender: SENDER,
+            coinRef,
+            coinBalance: coinSelection.selected.balance,
+            packages: { old: PSM_OLD, current: PSM_CURRENT },
+            types: { USDC, USDB },
+            refs: REFS,
+            cases,
+            controls,
+            currentBaselineWorks,
+            legacyAlwaysVersionRejected,
+            roundTripsNonPositive,
+            legacyAccountingReachable: cases.some((row) => row.packageId === PSM_OLD && row.success),
+            exploitConfirmed: false,
+            verdict: currentBaselineWorks && legacyAlwaysVersionRejected
+              ? 'LEGACY_PSM_SWAP_UNREACHABLE_BY_MODULE_VERSION'
+              : 'INCONCLUSIVE',
+            productionTransactionsSubmitted: 0,
+            generatedUnix: Math.floor(Date.now() / 1000),
+          };
+          fs.writeFileSync('SUMMARY.json', JSON.stringify(summary, null, 2));
+          console.log(JSON.stringify(summary, null, 2));
+          JS
+          cd bucket-psm-old-current-swap-r7
+          node probe.mjs | tee run.log
+          find . -type f ! -path './node_modules/*' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-psm-old-current-swap-r7/probe.mjs bucket-psm-old-current-swap-r7/SUMMARY.json && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-psm-old-current-swap-r7/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['productionTransactionsSubmitted'] == 0
+          print('BUCKET_PSM_OLD_CURRENT_SWAP_R7_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-psm-old-current-swap-r7
+          path: |
+            bucket-psm-old-current-swap-r7/SUMMARY.json
+            bucket-psm-old-current-swap-r7/SDK_VERSION.txt
+            bucket-psm-old-current-swap-r7/probe.mjs
+            bucket-psm-old-current-swap-r7/run.log
+            bucket-psm-old-current-swap-r7/SHA256SUMS.txt
+            bucket-psm-old-current-swap-r7/raw
+          if-no-files-found: error
+          retention-days: 7
