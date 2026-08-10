@@ -93,13 +93,15 @@ def test_invalid_tuple_stage_controls_authority_warmth(
         ],
     )
 
+    # The zero-balance authority only survives EIP-161 finalisation when the
+    # authorization is valid and installs delegation code/nonzero nonce.
     authority_post = (
         Account(
             nonce=1,
             code=Spec.delegation_designation(delegation_target),
         )
         if expected_valid
-        else Account(nonce=0, code=b"")
+        else Account.NONEXISTENT
     )
     observer_storage = storage if expected_warm else {}
 
