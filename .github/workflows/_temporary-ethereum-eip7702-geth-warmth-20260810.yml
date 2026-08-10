@@ -1,0 +1,182 @@
+name: Temporary Ethereum EIP-7702 Geth Warmth Gate
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  geth-eip7702-warmth:
+    if: github.head_ref == 'ethereum-eip7702-geth-gate-20260810'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout research branch
+        uses: actions/checkout@v4
+        with:
+          ref: ethereum-eip7702-geth-gate-20260810
+          path: research-repo
+          persist-credentials: false
+
+      - name: Checkout exact execution-specs oracle
+        uses: actions/checkout@v4
+        with:
+          repository: ethereum/execution-specs
+          ref: 343274cc0f43962ff39a648e2b2614bf227f8d1f
+          path: eest
+          persist-credentials: false
+
+      - name: Checkout exact Geth release
+        uses: actions/checkout@v4
+        with:
+          repository: ethereum/go-ethereum
+          ref: v1.17.5
+          path: geth
+          persist-credentials: false
+
+      - name: Configure uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: eest/uv.lock
+
+      - name: Configure Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: geth/go.mod
+          cache: true
+          cache-dependency-path: geth/go.sum
+
+      - name: Generate exact warmth fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p research-result/meta research-result/logs research-result/fixtures "$RUNNER_TEMP/eth7702-bin"
+          cp research-repo/research/ethereum/eip7702_geth/test_eip7702_invalid_tuple_warmth.py \
+             eest/tests/prague/eip7702_set_code_tx/test_eip7702_invalid_tuple_warmth.py
+          {
+            echo "eest_commit=$(git -C eest rev-parse HEAD)"
+            echo "geth_commit=$(git -C geth rev-parse HEAD)"
+            echo "research_commit=$(git -C research-repo rev-parse HEAD)"
+            echo "runner=$(uname -a)"
+            echo "go=$(go version)"
+            echo "uv=$(uv --version)"
+          } > research-result/meta/environment.txt
+          set +e
+          (cd eest && uv run --frozen fill \
+            tests/prague/eip7702_set_code_tx/test_eip7702_invalid_tuple_warmth.py \
+            --output="$GITHUB_WORKSPACE/research-result/fixtures" \
+            --clean --until Osaka -n 1 --no-html -q) \
+            > research-result/logs/fill.log 2>&1
+          rc=$?
+          set -e
+          echo "fill_exit_code=$rc" > research-result/meta/exit-codes.txt
+          test "$rc" -eq 0
+          printf 'fixture_files=%s\n' "$(find research-result/fixtures -type f | wc -l)" \
+            >> research-result/meta/environment.txt
+          if find research-result/fixtures -type f -path '*Amsterdam*' | grep -q .; then
+            echo 'future_fork_fixture_detected=1' >> research-result/meta/exit-codes.txt
+            exit 1
+          else
+            echo 'future_fork_fixture_detected=0' >> research-result/meta/exit-codes.txt
+          fi
+
+      - name: Build exact Geth evm tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          (cd geth && go build -trimpath -o "$RUNNER_TEMP/eth7702-bin/evm" ./cmd/evm) \
+            > research-result/logs/geth-build.log 2>&1
+          rc=$?
+          set -e
+          echo "geth_build_exit_code=$rc" >> research-result/meta/exit-codes.txt
+          test "$rc" -eq 0
+          "$RUNNER_TEMP/eth7702-bin/evm" --version \
+            > research-result/meta/geth-version.txt 2>&1
+
+      - name: Consume state fixtures with Geth
+        id: consume
+        shell: bash
+        run: |
+          set +e
+          (cd eest && uv run --frozen consume direct \
+            --input="$GITHUB_WORKSPACE/research-result/fixtures" \
+            --bin="$RUNNER_TEMP/eth7702-bin/evm" \
+            -m state_test -q) \
+            > research-result/logs/geth-consume.log 2>&1
+          rc=$?
+          set -e
+          echo "geth_consume_exit_code=$rc" >> research-result/meta/exit-codes.txt
+          exit "$rc"
+
+      - name: Classify machine result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG=research-result/logs/geth-consume.log
+          CODES=research-result/meta/exit-codes.txt
+          if [ ! -f "$LOG" ] || [ ! -f "$CODES" ]; then
+            decision='INCONCLUSIVE_GATE_INCOMPLETE'
+          elif grep -q '^fill_exit_code=0$' "$CODES" \
+            && grep -q '^geth_build_exit_code=0$' "$CODES" \
+            && grep -q '^geth_consume_exit_code=0$' "$CODES" \
+            && grep -q '^future_fork_fixture_detected=0$' "$CODES"; then
+            decision='NO_DIFFERENTIAL_OBSERVED'
+          elif grep -q '^fill_exit_code=0$' "$CODES" \
+            && grep -q '^geth_build_exit_code=0$' "$CODES" \
+            && grep -qE '^geth_consume_exit_code=[1-9][0-9]*$' "$CODES"; then
+            decision='CANDIDATE_GETH_WARMTH_DIVERGENCE'
+          else
+            decision='INCONCLUSIVE_TOOLCHAIN_FAILURE'
+          fi
+          printf '%s\n' "$decision" | tee research-result/meta/decision.txt
+
+      - name: Encrypt exact fixtures and logs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/research-result"
+          OUT="$GITHUB_WORKSPACE/encrypted-artifact"
+          mkdir -p "$ROOT" "$OUT"
+          cat > /tmp/research-public.pem <<'EOF'
+          -----BEGIN PUBLIC KEY-----
+          MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAsHpE3Q89tjL2jIGECuvc
+          XBAFyMz47sjahIivKbjLvz0Jc6Tlhsl5qdm67N/KUZw9mBglWICPEYQpWBezdwNm
+          DJ+wlcx6zHLaIo0bhYFejerOzUYQqVcDE65neuMQWohC8S4s1/ehc09t8eSuYf+h
+          ebW2gTlnmJNVZm9K49n5fgUovsicZfI155RAsNv+0S+1o2MJ0l6fdu6d2XH609Ae
+          fqS29du55AzUshkcMtm/iDEm1A9+fjUG4DD2Z/op4EA/PsJgGZw25EWqbxGHfrfR
+          5tE7ly5+aunFpHr7CXQsUwnYdAr+fdJWUh2KaL5g4zP048ALG84l0s4R7p0GCz3k
+          RoxqZoegS++h527T/nlOcIb1ty7s25yC3GLa56J+A8qMXbbFER4r3SC27gxJSoZi
+          DXfXrCVjVzay5OP2O8LUgLJR54aAPS+okCDOK4V82kmvgGuEo/7X0AMxuImkL6kH
+          h0t8hMVY7EHOTtgb6fPC/vNha14HaXaX/v0Xephkf9yTAgMBAAE=
+          -----END PUBLIC KEY-----
+          EOF
+          tar -C "$GITHUB_WORKSPACE" -czf /tmp/research-result.tar.gz research-result
+          keyhex="$(openssl rand -hex 32)"
+          ivhex="$(openssl rand -hex 16)"
+          printf '%s\n%s\n' "$keyhex" "$ivhex" > /tmp/key-material.txt
+          openssl enc -aes-256-cbc -K "$keyhex" -iv "$ivhex" \
+            -in /tmp/research-result.tar.gz \
+            -out "$OUT/research-result.tar.gz.enc"
+          openssl pkeyutl -encrypt -pubin -inkey /tmp/research-public.pem \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+            -in /tmp/key-material.txt \
+            -out "$OUT/key-material.rsa-oaep.enc"
+          (cd "$OUT" && sha256sum key-material.rsa-oaep.enc research-result.tar.gz.enc > SHA256SUMS.txt)
+          echo 'ENCRYPTED_ETHEREUM_EIP7702_GETH_WARMTH_V1' > "$OUT/FORMAT.txt"
+          rm -rf "$ROOT" /tmp/research-result.tar.gz /tmp/key-material.txt /tmp/research-public.pem
+
+      - name: Upload encrypted-only result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ethereum-eip7702-geth-warmth-encrypted
+          path: encrypted-artifact
+          if-no-files-found: error
+          retention-days: 1
