@@ -1,0 +1,251 @@
+name: Bucket R16-R21 Final Aggregator
+
+on:
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+    paths:
+      - '.github/workflows/bucket-r16-r21-final-aggregator.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  aggregate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/bucket-pyth-revival-gate-20260809
+          fetch-depth: 0
+
+      - name: Collect exact summaries and build final release gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GH_BRANCH: agent/bucket-pyth-revival-gate-20260809
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf analysis-results/bucket-r16-r21-final /tmp/bucket-final
+          mkdir -p analysis-results/bucket-r16-r21-final/evidence /tmp/bucket-final
+          cat > /tmp/bucket-final/aggregate.py <<'PY'
+          import hashlib
+          import io
+          import json
+          import os
+          import pathlib
+          import time
+          import urllib.parse
+          import urllib.request
+          import zipfile
+
+          TOKEN=os.environ['GH_TOKEN']; REPO=os.environ['GH_REPO']; BRANCH=os.environ['GH_BRANCH']
+          OUT=pathlib.Path('analysis-results/bucket-r16-r21-final')
+          EVIDENCE=OUT/'evidence'
+          DATE='2026-08-10'
+          WORKFLOWS={
+              'R16':('bucket-shared-account-withdraw-auth-r16.yml','bucket-shared-account-withdraw-auth-r16'),
+              'R17':('bucket-shared-account-sender-differential-r17.yml','bucket-shared-account-sender-r17'),
+              'R18':('bucket-pyth-stale-replay-live-r18.yml','bucket-pyth-stale-replay-r18'),
+              'R19':('bucket-pyth-priceinfo-differential-r19.yml','bucket-pyth-priceinfo-differential-r19'),
+              'R20':('bucket-pyth-psm-economic-differential-r20.yml','bucket-pyth-psm-economic-r20'),
+              'R21':('bucket-r21-materiality-duplicate-gate.yml','bucket-r21-materiality-duplicate'),
+          }
+          headers={
+              'Accept':'application/vnd.github+json','Authorization':f'Bearer {TOKEN}',
+              'X-GitHub-Api-Version':'2022-11-28','User-Agent':'bucket-final-aggregator/1',
+          }
+          def read(url,accept=None):
+              h=dict(headers)
+              if accept: h['Accept']=accept
+              req=urllib.request.Request(url,headers=h)
+              with urllib.request.urlopen(req,timeout=180) as response: return response.read()
+          def latest_success(workflow):
+              query=urllib.parse.urlencode({'branch':BRANCH,'status':'completed','per_page':30})
+              rows=json.loads(read(f'https://api.github.com/repos/{REPO}/actions/workflows/{workflow}/runs?{query}').decode()).get('workflow_runs') or []
+              return next((row for row in rows if row.get('conclusion')=='success'),None), rows[:10]
+          def get_summary(run,artifact_name):
+              artifacts=json.loads(read(f'https://api.github.com/repos/{REPO}/actions/runs/{run["id"]}/artifacts?per_page=100').decode()).get('artifacts') or []
+              artifact=next((row for row in artifacts if row.get('name')==artifact_name and not row.get('expired')),None)
+              if not artifact: raise RuntimeError(f'artifact {artifact_name} missing')
+              raw=read(f'https://api.github.com/repos/{REPO}/actions/artifacts/{artifact["id"]}/zip','application/octet-stream')
+              with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                  candidates=[name for name in archive.namelist() if name=='SUMMARY.json' or name.endswith('/SUMMARY.json')]
+                  if not candidates: raise RuntimeError('SUMMARY.json missing')
+                  member=sorted(candidates,key=lambda value:(value.count('/'),len(value)))[0]
+                  summary=json.loads(archive.read(member).decode())
+              return summary,artifact,member
+          def sha256(path):
+              h=hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda:f.read(1024*1024),b''): h.update(chunk)
+              return h.hexdigest()
+
+          collected={}
+          for label,(workflow,artifact_name) in WORKFLOWS.items():
+              row={'workflow':workflow,'expectedArtifact':artifact_name,'run':None,'artifact':None,'summaryMember':None,'summary':None,'error':None}
+              try:
+                  run,recent=latest_success(workflow)
+                  row['recentRuns']=[{'id':r.get('id'),'status':r.get('status'),'conclusion':r.get('conclusion'),'headSha':r.get('head_sha'),'createdAt':r.get('created_at')} for r in recent]
+                  if not run: raise RuntimeError('no successful completed run')
+                  row['run']={'id':run.get('id'),'status':run.get('status'),'conclusion':run.get('conclusion'),'headSha':run.get('head_sha'),'createdAt':run.get('created_at'),'htmlUrl':run.get('html_url')}
+                  summary,artifact,member=get_summary(run,artifact_name)
+                  row['artifact']={'id':artifact.get('id'),'name':artifact.get('name'),'digest':artifact.get('digest'),'size':artifact.get('size_in_bytes')}
+                  row['summaryMember']=member; row['summary']=summary
+                  (EVIDENCE/f'{label}_SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+              except Exception as exc: row['error']=f'{type(exc).__name__}: {exc}'
+              collected[label]=row
+
+          def summary(label): return collected.get(label,{}).get('summary') or {}
+          def gate(label,key,default=False): return (summary(label).get('gates') or {}).get(key,default)
+          r16=summary('R16'); r17=summary('R17'); r18=summary('R18'); r19=summary('R19'); r20=summary('R20'); r21=summary('R21')
+          strict={
+              'r16WithdrawWithoutOwnedInput':bool(gate('R16','withdrawHasNoOwnedObjectInput')),
+              'r16AllWithdrawsWithoutOwnedInput':bool(gate('R16','allWithdrawsHaveNoOwnedObjectInput')),
+              'r16PublicWithdrawExposed':bool(gate('R16','publicWithdrawExposed')),
+              'r16StaticAuthorizationSignalFound':bool(gate('R16','staticAuthorizationSignalFound')),
+              'r17ArbitrarySenderSuccess':bool(gate('R17','anyArbitrarySenderSuccess')),
+              'r17ArbitrarySenderPositiveRecipient':bool(gate('R17','anyArbitrarySenderPositiveRecipient')),
+              'r17ExploitConfirmed':bool(r17.get('exploitConfirmed')),
+              'r18ToleranceAtLeastOneDay':bool(gate('R18','targetToleranceAtLeastOneDay')),
+              'r18MultipleSameFeedPriceInfo':bool(gate('R18','multiplePriceInfoObjectsForTargetFeed')),
+              'r18PsmActivitySeen':bool(gate('R18','currentPsmActivitySeen')),
+              'r19AlternateAccepted':bool(gate('R19','anyAlternateAccepted')),
+              'r19DifferentOracleReturn':bool(gate('R19','anyAlternateAcceptedWithDifferentReturn')),
+              'r19ExactCandidateCount':int(gate('R19','exactCandidateCount',0) or 0),
+              'r20ViableCurrentSource':bool(gate('R20','anyViableCurrentSourceTransaction')),
+              'r20CanonicalBaselineSuccess':bool(gate('R20','anyCanonicalBaselineSuccess')),
+              'r20WrongFeedControlPass':bool(gate('R20','wrongFeedNegativeControlPass')),
+              'r20ControlledPositiveCaseCount':int(gate('R20','controlledPositiveCaseCount',0) or 0),
+              'r20RepeatablePositiveCandidateCount':int(gate('R20','repeatablePositiveCandidateCount',0) or 0),
+              'r20MaxAdvantageBps':gate('R20','maxAdvantageBps',0) or 0,
+              'r20ExploitConfirmed':bool(r20.get('exploitConfirmed')),
+              'r20EconomicImpactProven':bool(r20.get('economicImpactProven')),
+              'r21UnambiguousExposure':bool(gate('R21','unambiguousLiveExposureBound')),
+              'r21AuditDuplicateClean':bool(gate('R21','auditDuplicateClean')),
+              'r21MaterialHighOrCritical':bool(gate('R21','materialHighOrCriticalImpactProven')),
+              'r21ScopeVerified':bool(gate('R21','scopeVerified')),
+          }
+          account_mechanic=(strict['r16WithdrawWithoutOwnedInput'] and strict['r17ArbitrarySenderSuccess'] and strict['r17ArbitrarySenderPositiveRecipient'] and strict['r17ExploitConfirmed'])
+          oracle_mechanic=(strict['r18ToleranceAtLeastOneDay'] and strict['r19DifferentOracleReturn'] and strict['r19ExactCandidateCount']>0)
+          economic_exploit=(strict['r20ExploitConfirmed'] and strict['r20EconomicImpactProven'] and strict['r20RepeatablePositiveCandidateCount']>0)
+          safe=bool(r21.get('submissionReady')) or bool(r20.get('submissionReady')) or bool(r17.get('submissionReady'))
+          if safe:
+              verdict='SUBMIT_READY_FINDING_CONFIRMED'
+              strongest='PYTH_PRICEINFO_PSM' if economic_exploit else 'SHARED_ACCOUNT_AUTHORIZATION'
+          elif economic_exploit:
+              verdict='REAL_ECONOMIC_MECHANISM_NOT_YET_HIGH_OR_SCOPE_READY'
+              strongest='PYTH_PRICEINFO_PSM_HOLD'
+          elif oracle_mechanic:
+              verdict='ORACLE_DIFFERENTIAL_WITHOUT_PROVEN_ECONOMIC_EXPLOIT'
+              strongest='PYTH_PRICEINFO_DIFFERENTIAL_HOLD'
+          elif account_mechanic:
+              verdict='ACCOUNT_AUTHORIZATION_MECHANIC_WITHOUT_MATERIAL_HIGH_IMPACT'
+              strongest='SHARED_ACCOUNT_AUTHORIZATION_HOLD'
+          else:
+              verdict='NO_NEW_SUBMIT_READY_HIGH_OR_CRITICAL'
+              strongest='NONE'
+          required_next=(
+              'NONE_SUBMIT_READY' if safe else
+              'LIVE_USD_MATERIALITY_SCOPE_AND_DUPLICATE' if economic_exploit else
+              'FULL_PSM_ECONOMIC_DIFFERENTIAL' if oracle_mechanic else
+              'ACCOUNT_MATERIALITY_AND_RECIPIENT_CONTROL' if account_mechanic else
+              'NEW_ROOT_CAUSE_REQUIRED'
+          )
+          decision={
+              'schema':'bucket-r16-r21-final/v1','date':DATE,'repository':REPO,'branch':BRANCH,
+              'verdict':verdict,'safeToSubmitNow':safe,'strongestCandidate':strongest,
+              'requiredNextGate':required_next,'strictGates':strict,
+              'candidateStatus':{
+                  'sharedAccountAuthorizationMechanic':account_mechanic,
+                  'pythOracleDifferentialMechanic':oracle_mechanic,
+                  'pythPsmEconomicExploit':economic_exploit,
+              },
+              'severityDecision':(
+                  'PROGRAM_DEFINED_HIGH_OR_CRITICAL' if safe else
+                  'UNASSIGNED_HOLD' if account_mechanic or oracle_mechanic or economic_exploit else
+                  'NO_FINDING'
+              ),
+              'integrity':{
+                  'productionTransactionsSubmitted':0,'privateKeysUsed':0,'severityInflationAllowed':False,
+                  'exactControlledPocRequired':True,'materialImpactRequired':True,'scopeAndDuplicateRequired':True,
+              },
+              'collected':collected,'generatedUnix':int(time.time()),
+          }
+          (OUT/'FINAL_STATUS.json').write_text(json.dumps(decision,indent=2,sort_keys=True)+'\n')
+          compact={k:decision[k] for k in ('verdict','safeToSubmitNow','strongestCandidate','requiredNextGate','strictGates','candidateStatus','severityDecision','integrity')}
+          (OUT/'FINAL_COMPACT.json').write_text(json.dumps(compact,indent=2,sort_keys=True)+'\n')
+
+          def mark(value): return 'PASS' if value else 'FAIL'
+          lines=[
+              '# Bucket Protocol — R16–R21 final release gate','',
+              f'**Date:** {DATE}',f'**Verdict:** `{verdict}`',f'**Safe to submit now:** `{str(safe).lower()}`',
+              f'**Strongest candidate:** `{strongest}`',f'**Required next gate:** `{required_next}`','',
+              '## Non-negotiable release decision','',
+          ]
+          if safe:
+              lines += ['A candidate passed exploitability, controlled economic impact, materiality, scope and duplicate gates. The corresponding submission archive is eligible for review.','']
+          else:
+              lines += ['No candidate passed every mandatory release gate. **Do not submit this research checkpoint as a vulnerability report.**','']
+          lines += ['## Strict gate matrix','', '| Gate | Result | Value |','|---|---|---:|']
+          for key,value in strict.items(): lines.append(f'| `{key}` | **{mark(bool(value))}** | `{value}` |')
+          lines += ['','## Candidate decisions','',f'- Shared Account authorization mechanic: **{mark(account_mechanic)}**',f'- Pyth PriceInfo oracle differential: **{mark(oracle_mechanic)}**',f'- Repeatable PSM economic exploit: **{mark(economic_exploit)}**',f'- Material High/Critical + scope + duplicate: **{mark(safe)}**','',
+                    '## Integrity','', '- Production transactions submitted: **0**','- Private keys or seed phrases used: **0**','- Evidence methods: public source, public mainnet state, read-only RPC and simulation.','- Severity is not upgraded without measured impact.','']
+          (OUT/'FINAL_REPORT_HU.md').write_text('\n'.join(lines))
+          proof=[
+              '# Proof Card — strongest Bucket research wedges','',
+              '## Wedge A — shared vault-owned Bucket Account capability','',
+              '- Three Account objects were traced through dynamic fields to shared third-party USDC vaults.',
+              '- Production transactions use the deterministic `bucket_account` protocol-cap key.',
+              '- Two Accounts have live Saving positions.',
+              '- Promotion requires an unrelated sender to succeed and receive value without an owned authorization input.',
+              f'- Final mechanic gate: **{mark(account_mechanic)}**.','',
+              '## Wedge B — Pyth tolerance and alternate PriceInfo domain','',
+              '- USDC and BUCK tolerance configuration, same-feed object multiplicity and live PSM use were bound independently.',
+              '- Promotion requires canonical-vs-alternate oracle output difference, full PSM economic advantage, wrong-feed rejection, repeatability and material exposure.',
+              f'- Oracle mechanic gate: **{mark(oracle_mechanic)}**.',
+              f'- Economic exploit gate: **{mark(economic_exploit)}**.','',
+              '## Release rule','',
+              'A differentiator is not a bounty finding until exact exploitability, material impact, scope and duplicate gates all pass.',''
+          ]
+          (OUT/'PROOF_CARD.md').write_text('\n'.join(proof))
+
+          # Include workflow definitions and compact source evidence only.
+          workflow_dir=EVIDENCE/'workflows'; workflow_dir.mkdir(parents=True,exist_ok=True)
+          for workflow,_ in WORKFLOWS.values():
+              source=pathlib.Path('.github/workflows')/workflow
+              if source.exists(): (workflow_dir/workflow).write_bytes(source.read_bytes())
+          manifest=[]
+          for path in sorted(OUT.rglob('*')):
+              if path.is_file() and path.name not in ('MANIFEST.json',):
+                  manifest.append({'path':str(path.relative_to(OUT)),'size':path.stat().st_size,'sha256':sha256(path)})
+          (OUT/'MANIFEST.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
+          zip_name=(f'BUCKET_PROTOCOL_SUBMIT_READY_{DATE}.zip' if safe else f'BUCKET_PROTOCOL_R16_R21_RESEARCH_EVIDENCE_NOT_FOR_SUBMISSION_{DATE}.zip')
+          zip_path=OUT/zip_name
+          with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as archive:
+              for path in sorted(OUT.rglob('*')):
+                  if path.is_file() and path != zip_path and not path.name.endswith('.sha256'):
+                      archive.write(path,path.relative_to(OUT))
+          with zipfile.ZipFile(zip_path) as archive:
+              bad=archive.testzip()
+              if bad: raise RuntimeError(f'corrupt member {bad}')
+          (OUT/(zip_name+'.sha256')).write_text(f'{sha256(zip_path)}  {zip_name}\n')
+          pointer={'safeToSubmitNow':safe,'verdict':verdict,'zip':zip_name,'sha256':zip_name+'.sha256','report':'FINAL_REPORT_HU.md','status':'FINAL_STATUS.json'}
+          (OUT/'RELEASE_POINTER.json').write_text(json.dumps(pointer,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(pointer,indent=2,sort_keys=True))
+          PY
+          python3 /tmp/bucket-final/aggregate.py
+
+      - name: Commit final bounded evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'bucket-evidence-bot'
+          git config user.email 'bucket-evidence-bot@users.noreply.github.com'
+          git add -f analysis-results/bucket-r16-r21-final
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'evidence: publish Bucket R16-R21 final release decision'
+          git push origin HEAD:agent/bucket-pyth-revival-gate-20260809
