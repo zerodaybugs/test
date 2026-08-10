@@ -1,0 +1,267 @@
+name: Bucket Pyth Tolerance History R14
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  trace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trace set_tolerance_sec calls and production exposure
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-pyth-tolerance-history-r14
+          mkdir -p bucket-pyth-tolerance-history-r14/raw
+
+          cat > bucket-pyth-tolerance-history-r14/trace.py <<'PY'
+          import datetime
+          import json
+          import pathlib
+          import statistics
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-pyth-tolerance-history-r14')
+          RAW = OUT / 'raw'
+          RPCS = [
+              'https://fullnode.mainnet.sui.io:443',
+              'https://sui-mainnet-endpoint.blockvision.org',
+          ]
+          PYTH_RULE = '0x5bc4f912b59c5cfcc86dfc90419837b9c3f9d3a3a94cef7a198838fa196bac4a'
+          CONFIG = '0x00aea60b799575ae4203bcc80c16844c4d514d5af661200c4565f6d5a6deac1f'
+          POOLS = {
+              'USDC': '0x37721762186721fb6eaf053f249aaf594503a6ad98dbcc998916be78d20a2df4',
+              'BUCK': '0x4fef507f41f5b141625f0f193283820fbee26e883f24212d149e4220320ae321',
+          }
+          PRICE_INFOS = {
+              'USDC': '0x5dec622733a204ca27f5a90d8c2fad453cc6665186fd5dff13a83d0b6c9027ab',
+              'BUCK': '0x3ef821a5d9b14683a5edf3752d06f608b20c23cdf846fe6b9da68dde53bc9a56',
+          }
+
+          def post(url, payload, retries=6, timeout=180):
+              data = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      req = urllib.request.Request(
+                          url,
+                          data=data,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-pyth-tolerance-history-r14/1',
+                          },
+                      )
+                      with urllib.request.urlopen(req, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2 ** attempt, 30))
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {'jsonrpc':'2.0','id':1,'method':method,'params':params})
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': str(exc)})
+              return {'failures': failures}
+
+          def dump(name, value):
+              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          TX_OPTIONS = {
+              'showInput': True,
+              'showRawInput': True,
+              'showEffects': True,
+              'showEvents': True,
+              'showObjectChanges': True,
+              'showBalanceChanges': True,
+          }
+          OBJ_OPTIONS = {
+              'showType': True,
+              'showOwner': True,
+              'showPreviousTransaction': True,
+              'showDisplay': False,
+              'showContent': True,
+              'showBcs': True,
+          }
+
+          def move_calls(tx):
+              try:
+                  commands = tx['transaction']['data']['transaction']['transactions']
+              except Exception:
+                  return []
+              rows=[]
+              for index, command in enumerate(commands or []):
+                  call = command.get('MoveCall') if isinstance(command,dict) else None
+                  if call:
+                      rows.append({
+                          'index': index,
+                          'package': call.get('package'),
+                          'module': call.get('module'),
+                          'function': call.get('function'),
+                          'typeArguments': call.get('type_arguments') or call.get('typeArguments'),
+                          'arguments': call.get('arguments'),
+                      })
+              return rows
+
+          history=[]
+          cursor=None
+          for _ in range(20):
+              wrapper=rpc('suix_queryTransactionBlocks',[{
+                  'filter': {'MoveFunction': {'package': PYTH_RULE, 'module':'pyth_rule', 'function':'set_tolerance_sec'}},
+                  'options': TX_OPTIONS,
+              }, cursor, 50, False])
+              page=wrapper.get('result') if isinstance(wrapper,dict) else None
+              if not isinstance(page,dict):
+                  history.append({'queryFailure':wrapper})
+                  break
+              for tx in page.get('data') or []:
+                  inputs=((((tx.get('transaction') or {}).get('data') or {}).get('transaction') or {}).get('inputs') or [])
+                  calls=[row for row in move_calls(tx) if row['package']==PYTH_RULE and row['module']=='pyth_rule' and row['function']=='set_tolerance_sec']
+                  history.append({
+                      'digest':tx.get('digest'),
+                      'timestampMs':tx.get('timestampMs'),
+                      'timestampIso': datetime.datetime.fromtimestamp(int(tx.get('timestampMs'))/1000, datetime.timezone.utc).isoformat() if tx.get('timestampMs') else None,
+                      'sender':(((tx.get('transaction') or {}).get('data') or {}).get('sender')),
+                      'status':(tx.get('effects') or {}).get('status'),
+                      'inputs':inputs,
+                      'calls':calls,
+                      'events':tx.get('events'),
+                      'objectChanges':tx.get('objectChanges'),
+                  })
+              if not page.get('hasNextPage'):
+                  break
+              cursor=page.get('nextCursor')
+          dump('set_tolerance_history.json',history)
+
+          objects={}
+          for label,oid in {'CONFIG':CONFIG,**POOLS,**PRICE_INFOS}.items():
+              wrapper=rpc('sui_getObject',[oid,OBJ_OPTIONS])
+              dump(f'object_{label}.json',wrapper)
+              result=wrapper.get('result') if isinstance(wrapper,dict) else None
+              objects[label]=(result or {}).get('data') if isinstance(result,dict) else None
+
+          cadence={}
+          for label,oid in PRICE_INFOS.items():
+              txs=[]
+              cursor=None
+              for _ in range(20):
+                  wrapper=rpc('suix_queryTransactionBlocks',[{
+                      'filter':{'ChangedObject':oid},
+                      'options':{'showInput':False,'showRawInput':False,'showEffects':True,'showEvents':False,'showObjectChanges':False,'showBalanceChanges':False},
+                  },cursor,50,True])
+                  page=wrapper.get('result') if isinstance(wrapper,dict) else None
+                  if not isinstance(page,dict):
+                      txs.append({'queryFailure':wrapper}); break
+                  txs.extend(page.get('data') or [])
+                  if not page.get('hasNextPage') or len(txs)>=1000: break
+                  cursor=page.get('nextCursor')
+              dump(f'price_info_updates_{label}.json',txs)
+              stamps=sorted([int(row['timestampMs']) for row in txs if isinstance(row,dict) and row.get('timestampMs')])
+              gaps=[(b-a)/1000 for a,b in zip(stamps,stamps[1:]) if b>=a]
+              cadence[label]={
+                  'transactionCount':len([r for r in txs if isinstance(r,dict) and r.get('digest')]),
+                  'oldestTimestampMs':stamps[0] if stamps else None,
+                  'newestTimestampMs':stamps[-1] if stamps else None,
+                  'gapCount':len(gaps),
+                  'medianGapSec':statistics.median(gaps) if gaps else None,
+                  'maxGapSec':max(gaps) if gaps else None,
+                  'p99GapSec':sorted(gaps)[max(0,int(len(gaps)*0.99)-1)] if gaps else None,
+              }
+
+          config_fields=(((objects.get('CONFIG') or {}).get('content') or {}).get('fields') or {})
+          tolerance_entries=(((config_fields.get('tolerance_sec_map') or {}).get('fields') or {}).get('contents') or [])
+          tolerances=[]
+          for entry in tolerance_entries:
+              fields=(entry or {}).get('fields') or {}
+              tolerances.append({
+                  'type':(((fields.get('key') or {}).get('fields') or {}).get('name')),
+                  'value':fields.get('value'),
+              })
+
+          pool_exposure={}
+          for label in POOLS:
+              fields=(((objects.get(label) or {}).get('content') or {}).get('fields') or {})
+              pool_exposure[label]={
+                  'objectId':POOLS[label],
+                  'balanceRaw':fields.get('balance_amount') or fields.get('balance'),
+                  'usdbSupplyRaw':fields.get('usdb_supply'),
+                  'decimal':fields.get('decimal'),
+                  'priceTolerance':fields.get('price_tolerance'),
+                  'defaultFeeConfig':fields.get('default_fee_config'),
+              }
+
+          summary={
+              'schema':'bucket-pyth-tolerance-history-r14/v1',
+              'network':'sui-mainnet',
+              'readOnly':True,
+              'pythRulePackage':PYTH_RULE,
+              'config':CONFIG,
+              'currentTolerances':tolerances,
+              'setToleranceCallCount':len([r for r in history if r.get('digest')]),
+              'setToleranceHistory':history,
+              'priceInfoCadence':cadence,
+              'poolExposure':pool_exposure,
+              'gates':{
+                  'usdcOrBuckToleranceAtLeastOneDay':any(
+                      int(row.get('value') or 0)>=86400 and any(tag in str(row.get('type')) for tag in ('::usdc::USDC','::buck::BUCK'))
+                      for row in tolerances
+                  ),
+                  'toleranceExplicitlySetOnChain':len([r for r in history if r.get('digest')])>0,
+                  'observedPriceUpdateGapExceedsThirtySeconds':any((row.get('maxGapSec') or 0)>30 for row in cadence.values()),
+              },
+              'writes':0,
+              'transactionsConstructed':0,
+              'productionTransactionsSubmitted':0,
+              'generatedUnix':int(time.time()),
+          }
+          (OUT/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({
+              'currentTolerances':tolerances,
+              'setToleranceCallCount':summary['setToleranceCallCount'],
+              'setToleranceHistory':history,
+              'priceInfoCadence':cadence,
+              'poolExposure':pool_exposure,
+              'gates':summary['gates'],
+          },indent=2))
+          PY
+
+          python3 bucket-pyth-tolerance-history-r14/trace.py | tee bucket-pyth-tolerance-history-r14/run.log
+          find bucket-pyth-tolerance-history-r14 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-pyth-tolerance-history-r14/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-pyth-tolerance-history-r14 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary=json.load(open('bucket-pyth-tolerance-history-r14/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes']==0
+          assert summary['transactionsConstructed']==0
+          assert summary['productionTransactionsSubmitted']==0
+          print('BUCKET_PYTH_TOLERANCE_HISTORY_R14_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-pyth-tolerance-history-r14
+          path: bucket-pyth-tolerance-history-r14
+          if-no-files-found: error
+          retention-days: 7
