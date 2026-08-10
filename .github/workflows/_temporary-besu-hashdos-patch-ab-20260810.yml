@@ -1,0 +1,164 @@
+name: Temporary Besu HashDoS Patch A-B Validation
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: besu-hashdos-patch-ab-20260810
+  cancel-in-progress: false
+
+jobs:
+  validate-patch:
+    if: github.head_ref == 'ethereum-eip7702-diff-20260810'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout private harness
+        uses: actions/checkout@v4
+        with:
+          path: research-repo
+          persist-credentials: false
+
+      - name: Checkout exact execution-specs oracle
+        uses: actions/checkout@v4
+        with:
+          repository: ethereum/execution-specs
+          ref: 343274cc0f43962ff39a648e2b2614bf227f8d1f
+          path: eest
+          persist-credentials: false
+
+      - name: Checkout Besu 26.7.1
+        uses: actions/checkout@v4
+        with:
+          repository: besu-eth/besu
+          ref: 26.7.1
+          path: besu
+          persist-credentials: false
+
+      - name: Configure uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: eest/uv.lock
+
+      - name: Configure Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: gradle
+          cache-dependency-path: |
+            besu/**/*.gradle*
+            besu/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Generate one gas-identical Osaka state fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/hashdos-ab"
+          mkdir -p "$ROOT/fixtures"
+          cp research-repo/research/ethereum/besu_hashdos/test_besu_world_updater_hashdos_evm.py \
+             eest/tests/osaka/test_besu_world_updater_hashdos_evm.py
+          cd eest
+          uv run --frozen fill tests/osaka/test_besu_world_updater_hashdos_evm.py \
+            --output="$ROOT/fixtures" --clean --fork Osaka -n 1 --no-html -q
+          mapfile -t fixtures < <(find "$ROOT/fixtures/state_tests" -type f -name '*.json' | sort)
+          test "${#fixtures[@]}" -eq 1
+          sha256sum "${fixtures[0]}"
+
+      - name: Build and preserve unpatched Besu
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd besu
+          ./gradlew :ethereum:evmtool:installDist --no-daemon --stacktrace
+          cp -a ethereum/evmtool/build/install/evmtool "$RUNNER_TEMP/evmtool-unpatched"
+
+      - name: Run unpatched A measurements
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/hashdos-ab"
+          FIXTURE="$(find "$ROOT/fixtures/state_tests" -type f -name '*.json' | head -1)"
+          BIN="$RUNNER_TEMP/evmtool-unpatched/bin/evmtool"
+          "$BIN" --version
+          for pass in 1 2 3; do
+            echo "=== UNPATCHED PASS $pass ==="
+            timeout 600s "$BIN" state-test "$FIXTURE"
+          done
+
+      - name: Apply collision-resistant updater patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          abstract = Path("besu/evm/src/main/java/org/hyperledger/besu/evm/worldstate/AbstractWorldUpdater.java")
+          text = abstract.read_text(encoding="utf-8")
+          old = "import java.util.concurrent.ConcurrentHashMap;"
+          new = old + "\nimport java.util.concurrent.ConcurrentSkipListMap;\nimport java.util.concurrent.ConcurrentSkipListSet;"
+          assert old in text
+          text = text.replace(old, new, 1)
+          old = "protected Map<Address, UpdateTrackingAccount<A>> updatedAccounts = new ConcurrentHashMap<>();"
+          new = "protected Map<Address, UpdateTrackingAccount<A>> updatedAccounts = new ConcurrentSkipListMap<>();"
+          assert old in text
+          text = text.replace(old, new, 1)
+          old = "protected Set<Address> deletedAccounts = Collections.synchronizedSet(new HashSet<>(Address.SIZE));"
+          new = "protected Set<Address> deletedAccounts = new ConcurrentSkipListSet<>();"
+          assert old in text
+          text = text.replace(old, new, 1)
+          abstract.write_text(text, encoding="utf-8")
+
+          accumulator = Path(
+              "besu/ethereum/core/src/main/java/org/hyperledger/besu/ethereum/trie/pathbased/common/"
+              "worldview/accumulator/PathBasedWorldStateUpdateAccumulator.java"
+          )
+          text = accumulator.read_text(encoding="utf-8")
+          old = "import java.util.concurrent.ConcurrentHashMap;"
+          new = old + "\nimport java.util.concurrent.ConcurrentSkipListMap;\nimport java.util.concurrent.ConcurrentSkipListSet;"
+          assert old in text
+          text = text.replace(old, new, 1)
+          replacements = {
+              "private final Map<Address, PathBasedValue<Bytes>> codeToUpdate = new ConcurrentHashMap<>();":
+                  "private final Map<Address, PathBasedValue<Bytes>> codeToUpdate = new ConcurrentSkipListMap<>();",
+              "private final Set<Address> storageToClear = Collections.synchronizedSet(new HashSet<>());":
+                  "private final Set<Address> storageToClear = new ConcurrentSkipListSet<>();",
+              "      storageToUpdate = new ConcurrentHashMap<>();":
+                  "      storageToUpdate = new ConcurrentSkipListMap<>();",
+              "this.accountsToUpdate = new AccountConsumingMap<>(new ConcurrentHashMap<>(), accountPreloader);":
+                  "this.accountsToUpdate = new AccountConsumingMap<>(new ConcurrentSkipListMap<>(), accountPreloader);",
+          }
+          for old, new in replacements.items():
+              assert old in text, old
+              text = text.replace(old, new, 1)
+          accumulator.write_text(text, encoding="utf-8")
+          PY
+          git -C besu diff --check
+          git -C besu diff -- \
+            evm/src/main/java/org/hyperledger/besu/evm/worldstate/AbstractWorldUpdater.java \
+            ethereum/core/src/main/java/org/hyperledger/besu/ethereum/trie/pathbased/common/worldview/accumulator/PathBasedWorldStateUpdateAccumulator.java
+
+      - name: Build patched Besu
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd besu
+          ./gradlew :ethereum:evmtool:installDist --no-daemon --stacktrace
+
+      - name: Run patched B measurements
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/hashdos-ab"
+          FIXTURE="$(find "$ROOT/fixtures/state_tests" -type f -name '*.json' | head -1)"
+          BIN="$GITHUB_WORKSPACE/besu/ethereum/evmtool/build/install/evmtool/bin/evmtool"
+          "$BIN" --version
+          for pass in 1 2 3; do
+            echo "=== PATCHED PASS $pass ==="
+            timeout 600s "$BIN" state-test "$FIXTURE"
+          done
