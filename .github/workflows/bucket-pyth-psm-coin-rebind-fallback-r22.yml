@@ -1,0 +1,237 @@
+name: Bucket Pyth PSM Coin-Rebind Fallback R22
+
+on:
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+    paths:
+      - '.github/workflows/bucket-pyth-psm-coin-rebind-fallback-r22.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fallback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/bucket-pyth-revival-gate-20260809
+
+      - name: Install official Mysten SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-pyth-psm-coin-rebind-r22
+          mkdir -p bucket-pyth-psm-coin-rebind-r22/raw
+          cd bucket-pyth-psm-coin-rebind-r22
+          npm init -y >/dev/null
+          npm pkg set type=module >/dev/null
+          npm install --no-audit --no-fund @mysten/sui@2.23.2
+          npm list @mysten/sui | tee SDK_VERSION.txt
+
+      - name: Rebind deleted coin inputs and rerun full canonical-vs-alternate transactions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > bucket-pyth-psm-coin-rebind-r22/probe.mjs <<'JS'
+          import fs from 'node:fs';
+          import { Transaction, Inputs } from '@mysten/sui/transactions';
+          import { bcs } from '@mysten/sui/bcs';
+          import { SuiGrpcClient } from '@mysten/sui/grpc';
+
+          const FINAL_PATH = 'analysis-results/bucket-r16-r21-final/FINAL_STATUS.json';
+          const R19_PATH = 'analysis-results/bucket-r16-r21-final/evidence/R19_SUMMARY.json';
+          const RPCS = ['https://sui-mainnet-endpoint.blockvision.org','https://fullnode.mainnet.sui.io:443'];
+          const client = new SuiGrpcClient({network:'mainnet',baseUrl:'https://fullnode.mainnet.sui.io:443'});
+          const finalStatus = fs.existsSync(FINAL_PATH) ? JSON.parse(fs.readFileSync(FINAL_PATH,'utf8')) : {};
+          const r19 = fs.existsSync(R19_PATH) ? JSON.parse(fs.readFileSync(R19_PATH,'utf8')) : {};
+          const relevant = finalStatus.requiredNextGate === 'FULL_PSM_ECONOMIC_DIFFERENTIAL'
+            || finalStatus.strongestCandidate === 'PYTH_PRICEINFO_DIFFERENTIAL_HOLD'
+            || (r19.exactCandidates ?? []).length > 0;
+
+          async function rpc(method,params){
+            const errors=[];
+            for(const endpoint of RPCS){
+              try{
+                const response=await fetch(endpoint,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params})});
+                const body=await response.json();
+                if(body.error) throw new Error(JSON.stringify(body.error));
+                return body.result;
+              }catch(error){errors.push({endpoint,message:error?.message});}
+            }
+            throw new Error(`RPC ${method} failed: ${JSON.stringify(errors)}`);
+          }
+          async function objectData(id){
+            const row=await rpc('sui_getObject',[id,{showType:true,showOwner:true,showPreviousTransaction:true,showContent:true,showBcs:true}]);
+            return row?.data??null;
+          }
+          async function pastObject(input){
+            if(!input?.objectId || input?.version===undefined) return null;
+            const row=await rpc('sui_tryGetPastObject',[input.objectId,String(input.version),{showType:true,showOwner:true,showPreviousTransaction:true,showContent:true,showBcs:true}]);
+            return row?.details??row?.data??null;
+          }
+          function ownerAddress(owner){
+            if(!owner||typeof owner!=='object') return null;
+            const raw=owner.AddressOwner??owner.addressOwner??null;
+            if(typeof raw==='string') return raw;
+            return raw?.address??null;
+          }
+          function objectId(input){return input?.objectId??input?.Shared?.objectId??input?.sharedObject?.objectId??null;}
+          function coinType(type){
+            const match=typeof type==='string' ? type.match(/^0x0*2::coin::Coin<(.+)>$/) : null;
+            return match?.[1]??null;
+          }
+          async function replacementCoin(sender,type,used){
+            let cursor=null; const rows=[];
+            for(let page=0;page<20;page+=1){
+              const result=await rpc('suix_getCoins',[sender,type,cursor,50]);
+              rows.push(...(result?.data??[]));
+              if(!result?.hasNextPage) break;
+              cursor=result.nextCursor;
+            }
+            rows.sort((a,b)=>BigInt(b.balance)-BigInt(a.balance));
+            return rows.find((row)=>!used.has(row.coinObjectId))??null;
+          }
+          function pure(tx,input){
+            const t=input.valueType,v=input.value;
+            if(t==='u8')return tx.pure.u8(v); if(t==='u16')return tx.pure.u16(v); if(t==='u32')return tx.pure.u32(v);
+            if(t==='u64')return tx.pure.u64(v); if(t==='u128')return tx.pure.u128(v); if(t==='u256')return tx.pure.u256(v);
+            if(t==='bool')return tx.pure.bool(v); if(t==='address')return tx.pure.address(v);
+            if(t==='0x1::string::String'||t==='0x1::ascii::String')return tx.pure.string(v);
+            if(t==='vector<u8>')return tx.pure(bcs.vector(bcs.U8).serialize(v));
+            if(t==='vector<address>')return tx.pure.vector('address',v);
+            if(t?.startsWith('vector<')&&Array.isArray(v))return tx.pure.vector(t.slice(7,-1),v);
+            throw new Error(`unsupported pure ${t}`);
+          }
+          function resolve(arg,built,results,tx){
+            if(arg==='GasCoin'||arg?.GasCoin!==undefined)return tx.gas;
+            if(arg?.Input!==undefined)return built[Number(arg.Input)];
+            if(arg?.Result!==undefined)return results[Number(arg.Result)];
+            if(arg?.NestedResult!==undefined){const [c,r]=arg.NestedResult;return results[Number(c)][Number(r)];}
+            throw new Error(`unsupported arg ${JSON.stringify(arg)}`);
+          }
+          async function prepareInput(input,sender,substitution,usedCoins){
+            if(input.type==='pure') return {kind:'pure',input,meta:{kind:'pure',valueType:input.valueType,value:input.value}};
+            const originalId=objectId(input); const requestedId=substitution[originalId]??originalId;
+            let data=await objectData(requestedId);
+            let rebound=null; let historical=null;
+            if(!data && input.objectType==='immOrOwnedObject'){
+              historical=await pastObject(input);
+              const type=historical?.type??historical?.content?.type;
+              const ctype=coinType(type);
+              if(ctype){
+                const coin=await replacementCoin(sender,ctype,usedCoins);
+                if(coin){
+                  usedCoins.add(coin.coinObjectId); rebound=coin;
+                  data=await objectData(coin.coinObjectId);
+                }
+              }
+            }
+            if(!data) throw new Error(`unavailable input ${originalId}`);
+            const currentId=data.objectId;
+            if(input.objectType==='sharedObject'){
+              const shared=data.owner?.Shared; const initial=shared?.initial_shared_version??shared?.initialSharedVersion??input.initialSharedVersion;
+              return {kind:'shared',input,meta:{kind:'shared',originalId,currentId,type:data.type,owner:data.owner,version:data.version},argument:(tx)=>tx.object(Inputs.SharedObjectRef({objectId:currentId,initialSharedVersion:String(initial),mutable:Boolean(input.mutable)}))};
+            }
+            if(input.objectType==='receiving'){
+              return {kind:'receiving',input,meta:{kind:'receiving',originalId,currentId,type:data.type,owner:data.owner,version:data.version},argument:(tx)=>tx.object(Inputs.ReceivingRef({objectId:currentId,version:String(data.version),digest:data.digest}))};
+            }
+            return {kind:'owned',input,meta:{kind:'owned',originalId,currentId,type:data.type,owner:data.owner,version:data.version,reboundCoin:rebound,historicalType:historical?.type??historical?.content?.type??null},argument:(tx)=>tx.object(Inputs.ObjectRef({objectId:currentId,version:String(data.version),digest:data.digest}))};
+          }
+          async function rebuild(source,substitution={}){
+            const tx=new Transaction(); const sender=source.transaction.data.sender; tx.setSender(sender);
+            const programmable=source.transaction.data.transaction; const built=[]; const meta=[]; const usedCoins=new Set();
+            for(const input of programmable.inputs??[]){
+              const prepared=await prepareInput(input,sender,substitution,usedCoins);
+              if(prepared.kind==='pure')built.push(pure(tx,input));else built.push(prepared.argument(tx));
+              meta.push(prepared.meta);
+            }
+            const results=[]; const kinds=[];
+            for(const command of programmable.transactions??[]){
+              if(command.MoveCall){const c=command.MoveCall;results.push(tx.moveCall({target:`${c.package}::${c.module}::${c.function}`,typeArguments:c.type_arguments??[],arguments:(c.arguments??[]).map((a)=>resolve(a,built,results,tx))}));kinds.push(`MoveCall:${c.module}::${c.function}`);continue;}
+              if(command.TransferObjects){const [objects,address]=command.TransferObjects;results.push(tx.transferObjects(objects.map((a)=>resolve(a,built,results,tx)),resolve(address,built,results,tx)));kinds.push('TransferObjects');continue;}
+              if(command.SplitCoins){const [coin,amounts]=command.SplitCoins;results.push(tx.splitCoins(resolve(coin,built,results,tx),amounts.map((a)=>resolve(a,built,results,tx))));kinds.push('SplitCoins');continue;}
+              if(command.MergeCoins){const [dest,sources]=command.MergeCoins;results.push(tx.mergeCoins(resolve(dest,built,results,tx),sources.map((a)=>resolve(a,built,results,tx))));kinds.push('MergeCoins');continue;}
+              if(command.MakeMoveVec){const v=command.MakeMoveVec;results.push(tx.makeMoveVec({type:v.type??null,elements:(v.objects??v.elements??[]).map((a)=>resolve(a,built,results,tx))}));kinds.push('MakeMoveVec');continue;}
+              throw new Error(`unsupported command ${JSON.stringify(command)}`);
+            }
+            return {tx,sender,meta,kinds};
+          }
+          function classify(result){
+            if(result?.$kind==='Transaction')return{success:true,payload:result.Transaction,error:null};
+            if(result?.$kind==='FailedTransaction'){const p=result.FailedTransaction;return{success:false,payload:p,error:p?.status?.error??p?.effects?.status?.error??null};}
+            if(result?.Transaction)return{success:true,payload:result.Transaction,error:null};
+            if(result?.FailedTransaction){const p=result.FailedTransaction;return{success:false,payload:p,error:p?.status?.error??p?.effects?.status?.error??null};}
+            return{success:false,payload:result,error:result?.thrown??{message:'unknown'}};
+          }
+          async function simulate(source,sub,label){
+            let built,result;
+            try{built=await rebuild(source,sub);result=await client.core.simulateTransaction({transaction:built.tx,checksEnabled:true,include:{commandResults:true,effects:true,balanceChanges:true,objectTypes:true}});}catch(error){result={thrown:{name:error?.name,message:error?.message,stack:error?.stack,cause:error?.cause}};}
+            fs.writeFileSync(`raw/${label}.json`,JSON.stringify(result,null,2));
+            const p=classify(result),e=p.error,sender=built?.sender??source.transaction.data.sender;
+            const map={};
+            for(const row of p.payload?.balanceChanges??[]){if(String(ownerAddress(row.owner)).toLowerCase()!==String(sender).toLowerCase())continue;map[row.coinType]=String(BigInt(map[row.coinType]??'0')+BigInt(row.amount??0));}
+            return{label,success:p.success,sender,errorKind:e?.$kind??e?.name??null,errorMessage:e?.message??JSON.stringify(e),abortCode:e?.MoveAbort?.abortCode??null,abortLocation:e?.MoveAbort?.location??null,inputMeta:built?.meta??null,commandKinds:built?.kinds??null,senderBalanceMap:map,effects:p.payload?.effects??null};
+          }
+          function compare(a,b){
+            const types=new Set([...Object.keys(a.senderBalanceMap??{}),...Object.keys(b.senderBalanceMap??{})]);const rows=[];
+            for(const type of types){const av=BigInt(a.senderBalanceMap?.[type]??'0'),bv=BigInt(b.senderBalanceMap?.[type]??'0');rows.push({coinType:type,baseline:av.toString(),alternate:bv.toString(),advantage:(bv-av).toString()});}
+            const outputs=rows.filter((r)=>BigInt(r.baseline)>0n);const best=outputs.reduce((x,r)=>BigInt(r.advantage)>x?BigInt(r.advantage):x,0n);const base=outputs.reduce((x,r)=>BigInt(r.baseline)>x?BigInt(r.baseline):x,0n);const costsOkay=rows.filter((r)=>BigInt(r.baseline)<0n).every((r)=>BigInt(r.alternate)>=BigInt(r.baseline));
+            return{rows,maxOutputAdvantageRaw:best.toString(),baselineBestOutputRaw:base.toString(),advantageBps:base>0n?Number(best*1000000n/base)/100:0,inputCostsNotWorse:costsOkay,positive:best>0n&&costsOkay};
+          }
+          function psmCall(tx){for(const command of tx?.transaction?.data?.transaction?.transactions??[]){const c=command?.MoveCall;if(c&&c.module==='pool'&&(c.function==='swap_in'||c.function==='swap_out'))return c;}return null;}
+          async function scanSources(target,max=5){
+            const seed=await rpc('sui_getTransactionBlock',[target.sourceDigest,{showInput:true,showRawInput:true,showEffects:true,showEvents:true,showObjectChanges:true,showBalanceChanges:true}]);const call=psmCall(seed);if(!call)return[];
+            const all=[seed];let cursor=null;
+            for(let page=0;page<20&&all.length<400;page+=1){const p=await rpc('suix_queryTransactionBlocks',[{filter:{MoveFunction:{package:call.package,module:'pool',function:call.function}},options:{showInput:true,showRawInput:true,showEffects:true,showEvents:true,showObjectChanges:true,showBalanceChanges:true}},cursor,50,true]);all.push(...(p?.data??[]));if(!p?.hasNextPage)break;cursor=p.nextCursor;}
+            const uniq=new Map(all.filter((r)=>r?.digest).map((r)=>[r.digest,r]));const viable=[];
+            for(const row of uniq.values()){if(row?.effects?.status?.status!=='success')continue;if(!(row?.transaction?.data?.transaction?.inputs??[]).some((i)=>objectId(i)===target.canonical.objectId))continue;viable.push(row);if(viable.length>=max)break;}
+            return viable;
+          }
+
+          const exact=r19.exactCandidates??[];const targets=new Map((r19.targets??[]).map((row)=>[row.name,row]));const canonical={};for(const row of r19.targets??[])if(row.canonical?.objectId)canonical[row.name]=row.canonical.objectId;const names=Object.keys(canonical);
+          const cases=[];
+          if(relevant){
+            for(const candidate of exact.slice(0,20)){
+              const target=targets.get(candidate.target);if(!target?.canonical?.objectId||!target?.sourceDigest){cases.push({candidate,error:'target incomplete'});continue;}
+              const wrong=canonical[names.find((n)=>n!==candidate.target)]??null;const sources=await scanSources(target,5);const rows=[];
+              for(const source of sources){const baseline=await simulate(source,{},`${candidate.target}_${source.digest}_baseline`);const alternate=await simulate(source,{[target.canonical.objectId]:candidate.objectId},`${candidate.target}_${source.digest}_alternate`);const wrongFeed=wrong?await simulate(source,{[target.canonical.objectId]:wrong},`${candidate.target}_${source.digest}_wrong`):null;const comparison=baseline.success&&alternate.success?compare(baseline,alternate):null;rows.push({digest:source.digest,sender:source.transaction.data.sender,baseline,alternate,wrongFeed,comparison,controlPass:baseline.success&&(!wrongFeed||!wrongFeed.success),positive:Boolean(comparison?.positive)});}
+              const positive=rows.filter((r)=>r.controlPass&&r.positive);cases.push({candidate,sourceCount:sources.length,rows,positiveControlledCount:positive.length,repeatable:positive.length>=2,maxAdvantageBps:Math.max(0,...positive.map((r)=>r.comparison?.advantageBps??0))});
+            }
+          }
+          const promoted=cases.filter((r)=>r.repeatable);const summary={schema:'bucket-pyth-psm-coin-rebind-r22/v1',network:'sui-mainnet',readOnly:true,relevant,finalRequiredNextGate:finalStatus.requiredNextGate,r19ExactCandidateCount:exact.length,cases,gates:{anyCoinRebindUsed:cases.some((c)=>c.rows?.some((r)=>r.baseline?.inputMeta?.some((i)=>i.reboundCoin))),anyBaselineSuccess:cases.some((c)=>c.rows?.some((r)=>r.baseline?.success)),wrongFeedControlPass:cases.some((c)=>c.rows?.some((r)=>r.wrongFeed&&!r.wrongFeed.success)),positiveControlledCaseCount:cases.reduce((n,c)=>n+(c.positiveControlledCount??0),0),repeatablePositiveCandidateCount:promoted.length,maxAdvantageBps:Math.max(0,...promoted.map((r)=>r.maxAdvantageBps??0))},promotedCandidates:promoted.map((r)=>({candidate:r.candidate,positiveControlledCount:r.positiveControlledCount,maxAdvantageBps:r.maxAdvantageBps})),exploitConfirmed:promoted.length>0,economicImpactProven:promoted.length>0,materialHighOrCriticalImpactProven:false,scopeAndDuplicatePassed:false,submissionReady:false,productionTransactionsSubmitted:0,generatedUnix:Math.floor(Date.now()/1000)};
+          fs.writeFileSync('SUMMARY.json',JSON.stringify(summary,null,2));console.log(JSON.stringify({relevant:summary.relevant,r19ExactCandidateCount:summary.r19ExactCandidateCount,gates:summary.gates,promotedCandidates:summary.promotedCandidates,exploitConfirmed:summary.exploitConfirmed,economicImpactProven:summary.economicImpactProven,submissionReady:summary.submissionReady,cases:cases.map((c)=>({candidate:c.candidate,sourceCount:c.sourceCount,positiveControlledCount:c.positiveControlledCount,repeatable:c.repeatable,maxAdvantageBps:c.maxAdvantageBps,rows:(c.rows??[]).map((r)=>({digest:r.digest,sender:r.sender,baselineSuccess:r.baseline?.success,alternateSuccess:r.alternate?.success,wrongFeedSuccess:r.wrongFeed?.success,controlPass:r.controlPass,comparison:r.comparison,baselineError:r.baseline?.errorMessage,alternateError:r.alternate?.errorMessage}))}))},null,2));
+          JS
+          cd bucket-pyth-psm-coin-rebind-r22
+          node probe.mjs | tee run.log
+          find . -type f ! -path './node_modules/*' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+
+      - name: Validate strict no-submit boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-pyth-psm-coin-rebind-r22/probe.mjs bucket-pyth-psm-coin-rebind-r22/SUMMARY.json && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary=json.load(open('bucket-pyth-psm-coin-rebind-r22/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['productionTransactionsSubmitted']==0
+          assert summary['submissionReady'] is False
+          print('BUCKET_PYTH_PSM_COIN_REBIND_R22_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-pyth-psm-coin-rebind-r22
+          path: |
+            bucket-pyth-psm-coin-rebind-r22/SUMMARY.json
+            bucket-pyth-psm-coin-rebind-r22/SDK_VERSION.txt
+            bucket-pyth-psm-coin-rebind-r22/probe.mjs
+            bucket-pyth-psm-coin-rebind-r22/run.log
+            bucket-pyth-psm-coin-rebind-r22/SHA256SUMS.txt
+            bucket-pyth-psm-coin-rebind-r22/raw
+          if-no-files-found: error
+          retention-days: 7
