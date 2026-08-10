@@ -1,0 +1,252 @@
+name: Bucket R16-R19 Decision Publisher
+
+on:
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+    paths:
+      - '.github/workflows/bucket-r16-r19-decision-publisher.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/bucket-pyth-revival-gate-20260809
+          fetch-depth: 0
+
+      - name: Download latest completed evidence and publish strict decisions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GH_BRANCH: agent/bucket-pyth-revival-gate-20260809
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf analysis-results/bucket-r16-r19 /tmp/bucket-decisions
+          mkdir -p analysis-results/bucket-r16-r19 /tmp/bucket-decisions
+          cat > /tmp/bucket-decisions/publish.py <<'PY'
+          import io
+          import json
+          import os
+          import pathlib
+          import time
+          import urllib.parse
+          import urllib.request
+          import zipfile
+
+          TOKEN = os.environ['GH_TOKEN']
+          REPO = os.environ['GH_REPO']
+          BRANCH = os.environ['GH_BRANCH']
+          OUT = pathlib.Path('analysis-results/bucket-r16-r19')
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          WORKFLOWS = {
+              'R16': {
+                  'file': 'bucket-shared-account-withdraw-auth-r16.yml',
+                  'artifact': 'bucket-shared-account-withdraw-auth-r16',
+              },
+              'R17': {
+                  'file': 'bucket-shared-account-sender-differential-r17.yml',
+                  'artifact': 'bucket-shared-account-sender-r17',
+              },
+              'R18': {
+                  'file': 'bucket-pyth-stale-replay-live-r18.yml',
+                  'artifact': 'bucket-pyth-stale-replay-r18',
+              },
+              'R19': {
+                  'file': 'bucket-pyth-priceinfo-differential-r19.yml',
+                  'artifact': 'bucket-pyth-priceinfo-differential-r19',
+              },
+          }
+
+          def api(path, accept='application/vnd.github+json'):
+              req = urllib.request.Request(
+                  f'https://api.github.com/repos/{REPO}/{path}',
+                  headers={
+                      'Accept': accept,
+                      'Authorization': f'Bearer {TOKEN}',
+                      'X-GitHub-Api-Version': '2022-11-28',
+                      'User-Agent': 'bucket-r16-r19-decision-publisher/1',
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=180) as response:
+                  return response.read(), response.headers
+
+          def json_api(path):
+              raw, _ = api(path)
+              return json.loads(raw.decode())
+
+          def latest_run(workflow_file):
+              query = urllib.parse.urlencode({'branch': BRANCH, 'per_page': 20})
+              payload = json_api(f'actions/workflows/{workflow_file}/runs?{query}')
+              runs = payload.get('workflow_runs') or []
+              completed = [row for row in runs if row.get('status') == 'completed']
+              if completed:
+                  return completed[0]
+              return runs[0] if runs else None
+
+          def artifact_summary(run_id, expected_name):
+              payload = json_api(f'actions/runs/{run_id}/artifacts?per_page=100')
+              artifacts = payload.get('artifacts') or []
+              matching = [row for row in artifacts if row.get('name') == expected_name and not row.get('expired')]
+              if not matching:
+                  return None, {'artifacts': artifacts, 'error': f'artifact {expected_name!r} missing'}
+              artifact = matching[0]
+              raw, _ = api(f'actions/artifacts/{artifact["id"]}/zip', accept='application/octet-stream')
+              with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                  names = archive.namelist()
+                  candidates = [name for name in names if name.endswith('/SUMMARY.json') or name == 'SUMMARY.json']
+                  if not candidates:
+                      return None, {'artifact': artifact, 'names': names, 'error': 'SUMMARY.json missing'}
+                  name = sorted(candidates, key=lambda value: (value.count('/'), len(value)))[0]
+                  summary = json.loads(archive.read(name).decode())
+              return summary, {'artifact': artifact, 'summaryMember': name}
+
+          results = {}
+          for label, spec in WORKFLOWS.items():
+              row = {
+                  'workflowFile': spec['file'],
+                  'expectedArtifact': spec['artifact'],
+                  'run': None,
+                  'summary': None,
+                  'artifactMeta': None,
+              }
+              try:
+                  run = latest_run(spec['file'])
+                  if run is None:
+                      row['error'] = 'no workflow run found'
+                  else:
+                      row['run'] = {
+                          'id': run.get('id'),
+                          'status': run.get('status'),
+                          'conclusion': run.get('conclusion'),
+                          'headSha': run.get('head_sha'),
+                          'createdAt': run.get('created_at'),
+                          'updatedAt': run.get('updated_at'),
+                          'htmlUrl': run.get('html_url'),
+                      }
+                      if run.get('status') == 'completed' and run.get('conclusion') == 'success':
+                          summary, meta = artifact_summary(run['id'], spec['artifact'])
+                          row['summary'] = summary
+                          row['artifactMeta'] = meta
+              except Exception as exc:
+                  row['error'] = f'{type(exc).__name__}: {exc}'
+              results[label] = row
+
+          def gate(label, key, default=False):
+              summary = results.get(label, {}).get('summary') or {}
+              return (summary.get('gates') or {}).get(key, default)
+
+          r17 = results.get('R17', {}).get('summary') or {}
+          r19 = results.get('R19', {}).get('summary') or {}
+          r18 = results.get('R18', {}).get('summary') or {}
+          r16 = results.get('R16', {}).get('summary') or {}
+
+          strict = {
+              'r16WithdrawWithoutOwnedAuthInput': bool(gate('R16', 'withdrawHasNoOwnedObjectInput')),
+              'r16AllWithdrawsWithoutOwnedAuthInput': bool(gate('R16', 'allWithdrawsHaveNoOwnedObjectInput')),
+              'r16PublicWithdrawExposed': bool(gate('R16', 'publicWithdrawExposed')),
+              'r16StaticAuthorizationSignalFound': bool(gate('R16', 'staticAuthorizationSignalFound')),
+              'r17ArbitrarySenderSuccess': bool(gate('R17', 'anyArbitrarySenderSuccess')),
+              'r17ArbitrarySenderPositiveRecipient': bool(gate('R17', 'anyArbitrarySenderPositiveRecipient')),
+              'r17ExploitConfirmed': bool(r17.get('exploitConfirmed')),
+              'r18MultipleSameFeedPriceInfo': bool(gate('R18', 'multiplePriceInfoObjectsForTargetFeed')),
+              'r18PublicPriceInfoCreatorWithoutObviousCap': bool(gate('R18', 'publicPriceInfoCreatorWithoutObviousCap')),
+              'r18ToleranceAtLeastOneDay': bool(gate('R18', 'targetToleranceAtLeastOneDay')),
+              'r18PsmActivitySeen': bool(gate('R18', 'currentPsmActivitySeen')),
+              'r19AlternateAccepted': bool(gate('R19', 'anyAlternateAccepted')),
+              'r19AlternateAcceptedWithDifferentReturn': bool(gate('R19', 'anyAlternateAcceptedWithDifferentReturn')),
+              'r19ExactCandidateCount': int(gate('R19', 'exactCandidateCount', 0) or 0),
+              'r19EconomicImpactProven': bool(r19.get('economicImpactProven')),
+              'r19ExploitConfirmed': bool(r19.get('exploitConfirmed')),
+          }
+
+          account_candidate = (
+              strict['r16WithdrawWithoutOwnedAuthInput']
+              and strict['r17ArbitrarySenderSuccess']
+              and strict['r17ArbitrarySenderPositiveRecipient']
+              and strict['r17ExploitConfirmed']
+          )
+          pyth_candidate = (
+              strict['r18ToleranceAtLeastOneDay']
+              and strict['r18PsmActivitySeen']
+              and strict['r19AlternateAcceptedWithDifferentReturn']
+              and strict['r19ExactCandidateCount'] > 0
+          )
+          submit_ready = (
+              account_candidate and bool(r17.get('materialImpactProven'))
+          ) or (
+              pyth_candidate and strict['r19EconomicImpactProven'] and strict['r19ExploitConfirmed']
+          )
+
+          decision = {
+              'schema': 'bucket-r16-r19-release-gate/v1',
+              'repository': REPO,
+              'branch': BRANCH,
+              'generatedUnix': int(time.time()),
+              'strictGates': strict,
+              'candidateStatus': {
+                  'sharedAccountAuthorizationCandidate': account_candidate,
+                  'pythPriceInfoReplayCandidate': pyth_candidate,
+              },
+              'safeToSubmitNow': submit_ready,
+              'requiredNextGate': (
+                  'R20_PSM_ECONOMIC_DIFFERENTIAL'
+                  if pyth_candidate and not submit_ready
+                  else 'ACCOUNT_MATERIALITY_AND_DUPLICATE_GATE'
+                  if account_candidate and not submit_ready
+                  else 'NONE_SUBMIT_READY'
+                  if submit_ready
+                  else 'KILL_OR_REDESIGN'
+              ),
+              'results': results,
+          }
+          (OUT / 'DECISION.json').write_text(json.dumps(decision, indent=2, sort_keys=True) + '\n')
+
+          compact = {
+              'safeToSubmitNow': decision['safeToSubmitNow'],
+              'candidateStatus': decision['candidateStatus'],
+              'requiredNextGate': decision['requiredNextGate'],
+              'strictGates': strict,
+              'runs': {
+                  label: {
+                      'id': (row.get('run') or {}).get('id'),
+                      'status': (row.get('run') or {}).get('status'),
+                      'conclusion': (row.get('run') or {}).get('conclusion'),
+                      'error': row.get('error'),
+                      'schema': (row.get('summary') or {}).get('schema'),
+                  }
+                  for label, row in results.items()
+              },
+          }
+          (OUT / 'COMPACT.json').write_text(json.dumps(compact, indent=2, sort_keys=True) + '\n')
+          (OUT / 'STATUS.txt').write_text(
+              f"safeToSubmitNow={str(submit_ready).lower()}\n"
+              f"sharedAccountAuthorizationCandidate={str(account_candidate).lower()}\n"
+              f"pythPriceInfoReplayCandidate={str(pyth_candidate).lower()}\n"
+              f"requiredNextGate={decision['requiredNextGate']}\n"
+          )
+          print(json.dumps(compact, indent=2, sort_keys=True))
+          PY
+          python3 /tmp/bucket-decisions/publish.py
+
+      - name: Commit deterministic decision files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'bucket-evidence-bot'
+          git config user.email 'bucket-evidence-bot@users.noreply.github.com'
+          git add analysis-results/bucket-r16-r19
+          if git diff --cached --quiet; then
+            echo 'No decision changes.'
+            exit 0
+          fi
+          git commit -m 'evidence: publish Bucket R16-R19 strict release gates'
+          git push origin HEAD:agent/bucket-pyth-revival-gate-20260809
