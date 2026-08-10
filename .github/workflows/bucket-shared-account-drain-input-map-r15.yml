@@ -1,0 +1,427 @@
+name: Bucket Shared Account Drain Input Map R15
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  map:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve production transaction inputs and saving position state
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-shared-account-drain-input-map-r15
+          mkdir -p bucket-shared-account-drain-input-map-r15/{raw,asm,analysis}
+
+          cat > bucket-shared-account-drain-input-map-r15/map.py <<'PY'
+          import json
+          import pathlib
+          import re
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-shared-account-drain-input-map-r15')
+          RAW = OUT / 'raw'
+          ASM = OUT / 'asm'
+          ANALYSIS = OUT / 'analysis'
+          RPCS = [
+              'https://fullnode.mainnet.sui.io:443',
+              'https://sui-mainnet-endpoint.blockvision.org',
+          ]
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+
+          VAULT_A_ORIGIN = '0x75ecf86d06f900ceaa979339965b5f9fa4e8a43a60816e58cbbfa37762bba5b7'
+          VAULT_A_CURRENT = '0x16136081deb1652e889911c6a97ceaa94a3a7ed67f29260d6f2a0d56c0679aa8'
+          VAULT_A = '0x5ee16dbdf0fde4c0699db409957f5e1b0c7cc4e1b0b28921728b9251fab169b0'
+          ACCOUNT_A = '0x0bd4c9887129746355e0b44552fc2c92787a4fa418249ce1f92e84ab47e28b54'
+
+          VAULT_B_PACKAGE = '0x2f567f02e37a7e97cf603a7118e3b44f58401d4970cac2dda04d6bc71a25d9f5'
+          VAULT_B = '0xa8d05be9b464568dce0dd5fb947c7581179fa8c8770086ae0c4504af46b6c706'
+          ACCOUNT_B = '0x3d3ea407522b697303737f6fd736ef71672af6fdbac6e8a2478245082145d712'
+
+          SAVING_POOL = '0xa0bfd8f31cc869c5f91cc23cb24414f3e225f015d269803279dc8a2179ce964f'
+          REWARD_MANAGER = '0x79c753c1512a0eaeae0aedc623e620c599915e5855e27ee5d292d5bf95192578'
+          TREASURY = '0x4de1c29a89d6888ebf8f7ae20364571dce4e1e42b9c9221f7df924ad6f9e617d'
+          CLOCK = '0x0000000000000000000000000000000000000000000000000000000000000006'
+
+          TXS = {
+              'vault_a_withdraw': '6C8J9PRtkpt8HoJQtqojcN2xwgTFjhiAdoJ4v1H71cHR',
+              'vault_a_deposit': '8hhVLQVmzpUnTV5uhxzC43iNUDumxXUtKH1DxBMmqnwr',
+              'vault_b_withdraw': '35mjLeDwGu6ksJXUkc4teTZ31Sk96PH2XjWFwG69hpsH',
+              'vault_b_deposit': '4LSzdrk9vZpqtazD7CHJY94Vkt4EM7pqGkvxM2sc5EQx',
+              'vault_a_account_creation': 'HVR8WaaERqPGFgrUBazcYvUiqfAMkC8GAZzVLM956Pva',
+              'vault_b_account_creation': 'H4zmR9FVxmto7JD4REqWYaz6H5AxB77P6hniDaoTGrjp',
+          }
+
+          PACKAGES = {
+              'vault_a_origin': VAULT_A_ORIGIN,
+              'vault_a_current': VAULT_A_CURRENT,
+              'vault_b': VAULT_B_PACKAGE,
+          }
+
+          def post(url, payload, retries=6, timeout=180):
+              data = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      req = urllib.request.Request(
+                          url,
+                          data=data,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-shared-account-drain-input-map-r15/1',
+                          },
+                      )
+                      with urllib.request.urlopen(req, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2 ** attempt, 30))
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': str(exc)})
+              return {'failures': failures}
+
+          def gql(query, variables=None):
+              body = post(GQL, {'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body.get('data')
+
+          def dump(path, value):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          TX_OPTIONS = {
+              'showInput': True,
+              'showRawInput': True,
+              'showEffects': True,
+              'showEvents': True,
+              'showObjectChanges': True,
+              'showBalanceChanges': True,
+          }
+          OBJ_OPTIONS = {
+              'showType': True,
+              'showOwner': True,
+              'showPreviousTransaction': True,
+              'showDisplay': True,
+              'showContent': True,
+              'showBcs': True,
+          }
+
+          def tx_data(digest):
+              wrapper = rpc('sui_getTransactionBlock', [digest, TX_OPTIONS])
+              result = wrapper.get('result') if isinstance(wrapper, dict) else None
+              return wrapper, result
+
+          def object_data(object_id):
+              wrapper = rpc('sui_getObject', [object_id, OBJ_OPTIONS])
+              result = wrapper.get('result') if isinstance(wrapper, dict) else None
+              data = (result or {}).get('data') if isinstance(result, dict) else None
+              return wrapper, data
+
+          def move_calls(tx):
+              try:
+                  commands = tx['transaction']['data']['transaction']['transactions']
+              except Exception:
+                  return []
+              rows = []
+              for index, command in enumerate(commands or []):
+                  call = command.get('MoveCall') if isinstance(command, dict) else None
+                  if call:
+                      rows.append({
+                          'index': index,
+                          'package': call.get('package'),
+                          'module': call.get('module'),
+                          'function': call.get('function'),
+                          'typeArguments': call.get('type_arguments') or call.get('typeArguments'),
+                          'arguments': call.get('arguments') or [],
+                      })
+              return rows
+
+          def tx_inputs(tx):
+              try:
+                  return tx['transaction']['data']['transaction']['inputs'] or []
+              except Exception:
+                  return []
+
+          def resolve_argument(argument, inputs):
+              if not isinstance(argument, dict):
+                  return {'kind': 'unknown', 'raw': argument}
+              if 'Input' in argument:
+                  index = int(argument['Input'])
+                  return {
+                      'kind': 'Input',
+                      'index': index,
+                      'value': inputs[index] if 0 <= index < len(inputs) else None,
+                  }
+              if 'Result' in argument:
+                  return {'kind': 'Result', 'command': argument['Result']}
+              if 'NestedResult' in argument:
+                  return {'kind': 'NestedResult', 'commandResult': argument['NestedResult']}
+              return {'kind': 'unknown', 'raw': argument}
+
+          def compact_input(value):
+              if not isinstance(value, dict):
+                  return value
+              keep = {}
+              for key in (
+                  'type', 'objectType', 'objectId', 'initialSharedVersion', 'mutable',
+                  'version', 'digest', 'valueType', 'value',
+              ):
+                  if key in value:
+                      keep[key] = value[key]
+              return keep or value
+
+          tx_rows = []
+          relevant_functions = {
+              'borrow_protocol_cap', 'return_protocol_cap', 'request_with_account',
+              'withdraw', 'check_withdraw_response', 'new_checker_for_withdraw_action',
+              'update_withdraw_action', 'destroy_withdraw_checker', 'swap_in', 'swap_out',
+              'deposit', 'check_deposit_response', 'borrow_all_for_strategy', 'repay_withdraw',
+          }
+          for label, digest in TXS.items():
+              wrapper, tx = tx_data(digest)
+              dump(RAW / f'tx_{label}_{digest}.json', wrapper)
+              inputs = tx_inputs(tx or {})
+              calls = move_calls(tx or {})
+              resolved_calls = []
+              for call in calls:
+                  if call['function'] not in relevant_functions:
+                      continue
+                  resolved = dict(call)
+                  resolved['resolvedArguments'] = [resolve_argument(arg, inputs) for arg in call['arguments']]
+                  resolved_calls.append(resolved)
+              tx_rows.append({
+                  'label': label,
+                  'digest': digest,
+                  'sender': (((tx or {}).get('transaction') or {}).get('data') or {}).get('sender'),
+                  'timestampMs': (tx or {}).get('timestampMs'),
+                  'status': ((tx or {}).get('effects') or {}).get('status'),
+                  'inputCount': len(inputs),
+                  'inputs': [compact_input(value) for value in inputs],
+                  'relevantCalls': resolved_calls,
+                  'objectChanges': (tx or {}).get('objectChanges'),
+                  'balanceChanges': (tx or {}).get('balanceChanges'),
+              })
+          dump(ANALYSIS / 'transaction_input_map.json', tx_rows)
+
+          objects = {}
+          for label, object_id in {
+              'vault_a': VAULT_A,
+              'account_a': ACCOUNT_A,
+              'vault_b': VAULT_B,
+              'account_b': ACCOUNT_B,
+              'saving_pool': SAVING_POOL,
+              'reward_manager': REWARD_MANAGER,
+              'treasury': TREASURY,
+              'clock': CLOCK,
+          }.items():
+              wrapper, data = object_data(object_id)
+              dump(RAW / f'object_{label}_{object_id}.json', wrapper)
+              objects[label] = data
+
+          def find_table_ids(value, path=()):
+              rows = []
+              if isinstance(value, dict):
+                  if set(value.keys()) >= {'fields', 'type'} and isinstance(value.get('type'), str):
+                      fields = value.get('fields') or {}
+                      inner_id = fields.get('id')
+                      if isinstance(inner_id, dict):
+                          inner_id = inner_id.get('id')
+                      if isinstance(inner_id, str) and inner_id.startswith('0x'):
+                          rows.append({'path': '.'.join(path), 'type': value.get('type'), 'id': inner_id})
+                  for key, child in value.items():
+                      rows.extend(find_table_ids(child, path + (str(key),)))
+              elif isinstance(value, list):
+                  for index, child in enumerate(value):
+                      rows.extend(find_table_ids(child, path + (str(index),)))
+              return rows
+
+          saving_fields = (((objects.get('saving_pool') or {}).get('content') or {}).get('fields') or {})
+          reward_fields = (((objects.get('reward_manager') or {}).get('content') or {}).get('fields') or {})
+          saving_tables = find_table_ids(saving_fields)
+          reward_tables = find_table_ids(reward_fields)
+          dump(ANALYSIS / 'saving_table_candidates.json', saving_tables)
+          dump(ANALYSIS / 'reward_table_candidates.json', reward_tables)
+
+          position_candidates = []
+          for table in saving_tables:
+              for account_label, account_id in [('account_a', ACCOUNT_A), ('account_b', ACCOUNT_B)]:
+                  wrapper = rpc('suix_getDynamicFieldObject', [
+                      table['id'],
+                      {'type': 'address', 'value': account_id},
+                  ])
+                  dump(RAW / f'position_{account_label}_{table["id"]}.json', wrapper)
+                  result = wrapper.get('result') if isinstance(wrapper, dict) else None
+                  data = (result or {}).get('data') if isinstance(result, dict) else None
+                  error = (result or {}).get('error') if isinstance(result, dict) else None
+                  if data:
+                      position_candidates.append({
+                          'accountLabel': account_label,
+                          'account': account_id,
+                          'table': table,
+                          'objectId': data.get('objectId'),
+                          'type': data.get('type'),
+                          'owner': data.get('owner'),
+                          'version': data.get('version'),
+                          'content': data.get('content'),
+                      })
+                  elif error:
+                      position_candidates.append({
+                          'accountLabel': account_label,
+                          'account': account_id,
+                          'table': table,
+                          'error': error,
+                      })
+          dump(ANALYSIS / 'position_candidates.json', position_candidates)
+
+          package_query = '''query Package($address:SuiAddress!) {
+            object(address:$address) {
+              address version digest
+              previousTransaction { digest sender { address } }
+              asMovePackage {
+                address version
+                linkage { originalId upgradedId version }
+                typeOrigins { module struct definingId }
+                modules { nodes { name disassembly } }
+              }
+            }
+          }'''
+          package_rows = []
+          for label, package_id in PACKAGES.items():
+              graph = gql(package_query, {'address': package_id})
+              graph_obj = (graph or {}).get('object')
+              normalized = rpc('sui_getNormalizedMoveModulesByPackage', [package_id])
+              dump(RAW / f'package_{label}.json', graph_obj)
+              dump(RAW / f'normalized_{label}.json', normalized)
+              move_package = (graph_obj or {}).get('asMovePackage')
+              modules = []
+              if move_package:
+                  directory = ASM / label
+                  directory.mkdir(parents=True, exist_ok=True)
+                  for module in (move_package.get('modules') or {}).get('nodes', []):
+                      name = module.get('name')
+                      text = module.get('disassembly') or ''
+                      modules.append(name)
+                      (directory / f'{name}.asm').write_text(text)
+              package_rows.append({
+                  'label': label,
+                  'package': package_id,
+                  'version': (move_package or {}).get('version'),
+                  'modules': modules,
+                  'previousTransaction': (graph_obj or {}).get('previousTransaction'),
+              })
+
+          account_key_rows = []
+          for tx_row in tx_rows:
+              for call in tx_row['relevantCalls']:
+                  if call['function'] != 'borrow_protocol_cap':
+                      continue
+                  type_args = call.get('typeArguments') or []
+                  if not any(str(arg).endswith('::account::Account') for arg in type_args):
+                      continue
+                  key_arg = call['resolvedArguments'][1] if len(call['resolvedArguments']) > 1 else None
+                  account_key_rows.append({
+                      'txLabel': tx_row['label'],
+                      'digest': tx_row['digest'],
+                      'package': call['package'],
+                      'vaultInput': call['resolvedArguments'][0] if call['resolvedArguments'] else None,
+                      'keyInput': key_arg,
+                      'typeArguments': type_args,
+                  })
+
+          live_positions = [row for row in position_candidates if row.get('objectId')]
+          summary = {
+              'schema': 'bucket-shared-account-drain-input-map-r15/v1',
+              'network': 'sui-mainnet',
+              'readOnly': True,
+              'vaults': {
+                  'a': {'originPackage': VAULT_A_ORIGIN, 'currentPackage': VAULT_A_CURRENT, 'vault': VAULT_A, 'account': ACCOUNT_A},
+                  'b': {'package': VAULT_B_PACKAGE, 'vault': VAULT_B, 'account': ACCOUNT_B},
+              },
+              'bucketObjects': {
+                  'savingPool': SAVING_POOL,
+                  'rewardManager': REWARD_MANAGER,
+                  'treasury': TREASURY,
+                  'clock': CLOCK,
+              },
+              'transactions': tx_rows,
+              'accountBorrowKeys': account_key_rows,
+              'savingPoolFields': saving_fields,
+              'rewardManagerFields': reward_fields,
+              'savingTableCandidates': saving_tables,
+              'rewardTableCandidates': reward_tables,
+              'positionCandidates': position_candidates,
+              'livePositionCount': len(live_positions),
+              'livePositions': live_positions,
+              'packages': package_rows,
+              'gates': {
+                  'accountBorrowKeyResolved': any((row.get('keyInput') or {}).get('value') for row in account_key_rows),
+                  'savingPositionFoundForAccountA': any(row.get('account') == ACCOUNT_A and row.get('objectId') for row in position_candidates),
+                  'savingPositionFoundForAccountB': any(row.get('account') == ACCOUNT_B and row.get('objectId') for row in position_candidates),
+                  'currentVaultAPackageFetched': any(row['label'] == 'vault_a_current' and row['modules'] for row in package_rows),
+              },
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'productionTransactionsSubmitted': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'accountBorrowKeys': account_key_rows,
+              'savingTableCandidates': saving_tables,
+              'positionCandidates': position_candidates,
+              'packageRows': package_rows,
+              'gates': summary['gates'],
+          }, indent=2))
+          PY
+
+          python3 bucket-shared-account-drain-input-map-r15/map.py | tee bucket-shared-account-drain-input-map-r15/run.log
+          find bucket-shared-account-drain-input-map-r15 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-shared-account-drain-input-map-r15/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-shared-account-drain-input-map-r15 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-shared-account-drain-input-map-r15/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          assert summary['productionTransactionsSubmitted'] == 0
+          print('BUCKET_SHARED_ACCOUNT_DRAIN_INPUT_MAP_R15_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-shared-account-drain-input-map-r15
+          path: bucket-shared-account-drain-input-map-r15
+          if-no-files-found: error
+          retention-days: 7
