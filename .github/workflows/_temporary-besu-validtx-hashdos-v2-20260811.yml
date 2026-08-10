@@ -1,0 +1,257 @@
+name: Temporary Besu Valid-Transaction HashDoS Gate V2 20260811
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: besu-validtx-hashdos-v2-20260811
+  cancel-in-progress: true
+
+jobs:
+  valid-transaction-gate-v2:
+    if: github.event_name == 'workflow_dispatch' || github.head_ref == 'ethereum-besu-validtx-hashdos-v2-20260811'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - name: Checkout V1 transaction generator
+        uses: actions/checkout@v4
+        with:
+          repository: zerodaybugs/test
+          ref: ethereum-besu-validtx-hashdos-20260811
+          path: harness-v1
+          persist-credentials: false
+
+      - name: Checkout V2 classifier and control patch
+        uses: actions/checkout@v4
+        with:
+          repository: zerodaybugs/test
+          ref: ethereum-besu-validtx-hashdos-v2-20260811
+          path: harness-v2
+          persist-credentials: false
+
+      - name: Configure Java 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: gradle
+
+      - name: Resolve current Besu release and source trees
+        shell: bash
+        run: |
+          set -euo pipefail
+          LATEST_TAG="$(python3 - <<'PY'
+          import json, urllib.request
+          request = urllib.request.Request(
+              'https://api.github.com/repos/besu-eth/besu/releases/latest',
+              headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'ethereum-research-gate-v2'},
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              print(json.load(response)['tag_name'])
+          PY
+          )"
+          echo "LATEST_TAG=$LATEST_TAG" >> "$GITHUB_ENV"
+
+          git clone --filter=blob:none --no-checkout https://github.com/besu-eth/besu.git besu-latest
+          git -C besu-latest fetch --depth=1 origin "refs/tags/${LATEST_TAG}:refs/tags/${LATEST_TAG}"
+          git -C besu-latest checkout --detach "$LATEST_TAG"
+          git clone --depth=1 --branch main https://github.com/besu-eth/besu.git besu-main
+
+          echo "LATEST_SHA=$(git -C besu-latest rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "MAIN_SHA=$(git -C besu-main rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Build current release and current main evmtool
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/besu-bin"
+          (
+            cd besu-latest
+            ./gradlew :ethereum:evmtool:installDist --no-daemon --stacktrace
+          )
+          cp -a besu-latest/ethereum/evmtool/build/install/evmtool "$RUNNER_TEMP/besu-bin/latest-stock"
+
+          (
+            cd besu-main
+            ./gradlew :ethereum:evmtool:installDist --no-daemon --stacktrace
+          )
+          cp -a besu-main/ethereum/evmtool/build/install/evmtool "$RUNNER_TEMP/besu-bin/main-stock"
+
+      - name: Build narrow AbstractWorldUpdater control
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness-v2/research/ethereum/besu_hashdos_v2/patch_abstract_world_updater.py besu-latest
+          (
+            cd besu-latest
+            ./gradlew :ethereum:evmtool:installDist --no-daemon --stacktrace
+          )
+          cp -a besu-latest/ethereum/evmtool/build/install/evmtool "$RUNNER_TEMP/besu-bin/latest-patched"
+
+      - name: Generate gas-safe valid transaction grid
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/hashdos-v2-result"
+          GENERATOR="$GITHUB_WORKSPACE/harness-v1/research/ethereum/besu_hashdos/generate_t8n_inputs.py"
+          mkdir -p "$ROOT/cases" "$ROOT/runs" "$ROOT/public-result"
+
+          generate_case() {
+            local name="$1" depth="$2" count="$3"
+            for mode in control collision; do
+              python3 "$GENERATOR" \
+                --output "$ROOT/cases/$name/$mode" \
+                --mode "$mode" --count "$count" --depth "$depth" --fork Osaka
+            done
+          }
+
+          generate_case d40_n2000 40 2000
+          generate_case d48_n1800 48 1800
+          generate_case d56_n1650 56 1650
+          generate_case d64_n1500 64 1500
+          generate_case warmup 2 50
+
+          export LATEST_TAG LATEST_SHA MAIN_SHA
+          python3 - <<'PY'
+          import json, os, platform, subprocess
+          from pathlib import Path
+          root = Path(os.environ['GITHUB_WORKSPACE']) / 'hashdos-v2-result'
+          environment = {
+              'latest_tag': os.environ['LATEST_TAG'],
+              'latest_sha': os.environ['LATEST_SHA'],
+              'main_sha': os.environ['MAIN_SHA'],
+              'runner': platform.platform(),
+              'java': subprocess.check_output(['java', '-version'], stderr=subprocess.STDOUT, text=True).splitlines()[0],
+              'transaction_gas_cap': 2**24,
+              'transaction_gas_limit': 16_700_000,
+              'fork': 'Osaka',
+              'control_patch': 'AbstractWorldUpdater address maps only',
+          }
+          (root / 'environment.json').write_text(json.dumps(environment, indent=2, sort_keys=True) + '\n')
+          PY
+          sha256sum "$GENERATOR" \
+            harness-v2/research/ethereum/besu_hashdos_v2/patch_abstract_world_updater.py \
+            harness-v2/research/ethereum/besu_hashdos_v2/analyze_results_v2.py \
+            > "$ROOT/public-result/HARNESS_SHA256.txt"
+
+      - name: Execute current release, main and root-cause control
+        shell: bash
+        env:
+          JAVA_OPTS: -Xms1g -Xmx4g -XX:+UseG1GC
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/hashdos-v2-result"
+          LATEST_BIN="$RUNNER_TEMP/besu-bin/latest-stock/bin/evmtool"
+          MAIN_BIN="$RUNNER_TEMP/besu-bin/main-stock/bin/evmtool"
+          PATCHED_BIN="$RUNNER_TEMP/besu-bin/latest-patched/bin/evmtool"
+          CASES='d40_n2000 d48_n1800 d56_n1650 d64_n1500'
+
+          for binary in "$LATEST_BIN" "$MAIN_BIN" "$PATCHED_BIN"; do
+            test -x "$binary"
+            "$binary" t8n --help >/dev/null
+          done
+
+          run_one() {
+            local variant="$1" binary="$2" case_name="$3" mode="$4" rep="$5"
+            local input="$ROOT/cases/$case_name/$mode"
+            local output="$ROOT/runs/$variant/$case_name/$mode/rep$rep"
+            mkdir -p "$output/out"
+            set +e
+            /usr/bin/time -f '%e' -o "$output/time.txt" \
+              timeout 360s "$binary" t8n \
+                --state.fork=Osaka \
+                --input.alloc="$input/alloc.json" \
+                --input.env="$input/env.json" \
+                --input.txs="$input/txs.json" \
+                --output.basedir="$output/out" \
+                --output.alloc=alloc.json \
+                --output.result=result.json \
+                --output.body=body.rlp \
+                >"$output/stdout.log" 2>"$output/stderr.log"
+            local rc=$?
+            set -e
+            printf '%s\n' "$rc" > "$output/rc.txt"
+          }
+
+          run_one warmup "$LATEST_BIN" warmup control 1
+          run_one warmup "$MAIN_BIN" warmup control 2
+          run_one warmup "$PATCHED_BIN" warmup control 3
+
+          for rep in 1 2; do
+            for case_name in $CASES; do
+              if [ "$rep" -eq 1 ]; then modes='control collision'; else modes='collision control'; fi
+              for mode in $modes; do
+                run_one latest_stock "$LATEST_BIN" "$case_name" "$mode" "$rep"
+                run_one main_stock "$MAIN_BIN" "$case_name" "$mode" "$rep"
+                run_one latest_patched "$PATCHED_BIN" "$case_name" "$mode" "$rep"
+              done
+            done
+          done
+
+      - name: Strictly classify all matched cases
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/hashdos-v2-result"
+          python3 harness-v2/research/ethereum/besu_hashdos_v2/analyze_results_v2.py \
+            --root "$ROOT" --output "$ROOT/public-result" \
+            | tee "$ROOT/public-result/CLASSIFIER.log"
+          cat "$ROOT/public-result/SUMMARY.md"
+
+      - name: Encrypt detailed evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/hashdos-v2-result"
+          OUT="$GITHUB_WORKSPACE/encrypted-artifact"
+          mkdir -p "$ROOT" "$OUT"
+          cat > /tmp/research-public.pem <<'EOF'
+          -----BEGIN PUBLIC KEY-----
+          MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEApvGn1xm0jtBH6PqutVPv
+          GMp0c7xei4ZH4Eqgp7gykg/L0lvKq4UDguy0DvyqkhC/zklHXm4ZL7JKOY1FCFvJ
+          4yo/1UHDY5sHjfmwmubctOVDG+3N8J4hSrijKNyHx1Tc5kd5a/w1CTrkvl6tghmQ
+          lEXTg2lZOqOMnOMEbn1Ult6qCZqc0Dlso5/mE6nkThvpiUtKGroxtcIjS43GvR5J
+          xSNI2XakdnWIgUXAbswo+CWMNmZ4dG9vmsImf+EiDA2HP/gF53YkfZSeLrdfrEY/
+          mzV6VvLFiXXfJXOXDvt2jo+UkgNph50RksCndYaoKaxfptv62wJOfbr9Wbk344iC
+          yxxedPGWiTcGWEcETwiG3H1KNK7nDBFq9hCCAFwfF2OI28uqqsO1pF+LyOmQBNHu
+          MfMeMgJUM4L12deKmQr5gDaLIE1zNQ8dlnzZSvGuhbrE5aEosB1GsJlgr805Q5F6
+          /lKXSchFss4H5pvYAO/0FELZiS30M77M2HB56b/IQlrhAgMBAAE=
+          -----END PUBLIC KEY-----
+          EOF
+          tar -C "$GITHUB_WORKSPACE" -czf /tmp/hashdos-v2-result.tar.gz hashdos-v2-result
+          keyhex="$(openssl rand -hex 32)"
+          ivhex="$(openssl rand -hex 16)"
+          printf '%s\n%s\n' "$keyhex" "$ivhex" > /tmp/key-material.txt
+          openssl enc -aes-256-cbc -K "$keyhex" -iv "$ivhex" \
+            -in /tmp/hashdos-v2-result.tar.gz -out "$OUT/hashdos-v2-result.tar.gz.enc"
+          openssl pkeyutl -encrypt -pubin -inkey /tmp/research-public.pem \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+            -in /tmp/key-material.txt -out "$OUT/key-material.rsa-oaep.enc"
+          (cd "$OUT" && sha256sum key-material.rsa-oaep.enc hashdos-v2-result.tar.gz.enc > SHA256SUMS.txt)
+          echo ENCRYPTED_RESEARCH_ARTIFACT_V1 > "$OUT/FORMAT.txt"
+          rm -rf "$ROOT/cases" "$ROOT/runs" /tmp/hashdos-v2-result.tar.gz /tmp/key-material.txt /tmp/research-public.pem
+
+      - name: Upload sanitized result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: besu-validtx-hashdos-v2-public-result
+          path: hashdos-v2-result/public-result
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Upload encrypted detailed result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: besu-validtx-hashdos-v2-encrypted
+          path: encrypted-artifact
+          if-no-files-found: error
+          retention-days: 2
