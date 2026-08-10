@@ -31,12 +31,11 @@ jobs:
           npm install --no-audit --no-fund @codahq/packs-sdk@1.17.1
           node -e "const p=require('./node_modules/@codahq/packs-sdk/package.json'); if(p.version!=='1.17.1') process.exit(1); console.log(p.version)" > evidence/sdk-version.txt
 
-      - name: Compile one bundle, validate benign metadata, execute divergent runtime manifest
+      - name: Build exact Pack bundle with the official CLI
         shell: bash
         run: |
           set -euo pipefail
           cd bundle-metadata-gate
-
           cat > pack.ts <<'PACK'
           import * as sdk from '@codahq/packs-sdk';
 
@@ -70,6 +69,22 @@ jobs:
           });
           PACK
 
+          npx packs build pack.ts \
+            --outputDir compiled \
+            --intermediateOutputDirectory intermediate \
+            --minify false \
+            --timerStrategy none | tee evidence/BUILD_OUTPUT.txt
+
+          BUNDLE_PATH="$(find compiled -maxdepth 1 -type f -name '*.js' ! -name '*.map' | head -n 1)"
+          test -n "$BUNDLE_PATH"
+          test -f "$BUNDLE_PATH.map"
+          printf '%s\n' "$BUNDLE_PATH" > evidence/BUNDLE_PATH.txt
+
+      - name: Validate benign metadata and execute divergent runtime manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd bundle-metadata-gate
           cat > gate.js <<'NODE'
           'use strict';
           const assert = require('assert');
@@ -80,7 +95,6 @@ jobs:
           const {pathToFileURL} = require('url');
 
           const sdkRoot = path.dirname(require.resolve('@codahq/packs-sdk/package.json'));
-          const {compilePackBundle} = require(path.join(sdkRoot, 'dist/testing/compile.js'));
           const {compilePackMetadata} = require(path.join(sdkRoot, 'dist/helpers/metadata.js'));
           const {validatePackVersionMetadata} = require(path.join(sdkRoot, 'dist/testing/upload_validation.js'));
           const {findFormula} = require(path.join(sdkRoot, 'dist/runtime/common/helpers.js'));
@@ -112,6 +126,10 @@ jobs:
           };
 
           async function main() {
+            const relativeBundlePath = fs.readFileSync('evidence/BUNDLE_PATH.txt', 'utf8').trim();
+            const bundlePath = path.resolve(relativeBundlePath);
+            const bundleSourceMapPath = `${bundlePath}.map`;
+
             server = http.createServer((req, res) => {
               const authorization = req.headers.authorization || '';
               captured.push({method: req.method, url: req.url, authorization});
@@ -121,21 +139,12 @@ jobs:
             });
             await listen(server);
 
-            const {bundlePath, bundleSourceMapPath} = await compilePackBundle({
-              manifestPath: path.resolve('pack.ts'),
-              outputDirectory: path.resolve('compiled'),
-              intermediateOutputDirectory: path.resolve('intermediate'),
-              minify: false,
-            });
-
             const bundleBytes = fs.readFileSync(bundlePath);
             const sourceMapBytes = fs.readFileSync(bundleSourceMapPath);
             const bundleSha256 = crypto.createHash('sha256').update(bundleBytes).digest('hex');
 
-            // Equivalent to the official CLI importManifest(): dynamic-import the compiled bundle,
-            // then select module.pack || module.manifest. This avoids loading unrelated CLI config modules.
-            const moduleUrl = pathToFileURL(path.resolve(bundlePath)).href + `?metadata=${Date.now()}`;
-            const importedModule = await import(moduleUrl);
+            // Equivalent to official importManifest(): dynamic-import the exact compiled bundle.
+            const importedModule = await import(pathToFileURL(bundlePath).href + `?metadata=${Date.now()}`);
             const uploadManifest =
               importedModule.pack ||
               importedModule.manifest ||
@@ -214,7 +223,6 @@ jobs:
               sourceMap: sourceMapBytes.toString(),
             });
 
-            fs.mkdirSync('evidence', {recursive: true});
             fs.copyFileSync(bundlePath, 'evidence/EXACT_BUNDLE.js');
             fs.copyFileSync(bundleSourceMapPath, 'evidence/EXACT_BUNDLE.js.map');
             fs.writeFileSync('evidence/VALIDATED_METADATA.json', JSON.stringify(validatedMetadata, null, 2) + '\n');
@@ -226,6 +234,7 @@ jobs:
               bundleSha256,
               uploadPayloadSha256: crypto.createHash('sha256').update(uploadPayload).digest('hex'),
               sameBundleUsedForMetadataAndRuntime: true,
+              officialCliBuildSucceeded: true,
               officialUploadValidationAccepted: true,
               validatedUploadPolicy: validatedPolicy,
               runtimePolicy: runtimePolicyValue === undefined ? null : runtimePolicyValue,
@@ -236,7 +245,7 @@ jobs:
               systemCredentialApplied: captured[0].authorization === `Bearer ${SYSTEM_TOKEN}`,
               securityPolicyEquivalent,
               rootCause: 'Upload validates metadata extracted when the trusted thunk is absent, while canonical runtime evaluates the same bundle after installing the trusted thunk. The bundle can expose different security policy to validation and execution.',
-              canonicalRuntimePath: 'createIsolateContext -> registerBundles(thunk, pack) -> injectExecutionContext -> executeThunk',
+              canonicalRuntimePath: 'official packs build -> metadata dynamic import/validation -> createIsolateContext -> registerBundles(thunk, pack) -> injectExecutionContext -> executeThunk',
               productionRequestCount: 0,
               syntheticOnly: true,
             }, null, 2) + '\n');
@@ -260,8 +269,8 @@ jobs:
           NODE
 
           node gate.js | tee evidence/TEST_OUTPUT.txt
-          jq -e '.pass == true and .officialUploadValidationAccepted == true and .sameBundleUsedForMetadataAndRuntime == true and .systemCredentialApplied == true and .securityPolicyEquivalent == false' evidence/RESULT.json >/dev/null
-          sha256sum pack.ts gate.js package.json package-lock.json evidence/EXACT_BUNDLE.js evidence/EXACT_BUNDLE.js.map evidence/RESULT.json evidence/VALIDATED_METADATA.json evidence/UPLOAD_PAYLOAD_SUMMARY.json evidence/TEST_OUTPUT.txt evidence/sdk-version.txt > evidence/SHA256SUMS.txt
+          jq -e '.pass == true and .officialCliBuildSucceeded == true and .officialUploadValidationAccepted == true and .sameBundleUsedForMetadataAndRuntime == true and .systemCredentialApplied == true and .securityPolicyEquivalent == false' evidence/RESULT.json >/dev/null
+          sha256sum pack.ts gate.js package.json package-lock.json evidence/EXACT_BUNDLE.js evidence/EXACT_BUNDLE.js.map evidence/RESULT.json evidence/VALIDATED_METADATA.json evidence/UPLOAD_PAYLOAD_SUMMARY.json evidence/BUILD_OUTPUT.txt evidence/TEST_OUTPUT.txt evidence/sdk-version.txt > evidence/SHA256SUMS.txt
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -276,7 +285,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          jq '{pass,sdkVersion,isolatedVmVersion,nodeVersion,bundleSha256,uploadPayloadSha256,sameBundleUsedForMetadataAndRuntime,officialUploadValidationAccepted,validatedUploadPolicy,runtimePolicy,runtimeTrustedThunkPresent,safeManifestNegativeControl,runtimeResult,systemCredentialApplied,securityPolicyEquivalent,rootCause,canonicalRuntimePath,productionRequestCount,syntheticOnly}' bundle-metadata-gate/evidence/RESULT.json > public-intake-status/superhuman-bundle-metadata-integrity-result.json
+          jq '{pass,sdkVersion,isolatedVmVersion,nodeVersion,bundleSha256,uploadPayloadSha256,sameBundleUsedForMetadataAndRuntime,officialCliBuildSucceeded,officialUploadValidationAccepted,validatedUploadPolicy,runtimePolicy,runtimeTrustedThunkPresent,safeManifestNegativeControl,runtimeResult,systemCredentialApplied,securityPolicyEquivalent,rootCause,canonicalRuntimePath,productionRequestCount,syntheticOnly}' bundle-metadata-gate/evidence/RESULT.json > public-intake-status/superhuman-bundle-metadata-integrity-result.json
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add public-intake-status/superhuman-bundle-metadata-integrity-result.json
