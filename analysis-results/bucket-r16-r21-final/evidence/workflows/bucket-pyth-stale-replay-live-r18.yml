@@ -1,0 +1,466 @@
+name: Bucket Pyth Stale Replay Live Gate R18
+
+on:
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stale-replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bind tolerance, PriceInfo multiplicity, current age, price divergence, and PSM exposure
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-pyth-stale-replay-r18
+          mkdir -p bucket-pyth-stale-replay-r18/{raw,asm,analysis}
+          cat > bucket-pyth-stale-replay-r18/gate.py <<'PY'
+          import datetime
+          import json
+          import pathlib
+          import re
+          import statistics
+          import time
+          import urllib.parse
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-pyth-stale-replay-r18')
+          RAW = OUT / 'raw'
+          ASM = OUT / 'asm'
+          ANALYSIS = OUT / 'analysis'
+          RPCS = [
+              'https://fullnode.mainnet.sui.io:443',
+              'https://sui-mainnet-endpoint.blockvision.org',
+          ]
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+          HERMES = 'https://hermes.pyth.network'
+
+          BUCKET_PYTH_RULE = '0x5bc4f912b59c5cfcc86dfc90419837b9c3f9d3a3a94cef7a198838fa196bac4a'
+          PYTH_CONFIG = '0x00aea60b799575ae4203bcc80c16844c4d514d5af661200c4565f6d5a6deac1f'
+          PYTH_STATE = '0x1f9310238ee9298fb703c3419030b35b22bb1cc37113e3bb5007c99aec79e5b8'
+          PRICE_INFOS = {
+              'USDC': '0x5dec622733a204ca27f5a90d8c2fad453cc6665186fd5dff13a83d0b6c9027ab',
+              'BUCK': '0x3ef821a5d9b14683a5edf3752d06f608b20c23cdf846fe6b9da68dde53bc9a56',
+          }
+          PSM_POOLS = {
+              'USDC': '0x37721762186721fb6eaf053f249aaf594503a6ad98dbcc998916be78d20a2df4',
+              'BUCK': '0x4fef507f41f5b141625f0f193283820fbee26e883f24212d149e4220320ae321',
+          }
+
+          def request(url, payload=None, retries=6, timeout=180):
+              last = None
+              for attempt in range(retries):
+                  try:
+                      data = None if payload is None else json.dumps(payload).encode()
+                      req = urllib.request.Request(
+                          url,
+                          data=data,
+                          method='GET' if payload is None else 'POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-pyth-stale-replay-r18/1',
+                          },
+                      )
+                      with urllib.request.urlopen(req, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2 ** attempt, 30))
+              raise RuntimeError(f'request failed for {url}: {last}')
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = request(endpoint, {'jsonrpc':'2.0','id':1,'method':method,'params':params})
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint':endpoint,'result':body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint':endpoint,'error':str(exc)})
+              return {'failures':failures}
+
+          def result(wrapper):
+              return wrapper.get('result') if isinstance(wrapper, dict) else None
+
+          def gql(query, variables=None):
+              body = request(GQL, {'query':query,'variables':variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body.get('data')
+
+          def dump(path, value):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def object_data(object_id):
+              wrapper = rpc('sui_getObject', [object_id, {
+                  'showType':True,
+                  'showOwner':True,
+                  'showPreviousTransaction':True,
+                  'showDisplay':False,
+                  'showContent':True,
+                  'showBcs':True,
+              }])
+              data = (result(wrapper) or {}).get('data') if isinstance(result(wrapper), dict) else None
+              return wrapper, data
+
+          def walk(value, path=()):
+              if isinstance(value, dict):
+                  for key, child in value.items():
+                      yield from walk(child, path + (str(key),))
+              elif isinstance(value, list):
+                  for index, child in enumerate(value):
+                      yield from walk(child, path + (str(index),))
+              else:
+                  yield '.'.join(path), value
+
+          def scalar_candidates(value, terms):
+              rows=[]
+              for path, scalar in walk(value):
+                  lower=path.lower()
+                  if any(term in lower for term in terms):
+                      rows.append({'path':path,'value':scalar})
+              return rows
+
+          def as_int(value):
+              if isinstance(value, bool) or value is None:
+                  return None
+              if isinstance(value, int):
+                  return value
+              if isinstance(value, str) and (value.isdigit() or (value.startswith('-') and value[1:].isdigit())):
+                  return int(value)
+              if isinstance(value, dict):
+                  for key in ('value','magnitude'):
+                      if key in value:
+                          inner=as_int(value[key])
+                          if inner is not None:
+                              return -inner if value.get('negative') or value.get('is_negative') else inner
+                  fields=value.get('fields')
+                  if isinstance(fields, dict):
+                      return as_int(fields)
+              return None
+
+          def first_path(rows, required):
+              for row in rows:
+                  path=row['path'].lower()
+                  if all(token in path for token in required):
+                      return row['value']
+              return None
+
+          latest_seq = result(rpc('sui_getLatestCheckpointSequenceNumber', []))
+          checkpoint = result(rpc('sui_getCheckpoint', [latest_seq]))
+          now_ms = int((checkpoint or {}).get('timestampMs') or 0)
+          dump(RAW / 'checkpoint.json', checkpoint)
+
+          wrappers={}
+          objects={}
+          for label, object_id in {
+              'PYTH_CONFIG':PYTH_CONFIG,
+              'PYTH_STATE':PYTH_STATE,
+              **{f'PRICE_{k}':v for k,v in PRICE_INFOS.items()},
+              **{f'POOL_{k}':v for k,v in PSM_POOLS.items()},
+          }.items():
+              wrapper,data=object_data(object_id)
+              wrappers[label]=wrapper
+              objects[label]=data
+              dump(RAW / f'object_{label}.json', wrapper)
+
+          config_fields=(((objects.get('PYTH_CONFIG') or {}).get('content') or {}).get('fields') or {})
+          tolerance_entries=(((config_fields.get('tolerance_sec_map') or {}).get('fields') or {}).get('contents') or [])
+          tolerances=[]
+          for entry in tolerance_entries:
+              fields=(entry or {}).get('fields') or {}
+              type_name=(((fields.get('key') or {}).get('fields') or {}).get('name'))
+              tolerances.append({'type':type_name,'value':as_int(fields.get('value'))})
+
+          price_rows={}
+          exact_types=set()
+          feed_ids={}
+          for label in PRICE_INFOS:
+              data=objects.get(f'PRICE_{label}') or {}
+              object_type=data.get('type')
+              if object_type:
+                  exact_types.add(object_type)
+              fields=((data.get('content') or {}).get('fields') or {})
+              scalars=scalar_candidates(fields, ('publish_time','price','expo','conf','identifier','feed','id'))
+              publish=as_int(first_path(scalars, ('publish_time',)))
+              # Prefer price_feed.id / price_identifier, excluding UID/object IDs.
+              feed=None
+              for row in scalars:
+                  path=row['path'].lower()
+                  value=row['value']
+                  if isinstance(value,str) and len(value.replace('0x',''))==64 and ('price_feed' in path or 'price_identifier' in path or 'feed_id' in path):
+                      feed=value.removeprefix('0x')
+                      break
+              raw_price=None
+              expo=None
+              for row in scalars:
+                  path=row['path'].lower()
+                  if raw_price is None and path.endswith('.price') and 'ema' not in path and 'price_feed' in path:
+                      raw_price=as_int(row['value'])
+                  if expo is None and (path.endswith('.expo') or path.endswith('.exponent')) and 'ema' not in path:
+                      expo=as_int(row['value'])
+              age_sec=(now_ms/1000-publish) if publish is not None and now_ms else None
+              computed=(raw_price*(10**expo)) if raw_price is not None and expo is not None else None
+              price_rows[label]={
+                  'objectId':PRICE_INFOS[label],
+                  'type':object_type,
+                  'owner':data.get('owner'),
+                  'version':data.get('version'),
+                  'previousTransaction':data.get('previousTransaction'),
+                  'feedId':feed,
+                  'publishTime':publish,
+                  'ageSec':age_sec,
+                  'rawPrice':raw_price,
+                  'expo':expo,
+                  'computedPrice':computed,
+                  'scalarCandidates':scalars,
+              }
+              if feed:
+                  feed_ids[label]=feed
+
+          hermes={}
+          for label,feed in feed_ids.items():
+              query=urllib.parse.urlencode([('ids[]',feed),('parsed','true')])
+              try:
+                  response=request(f'{HERMES}/v2/updates/price/latest?{query}')
+              except Exception as exc:
+                  response={'error':str(exc)}
+              dump(RAW / f'hermes_{label}.json', response)
+              parsed=(response.get('parsed') or [None])[0] if isinstance(response,dict) else None
+              price=(parsed or {}).get('price') or {}
+              latest_raw=as_int(price.get('price'))
+              latest_expo=as_int(price.get('expo'))
+              latest=(latest_raw*(10**latest_expo)) if latest_raw is not None and latest_expo is not None else None
+              onchain=price_rows[label].get('computedPrice')
+              divergence=None
+              if latest not in (None,0) and onchain is not None:
+                  divergence=(onchain/latest-1)*100
+              hermes[label]={
+                  'latestRaw':latest_raw,
+                  'latestExpo':latest_expo,
+                  'latestPrice':latest,
+                  'latestPublishTime':as_int(price.get('publish_time')),
+                  'onchainPrice':onchain,
+                  'divergencePercent':divergence,
+              }
+
+          # Enumerate all live PriceInfoObjects for each exact type and group by feed ID.
+          price_info_inventory=[]
+          for type_name in sorted(exact_types):
+              cursor=None
+              for _ in range(100):
+                  wrapper=rpc('suix_queryObjects',[{
+                      'filter':{'StructType':type_name},
+                      'options':{
+                          'showType':True,'showOwner':True,'showPreviousTransaction':True,
+                          'showDisplay':False,'showContent':True,'showBcs':True,
+                      },
+                  },cursor,50])
+                  page=result(wrapper)
+                  if not isinstance(page,dict):
+                      price_info_inventory.append({'type':type_name,'queryFailure':wrapper})
+                      break
+                  for item in page.get('data') or []:
+                      fields=((item.get('content') or {}).get('fields') or {})
+                      candidates=scalar_candidates(fields,('publish_time','identifier','feed','id'))
+                      feed=None
+                      for row in candidates:
+                          path=row['path'].lower(); value=row['value']
+                          if isinstance(value,str) and len(value.replace('0x',''))==64 and ('price_feed' in path or 'price_identifier' in path or 'feed_id' in path):
+                              feed=value.removeprefix('0x'); break
+                      price_info_inventory.append({
+                          'id':item.get('objectId'),
+                          'type':item.get('type'),
+                          'owner':item.get('owner'),
+                          'version':item.get('version'),
+                          'previousTransaction':item.get('previousTransaction'),
+                          'feedId':feed,
+                          'publishTime':as_int(first_path(candidates,('publish_time',))),
+                      })
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor=page.get('nextCursor')
+          dump(ANALYSIS / 'price_info_inventory.json', price_info_inventory)
+          feed_multiplicity={}
+          for row in price_info_inventory:
+              feed=row.get('feedId')
+              if not feed: continue
+              feed_multiplicity.setdefault(feed,[]).append(row)
+
+          # Discover Pyth package and public creation/update surface from the live PriceInfo type.
+          pyth_packages=sorted({row['type'].split('::')[0] for row in price_rows.values() if row.get('type') and '::' in row['type']})
+          pyth_functions=[]
+          for package in pyth_packages:
+              wrapper=rpc('sui_getNormalizedMoveModulesByPackage',[package])
+              dump(RAW / f'normalized_pyth_{package}.json',wrapper)
+              normalized=result(wrapper)
+              if not isinstance(normalized,dict): continue
+              for module_name,module in normalized.items():
+                  for function_name,function in (module.get('exposedFunctions') or {}).items():
+                      if not re.search(r'price|feed|update|create',function_name,re.I): continue
+                      pyth_functions.append({
+                          'package':package,'module':module_name,'function':function_name,
+                          'visibility':function.get('visibility'),'isEntry':function.get('isEntry'),
+                          'parameters':function.get('parameters') or [],'returns':function.get('return') or [],
+                      })
+          public_create=[row for row in pyth_functions if re.search(r'create.*price|new.*price',row['function'],re.I) and (str(row['visibility']).lower()=='public' or row['isEntry'])]
+
+          # Bucket pyth_rule exact disassembly and normalized feed signature.
+          package_query='''query Package($address:SuiAddress!){object(address:$address){address version digest asMovePackage{address version modules{nodes{name disassembly}}linkage{originalId upgradedId version}typeOrigins{module struct definingId}}}}'''
+          graph=gql(package_query,{'address':BUCKET_PYTH_RULE})
+          graph_obj=(graph or {}).get('object')
+          dump(RAW / 'bucket_pyth_rule_package.json',graph_obj)
+          feed_contexts=[]
+          modules=(((graph_obj or {}).get('asMovePackage') or {}).get('modules') or {}).get('nodes') or []
+          for module in modules:
+              name=module.get('name'); text=module.get('disassembly') or ''
+              (ASM/f'{name}.asm').write_text(text)
+              lines=text.splitlines()
+              for index,line in enumerate(lines):
+                  if re.search(r'feed|tolerance|publish_time|PriceInfoObject|identifier',line,re.I):
+                      feed_contexts.append({'module':name,'line':index+1,'text':line.strip(),'context':'\n'.join(lines[max(0,index-25):min(len(lines),index+60)])})
+          normalized_bucket=rpc('sui_getNormalizedMoveModulesByPackage',[BUCKET_PYTH_RULE])
+          dump(RAW/'bucket_pyth_rule_normalized.json',normalized_bucket)
+          bucket_functions=[]
+          norm=result(normalized_bucket)
+          if isinstance(norm,dict):
+              for module_name,module in norm.items():
+                  for function_name,function in (module.get('exposedFunctions') or {}).items():
+                      if re.search(r'feed|tolerance|identifier',function_name,re.I):
+                          bucket_functions.append({
+                              'module':module_name,'function':function_name,
+                              'visibility':function.get('visibility'),'isEntry':function.get('isEntry'),
+                              'parameters':function.get('parameters') or [],'returns':function.get('return') or [],
+                          })
+
+          # Pool state and live PSM call activity.
+          pools={}
+          activity={}
+          for label,object_id in PSM_POOLS.items():
+              data=objects.get(f'POOL_{label}') or {}
+              fields=((data.get('content') or {}).get('fields') or {})
+              scalars=scalar_candidates(fields,('balance','supply','decimal','fee','limit','paused'))
+              package=(data.get('type') or '').split('::')[0] if data.get('type') else None
+              pools[label]={
+                  'objectId':object_id,'type':data.get('type'),'owner':data.get('owner'),
+                  'version':data.get('version'),'previousTransaction':data.get('previousTransaction'),
+                  'scalarCandidates':scalars,
+              }
+              calls=[]
+              if package:
+                  for function in ('swap_in','swap_out'):
+                      cursor=None
+                      count=0; latest=None
+                      for _ in range(20):
+                          wrapper=rpc('suix_queryTransactionBlocks',[{
+                              'filter':{'MoveFunction':{'package':package,'module':'pool','function':function}},
+                              'options':{'showInput':True,'showRawInput':False,'showEffects':True,'showEvents':True,'showObjectChanges':True,'showBalanceChanges':True},
+                          },cursor,50,True])
+                          page=result(wrapper)
+                          if not isinstance(page,dict):
+                              calls.append({'function':function,'queryFailure':wrapper}); break
+                          rows=page.get('data') or []
+                          count+=len(rows)
+                          if latest is None and rows: latest=rows[0]
+                          if not page.get('hasNextPage') or count>=500: break
+                          cursor=page.get('nextCursor')
+                      calls.append({'function':function,'count':count,'latest':latest})
+              activity[label]=calls
+          dump(ANALYSIS/'psm_activity.json',activity)
+
+          # Strict promotion signals. Economic exploit still requires an exact old-update simulation.
+          target_tolerances={}
+          for row in tolerances:
+              type_name=str(row.get('type') or '')
+              for label in ('USDC','BUCK'):
+                  if f'::{label.lower()}::{label}' in type_name.lower() or f'::{label.lower()}::{label.upper()}' in type_name:
+                      target_tolerances[label]=row.get('value')
+          duplicate_for_targets={}
+          for label,feed in feed_ids.items():
+              duplicate_for_targets[label]=len(feed_multiplicity.get(feed,[]))
+          public_create_without_obvious_cap=[]
+          for row in public_create:
+              blob=json.dumps(row['parameters'])
+              if not re.search(r'AdminCap|ListingCap|ManagerCap|OwnerCap|UpgradeCap',blob):
+                  public_create_without_obvious_cap.append(row)
+
+          summary={
+              'schema':'bucket-pyth-stale-replay-live-r18/v1',
+              'network':'sui-mainnet','readOnly':True,
+              'checkpoint':{'sequenceNumber':latest_seq,'timestampMs':now_ms},
+              'currentTolerances':tolerances,
+              'targetTolerances':target_tolerances,
+              'priceInfos':price_rows,
+              'hermes':hermes,
+              'priceInfoInventoryCount':len([r for r in price_info_inventory if r.get('id')]),
+              'feedMultiplicity':{k:len(v) for k,v in feed_multiplicity.items()},
+              'targetFeedMultiplicity':duplicate_for_targets,
+              'pythPackages':pyth_packages,
+              'pythFunctions':pyth_functions,
+              'publicPriceInfoCreators':public_create,
+              'publicPriceInfoCreatorsWithoutObviousCap':public_create_without_obvious_cap,
+              'bucketPythFunctions':bucket_functions,
+              'bucketFeedContexts':feed_contexts[:120],
+              'pools':pools,
+              'psmActivity':activity,
+              'gates':{
+                  'targetToleranceAtLeastOneDay':any((v or 0)>=86400 for v in target_tolerances.values()),
+                  'targetToleranceAtLeastSixDays':any((v or 0)>=518400 for v in target_tolerances.values()),
+                  'multiplePriceInfoObjectsForTargetFeed':any(v>1 for v in duplicate_for_targets.values()),
+                  'publicPriceInfoCreatorWithoutObviousCap':bool(public_create_without_obvious_cap),
+                  'currentTargetPriceInfoOlderThanThirtySeconds':any((row.get('ageSec') or 0)>30 for row in price_rows.values()),
+                  'currentTargetPriceDivergenceAboveHalfPercent':any(abs(row.get('divergencePercent') or 0)>0.5 for row in hermes.values()),
+                  'currentPsmActivitySeen':any(any(call.get('count',0)>0 for call in calls) for calls in activity.values()),
+              },
+              'exactHistoricalReplaySimulationRequired':True,
+              'exploitConfirmed':False,
+              'writes':0,'transactionsConstructed':0,'productionTransactionsSubmitted':0,
+              'generatedUnix':int(time.time()),
+          }
+          (OUT/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({
+              'targetTolerances':summary['targetTolerances'],
+              'priceInfos':{k:{kk:v.get(kk) for kk in ('objectId','type','feedId','publishTime','ageSec','computedPrice')} for k,v in price_rows.items()},
+              'hermes':hermes,
+              'targetFeedMultiplicity':duplicate_for_targets,
+              'publicPriceInfoCreatorsWithoutObviousCap':public_create_without_obvious_cap,
+              'bucketPythFunctions':bucket_functions,
+              'pools':pools,
+              'psmActivity':{k:[{'function':c.get('function'),'count':c.get('count'),'latestDigest':(c.get('latest') or {}).get('digest')} for c in v] for k,v in activity.items()},
+              'gates':summary['gates'],
+          },indent=2))
+          PY
+          python3 bucket-pyth-stale-replay-r18/gate.py | tee bucket-pyth-stale-replay-r18/run.log
+          find bucket-pyth-stale-replay-r18 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-pyth-stale-replay-r18/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-pyth-stale-replay-r18 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary=json.load(open('bucket-pyth-stale-replay-r18/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes']==0
+          assert summary['transactionsConstructed']==0
+          assert summary['productionTransactionsSubmitted']==0
+          print('BUCKET_PYTH_STALE_REPLAY_R18_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-pyth-stale-replay-r18
+          path: bucket-pyth-stale-replay-r18
+          if-no-files-found: error
+          retention-days: 7
