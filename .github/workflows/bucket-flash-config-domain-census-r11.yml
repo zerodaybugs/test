@@ -1,0 +1,362 @@
+name: Bucket Flash Config Domain Census R11
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enumerate flash config, partner, and call domains
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-flash-config-domain-r11
+          mkdir -p bucket-flash-config-domain-r11/raw
+
+          cat > bucket-flash-config-domain-r11/census.py <<'PY'
+          import json
+          import pathlib
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-flash-config-domain-r11')
+          RAW = OUT / 'raw'
+          RPCS = [
+              'https://fullnode.mainnet.sui.io:443',
+              'https://sui-mainnet-endpoint.blockvision.org',
+          ]
+
+          FLASH_ORIGIN = '0x0f51f9eb63574a1d12b62295599ac4f8231197f95b3cce9a516daba64f419d06'
+          FLASH_CURRENT = '0xca00bbb7ecfe11dbb527efab6145b358f2a95aa11a8aae9b9f475176430cf42a'
+          FRAMEWORK_ORIGIN = '0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc'
+          USD_ORIGIN = '0xe14726c336e81b32328e92afc37345d159f5b550b09fa92bd43640cfdd0a0cfd'
+
+          GLOBAL_TYPES = [
+              f'{FLASH_ORIGIN}::config::GlobalConfig',
+              f'{FLASH_CURRENT}::config::GlobalConfig',
+          ]
+          ACCOUNT_TYPE_SUFFIX = '::account::Account'
+          TREASURY_TYPES = [
+              f'{USD_ORIGIN}::usdb::Treasury',
+              f'{USD_ORIGIN}::treasury::Treasury',
+          ]
+
+          def post(url, payload, retries=6, timeout=180):
+              data = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      req = urllib.request.Request(
+                          url,
+                          data=data,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-flash-config-domain-r11/1',
+                          },
+                      )
+                      with urllib.request.urlopen(req, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2 ** attempt, 30))
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': str(exc)})
+              return {'failures': failures}
+
+          def dump(name, value):
+              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def query_objects(type_name):
+              rows = []
+              cursor = None
+              for _ in range(100):
+                  wrapper = rpc('suix_queryObjects', [{
+                      'filter': {'StructType': type_name},
+                      'options': {
+                          'showType': True,
+                          'showOwner': True,
+                          'showPreviousTransaction': True,
+                          'showDisplay': False,
+                          'showContent': True,
+                          'showBcs': True,
+                      },
+                  }, cursor, 50])
+                  result = wrapper.get('result') if isinstance(wrapper, dict) else None
+                  if not isinstance(result, dict):
+                      rows.append({'queryFailure': wrapper})
+                      break
+                  rows.extend(result.get('data') or [])
+                  if not result.get('hasNextPage'):
+                      break
+                  cursor = result.get('nextCursor')
+              return rows
+
+          def query_calls(package, function):
+              rows = []
+              cursor = None
+              for _ in range(100):
+                  wrapper = rpc('suix_queryTransactionBlocks', [{
+                      'filter': {
+                          'MoveFunction': {
+                              'package': package,
+                              'module': 'config',
+                              'function': function,
+                          },
+                      },
+                      'options': {
+                          'showInput': True,
+                          'showRawInput': False,
+                          'showEffects': True,
+                          'showEvents': True,
+                          'showObjectChanges': True,
+                          'showBalanceChanges': True,
+                      },
+                  }, cursor, 50, True])
+                  result = wrapper.get('result') if isinstance(wrapper, dict) else None
+                  if not isinstance(result, dict):
+                      rows.append({'queryFailure': wrapper})
+                      break
+                  rows.extend(result.get('data') or [])
+                  if not result.get('hasNextPage'):
+                      break
+                  cursor = result.get('nextCursor')
+              return rows
+
+          def normalize_object(item):
+              if not isinstance(item, dict):
+                  return None
+              data = item.get('data') if isinstance(item.get('data'), dict) else item
+              if not isinstance(data, dict):
+                  return None
+              return data
+
+          def walk(value, path=()):
+              if isinstance(value, dict):
+                  for key, child in value.items():
+                      yield from walk(child, path + (str(key),))
+              elif isinstance(value, list):
+                  for index, child in enumerate(value):
+                      yield from walk(child, path + (str(index),))
+              else:
+                  yield path, value
+
+          def owner_kind(owner):
+              if not isinstance(owner, dict):
+                  return None
+              if 'Shared' in owner or 'shared' in owner:
+                  return 'shared'
+              if 'AddressOwner' in owner or 'addressOwner' in owner:
+                  return 'address-owned'
+              if 'ObjectOwner' in owner or 'objectOwner' in owner:
+                  return 'object-owned'
+              if 'Immutable' in owner or 'immutable' in owner:
+                  return 'immutable'
+              return 'other'
+
+          def address_strings(value):
+              found = set()
+              for _, scalar in walk(value):
+                  if isinstance(scalar, str) and scalar.startswith('0x') and len(scalar) == 66:
+                      found.add(scalar)
+              return sorted(found)
+
+          def config_rows(fields):
+              rows = []
+              partner_node = fields.get('partner_configs') if isinstance(fields, dict) else None
+              for path, scalar in walk(partner_node):
+                  if not (isinstance(scalar, str) and scalar.startswith('0x') and len(scalar) == 66):
+                      continue
+                  if not any(part.lower() in ('key', 'name') for part in path):
+                      continue
+                  rows.append({'partner': scalar, 'path': '.'.join(path)})
+              # Deduplicate while preserving first path.
+              unique = {}
+              for row in rows:
+                  unique.setdefault(row['partner'], row)
+              return list(unique.values())
+
+          indexed = {}
+          config_data_by_id = {}
+          for type_name in GLOBAL_TYPES:
+              rows = query_objects(type_name)
+              indexed[type_name] = rows
+              dump(f'global_{type_name.split("::")[0]}.json', rows)
+              for item in rows:
+                  data = normalize_object(item)
+                  if data and data.get('objectId'):
+                      config_data_by_id[data['objectId']] = data
+
+          configs = []
+          partners = set()
+          for object_id, data in sorted(config_data_by_id.items()):
+              fields = ((data.get('content') or {}).get('fields') or {})
+              rows = config_rows(fields)
+              partners.update(row['partner'] for row in rows)
+              configs.append({
+                  'id': object_id,
+                  'type': data.get('type'),
+                  'owner': data.get('owner'),
+                  'ownerKind': owner_kind(data.get('owner')),
+                  'version': data.get('version'),
+                  'digest': data.get('digest'),
+                  'previousTransaction': data.get('previousTransaction'),
+                  'defaultConfig': fields.get('default_config'),
+                  'partnerConfigs': fields.get('partner_configs'),
+                  'partnerRows': rows,
+                  'allEmbeddedAddresses': address_strings(fields),
+              })
+
+          partner_objects = []
+          object_options = {
+              'showType': True,
+              'showOwner': True,
+              'showPreviousTransaction': True,
+              'showDisplay': False,
+              'showContent': True,
+              'showBcs': True,
+          }
+          for partner in sorted(partners):
+              wrapper = rpc('sui_getObject', [partner, object_options])
+              dump(f'partner_{partner}.json', wrapper)
+              result = wrapper.get('result') if isinstance(wrapper, dict) else None
+              data = (result or {}).get('data') if isinstance(result, dict) else None
+              error = (result or {}).get('error') if isinstance(result, dict) else None
+              object_type = data.get('type') if isinstance(data, dict) else None
+              owner = data.get('owner') if isinstance(data, dict) else None
+              partner_objects.append({
+                  'partner': partner,
+                  'objectExists': bool(data),
+                  'error': error,
+                  'type': object_type,
+                  'owner': owner,
+                  'ownerKind': owner_kind(owner),
+                  'isAccountObject': isinstance(object_type, str) and object_type.endswith(ACCOUNT_TYPE_SUFFIX),
+                  'sharedAccountPartnerCandidate': (
+                      isinstance(object_type, str)
+                      and object_type.endswith(ACCOUNT_TYPE_SUFFIX)
+                      and owner_kind(owner) == 'shared'
+                  ),
+              })
+
+          calls = {}
+          for package_label, package in [('origin', FLASH_ORIGIN), ('current', FLASH_CURRENT)]:
+              for function in ('flash_mint', 'flash_burn', 'set_flash_config', 'remove_flash_config'):
+                  key = f'{package_label}:{function}'
+                  rows = query_calls(package, function)
+                  calls[key] = rows
+                  dump(f'calls_{package_label}_{function}.json', rows)
+
+          call_summary = {}
+          for key, rows in calls.items():
+              real = [row for row in rows if isinstance(row, dict) and row.get('digest')]
+              senders = sorted({
+                  (((row.get('transaction') or {}).get('data') or {}).get('sender'))
+                  for row in real
+                  if (((row.get('transaction') or {}).get('data') or {}).get('sender'))
+              })
+              call_summary[key] = {
+                  'count': len(real),
+                  'senders': senders,
+                  'latestDigest': real[0].get('digest') if real else None,
+                  'latestTimestampMs': real[0].get('timestampMs') if real else None,
+              }
+
+          treasury_index = {}
+          for type_name in TREASURY_TYPES:
+              rows = query_objects(type_name)
+              treasury_index[type_name] = rows
+              dump(f'treasury_{type_name.split("::")[-2]}.json', rows)
+
+          unique_config_count = len(configs)
+          shared_partner_candidates = [row for row in partner_objects if row['sharedAccountPartnerCandidate']]
+          summary = {
+              'schema': 'bucket-flash-config-domain-r11/v1',
+              'network': 'sui-mainnet',
+              'readOnly': True,
+              'packages': {
+                  'flashOrigin': FLASH_ORIGIN,
+                  'flashCurrent': FLASH_CURRENT,
+                  'frameworkOrigin': FRAMEWORK_ORIGIN,
+                  'usdOrigin': USD_ORIGIN,
+              },
+              'candidateTypes': GLOBAL_TYPES,
+              'indexedCounts': {key: len(value) for key, value in indexed.items()},
+              'uniqueGlobalConfigCount': unique_config_count,
+              'configs': configs,
+              'partnerCount': len(partners),
+              'partnerObjects': partner_objects,
+              'callSummary': call_summary,
+              'treasuryIndexedCounts': {key: len(value) for key, value in treasury_index.items()},
+              'gates': {
+                  'multipleGlobalConfigs': unique_config_count > 1,
+                  'crossConfigReceiptCandidate': unique_config_count > 1,
+                  'sharedAccountPartnerCandidateCount': len(shared_partner_candidates),
+                  'sharedAccountPartnerCandidates': shared_partner_candidates,
+                  'currentFlashMintSeen': call_summary.get('current:flash_mint', {}).get('count', 0) > 0,
+                  'legacyFlashMintSeen': call_summary.get('origin:flash_mint', {}).get('count', 0) > 0,
+              },
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'productionTransactionsSubmitted': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'uniqueGlobalConfigCount': summary['uniqueGlobalConfigCount'],
+              'configs': configs,
+              'partnerObjects': partner_objects,
+              'callSummary': call_summary,
+              'treasuryIndexedCounts': summary['treasuryIndexedCounts'],
+              'gates': summary['gates'],
+          }, indent=2))
+          PY
+
+          python3 bucket-flash-config-domain-r11/census.py | tee bucket-flash-config-domain-r11/run.log
+          find bucket-flash-config-domain-r11 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-flash-config-domain-r11/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-flash-config-domain-r11 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-flash-config-domain-r11/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          assert summary['productionTransactionsSubmitted'] == 0
+          print('BUCKET_FLASH_CONFIG_DOMAIN_R11_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-flash-config-domain-r11
+          path: bucket-flash-config-domain-r11
+          if-no-files-found: error
+          retention-days: 7
