@@ -1,0 +1,186 @@
+name: Bucket Sheet Entity Instance Collision Gate R39
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-framework-lineage-r28-20260811]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Inspect live debtor entity package ABIs, objects and constructors
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-sheet-entity-r39
+          mkdir -p bucket-sheet-entity-r39/{raw,asm}
+          cat > bucket-sheet-entity-r39/probe.py <<'PY'
+          import json, pathlib, re, time, urllib.request
+
+          OUT=pathlib.Path('bucket-sheet-entity-r39'); RAW=OUT/'raw'; ASM=OUT/'asm'
+          RPCS=['https://sui-mainnet-endpoint.blockvision.org','https://fullnode.mainnet.sui.io:443']
+          GQL='https://graphql.mainnet.sui.io/graphql'
+          TARGETS={
+              'delegation_farm': {
+                  'package':'0xd95810493736139876e9f1fe0cd1de12639a6d6abe7c92c86d7d4f9ada96adce',
+                  'entityModule':'delegation_farm','entityStruct':'DelegationEntity',
+              },
+              'navi_farm': {
+                  'package':'0x22955b7a13502d3b20383a6904abadad683456128141d9ff6820260c7020f0cb',
+                  'entityModule':'navi_farm','entityStruct':'NaviFarmEntity',
+              },
+          }
+
+          def post(url,payload,retries=6,timeout=150):
+              data=json.dumps(payload).encode(); last=None
+              for n in range(retries):
+                  try:
+                      req=urllib.request.Request(url,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-sheet-entity-r39/1'})
+                      with urllib.request.urlopen(req,timeout=timeout) as r: return json.loads(r.read().decode())
+                  except Exception as e:
+                      last=e; time.sleep(min(2**n,30))
+              raise RuntimeError(f'{url}: {last}')
+
+          def rpc(method,params):
+              errors=[]
+              for ep in RPCS:
+                  try:
+                      body=post(ep,{'jsonrpc':'2.0','id':1,'method':method,'params':params})
+                      if body.get('error'): raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint':ep,'result':body.get('result')}
+                  except Exception as e: errors.append({'endpoint':ep,'error':str(e)})
+              return {'failures':errors}
+
+          def gql(query,variables=None):
+              body=post(GQL,{'query':query,'variables':variables or {}})
+              if body.get('errors'): raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          def dump(name,value): (RAW/name).write_text(json.dumps(value,indent=2,sort_keys=True)+'\n')
+
+          package_query='''query P($address:SuiAddress!){object(address:$address){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}modules{nodes{name fileFormatVersion disassembly functions(first:50){nodes{name visibility isEntry parameters{repr}return{repr}typeParameters{constraints}}}structs(first:50){nodes{name abilities fields{name type{repr}}typeParameters{constraints}}}}}}}}'''
+          object_query='''query O($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+
+          results={}
+          for label,spec in TARGETS.items():
+              pid=spec['package']
+              obj=rpc('sui_getObject',[pid,{'showType':True,'showOwner':True,'showPreviousTransaction':True,'showDisplay':False,'showContent':True,'showBcs':True}])
+              norm=rpc('sui_getNormalizedMoveModulesByPackage',[pid])
+              graph=gql(package_query,{'address':pid})
+              dump(f'{label}_package_object.json',obj); dump(f'{label}_normalized.json',norm); dump(f'{label}_graphql.json',graph)
+              pkg=((graph.get('object') or {}).get('asMovePackage')) or {}
+              functions=[]; structs=[]
+              key_types=[]
+              for module in pkg.get('modules',{}).get('nodes',[]):
+                  mname=module.get('name'); text=module.get('disassembly') or ''
+                  (ASM/f'{label}__{mname}.asm').write_text(text)
+                  for fn in (module.get('functions') or {}).get('nodes',[]): functions.append({'module':mname,**fn})
+                  for st in (module.get('structs') or {}).get('nodes',[]):
+                      row={'module':mname,**st}; structs.append(row)
+                      abilities=[str(a).upper() for a in st.get('abilities') or []]
+                      if 'KEY' in abilities:
+                          key_types.append(f"{pid}::{mname}::{st.get('name')}")
+
+              type_counts={}; type_objects={}
+              for type_name in key_types:
+                  rows=[]; cursor=None
+                  while True:
+                      conn=gql(object_query,{'type':type_name,'after':cursor})['objects']; rows.extend(conn.get('nodes') or [])
+                      page=conn.get('pageInfo') or {}
+                      if not page.get('hasNextPage'): break
+                      cursor=page.get('endCursor')
+                  type_counts[type_name]=len(rows); type_objects[type_name]=rows
+              dump(f'{label}_key_objects.json',type_objects)
+
+              entity_struct=[s for s in structs if s.get('module')==spec['entityModule'] and s.get('name')==spec['entityStruct']]
+              entity_functions=[]
+              constructors=[]; operational=[]
+              for fn in functions:
+                  serial=json.dumps(fn)
+                  public=str(fn.get('visibility')).upper()=='PUBLIC' or fn.get('isEntry')
+                  if spec['entityStruct'] in serial or fn.get('module')==spec['entityModule']:
+                      entity_functions.append(fn)
+                  if public and any(spec['entityStruct'] in str(x.get('repr')) for x in fn.get('return',[]) or []):
+                      constructors.append(fn)
+                  if public and re.search(r'new|create|init|deposit|withdraw|borrow|loan|receive|repay|pay|harvest|redeem',str(fn.get('name')),re.I):
+                      operational.append(fn)
+
+              def protected(fn):
+                  serial=' '.join(str(x.get('repr')) for x in fn.get('parameters') or [])
+                  return bool(re.search(r'Admin|Cap|Witness|Manager|Owner|AccessControl|Publisher',serial,re.I))
+              unprotected_constructors=[fn for fn in constructors if not protected(fn)]
+              unprotected_ops=[fn for fn in operational if not protected(fn)]
+
+              txs=[]; cursor=None; query_errors=[]
+              opts={'showInput':True,'showRawInput':False,'showEffects':True,'showEvents':True,'showObjectChanges':True,'showBalanceChanges':True}
+              for _ in range(20):
+                  wrapper=rpc('suix_queryTransactionBlocks',[{'filter':{'MoveFunction':{'package':pid}},'options':opts},cursor,50,True])
+                  result=wrapper.get('result') if isinstance(wrapper,dict) else None
+                  if not isinstance(result,dict): query_errors.append(wrapper); break
+                  txs.extend(result.get('data') or [])
+                  if not result.get('hasNextPage'): break
+                  cursor=result.get('nextCursor')
+              dump(f'{label}_recent_transactions.json',txs); dump(f'{label}_tx_query_errors.json',query_errors)
+              calls=[]; senders={}
+              for tx in txs:
+                  sender=(((tx.get('transaction') or {}).get('data') or {}).get('sender'))
+                  senders[sender]=senders.get(sender,0)+1
+                  try: commands=tx['transaction']['data']['transaction']['transactions']
+                  except Exception: commands=[]
+                  for index,cmd in enumerate(commands or []):
+                      call=cmd.get('MoveCall') if isinstance(cmd,dict) else None
+                      if call and str(call.get('package')).lower()==pid.lower():
+                          calls.append({'digest':tx.get('digest'),'timestampMs':tx.get('timestampMs'),'sender':sender,'status':((tx.get('effects') or {}).get('status')),'index':index,'module':call.get('module'),'function':call.get('function'),'typeArguments':call.get('type_arguments')})
+
+              results[label]={
+                  'package':pid,'entityType':f"{pid}::{spec['entityModule']}::{spec['entityStruct']}",
+                  'entityStruct':entity_struct,'entityFunctions':entity_functions,
+                  'constructors':constructors,'unprotectedConstructors':unprotected_constructors,
+                  'publicOperationalFunctions':operational,'unprotectedOperationalFunctions':unprotected_ops,
+                  'keyTypeCounts':type_counts,'keyObjects':type_objects,
+                  'recentTransactionCount':len(txs),'recentCallCount':len(calls),'recentCalls':calls,'senderCounts':senders,
+                  'multipleLiveInstanceTypeCount':sum(1 for count in type_counts.values() if count>1),
+                  'permissionlessMultipleInstanceCandidate':bool(unprotected_constructors and any(count>1 for count in type_counts.values())),
+                  'transactionQueryErrors':query_errors,
+              }
+
+          summary={
+              'schema':'bucket-sheet-entity-instance-collision-r39/v1','network':'sui-mainnet','readOnly':True,
+              'targets':results,
+              'candidateCount':sum(1 for r in results.values() if r['permissionlessMultipleInstanceCandidate']),
+              'writes':0,'transactionsConstructed':0,'productionTransactionsSubmitted':0,'generatedUnix':int(time.time()),
+          }
+          (OUT/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({label:{'entityType':r['entityType'],'entityStruct':r['entityStruct'],'unprotectedConstructors':r['unprotectedConstructors'],'unprotectedOperationalFunctions':r['unprotectedOperationalFunctions'],'keyTypeCounts':r['keyTypeCounts'],'recentCallCount':r['recentCallCount'],'senderCounts':r['senderCounts'],'permissionlessMultipleInstanceCandidate':r['permissionlessMultipleInstanceCandidate']} for label,r in results.items()},indent=2))
+          PY
+          python3 bucket-sheet-entity-r39/probe.py | tee bucket-sheet-entity-r39/run.log
+          find bucket-sheet-entity-r39 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-sheet-entity-r39/SHA256SUMS.txt
+
+      - name: Validate passive boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-sheet-entity-r39 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          s=json.load(open('bucket-sheet-entity-r39/SUMMARY.json'))
+          assert s['readOnly'] is True and s['writes']==0 and s['transactionsConstructed']==0 and s['productionTransactionsSubmitted']==0
+          print('BUCKET_SHEET_ENTITY_R39_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-sheet-entity-r39
+          path: bucket-sheet-entity-r39
+          if-no-files-found: error
+          retention-days: 3
