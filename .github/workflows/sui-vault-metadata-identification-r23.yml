@@ -1,0 +1,106 @@
+name: Sui Vault Metadata Identification R23
+
+on:
+  push:
+    branches: [agent/bucket-cdp-account-gate-r23-20260811]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  identify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Query public Sui metadata and package provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf sui-vault-metadata-r23
+          mkdir -p sui-vault-metadata-r23/raw
+          cat > sui-vault-metadata-r23/query.py <<'PY'
+          import json, pathlib, time, urllib.request
+          OUT=pathlib.Path('sui-vault-metadata-r23'); RAW=OUT/'raw'
+          RPCS=['https://fullnode.mainnet.sui.io:443','https://sui-mainnet-endpoint.blockvision.org']
+          TYPES={
+            'receipt_a':'0xa4ffc4778b541f2c962c1548a80eebb21e884061ac7f5efea419c9aa8dd9a484::receipt::RECEIPT',
+            'receipt_b':'0x46ed88368c5c1fbac0f9da490d6fd76fe65f9dea33f64ccc75c74a161ffb11c2::receipt::RECEIPT',
+          }
+          PACKAGES={
+            'vault_a_origin':'0x75ecf86d06f900ceaa979339965b5f9fa4e8a43a60816e58cbbfa37762bba5b7',
+            'vault_a_current':'0x16136081deb1652e889911c6a97ceaa94a3a7ed67f29260d6f2a0d56c0679aa8',
+            'vault_b':'0x2f567f02e37a7e97cf603a7118e3b44f58401d4970cac2dda04d6bc71a25d9f5',
+            'receipt_a':'0xa4ffc4778b541f2c962c1548a80eebb21e884061ac7f5efea419c9aa8dd9a484',
+            'receipt_b':'0x46ed88368c5c1fbac0f9da490d6fd76fe65f9dea33f64ccc75c74a161ffb11c2',
+          }
+          PUBLISHER='0x1ae73dabfa4b71abd21fead6a14c5861cea4b9dc1cfb456748751cff8baed61e'
+
+          def post(url,payload,retries=5):
+            data=json.dumps(payload).encode(); last=None
+            for n in range(retries):
+              try:
+                req=urllib.request.Request(url,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'sui-vault-metadata-r23/1'})
+                with urllib.request.urlopen(req,timeout=120) as r: return json.loads(r.read().decode())
+              except Exception as e: last=e; time.sleep(2**n)
+            raise RuntimeError(f'{url}: {last}')
+          def rpc(method,params):
+            errors=[]
+            for ep in RPCS:
+              try:
+                body=post(ep,{'jsonrpc':'2.0','id':1,'method':method,'params':params})
+                if body.get('error'): raise RuntimeError(json.dumps(body['error']))
+                return {'endpoint':ep,'result':body.get('result')}
+              except Exception as e: errors.append({'endpoint':ep,'error':str(e)})
+            return {'failures':errors}
+          def dump(name,value): (RAW/name).write_text(json.dumps(value,indent=2,sort_keys=True)+'\n')
+
+          metadata={label:rpc('suix_getCoinMetadata',[type_]) for label,type_ in TYPES.items()}
+          dump('coin_metadata.json',metadata)
+          package_objects={}
+          publish_txs={}
+          for label,pid in PACKAGES.items():
+            obj=rpc('sui_getObject',[pid,{'showType':True,'showOwner':True,'showPreviousTransaction':True,'showDisplay':True,'showContent':True,'showBcs':True}])
+            package_objects[label]=obj
+            result=obj.get('result') if isinstance(obj,dict) else None
+            data=(result or {}).get('data') if isinstance(result,dict) else None
+            digest=(data or {}).get('previousTransaction') if isinstance(data,dict) else None
+            if digest:
+              publish_txs[label]=rpc('sui_getTransactionBlock',[digest,{'showInput':True,'showRawInput':False,'showEffects':True,'showEvents':True,'showObjectChanges':True,'showBalanceChanges':True}])
+          dump('package_objects.json',package_objects); dump('publish_transactions.json',publish_txs)
+          owned=rpc('suix_getOwnedObjects',[PUBLISHER,{'filter':None,'options':{'showType':True,'showOwner':True,'showPreviousTransaction':True,'showDisplay':True,'showContent':True,'showBcs':True}},None,200])
+          dump('publisher_owned_objects.json',owned)
+          txs=rpc('suix_queryTransactionBlocks',[{'filter':{'FromAddress':PUBLISHER},'options':{'showInput':True,'showRawInput':False,'showEffects':True,'showEvents':True,'showObjectChanges':True,'showBalanceChanges':True}},None,100,True])
+          dump('publisher_recent_transactions.json',txs)
+          result={
+            'network':'sui-mainnet','publisher':PUBLISHER,'coinMetadata':metadata,
+            'packageObjects':package_objects,'publishTransactions':publish_txs,
+            'writes':0,'transactionsConstructed':0,'generatedUnix':int(time.time()),
+          }
+          (OUT/'SUMMARY.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({'publisher':PUBLISHER,'coinMetadata':metadata,'packagePreviousTransactions':{k:(((v.get('result') or {}).get('data') or {}).get('previousTransaction')) for k,v in package_objects.items()}},indent=2))
+          PY
+          python3 sui-vault-metadata-r23/query.py | tee sui-vault-metadata-r23/run.log
+          find sui-vault-metadata-r23 -type f -print0 | sort -z | xargs -0 sha256sum > sui-vault-metadata-r23/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' sui-vault-metadata-r23 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          s=json.load(open('sui-vault-metadata-r23/SUMMARY.json'))
+          assert s['writes']==0 and s['transactionsConstructed']==0
+          print('SUI_VAULT_METADATA_R23_READ_ONLY_PASS')
+          PY
+
+      - name: Upload metadata evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: sui-vault-metadata-r23
+          path: sui-vault-metadata-r23
+          if-no-files-found: error
+          retention-days: 2
