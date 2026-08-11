@@ -1,0 +1,190 @@
+name: Temporary Besu Valid-Block HashDoS Patched Control
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - research/ethereum/besu_worldupdater_hashdos/**
+      - .github/workflows/_temporary-besu-validblock-hashdos-patched-control-20260811.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: besu-validblock-hashdos-patched-20260811
+  cancel-in-progress: true
+
+jobs:
+  patched-control:
+    if: github.event_name == 'workflow_dispatch' || github.head_ref == 'ethereum-besu-hashdos-valid-block-gate2'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - name: Checkout harness
+        uses: actions/checkout@v4
+        with:
+          path: research-repo
+          persist-credentials: false
+
+      - name: Checkout execution-specs
+        uses: actions/checkout@v4
+        with:
+          repository: ethereum/execution-specs
+          ref: 343274cc0f43962ff39a648e2b2614bf227f8d1f
+          path: eest
+          persist-credentials: false
+
+      - name: Checkout Besu 26.7.1
+        uses: actions/checkout@v4
+        with:
+          repository: besu-eth/besu
+          ref: 26.7.1
+          path: besu
+          persist-credentials: false
+
+      - name: Configure uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: eest/uv.lock
+
+      - name: Configure Java 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: gradle
+          cache-dependency-path: |
+            besu/**/*.gradle*
+            besu/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Build fixtures and run unpatched/patched differential
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/patched-result"
+          TEST_DST="eest/tests/prague/eip7702_set_code_tx/test_besu_worldupdater_hashdos.py"
+          mkdir -p "$ROOT/fixtures" "$ROOT/logs" "$ROOT/bin"
+          cp research-repo/research/ethereum/besu_worldupdater_hashdos/test_besu_worldupdater_hashdos.py "$TEST_DST"
+
+          for case_id in worldupdater_control_5200x2 worldupdater_colliding_5200x2; do
+            mkdir -p "$ROOT/fixtures/$case_id"
+            (cd eest && uv run --frozen fill \
+              tests/prague/eip7702_set_code_tx/test_besu_worldupdater_hashdos.py \
+              -k "$case_id" --output="$ROOT/fixtures/$case_id" --clean \
+              --until Osaka -n 1 --no-html -q) \
+              2>&1 | tee "$ROOT/logs/fill-$case_id.log"
+            test "$(find "$ROOT/fixtures/$case_id" -name '*.json' | wc -l)" -gt 0
+          done
+
+          build_besu() {
+            label="$1"
+            (cd besu && ./gradlew :ethereum:evmtool:installDist --no-daemon --stacktrace --rerun-tasks) \
+              >"$ROOT/logs/build-$label.log" 2>&1
+            cp -a besu/ethereum/evmtool/build/install/evmtool "$ROOT/bin/$label"
+          }
+
+          consume_timed() {
+            label="$1"; case_id="$2"; iteration="$3"
+            bin="$ROOT/bin/$label/bin/evmtool"
+            timefile="$ROOT/logs/$label-$case_id-$iteration.time"
+            logfile="$ROOT/logs/$label-$case_id-$iteration.log"
+            /usr/bin/time -f '%e' -o "$timefile" timeout 900s bash -lc \
+              "cd eest && uv run --frozen consume direct --input='$ROOT/fixtures/$case_id' --bin='$bin' -m blockchain_test -q" \
+              >"$logfile" 2>&1
+            seconds="$(cat "$timefile")"
+            echo "timing variant=$label case=$case_id iteration=$iteration seconds=$seconds status=PASS"
+          }
+
+          echo "besu_unpatched=$(git -C besu rev-parse HEAD)"
+          build_besu unpatched
+          for i in 1 2 3; do
+            consume_timed unpatched worldupdater_control_5200x2 "$i"
+            consume_timed unpatched worldupdater_colliding_5200x2 "$i"
+          done
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          abstract = Path('besu/evm/src/main/java/org/hyperledger/besu/evm/worldstate/AbstractWorldUpdater.java')
+          text = abstract.read_text()
+          old_imports = '''import java.util.Collections;\nimport java.util.HashSet;\nimport java.util.Map;\nimport java.util.Optional;\nimport java.util.Set;\nimport java.util.concurrent.ConcurrentHashMap;'''
+          new_imports = '''import java.util.Collection;\nimport java.util.Map;\nimport java.util.Optional;\nimport java.util.Set;\nimport java.util.concurrent.ConcurrentSkipListMap;\nimport java.util.concurrent.ConcurrentSkipListSet;'''
+          # Some releases already import Collection separately; perform focused replacements.
+          text = text.replace('import java.util.HashSet;\n', '')
+          text = text.replace('import java.util.Collections;\n', '')
+          text = text.replace('import java.util.concurrent.ConcurrentHashMap;\n', 'import java.util.concurrent.ConcurrentSkipListMap;\nimport java.util.concurrent.ConcurrentSkipListSet;\n')
+          old1 = 'protected Map<Address, UpdateTrackingAccount<A>> updatedAccounts = new ConcurrentHashMap<>();'
+          new1 = 'protected Map<Address, UpdateTrackingAccount<A>> updatedAccounts = new ConcurrentSkipListMap<>();'
+          old2 = 'protected Set<Address> deletedAccounts = Collections.synchronizedSet(new HashSet<>(Address.SIZE));'
+          new2 = 'protected Set<Address> deletedAccounts = new ConcurrentSkipListSet<>();'
+          if old1 not in text or old2 not in text:
+              raise SystemExit('AbstractWorldUpdater patch anchors not found')
+          text = text.replace(old1, new1).replace(old2, new2)
+          abstract.write_text(text)
+
+          path = Path('besu/ethereum/core/src/main/java/org/hyperledger/besu/ethereum/trie/pathbased/common/worldview/accumulator/PathBasedWorldStateUpdateAccumulator.java')
+          text = path.read_text()
+          text = text.replace('import java.util.HashSet;\n', '')
+          text = text.replace('import java.util.concurrent.ConcurrentHashMap;\n', 'import java.util.concurrent.ConcurrentHashMap;\nimport java.util.concurrent.ConcurrentSkipListMap;\nimport java.util.concurrent.ConcurrentSkipListSet;\n')
+          old_accounts = 'this.accountsToUpdate = new AccountConsumingMap<>(new ConcurrentHashMap<>(), accountPreloader);'
+          new_accounts = 'this.accountsToUpdate = new AccountConsumingMap<>(new ConcurrentSkipListMap<>(), accountPreloader);'
+          old_code = 'private final Map<Address, PathBasedValue<Bytes>> codeToUpdate = new ConcurrentHashMap<>();'
+          new_code = 'private final Map<Address, PathBasedValue<Bytes>> codeToUpdate = new ConcurrentSkipListMap<>();'
+          old_clear = 'private final Set<Address> storageToClear = Collections.synchronizedSet(new HashSet<>());'
+          new_clear = 'private final Set<Address> storageToClear = new ConcurrentSkipListSet<>();'
+          old_storage = '      storageToUpdate = new ConcurrentHashMap<>();'
+          new_storage = '      storageToUpdate = new ConcurrentSkipListMap<>();'
+          anchors = [old_accounts, old_code, old_clear, old_storage]
+          if not all(anchor in text for anchor in anchors):
+              missing = [anchor for anchor in anchors if anchor not in text]
+              raise SystemExit(f'PathBased accumulator patch anchors not found: {missing}')
+          text = text.replace(old_accounts, new_accounts)
+          text = text.replace(old_code, new_code)
+          text = text.replace(old_clear, new_clear)
+          text = text.replace(old_storage, new_storage)
+          path.write_text(text)
+          PY
+
+          git -C besu diff --check
+          git -C besu diff -- \
+            evm/src/main/java/org/hyperledger/besu/evm/worldstate/AbstractWorldUpdater.java \
+            ethereum/core/src/main/java/org/hyperledger/besu/ethereum/trie/pathbased/common/worldview/accumulator/PathBasedWorldStateUpdateAccumulator.java \
+            | tee "$ROOT/logs/collision-resistant-control.patch"
+
+          rm -rf besu/ethereum/evmtool/build/install/evmtool
+          build_besu patched
+          for i in 1 2 3; do
+            consume_timed patched worldupdater_control_5200x2 "$i"
+            consume_timed patched worldupdater_colliding_5200x2 "$i"
+          done
+
+          python3 - "$ROOT/logs" <<'PY'
+          import pathlib, statistics, sys
+          root = pathlib.Path(sys.argv[1])
+          values = {}
+          for variant in ('unpatched', 'patched'):
+              for case in ('worldupdater_control_5200x2', 'worldupdater_colliding_5200x2'):
+                  samples = [float(p.read_text().strip()) for p in sorted(root.glob(f'{variant}-{case}-*.time'))]
+                  values[(variant, case)] = statistics.median(samples)
+                  print(f'median variant={variant} case={case} seconds={statistics.median(samples):.6f} n={len(samples)}')
+          for variant in ('unpatched', 'patched'):
+              c = values[(variant, 'worldupdater_control_5200x2')]
+              x = values[(variant, 'worldupdater_colliding_5200x2')]
+              print(f'ratio variant={variant} control={c:.6f} collision={x:.6f} ratio={x/c:.3f}')
+          recovery = values[('unpatched', 'worldupdater_colliding_5200x2')] / values[('patched', 'worldupdater_colliding_5200x2')]
+          print(f'patched_collision_speedup={recovery:.3f}')
+          print('PATCHED_CONTROL_FIXTURE_ACCEPTANCE=PASS')
+          PY
+
+      - name: Upload sanitized patched-control evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: besu-validblock-hashdos-patched-control
+          path: |
+            patched-result/logs/*.time
+            patched-result/logs/collision-resistant-control.patch
+          if-no-files-found: warn
+          retention-days: 2
