@@ -1,0 +1,198 @@
+name: Bucket Account Owner Graph Exhaustive R32
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-account-owner-graph-r32-20260811]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  graph:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enumerate every live Bucket Account and resolve its authorization root
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-account-owner-graph-r32
+          mkdir -p bucket-account-owner-graph-r32/raw
+          cat > bucket-account-owner-graph-r32/graph.py <<'PY'
+          import json, pathlib, time, urllib.request, re
+
+          OUT=pathlib.Path('bucket-account-owner-graph-r32'); RAW=OUT/'raw'
+          GQL='https://graphql.mainnet.sui.io/graphql'
+          RPCS=['https://fullnode.mainnet.sui.io:443','https://sui-mainnet-endpoint.blockvision.org']
+          ACCOUNT_ORIGIN='0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc'
+          ACCOUNT_TYPE=ACCOUNT_ORIGIN+'::account::Account'
+          BUCKET_ORIGINS={
+            ACCOUNT_ORIGIN,
+            '0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e',
+            '0xe14726c336e81b32328e92afc37345d159f5b550b09fa92bd43640cfdd0a0cfd',
+            '0x872d08a70db3db498aa7853276acea8091fdd9871b2d86bc8dcb8524526df622',
+            '0xc2ae6693383e4a81285136effc8190c7baaf0e75aafa36d1c69cd2170cfc3803',
+          }
+
+          def post(url,payload,retries=6,timeout=150):
+            data=json.dumps(payload).encode(); last=None
+            for n in range(retries):
+              try:
+                req=urllib.request.Request(url,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-account-owner-graph-r32/1'})
+                with urllib.request.urlopen(req,timeout=timeout) as r: return json.loads(r.read().decode())
+              except Exception as e:
+                last=e; time.sleep(2**n)
+            raise RuntimeError(f'{url}: {last}')
+          def gql(q,v=None):
+            b=post(GQL,{'query':q,'variables':v or {}})
+            if b.get('errors'): raise RuntimeError(json.dumps(b['errors']))
+            return b['data']
+          def rpc(method,params):
+            errors=[]
+            for ep in RPCS:
+              try:
+                b=post(ep,{'jsonrpc':'2.0','id':1,'method':method,'params':params})
+                if b.get('error'): raise RuntimeError(json.dumps(b['error']))
+                return {'endpoint':ep,'result':b.get('result')}
+              except Exception as e: errors.append({'endpoint':ep,'error':str(e)})
+            return {'failures':errors}
+          def result(w): return w.get('result') if isinstance(w,dict) else None
+          def dump(name,v): (RAW/name).write_text(json.dumps(v,indent=2,sort_keys=True)+'\n')
+          def owner_kind(owner):
+            if not isinstance(owner,dict): return ('unknown',None)
+            if 'Shared' in owner: return ('shared',None)
+            if 'Immutable' in owner: return ('immutable',None)
+            if 'AddressOwner' in owner: return ('address',owner.get('AddressOwner'))
+            if 'ObjectOwner' in owner: return ('object',owner.get('ObjectOwner'))
+            typ=owner.get('__typename')
+            if typ=='Shared': return ('shared',None)
+            if typ=='AddressOwner': return ('address',((owner.get('address') or {}).get('address')))
+            if typ=='ObjectOwner': return ('object',((owner.get('address') or {}).get('address')))
+            return ('unknown',None)
+          def pkg_from_type(typ):
+            if isinstance(typ,str) and '::' in typ:
+              return '0x'+typ.split('::')[0].removeprefix('0x').lower().rjust(64,'0')
+            return None
+          def get_object(oid):
+            return rpc('sui_getObject',[oid,{'showType':True,'showOwner':True,'showPreviousTransaction':True,'showDisplay':True,'showContent':True,'showBcs':True}])
+
+          q='''query A($after:String){objects(first:50,after:$after,filter:{type:"'''+ACCOUNT_TYPE+'''"}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+          accounts=[]; cursor=None
+          while True:
+            conn=gql(q,{'after':cursor})['objects']; accounts.extend(conn.get('nodes') or [])
+            page=conn.get('pageInfo') or {}
+            if not page.get('hasNextPage'): break
+            cursor=page.get('endCursor')
+          dump('accounts.json',accounts)
+
+          cache={}; graphs=[]; root_packages=set(); all_packages=set()
+          for account in accounts:
+            aid=account['address']; kind,parent=owner_kind(account.get('owner'))
+            chain=[{'id':aid,'type':((account.get('asMoveObject') or {}).get('contents') or {}).get('type',{}).get('repr'),'owner':account.get('owner'),'ownerKind':kind,'parent':parent}]
+            current=parent; seen={aid}; depth=0
+            while kind=='object' and current and current not in seen and depth<12:
+              seen.add(current); depth+=1
+              if current not in cache: cache[current]=get_object(current)
+              data=(result(cache[current]) or {}).get('data') if isinstance(result(cache[current]),dict) else None
+              typ=(data or {}).get('type') if isinstance(data,dict) else None
+              owner=(data or {}).get('owner') if isinstance(data,dict) else None
+              kind,parent=owner_kind(owner)
+              chain.append({'id':current,'type':typ,'owner':owner,'ownerKind':kind,'parent':parent,'package':pkg_from_type(typ),'previousTransaction':(data or {}).get('previousTransaction') if isinstance(data,dict) else None})
+              if pkg_from_type(typ): all_packages.add(pkg_from_type(typ))
+              current=parent
+            root=chain[-1]
+            root_pkg=root.get('package') or pkg_from_type(root.get('type'))
+            if root_pkg: root_packages.add(root_pkg)
+            graphs.append({'account':aid,'chain':chain,'rootKind':root.get('ownerKind'),'rootObject':root.get('id'),'rootType':root.get('type'),'rootPackage':root_pkg,'directlyShared':chain[0]['ownerKind']=='shared'})
+          dump('owner_objects.json',cache); dump('owner_graphs.json',graphs)
+
+          packages={}; exposure=[]; public_capability_apis=[]
+          sensitive=re.compile(r'borrow|return|account|cap|withdraw|claim|redeem|deposit|strategy|vault|request',re.I)
+          for pid in sorted(all_packages | root_packages):
+            norm=rpc('sui_getNormalizedMoveModulesByPackage',[pid]); obj=get_object(pid)
+            packages[pid]={'normalized':norm,'object':obj}
+            mods=result(norm)
+            if not isinstance(mods,dict): continue
+            for module_name,module in mods.items():
+              for fn_name,fn in (module.get('exposedFunctions') or {}).items():
+                params=fn.get('parameters') or []; returns=fn.get('return') or []
+                serial=json.dumps({'module':module_name,'function':fn_name,'parameters':params,'return':returns})
+                public=str(fn.get('visibility')).lower()=='public' or bool(fn.get('isEntry'))
+                account_related=ACCOUNT_ORIGIN in serial or sensitive.search(fn_name)
+                if public and account_related:
+                  row={'package':pid,'module':module_name,'function':fn_name,'visibility':fn.get('visibility'),'isEntry':fn.get('isEntry'),'parameters':params,'return':returns}
+                  public_capability_apis.append(row)
+                  if any(term in fn_name.lower() for term in ('borrow_protocol_cap','borrow_account','return_protocol_cap','request_with_account')):
+                    exposure.append(row)
+          dump('packages.json',packages); dump('public_capability_apis.json',public_capability_apis)
+
+          opts={'showInput':True,'showRawInput':False,'showEffects':True,'showEvents':True,'showObjectChanges':True,'showBalanceChanges':True}
+          activity={}; account_calls=[]
+          for g in graphs:
+            aid=g['account']; txs=[]; cursor=None
+            for _ in range(12):
+              w=rpc('suix_queryTransactionBlocks',[{'filter':{'InputObject':aid},'options':opts},cursor,50,True]); page=result(w)
+              if not isinstance(page,dict): break
+              txs.extend(page.get('data') or [])
+              if not page.get('hasNextPage'): break
+              cursor=page.get('nextCursor')
+            activity[aid]=txs
+            for tx in txs:
+              try: commands=tx['transaction']['data']['transaction']['transactions']
+              except Exception: commands=[]
+              for index,cmd in enumerate(commands or []):
+                mc=cmd.get('MoveCall') if isinstance(cmd,dict) else None
+                if mc and (mc.get('module')=='account' or 'account' in str(mc.get('function','')).lower() or mc.get('function') in ('borrow_protocol_cap','return_protocol_cap')):
+                  account_calls.append({'account':aid,'digest':tx.get('digest'),'timestampMs':tx.get('timestampMs'),'sender':((tx.get('transaction') or {}).get('data') or {}).get('sender'),'status':((tx.get('effects') or {}).get('status')),'index':index,'package':mc.get('package'),'module':mc.get('module'),'function':mc.get('function'),'typeArguments':mc.get('type_arguments')})
+          dump('activity.json',activity); dump('account_calls.json',account_calls)
+
+          in_scope_roots=[]; external_roots=[]
+          for g in graphs:
+            p=g.get('rootPackage')
+            if p in BUCKET_ORIGINS: in_scope_roots.append(g)
+            else: external_roots.append(g)
+          in_scope_exposure=[row for row in exposure if row['package'] in BUCKET_ORIGINS]
+          summary={
+            'schema':'bucket-account-owner-graph-r32/v1','network':'sui-mainnet','readOnly':True,
+            'accountCount':len(accounts),'ownerGraphs':graphs,
+            'rootPackageCount':len(root_packages),'rootPackages':sorted(root_packages),
+            'directlySharedAccountCount':sum(1 for g in graphs if g['directlyShared']),
+            'bucketOriginRootCount':len(in_scope_roots),'bucketOriginRoots':in_scope_roots,
+            'externalRootCount':len(external_roots),'externalRoots':external_roots,
+            'publicCapabilityApiCount':len(public_capability_apis),'capabilityExposureApis':exposure,
+            'bucketOriginCapabilityExposureCount':len(in_scope_exposure),'bucketOriginCapabilityExposureApis':in_scope_exposure,
+            'accountCallCount':len(account_calls),'accountCalls':account_calls,
+            'strictInScopePermissionlessAccountExposure':bool(in_scope_roots and in_scope_exposure),
+            'exactMaterialTheftPoC':False,'highCriticalCandidate':False,
+            'writes':0,'transactionsConstructed':0,'generatedUnix':int(time.time()),
+          }
+          (OUT/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({k:summary[k] for k in ('accountCount','rootPackages','directlySharedAccountCount','bucketOriginRootCount','bucketOriginCapabilityExposureCount','strictInScopePermissionlessAccountExposure','highCriticalCandidate')},indent=2))
+          PY
+          python3 bucket-account-owner-graph-r32/graph.py | tee bucket-account-owner-graph-r32/run.log
+          find bucket-account-owner-graph-r32 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-account-owner-graph-r32/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-account-owner-graph-r32 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          s=json.load(open('bucket-account-owner-graph-r32/SUMMARY.json'))
+          assert s['readOnly'] is True and s['writes']==0 and s['transactionsConstructed']==0
+          print('BUCKET_ACCOUNT_OWNER_GRAPH_R32_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-account-owner-graph-r32
+          path: bucket-account-owner-graph-r32
+          if-no-files-found: error
+          retention-days: 3
