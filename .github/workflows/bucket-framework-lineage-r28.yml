@@ -1,0 +1,124 @@
+name: Bucket Framework Account Lineage R28
+
+on:
+  push:
+    branches: [agent/bucket-framework-lineage-r28-20260811]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Query framework package generations and disassemble Account APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-framework-lineage-r28
+          mkdir -p bucket-framework-lineage-r28/{raw,asm}
+          cat > bucket-framework-lineage-r28/probe.py <<'PY'
+          import json, pathlib, time, urllib.request
+
+          OUT=pathlib.Path('bucket-framework-lineage-r28')
+          RAW=OUT/'raw'; ASM=OUT/'asm'
+          RPCS=['https://fullnode.mainnet.sui.io:443','https://sui-mainnet-endpoint.blockvision.org']
+          GQL='https://graphql.mainnet.sui.io/graphql'
+          PACKAGES={
+              'framework_origin':'0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc',
+              'framework_alt':'0xe2d49d67ff42dc500275f2d84841bf35632aa6c1abdb70af66a10e1de93a4400',
+          }
+
+          def post(url,payload,retries=6,timeout=150):
+              data=json.dumps(payload).encode(); last=None
+              for n in range(retries):
+                  try:
+                      req=urllib.request.Request(url,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-framework-lineage-r28/1'})
+                      with urllib.request.urlopen(req,timeout=timeout) as r: return json.loads(r.read().decode())
+                  except Exception as e:
+                      last=e; time.sleep(2**n)
+              raise RuntimeError(f'{url}: {last}')
+
+          def rpc(method,params):
+              errors=[]
+              for ep in RPCS:
+                  try:
+                      body=post(ep,{'jsonrpc':'2.0','id':1,'method':method,'params':params})
+                      if body.get('error'): raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint':ep,'result':body.get('result')}
+                  except Exception as e: errors.append({'endpoint':ep,'error':str(e)})
+              return {'failures':errors}
+
+          def gql(query,variables=None):
+              body=post(GQL,{'query':query,'variables':variables or {}})
+              if body.get('errors'): raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          def dump(path,value): path.write_text(json.dumps(value,indent=2,sort_keys=True)+'\n')
+
+          q='''query P($address:SuiAddress!){object(address:$address){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}modules{nodes{name fileFormatVersion disassembly functions(first:100){nodes{name visibility isEntry parameters{repr}return{repr}typeParameters{constraints}}}structs(first:100){nodes{name abilities fields{name type{repr}}typeParameters{constraints}}}}}}}}'''
+
+          packages={}; account_functions=[]; account_structs=[]
+          for label,pid in PACKAGES.items():
+              obj=rpc('sui_getObject',[pid,{'showType':True,'showOwner':True,'showPreviousTransaction':True,'showDisplay':False,'showContent':True,'showBcs':True}])
+              norm=rpc('sui_getNormalizedMoveModulesByPackage',[pid])
+              try: graph=gql(q,{'address':pid})
+              except Exception as e: graph={'query_error':type(e).__name__,'message':str(e)}
+              dump(RAW/f'{label}_object.json',obj); dump(RAW/f'{label}_normalized.json',norm); dump(RAW/f'{label}_graphql.json',graph)
+              package=((graph.get('object') or {}).get('asMovePackage')) if isinstance(graph,dict) else None
+              row={'label':label,'packageId':pid,'object':obj,'normalized':norm,'graphqlPackagePresent':bool(package)}
+              packages[label]=row
+              if package:
+                  for module in package.get('modules',{}).get('nodes',[]):
+                      name=module.get('name'); text=module.get('disassembly') or ''
+                      (ASM/f'{label}__{name}.asm').write_text(text)
+                      if name=='account':
+                          for fn in (module.get('functions') or {}).get('nodes',[]):
+                              account_functions.append({'label':label,'packageId':pid,'module':name,**fn})
+                          for struct in (module.get('structs') or {}).get('nodes',[]):
+                              account_structs.append({'label':label,'packageId':pid,'module':name,**struct})
+
+          # Compare public Account APIs and flag any constructor that accepts raw address/ID.
+          risky=[]
+          for fn in account_functions:
+              params=[x.get('repr') for x in fn.get('parameters') or []]
+              public=str(fn.get('visibility')).upper()=='PUBLIC' or fn.get('isEntry')
+              raw_address=any(p in ('address','0x1::object::ID','0x2::object::ID') or p.endswith('::object::ID') for p in params)
+              if public and (raw_address or 'request' in str(fn.get('name')).lower() or 'account' in str(fn.get('name')).lower()):
+                  risky.append({**fn,'parameters':params,'rawAddressOrIdParameter':raw_address})
+          summary={
+              'schema':'bucket-framework-account-lineage-r28/v1','network':'sui-mainnet','readOnly':True,
+              'packages':packages,'accountFunctions':account_functions,'accountStructs':account_structs,
+              'riskyPublicAccountFunctions':risky,
+              'rawAddressRequestConstructorFound':any(r.get('rawAddressOrIdParameter') and 'request' in str(r.get('name')).lower() for r in risky),
+              'writes':0,'transactionsConstructed':0,'generatedUnix':int(time.time()),
+          }
+          (OUT/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({'accountFunctions':account_functions,'accountStructs':account_structs,'riskyPublicAccountFunctions':risky,'rawAddressRequestConstructorFound':summary['rawAddressRequestConstructorFound']},indent=2))
+          PY
+          python3 bucket-framework-lineage-r28/probe.py | tee bucket-framework-lineage-r28/run.log
+          find bucket-framework-lineage-r28 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-framework-lineage-r28/SHA256SUMS.txt
+
+      - name: Validate passive boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-framework-lineage-r28 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          s=json.load(open('bucket-framework-lineage-r28/SUMMARY.json'))
+          assert s['readOnly'] is True and s['writes']==0 and s['transactionsConstructed']==0
+          print('BUCKET_FRAMEWORK_LINEAGE_R28_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-framework-lineage-r28
+          path: bucket-framework-lineage-r28
+          if-no-files-found: error
+          retention-days: 3
