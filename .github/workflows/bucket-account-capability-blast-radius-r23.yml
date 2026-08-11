@@ -1,0 +1,329 @@
+name: Bucket Account Capability Blast Radius R23
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Map all live consumers of protocol-owned Account capabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-account-capability-r23
+          mkdir -p bucket-account-capability-r23/raw
+          cat > bucket-account-capability-r23/census.py <<'PY'
+          import json
+          import pathlib
+          import re
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-account-capability-r23')
+          RAW = OUT / 'raw'
+          RPCS = [
+              'https://fullnode.mainnet.sui.io:443',
+              'https://sui-mainnet-endpoint.blockvision.org',
+          ]
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+
+          VAULTS = {
+              'vault_a': '0x5ee16dbdf0fde4c0699db409957f5e1b0c7cc4e1b0b28921728b9251fab169b0',
+              'vault_b': '0xa8d05be9b464568dce0dd5fb947c7581179fa8c8770086ae0c4504af46b6c706',
+          }
+          ACCOUNTS = {
+              'account_a': '0x0bd4c9887129746355e0b44552fc2c92787a4fa418249ce1f92e84ab47e28b54',
+              'account_b': '0x3d3ea407522b697303737f6fd736ef71672af6fdbac6e8a2478245082145d712',
+          }
+          ACCOUNT_TYPE = '0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc::account::Account'
+          SAVING_POSITION_TABLE = '0x4810387f10e5ca9bb3a87457fefc02414bec3586089d700ee222c1404b4332ff'
+          CDP_VAULT_TYPE = '0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e::vault::Vault'
+          PSM_POOL_TYPE = '0xc2ae6693383e4a81285136effc8190c7baaf0e75aafa36d1c69cd2170cfc3803::pool::Pool'
+          SAVING_REWARD_MANAGER = '0x79c753c1512a0eaeae0aedc623e620c599915e5855e27ee5d292d5bf95192578'
+
+          def post(url, payload, retries=6, timeout=120):
+              encoded = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      request = urllib.request.Request(
+                          url,
+                          data=encoded,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-account-capability-r23/1',
+                          },
+                      )
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2 ** attempt)
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': str(exc)})
+              return {'failures': failures}
+
+          def gql(query, variables=None):
+              body = post(GQL, {'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          def result(wrapper):
+              return wrapper.get('result') if isinstance(wrapper, dict) else None
+
+          def dump(name, value):
+              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def as_int(value):
+              if isinstance(value, bool) or value is None:
+                  return None
+              if isinstance(value, int):
+                  return value
+              if isinstance(value, str) and re.fullmatch(r'-?\d+', value):
+                  return int(value)
+              if isinstance(value, dict):
+                  for key in ('value', 'magnitude'):
+                      if key in value:
+                          parsed = as_int(value[key])
+                          if parsed is not None:
+                              return parsed
+                  if isinstance(value.get('fields'), dict):
+                      return as_int(value['fields'])
+              return None
+
+          def find_key(value, key):
+              if isinstance(value, dict):
+                  if key in value:
+                      return value[key]
+                  for child in value.values():
+                      found = find_key(child, key)
+                      if found is not None:
+                          return found
+              elif isinstance(value, list):
+                  for child in value:
+                      found = find_key(child, key)
+                      if found is not None:
+                          return found
+              return None
+
+          def get_object(object_id):
+              return rpc('sui_getObject', [object_id, {
+                  'showType': True,
+                  'showOwner': True,
+                  'showPreviousTransaction': True,
+                  'showDisplay': True,
+                  'showContent': True,
+                  'showBcs': True,
+              }])
+
+          def dynamic_object(parent, type_name, value):
+              return rpc('suix_getDynamicFieldObject', [parent, {
+                  'type': type_name,
+                  'value': value,
+              }])
+
+          object_query = '''query O($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+
+          def objects(type_name):
+              rows = []
+              cursor = None
+              while True:
+                  connection = gql(object_query, {'type': type_name, 'after': cursor})['objects']
+                  rows.extend(connection.get('nodes') or [])
+                  page = connection.get('pageInfo') or {}
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('endCursor')
+              return rows
+
+          checkpoint = gql('query { checkpoint { sequenceNumber timestamp } }')['checkpoint']
+
+          vault_rows = []
+          for label, object_id in VAULTS.items():
+              wrapper = get_object(object_id)
+              data = (result(wrapper) or {}).get('data') or {}
+              object_type = data.get('type')
+              package_id = None
+              if isinstance(object_type, str) and '::' in object_type:
+                  package_id = '0x' + object_type.split('::')[0].removeprefix('0x')
+              modules = rpc('sui_getNormalizedMoveModulesByPackage', [package_id]) if package_id else None
+              exposed = (((result(modules) or {}).get('vault') or {}).get('exposedFunctions') or {})
+              relevant = {
+                  name: metadata
+                  for name, metadata in exposed.items()
+                  if 'protocol_cap' in name.lower() or 'account' in name.lower()
+              }
+              vault_rows.append({
+                  'label': label,
+                  'id': object_id,
+                  'type': object_type,
+                  'package': package_id,
+                  'owner': data.get('owner'),
+                  'relevantFunctions': relevant,
+              })
+              dump(f'{label}_object.json', wrapper)
+              dump(f'{label}_modules.json', modules)
+
+          account_rows = []
+          for label, object_id in ACCOUNTS.items():
+              wrapper = get_object(object_id)
+              data = (result(wrapper) or {}).get('data') or {}
+              account_rows.append({
+                  'label': label,
+                  'id': object_id,
+                  'type': data.get('type'),
+                  'owner': data.get('owner'),
+                  'previousTransaction': data.get('previousTransaction'),
+              })
+              dump(f'{label}_object.json', wrapper)
+
+          all_accounts = objects(ACCOUNT_TYPE)
+          dump('all_accounts.json', all_accounts)
+
+          saving_positions = []
+          saving_total = 0
+          for label, account in ACCOUNTS.items():
+              wrapper = dynamic_object(SAVING_POSITION_TABLE, 'address', account)
+              data = (result(wrapper) or {}).get('data') or {}
+              fields = ((data.get('content') or {}).get('fields') or {})
+              value = fields.get('value') or fields
+              balance = as_int(find_key(value, 'balance'))
+              if balance:
+                  saving_total += balance
+              saving_positions.append({
+                  'accountLabel': label,
+                  'account': account,
+                  'balanceRaw': balance,
+                  'position': wrapper,
+              })
+          dump('saving_positions.json', saving_positions)
+
+          cdp_vaults = objects(CDP_VAULT_TYPE)
+          cdp_hits = []
+          for vault in cdp_vaults:
+              contents = ((vault.get('asMoveObject') or {}).get('contents') or {})
+              state = contents.get('json') or {}
+              table = state.get('position_table') or {}
+              table_id = table.get('id') if isinstance(table, dict) else None
+              if not table_id:
+                  continue
+              for account_label, account in ACCOUNTS.items():
+                  wrapper = dynamic_object(table_id, 'address', account)
+                  data = result(wrapper)
+                  if isinstance(data, dict) and data.get('data'):
+                      cdp_hits.append({
+                          'vaultId': vault.get('address'),
+                          'vaultType': (contents.get('type') or {}).get('repr'),
+                          'positionTable': table_id,
+                          'accountLabel': account_label,
+                          'account': account,
+                          'position': wrapper,
+                      })
+          dump('cdp_hits.json', cdp_hits)
+
+          psm_pools = objects(PSM_POOL_TYPE)
+          psm_hits = []
+          for pool in psm_pools:
+              state = (((pool.get('asMoveObject') or {}).get('contents') or {}).get('json') or {})
+              serialized = json.dumps(state).lower()
+              for account_label, account in ACCOUNTS.items():
+                  if account.lower() in serialized:
+                      psm_hits.append({
+                          'poolId': pool.get('address'),
+                          'accountLabel': account_label,
+                          'account': account,
+                      })
+          dump('psm_hits.json', psm_hits)
+
+          reward_manager = get_object(SAVING_REWARD_MANAGER)
+          reward_serialized = json.dumps(reward_manager).lower()
+          reward_direct_hits = [
+              label for label, account in ACCOUNTS.items()
+              if account.lower() in reward_serialized
+          ]
+          dump('reward_manager.json', reward_manager)
+
+          facts = {
+              'vaultCount': len(vault_rows),
+              'vaults': vault_rows,
+              'accountCount': len(all_accounts),
+              'objectOwnedAccountCount': sum(
+                  1 for account in all_accounts
+                  if (account.get('owner') or {}).get('__typename') == 'ObjectOwner'
+              ),
+              'targetAccounts': account_rows,
+              'savingPositionRawByAccount': {
+                  row['accountLabel']: row['balanceRaw'] for row in saving_positions
+              },
+              'savingPositionTotalRaw': saving_total,
+              'savingPositionDisplayUSDBAssuming6Decimals': saving_total / 1_000_000,
+              'cdpVaultCount': len(cdp_vaults),
+              'cdpPositionHitCount': len(cdp_hits),
+              'cdpPositionHits': cdp_hits,
+              'psmPoolCount': len(psm_pools),
+              'psmAccountHitCount': len(psm_hits),
+              'psmAccountHits': psm_hits,
+              'rewardManagerDirectAccountHits': reward_direct_hits,
+          }
+          summary = {
+              'schema': 'bucket-account-capability-blast-radius-r23/v1',
+              'network': 'sui-mainnet',
+              'checkpoint': checkpoint,
+              'readOnly': True,
+              'facts': facts,
+              'productionTransactionsSubmitted': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print('BUCKET_R23_FACTS=' + json.dumps(facts, sort_keys=True))
+          PY
+          python3 bucket-account-capability-r23/census.py | tee bucket-account-capability-r23/run.log
+          find bucket-account-capability-r23 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-account-capability-r23/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-account-capability-r23 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-account-capability-r23/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['productionTransactionsSubmitted'] == 0
+          assert summary['facts']['savingPositionTotalRaw'] > 0
+          print('BUCKET_ACCOUNT_CAPABILITY_R23_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-account-capability-r23
+          path: bucket-account-capability-r23
+          if-no-files-found: error
+          retention-days: 7
