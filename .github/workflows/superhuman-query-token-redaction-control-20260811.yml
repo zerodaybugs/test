@@ -1,0 +1,97 @@
+name: Temporary Superhuman query credential redaction control
+
+on:
+  push:
+    branches: [research/superhuman-index-attachment-20260811]
+    paths: [.github/workflows/superhuman-query-token-redaction-control-20260811.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+
+      - name: Install exact stable runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf sh-query-redaction
+          mkdir -p sh-query-redaction/evidence public-intake-status
+          cd sh-query-redaction
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund @codahq/packs-sdk@1.17.1 isolated-vm@6.0.2
+
+      - name: Run vulnerable and patched canonical isolate gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd sh-query-redaction
+          cat > redaction_gate.js <<'NODE'
+          'use strict';
+          const assert=require('assert'); const crypto=require('crypto'); const fs=require('fs'); const os=require('os'); const path=require('path');
+          const sdkRoot=path.dirname(require.resolve('@codahq/packs-sdk/package.json')); const bootstrap=require(path.join(sdkRoot,'dist/runtime/bootstrap/index.js'));
+          const {AuthenticatingFetcher}=require(path.join(sdkRoot,'dist/testing/fetcher.js'));
+          const logger={trace(){},debug(){},info(){},warn(){},error(){}}; const blob={async storeUrl(){throw new Error('unused')},async storeBlob(){throw new Error('unused')}};
+
+          function sensitiveValues(authDef,credentials){
+            switch(authDef.type){
+              case 'QueryParamToken': return [credentials.paramValue];
+              case 'MultiQueryParamToken': return Object.values(credentials.params||{});
+              case 'OAuth2': case 'OAuth2ClientCredentials': return authDef.tokenQueryParam?[credentials.accessToken]:[];
+              default:return [];
+            }
+          }
+          function redactString(value,secrets){let out=String(value??'');for(const secret of secrets.filter(Boolean)){out=out.split(String(secret)).join('<<REDACTED BY SUPERHUMAN>>')}return out}
+          function redactError(error,secrets){const safe=new Error(redactString(error&&error.message,secrets));safe.name=error&&error.name||'Error';safe.stack=redactString(error&&error.stack,secrets);for(const [k,v] of Object.entries(error||{})){if(k==='message'||k==='stack'||k==='name')continue;try{safe[k]=typeof v==='string'?redactString(v,secrets):v}catch(_){}}return safe}
+          class RedactingFetcher{
+            constructor(inner,authDef,credentials){this.inner=inner;this.secrets=sensitiveValues(authDef,credentials)}
+            async fetch(request){try{return await this.inner.fetch(request)}catch(error){throw redactError(error,this.secrets)}}
+          }
+          async function run(label,authDef,credentials,secrets,patched){
+            const nonce=crypto.randomBytes(8).toString('hex'); const target=`https://${nonce}.example.invalid/closed`;
+            const work=fs.mkdtempSync(path.join(os.tmpdir(),'sh-redaction-')); const packPath=path.join(work,'pack.js'),mapPath=path.join(work,'pack.js.map');
+            fs.writeFileSync(packPath,`module.exports={pack:{defaultAuthentication:${JSON.stringify(authDef)},networkDomains:['example.invalid'],formulas:[{name:'Probe',description:'probe',parameters:[],resultType:'string',connectionRequirement:'required',execute:async(_p,context)=>{try{await context.fetcher.fetch({method:'GET',url:${JSON.stringify(target)}});return 'UNEXPECTED_SUCCESS'}catch(e){return [e&&e.name,e&&e.message,e&&e.stack].filter(Boolean).join('\\n')}}}]}};`); fs.writeFileSync(mapPath,'{"version":3,"file":"pack.js","sources":["pack-source.js"],"names":[],"mappings":""}\n');
+            const isolate=bootstrap.createIsolate({memoryLimit:64}),context=await bootstrap.createIsolateContext(isolate); await bootstrap.registerBundles(isolate,context,packPath,bootstrap.getThunkPath(),true);
+            const raw=new AuthenticatingFetcher(()=>{},authDef,['example.invalid'],credentials,`LAB_INVOCATION_${label}`); const fetcher=patched?new RedactingFetcher(raw,authDef,credentials):raw;
+            await bootstrap.injectExecutionContext({context,fetcher,temporaryBlobStorage:blob,syncStateService:undefined,logger,endpoint:undefined,invocationLocation:{protocolAndHost:'https://coda.io'},timezone:'UTC',invocationToken:`LAB_INVOCATION_${label}`,sync:undefined,authenticationName:'defaultUserAuthentication',executionId:`LAB_EXECUTION_${label}`,previousAttemptError:undefined});
+            const output=await bootstrap.executeThunk(context,{params:[],formulaSpec:{type:'Standard',formulaName:'Probe'}},packPath,mapPath); isolate.dispose(); fs.rmSync(work,{recursive:true,force:true});
+            return{label,patched,output,secretsVisible:Object.fromEntries(secrets.map(s=>[s,output.includes(s)])),redactionMarkerPresent:output.includes('<<REDACTED BY SUPERHUMAN>>')};
+          }
+          (async()=>{
+            const cases=[
+              {label:'QUERY',authDef:{type:'QueryParamToken',paramName:'api_key'},credentials:{paramValue:'LAB_QUERY_SECRET_20260811'},secrets:['LAB_QUERY_SECRET_20260811']},
+              {label:'MULTI',authDef:{type:'MultiQueryParamToken',params:[{name:'a'},{name:'b'}]},credentials:{params:{a:'LAB_MULTI_A_20260811',b:'LAB_MULTI_B_20260811'}},secrets:['LAB_MULTI_A_20260811','LAB_MULTI_B_20260811']},
+              {label:'OAUTH_QUERY',authDef:{type:'OAuth2',authorizationUrl:'https://auth.example.invalid/a',tokenUrl:'https://auth.example.invalid/t',scopes:[],tokenQueryParam:'access_token'},credentials:{clientId:'LAB_ID',clientSecret:'LAB_SECRET',accessToken:'LAB_OAUTH_QUERY_20260811',refreshToken:'LAB_REFRESH',scopes:[]},secrets:['LAB_OAUTH_QUERY_20260811']},
+            ];
+            const results=[];for(const c of cases){const vulnerable=await run(c.label,c.authDef,c.credentials,c.secrets,false),patched=await run(c.label,c.authDef,c.credentials,c.secrets,true);assert(Object.values(vulnerable.secretsVisible).every(Boolean));assert(Object.values(patched.secretsVisible).every(v=>!v));assert(patched.redactionMarkerPresent);results.push({vulnerable,patched})}
+            const result={pass:true,sdkVersion:require(path.join(sdkRoot,'package.json')).version,isolatedVmVersion:require('isolated-vm/package.json').version,nodeVersion:process.version,canonicalRuntime:true,allVulnerableControlsLeak:true,allPatchedControlsRedact:true,results,syntheticOnly:true,productionRequestCount:0}; fs.writeFileSync('evidence/REDACTION_CONTROL_RESULT.json',JSON.stringify(result,null,2)+'\n');console.log(JSON.stringify(result,null,2));
+          })().catch(e=>{console.error(e&&e.stack||e);process.exit(1)});
+          NODE
+          node redaction_gate.js | tee evidence/REDACTION_CONTROL_OUTPUT.txt
+          jq -e '.pass == true and .allVulnerableControlsLeak == true and .allPatchedControlsRedact == true' evidence/REDACTION_CONTROL_RESULT.json >/dev/null
+          sha256sum redaction_gate.js evidence/REDACTION_CONTROL_RESULT.json evidence/REDACTION_CONTROL_OUTPUT.txt > evidence/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-query-token-redaction-control
+          path: sh-query-redaction/evidence/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Commit compact result
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq '{pass,sdkVersion,isolatedVmVersion,nodeVersion,canonicalRuntime,allVulnerableControlsLeak,allPatchedControlsRedact,syntheticOnly,productionRequestCount}' sh-query-redaction/evidence/REDACTION_CONTROL_RESULT.json > public-intake-status/superhuman-query-token-redaction-control-result.json
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-query-token-redaction-control-result.json
+          git commit -m 'chore: record Superhuman query credential redaction control'
+          git push
