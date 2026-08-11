@@ -1,0 +1,202 @@
+name: Temporary Cap EVM Impact Gate V8
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-cap-evm-impact-gate-v8-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  impact-gate:
+    if: github.head_ref == 'cap-public-state-20260811'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Run isolated local-fork impact gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          RPC='https://ethereum-rpc.publicnode.com'
+          LOCAL='http://127.0.0.1:8546'
+          OUTDIR='cap-evm-impact-gate-v8'
+          OUT="$OUTDIR/result.txt"
+          mkdir -p "$OUTDIR"
+
+          EIGEN='0xE65c3eccd18879E103dBC96D854e376Ced4cC7dd'
+          DELEGATION='0xF3E3Eae671000612CE3Fd15e1019154C1a4d693F'
+          LENDER='0x15622c3dbbc5614E6DFa9446603c1779647f01FC'
+          USDC='0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'
+          STALE_AGENT='0x89Ffc736225bbfaA18aC20a846203CDbe7cC67D6'
+          CONTROL_AGENT='0x5f33ff3027c4763D36e6f4F7C20eE72F700A5D34'
+          CALLER='0x000000000000000000000000000000000000bEEF'
+          NS='0x9813e4033b5f31d05a061ad9d06fb8352756b0443d3cc09baeca467c0811ef00'
+
+          addhex() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+          print(hex(int(sys.argv[1], 16) + int(sys.argv[2], 0)))
+          PY
+          }
+          dec() { cast to-dec "$1" | awk '{print $1}'; }
+          word() {
+            python3 - "$1" <<'PY'
+          import sys
+          print('0x' + int(sys.argv[1], 0).to_bytes(32, 'big').hex())
+          PY
+          }
+          one_line() { tr '\n\t' '  ' | sed 's/[[:space:]]\+/ /g'; }
+          probe_call() {
+            local label="$1"; shift
+            set +e
+            local raw
+            raw=$("$@" 2>&1)
+            local rc=$?
+            set -e
+            printf '%s_result=%s\n' "$label" "$([ "$rc" -eq 0 ] && echo SUCCESS || echo REVERT)" >> "$OUT"
+            printf '%s_output=%s\n' "$label" "$(printf '%s' "$raw" | one_line)" >> "$OUT"
+            return 0
+          }
+
+          anvil --fork-url "$RPC" --port 8546 --silent > "$OUTDIR/anvil.log" 2>&1 &
+          ANVIL_PID=$!
+          trap 'kill "$ANVIL_PID" 2>/dev/null || true' EXIT
+          for i in $(seq 1 60); do
+            if cast block-number --rpc-url "$LOCAL" >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          cast block-number --rpc-url "$LOCAL" >/dev/null
+
+          BLOCK=$(cast block-number --rpc-url "$LOCAL" | awk '{print $1}')
+          TS_RAW=$(cast block latest --rpc-url "$LOCAL" --json | jq -r '.timestamp')
+          if [[ "$TS_RAW" == 0x* ]]; then TS=$(cast to-dec "$TS_RAW" | awk '{print $1}'); else TS="$TS_RAW"; fi
+          mapfile -t EA < <(cast call --rpc-url "$LOCAL" "$EIGEN" 'eigenAddresses()((address,address,address,address))' | grep -oE '0x[0-9a-fA-F]{40}')
+          RC=${EA[3]}
+          INTERVAL=$(cast call --rpc-url "$LOCAL" "$RC" 'CALCULATION_INTERVAL_SECONDS()(uint32)' | awk '{print $1}')
+          MAXRETRO=$(cast call --rpc-url "$LOCAL" "$RC" 'MAX_RETROACTIVE_LENGTH()(uint32)' | awk '{print $1}')
+          CURRENT_EPOCH=$((TS / INTERVAL))
+          MAX_RETRO_EPOCHS=$((MAXRETRO / INTERVAL))
+
+          PENDING_SLOT=$(addhex "$NS" 8)
+          OPERATORS_SLOT=$(addhex "$NS" 9)
+          GLOBAL_SLOT=$(cast index address "$USDC" "$PENDING_SLOT")
+          GLOBAL_PENDING=$(dec "$(cast storage --rpc-url "$LOCAL" "$EIGEN" "$GLOBAL_SLOT")")
+
+          # Detect FiatToken balance mapping index without relying on undocumented storage layout.
+          SENTINEL=987654321
+          SENTINEL_WORD=$(word "$SENTINEL")
+          BALANCE_INDEX=''
+          for i in $(seq 0 40); do
+            SNAP=$(cast rpc --rpc-url "$LOCAL" evm_snapshot | tr -d '"')
+            SLOT=$(cast index address "$EIGEN" "$i")
+            cast rpc --rpc-url "$LOCAL" anvil_setStorageAt "$USDC" "$SLOT" "$SENTINEL_WORD" >/dev/null
+            BAL=$(cast call --rpc-url "$LOCAL" "$USDC" 'balanceOf(address)(uint256)' "$EIGEN" | awk '{print $1}')
+            cast rpc --rpc-url "$LOCAL" evm_revert "$SNAP" >/dev/null
+            if [ "$BAL" = "$SENTINEL" ]; then BALANCE_INDEX="$i"; break; fi
+          done
+          test -n "$BALANCE_INDEX"
+
+          operator_slots() {
+            local agent="$1"
+            local base pending_map last_map
+            base=$(cast index address "$agent" "$OPERATORS_SLOT")
+            # Solidity packs createdAtEpoch/operatorSetId behind strategy in slot 1;
+            # the two mappings therefore occupy value slots 2 and 3.
+            pending_map=$(addhex "$base" 2)
+            last_map=$(addhex "$base" 3)
+            echo "$(cast index address "$USDC" "$pending_map") $(cast index address "$USDC" "$last_map")"
+          }
+
+          read -r STALE_PENDING_SLOT STALE_LAST_SLOT < <(operator_slots "$STALE_AGENT")
+          read -r CONTROL_PENDING_SLOT CONTROL_LAST_SLOT < <(operator_slots "$CONTROL_AGENT")
+          STALE_CREATED=$(cast call --rpc-url "$LOCAL" "$EIGEN" 'createdAtEpoch(address)(uint32)' "$STALE_AGENT" | awk '{print $1}')
+          STALE_PENDING=$(dec "$(cast storage --rpc-url "$LOCAL" "$EIGEN" "$STALE_PENDING_SLOT")")
+          STALE_LAST=$(dec "$(cast storage --rpc-url "$LOCAL" "$EIGEN" "$STALE_LAST_SLOT")")
+          CONTROL_CREATED=$(cast call --rpc-url "$LOCAL" "$EIGEN" 'createdAtEpoch(address)(uint32)' "$CONTROL_AGENT" | awk '{print $1}')
+          CONTROL_PENDING=$(dec "$(cast storage --rpc-url "$LOCAL" "$EIGEN" "$CONTROL_PENDING_SLOT")")
+          CONTROL_LAST=$(dec "$(cast storage --rpc-url "$LOCAL" "$EIGEN" "$CONTROL_LAST_SLOT")")
+          STALE_EFFECTIVE=$STALE_LAST; if [ "$STALE_EFFECTIVE" -eq 0 ]; then STALE_EFFECTIVE=$STALE_CREATED; fi
+          STALE_START=$((STALE_EFFECTIVE + 1))
+          STALE_AGE=$((CURRENT_EPOCH - STALE_START))
+          DEBT=$(cast call --rpc-url "$LOCAL" "$LENDER" 'debt(address,address)(uint256)' "$STALE_AGENT" "$USDC" | awk '{print $1}')
+          ACCRUED=$(cast call --rpc-url "$LOCAL" "$LENDER" 'accruedRestakerInterest(address,address)(uint256)' "$STALE_AGENT" "$USDC" | awk '{print $1}')
+
+          {
+            echo "captured_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "fork_block=$BLOCK"
+            echo "fork_timestamp=$TS"
+            echo "current_epoch=$CURRENT_EPOCH"
+            echo "max_retro_epochs=$MAX_RETRO_EPOCHS"
+            echo "global_pending_usdc=$GLOBAL_PENDING"
+            echo "usdc_balance_mapping_index=$BALANCE_INDEX"
+            echo "stale_agent=$STALE_AGENT"
+            echo "stale_created_epoch=$STALE_CREATED"
+            echo "stale_pending_usdc=$STALE_PENDING"
+            echo "stale_last_distribution_epoch=$STALE_LAST"
+            echo "stale_reward_start_age_epochs=$STALE_AGE"
+            echo "stale_live_debt_usdc=$DEBT"
+            echo "stale_accrued_restaker_interest_usdc=$ACCRUED"
+            echo "control_agent=$CONTROL_AGENT"
+            echo "control_created_epoch=$CONTROL_CREATED"
+            echo "control_pending_usdc=$CONTROL_PENDING"
+            echo "control_last_distribution_epoch=$CONTROL_LAST"
+          } > "$OUT"
+
+          # 1. Exact direct distribution: stale agent must revert, recent control must succeed.
+          TARGET_WORD=$(word $((GLOBAL_PENDING + 1)))
+          for pair in "stale:$STALE_AGENT" "control:$CONTROL_AGENT"; do
+            label=${pair%%:*}; agent=${pair##*:}
+            SNAP=$(cast rpc --rpc-url "$LOCAL" evm_snapshot | tr -d '"')
+            EIGEN_BAL_SLOT=$(cast index address "$EIGEN" "$BALANCE_INDEX")
+            cast rpc --rpc-url "$LOCAL" anvil_setStorageAt "$USDC" "$EIGEN_BAL_SLOT" "$TARGET_WORD" >/dev/null
+            probe_call "direct_distribution_${label}" cast call --rpc-url "$LOCAL" --from "$DELEGATION" "$EIGEN" 'distributeRewards(address,address)' "$agent" "$USDC"
+            cast rpc --rpc-url "$LOCAL" evm_revert "$SNAP" >/dev/null
+          done
+
+          # 2. Exact current protocol paths on the live stale position.
+          probe_call 'realize_live' cast call --rpc-url "$LOCAL" --from "$CALLER" "$LENDER" 'realizeRestakerInterest(address,address)(uint256)' "$STALE_AGENT" "$USDC"
+          probe_call 'borrow_live' cast call --rpc-url "$LOCAL" --from "$STALE_AGENT" "$LENDER" 'borrow(address,uint256,address)(uint256)' "$USDC" 1 "$STALE_AGENT"
+
+          # Fund and approve a local-only repayer, then simulate full repayment.
+          ROOT_SNAP=$(cast rpc --rpc-url "$LOCAL" evm_snapshot | tr -d '"')
+          cast rpc --rpc-url "$LOCAL" anvil_setBalance "$CALLER" 0x56BC75E2D63100000 >/dev/null
+          CALLER_BAL_SLOT=$(cast index address "$CALLER" "$BALANCE_INDEX")
+          CALLER_BAL_WORD=$(word $((DEBT + ACCRUED + 1000000000)))
+          cast rpc --rpc-url "$LOCAL" anvil_setStorageAt "$USDC" "$CALLER_BAL_SLOT" "$CALLER_BAL_WORD" >/dev/null
+          cast rpc --rpc-url "$LOCAL" anvil_impersonateAccount "$CALLER" >/dev/null
+          cast send --rpc-url "$LOCAL" --unlocked --from "$CALLER" --gas-limit 200000 "$USDC" 'approve(address,uint256)(bool)' "$LENDER" 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff >/dev/null
+          probe_call 'repay_live' cast call --rpc-url "$LOCAL" --from "$CALLER" "$LENDER" 'repay(address,uint256,address)(uint256)' "$USDC" "$DEBT" "$STALE_AGENT"
+          cast rpc --rpc-url "$LOCAL" evm_revert "$ROOT_SNAP" >/dev/null
+
+          # 3. Patched negative control: set only lastDistributionEpoch to current-7.
+          # This preserves the external path while moving the start inside the retroactive window.
+          FIXED_LAST=$((CURRENT_EPOCH - 7))
+          FIXED_WORD=$(word "$FIXED_LAST")
+          FIX_SNAP=$(cast rpc --rpc-url "$LOCAL" evm_snapshot | tr -d '"')
+          cast rpc --rpc-url "$LOCAL" anvil_setStorageAt "$EIGEN" "$STALE_LAST_SLOT" "$FIXED_WORD" >/dev/null
+          EIGEN_BAL_SLOT=$(cast index address "$EIGEN" "$BALANCE_INDEX")
+          cast rpc --rpc-url "$LOCAL" anvil_setStorageAt "$USDC" "$EIGEN_BAL_SLOT" "$TARGET_WORD" >/dev/null
+          probe_call 'direct_distribution_fixed' cast call --rpc-url "$LOCAL" --from "$DELEGATION" "$EIGEN" 'distributeRewards(address,address)' "$STALE_AGENT" "$USDC"
+          probe_call 'realize_fixed' cast call --rpc-url "$LOCAL" --from "$CALLER" "$LENDER" 'realizeRestakerInterest(address,address)(uint256)' "$STALE_AGENT" "$USDC"
+          cast rpc --rpc-url "$LOCAL" evm_revert "$FIX_SNAP" >/dev/null
+
+          sha256sum "$OUT" "$OUTDIR/anvil.log" > "$OUTDIR/SHA256SUMS"
+          cat "$OUT"
+
+      - name: Upload impact gate
+        uses: actions/upload-artifact@v4
+        with:
+          name: cap-evm-impact-gate-v8-20260811
+          path: cap-evm-impact-gate-v8
+          if-no-files-found: error
+          retention-days: 1
