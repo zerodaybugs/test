@@ -1,0 +1,163 @@
+name: build-patched-aspnetcore-components-server-v10-0-10
+
+on:
+  push:
+    branches:
+      - tooling/dotnet-sdk-10.0.302-cache-20260811
+    paths:
+      - .github/workflows/build-patched-aspnetcore-components-server-v10-0-10.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test-patched-product:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out exact official ASP.NET Core tag with submodules
+        uses: actions/checkout@v4
+        with:
+          repository: dotnet/aspnetcore
+          ref: v10.0.10
+          path: source
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Verify source provenance and apply minimal security patch
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          actual="$(git -C source rev-parse HEAD)"
+          test "$actual" = "2adedfc51f57ce4f0e98616fa0eb1e65283dd6af"
+          printf '%s\n' "$actual" > source-commit.txt
+          python3 - <<'PY'
+          from pathlib import Path
+
+          provider = Path('source/src/Components/Server/src/Circuits/RevalidatingServerAuthenticationStateProvider.cs')
+          text = provider.read_text(encoding='utf-8')
+          old = 'if (authenticationState.User.Identity?.IsAuthenticated == true)'
+          new = 'if (authenticationState.User.Identities.Any(static identity => identity.IsAuthenticated))'
+          if text.count(old) != 1:
+              raise SystemExit(f'expected exactly one vulnerable gate, got {text.count(old)}')
+          provider.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+
+          tests = Path('source/src/Components/Server/test/Circuits/RevalidatingServerAuthenticationStateProviderTest.cs')
+          test_text = tests.read_text(encoding='utf-8')
+          marker = '    static Task<AuthenticationState> CreateAuthenticationStateTask(string username)\n'
+          regression = r'''    [Fact]
+    public async Task RevalidatesWhenSecondaryIdentityIsAuthenticated()
+    {
+        // The first identity is a legitimate unauthenticated metadata identity.
+        // Built-in authorization still treats the principal as authenticated because
+        // a later identity is authenticated, so revalidation must use the same semantic.
+        using var provider = new TestRevalidatingServerAuthenticationStateProvider(
+            TimeSpan.FromMilliseconds(50));
+        provider.NextValidationResult = Task.FromResult(true);
+
+        var metadataIdentity = new ClaimsIdentity(new[] { new Claim("tenant", "tenant-a") });
+        var authenticatedIdentity = new ClaimsIdentity(
+            new[] { new Claim(ClaimTypes.Name, "test user") }, "testauth");
+        var principal = new ClaimsPrincipal(new[] { metadataIdentity, authenticatedIdentity });
+
+        Assert.False(principal.Identity.IsAuthenticated);
+        Assert.True(principal.Identities.Any(identity => identity.IsAuthenticated));
+
+        provider.SetAuthenticationState(Task.FromResult(new AuthenticationState(principal)));
+        await provider.NextValidateAuthenticationStateAsyncCall.TimeoutAfter(TimeSpan.FromSeconds(5));
+
+        var call = Assert.Single(provider.RevalidationCallLog);
+        Assert.Same(principal, call.AuthenticationState.User);
+    }
+
+'''
+          if marker not in test_text:
+              raise SystemExit('test insertion marker not found')
+          if 'RevalidatesWhenSecondaryIdentityIsAuthenticated' in test_text:
+              raise SystemExit('regression test already exists')
+          tests.write_text(test_text.replace(marker, regression + marker), encoding='utf-8', newline='\n')
+          PY
+          git -C source diff --check
+          git -C source diff -- \
+            src/Components/Server/src/Circuits/RevalidatingServerAuthenticationStateProvider.cs \
+            src/Components/Server/test/Circuits/RevalidatingServerAuthenticationStateProviderTest.cs \
+            > security-fix.patch
+
+      - name: Build actual patched Microsoft.AspNetCore.Components.Server product assembly
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd source
+          ./eng/build.sh \
+            --configuration Release \
+            --projects "$PWD/src/Components/Server/src/Microsoft.AspNetCore.Components.Server.csproj" \
+            --no-build-native \
+            --no-build-nodejs \
+            --no-build-java \
+            --no-build-installers \
+            --verbosity minimal \
+            2>&1 | tee ../product-build.log
+
+      - name: Run complete Components.Server test project with new regression test
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd source
+          ./eng/build.sh \
+            --configuration Release \
+            --projects "$PWD/src/Components/Server/test/Microsoft.AspNetCore.Components.Server.Tests.csproj" \
+            --test \
+            --no-build-native \
+            --no-build-nodejs \
+            --no-build-java \
+            --no-build-installers \
+            --verbosity minimal \
+            2>&1 | tee ../components-server-tests.log
+
+      - name: Collect patched assemblies, test results and provenance
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifact/assemblies artifact/source artifact/test-results artifact/environment
+          mapfile -d '' assemblies < <(find source/artifacts -type f -name 'Microsoft.AspNetCore.Components.Server.dll' -print0 | sort -z)
+          if [[ ${#assemblies[@]} -eq 0 ]]; then
+            echo 'No patched product assembly was produced.' >&2
+            exit 1
+          fi
+          for file in "${assemblies[@]}"; do
+            rel="${file#source/}"
+            safe="${rel//\//__}"
+            cp "$file" "artifact/assemblies/$safe"
+            for ext in pdb xml deps.json; do
+              sibling="${file%.dll}.$ext"
+              if [[ -f "$sibling" ]]; then
+                cp "$sibling" "artifact/assemblies/${safe%.dll}.$ext"
+              fi
+            done
+          done
+          find source/artifacts/TestResults -type f -print0 2>/dev/null \
+            | while IFS= read -r -d '' file; do
+                rel="${file#source/artifacts/TestResults/}"
+                mkdir -p "artifact/test-results/$(dirname "$rel")"
+                cp "$file" "artifact/test-results/$rel"
+              done
+          cp source/src/Components/Server/src/Circuits/RevalidatingServerAuthenticationStateProvider.cs artifact/source/
+          cp source/src/Components/Server/test/Circuits/RevalidatingServerAuthenticationStateProviderTest.cs artifact/source/
+          cp source-commit.txt security-fix.patch product-build.log components-server-tests.log artifact/
+          source/.dotnet/dotnet --info > artifact/environment/dotnet-info.txt
+          source/.dotnet/dotnet --list-sdks > artifact/environment/dotnet-sdks.txt
+          source/.dotnet/dotnet --list-runtimes > artifact/environment/dotnet-runtimes.txt
+          git -C source status --porcelain=v1 > artifact/source-status-after.txt
+          find artifact -type f ! -name SHA256SUMS.txt -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > artifact/SHA256SUMS.txt
+
+      - name: Upload patched product build and complete test evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: aspnetcore-components-server-v10.0.10-patched-build-and-tests
+          path: artifact
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
