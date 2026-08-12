@@ -1,0 +1,190 @@
+name: Monad public cross-network validator key overlap
+
+on:
+  push:
+    branches:
+      - agent/monad-crossnet-key-overlap-20260812
+    paths:
+      - .github/workflows/monad-crossnet-validator-key-overlap-20260812.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monad-crossnet-validator-key-overlap-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze-public-metadata:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone pinned public validator metadata
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          repo_commit='b2de869b7b50cb72903b46f6aa8dd072623e6991'
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/monad-developers/validator-info.git validator-info
+          git -C validator-info checkout --detach "$repo_commit"
+          test "$(git -C validator-info rev-parse HEAD)" = "$repo_commit"
+          printf 'validator_info_commit=%s\n' "$repo_commit" > SOURCE_PROVENANCE.txt
+
+      - name: Compare SECP and BLS identities
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          import collections
+          import hashlib
+          import json
+          import pathlib
+          from datetime import datetime, timezone
+
+          root = pathlib.Path('validator-info')
+
+          def load_network(name):
+              rows = []
+              errors = []
+              for path in sorted((root / name).glob('*.json')):
+                  try:
+                      obj = json.loads(path.read_text())
+                  except Exception as exc:
+                      errors.append({'path': str(path), 'error': repr(exc)})
+                      continue
+                  secp = str(obj.get('secp', '')).lower().removeprefix('0x')
+                  bls = str(obj.get('bls', '')).lower().removeprefix('0x')
+                  filename_secp = path.stem.lower()
+                  rows.append({
+                      'network': name,
+                      'path': str(path.relative_to(root)),
+                      'id': obj.get('id'),
+                      'name': obj.get('name'),
+                      'secp': secp,
+                      'bls': bls,
+                      'decommissioned': bool(obj.get('decommissioned', False)),
+                      'filename_matches_secp': filename_secp == secp,
+                      'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                  })
+              return rows, errors
+
+          mainnet, main_errors = load_network('mainnet')
+          testnet, test_errors = load_network('testnet')
+
+          def group(rows, key, active_only=False):
+              out = collections.defaultdict(list)
+              for row in rows:
+                  if active_only and row['decommissioned']:
+                      continue
+                  value = row[key]
+                  if value:
+                      out[value].append(row)
+              return out
+
+          def overlap(key, active_only=False):
+              ma = group(mainnet, key, active_only)
+              te = group(testnet, key, active_only)
+              values = sorted(set(ma) & set(te))
+              return [
+                  {
+                      key: value,
+                      'mainnet': ma[value],
+                      'testnet': te[value],
+                  }
+                  for value in values
+              ]
+
+          def internal_duplicates(rows, key, active_only=False):
+              groups = group(rows, key, active_only)
+              return [
+                  {key: value, 'entries': entries}
+                  for value, entries in sorted(groups.items())
+                  if len(entries) > 1
+              ]
+
+          report = {
+              'generated_utc': datetime.now(timezone.utc).isoformat(),
+              'source_commit': 'b2de869b7b50cb72903b46f6aa8dd072623e6991',
+              'scope': 'public validator-info repository metadata only; not authoritative stake snapshots',
+              'counts': {
+                  'mainnet_total': len(mainnet),
+                  'testnet_total': len(testnet),
+                  'mainnet_active_metadata': sum(not x['decommissioned'] for x in mainnet),
+                  'testnet_active_metadata': sum(not x['decommissioned'] for x in testnet),
+                  'mainnet_parse_errors': len(main_errors),
+                  'testnet_parse_errors': len(test_errors),
+                  'mainnet_filename_mismatches': sum(not x['filename_matches_secp'] for x in mainnet),
+                  'testnet_filename_mismatches': sum(not x['filename_matches_secp'] for x in testnet),
+              },
+              'cross_network': {
+                  'secp_all': overlap('secp', False),
+                  'secp_active_metadata_only': overlap('secp', True),
+                  'bls_all': overlap('bls', False),
+                  'bls_active_metadata_only': overlap('bls', True),
+              },
+              'within_network_duplicates': {
+                  'mainnet_secp_all': internal_duplicates(mainnet, 'secp', False),
+                  'testnet_secp_all': internal_duplicates(testnet, 'secp', False),
+                  'mainnet_bls_all': internal_duplicates(mainnet, 'bls', False),
+                  'testnet_bls_all': internal_duplicates(testnet, 'bls', False),
+                  'mainnet_bls_active_metadata_only': internal_duplicates(mainnet, 'bls', True),
+                  'testnet_bls_active_metadata_only': internal_duplicates(testnet, 'bls', True),
+              },
+              'parse_errors': main_errors + test_errors,
+          }
+
+          pathlib.Path('evidence/OVERLAP.json').write_text(
+              json.dumps(report, indent=2, sort_keys=True) + '\n'
+          )
+
+          summary = [
+              '# Monad public validator metadata cross-network overlap',
+              '',
+              f"Pinned source commit: `{report['source_commit']}`",
+              '',
+              'This is a metadata-screening result, not an authoritative current stake snapshot.',
+              '',
+              '## Counts',
+              '',
+              f"- Mainnet entries: {len(mainnet)}",
+              f"- Testnet entries: {len(testnet)}",
+              f"- Active-metadata mainnet entries: {report['counts']['mainnet_active_metadata']}",
+              f"- Active-metadata testnet entries: {report['counts']['testnet_active_metadata']}",
+              '',
+              '## Cross-network exact key overlap',
+              '',
+              f"- SECP, all metadata: {len(report['cross_network']['secp_all'])}",
+              f"- SECP, active metadata only: {len(report['cross_network']['secp_active_metadata_only'])}",
+              f"- BLS, all metadata: {len(report['cross_network']['bls_all'])}",
+              f"- BLS, active metadata only: {len(report['cross_network']['bls_active_metadata_only'])}",
+              '',
+              '## Interpretation gate',
+              '',
+              '- A nonzero overlap is only a candidate signal; exploitability requires current on-chain membership, stake weight, aligned epoch/round metadata, and a verified replay path.',
+              '- A zero overlap in this repository does not prove absence of private/on-chain key reuse.',
+          ]
+          pathlib.Path('evidence/SUMMARY.md').write_text('\n'.join(summary) + '\n')
+
+          # Fail closed on malformed metadata, but not on a security-result outcome.
+          if main_errors or test_errors:
+              raise SystemExit('metadata parse errors present')
+          if any(not x['filename_matches_secp'] for x in mainnet + testnet):
+              raise SystemExit('filename/SECP mismatch present')
+          PY
+
+          cp SOURCE_PROVENANCE.txt evidence/
+          sha256sum evidence/* | sort > evidence/SHA256SUMS
+          cat evidence/SUMMARY.md
+
+      - name: Upload analysis evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-crossnet-validator-key-overlap-${{ github.run_id }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
