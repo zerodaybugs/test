@@ -1,4 +1,4 @@
-name: Temporary public Windows runner probe
+name: Temporary encrypted Windows validation relay
 
 on:
   push:
@@ -8,15 +8,193 @@ on:
       - '.github/workflows/_temporary-windows-runner-probe-20260812.yml'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  probe:
+  validate:
     runs-on: windows-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+
     steps:
-      - name: Report runner
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Install supported SDK lines
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.400
+
+      - name: Publish ephemeral exchange key
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          Write-Output "WINDOWS_RUNNER_OK"
-          Get-ComputerInfo -Property WindowsProductName,WindowsVersion,OsBuildNumber,OsArchitecture | Format-List
+          $ErrorActionPreference = 'Stop'
+          $exchange = Join-Path $env:GITHUB_WORKSPACE 'exchange'
+          New-Item -ItemType Directory -Force -Path $exchange | Out-Null
+
+          $rsa = [System.Security.Cryptography.RSA]::Create(3072)
+          [IO.File]::WriteAllBytes(
+            (Join-Path $env:RUNNER_TEMP 'runner-private.der'),
+            $rsa.ExportPkcs8PrivateKey())
+          [IO.File]::WriteAllText(
+            (Join-Path $exchange 'runner-public.pem'),
+            $rsa.ExportSubjectPublicKeyInfoPem(),
+            [Text.Encoding]::ASCII)
+          [IO.File]::WriteAllText(
+            (Join-Path $exchange 'session.txt'),
+            $env:GITHUB_RUN_ID,
+            [Text.Encoding]::ASCII)
+          $rsa.Dispose()
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add exchange/runner-public.pem exchange/session.txt
+          git commit -m 'publish ephemeral validation exchange key [skip ci]'
+          git push origin "HEAD:refs/heads/$env:GITHUB_REF_NAME"
+          Write-Output 'EXCHANGE_KEY_PUBLISHED'
+
+      - name: Receive, decrypt, and execute payload
+        id: execute
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $encodedRef = [Uri]::EscapeDataString($env:GITHUB_REF_NAME)
+          $payloadUrl = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/contents/exchange/payload-envelope.json?ref=$encodedRef"
+          $payloadPath = Join-Path $env:RUNNER_TEMP 'payload-envelope.json'
+          $received = $false
+
+          for ($attempt = 0; $attempt -lt 120; $attempt++) {
+            try {
+              $response = Invoke-RestMethod -Uri $payloadUrl -Headers $headers -Method Get
+              $bytes = [Convert]::FromBase64String(($response.content -replace '\s', ''))
+              [IO.File]::WriteAllBytes($payloadPath, $bytes)
+              $candidate = Get-Content -Raw $payloadPath | ConvertFrom-Json
+              if ([string]$candidate.session -eq [string]$env:GITHUB_RUN_ID) {
+                $received = $true
+                break
+              }
+            }
+            catch {
+              if ($_.Exception.Response.StatusCode.value__ -ne 404) {
+                throw
+              }
+            }
+            Start-Sleep -Seconds 3
+          }
+
+          if (-not $received) {
+            throw 'No matching encrypted validation payload was received.'
+          }
+
+          $envelope = Get-Content -Raw $payloadPath | ConvertFrom-Json
+          $privateBytes = [IO.File]::ReadAllBytes((Join-Path $env:RUNNER_TEMP 'runner-private.der'))
+          $rsa = [System.Security.Cryptography.RSA]::Create()
+          $bytesRead = 0
+          $rsa.ImportPkcs8PrivateKey($privateBytes, [ref]$bytesRead)
+          $key = $rsa.Decrypt(
+            [Convert]::FromBase64String([string]$envelope.encryptedKey),
+            [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          $rsa.Dispose()
+
+          $ciphertext = [Convert]::FromBase64String([string]$envelope.ciphertext)
+          $nonce = [Convert]::FromBase64String([string]$envelope.nonce)
+          $tag = [Convert]::FromBase64String([string]$envelope.tag)
+          $plaintext = [byte[]]::new($ciphertext.Length)
+          $aad = [Text.Encoding]::UTF8.GetBytes([string]$env:GITHUB_RUN_ID)
+          $aes = [System.Security.Cryptography.AesGcm]::new($key, 16)
+          $aes.Decrypt($nonce, $ciphertext, $tag, $plaintext, $aad)
+          $aes.Dispose()
+          [System.Security.Cryptography.CryptographicOperations]::ZeroMemory($key)
+
+          $payloadZip = Join-Path $env:RUNNER_TEMP 'payload.zip'
+          [IO.File]::WriteAllBytes($payloadZip, $plaintext)
+          [System.Security.Cryptography.CryptographicOperations]::ZeroMemory($plaintext)
+          $work = Join-Path $env:RUNNER_TEMP 'validation-work'
+          Expand-Archive -Path $payloadZip -DestinationPath $work -Force
+
+          $evidenceRoot = Join-Path $env:RUNNER_TEMP 'private-evidence'
+          New-Item -ItemType Directory -Force -Path $evidenceRoot | Out-Null
+          $results = @()
+          foreach ($tfm in @('net8.0', 'net9.0', 'net10.0')) {
+            $evidence = Join-Path $evidenceRoot $tfm
+            New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+            $privateRunLog = Join-Path $evidence 'dotnet-run-private.log'
+            & dotnet run `
+              --project (Join-Path $work 'ValidationHarness.csproj') `
+              --configuration Release `
+              --framework $tfm `
+              -- `
+              --evidence-dir $evidence *> $privateRunLog
+            $code = $LASTEXITCODE
+            $results += [PSCustomObject]@{ framework = $tfm; exitCode = $code }
+          }
+
+          $relaySummary = [PSCustomObject]@{
+            session = [string]$env:GITHUB_RUN_ID
+            generatedUtc = [DateTimeOffset]::UtcNow.ToString('O')
+            results = $results
+          }
+          $relaySummary | ConvertTo-Json -Depth 5 |
+            Set-Content -Encoding utf8 (Join-Path $evidenceRoot 'relay-summary.json')
+
+          $resultZip = Join-Path $env:RUNNER_TEMP 'private-evidence.zip'
+          Compress-Archive -Path (Join-Path $evidenceRoot '*') -DestinationPath $resultZip -CompressionLevel Optimal
+          $resultPlaintext = [IO.File]::ReadAllBytes($resultZip)
+          $resultKey = [byte[]]::new(32)
+          $resultNonce = [byte[]]::new(12)
+          [System.Security.Cryptography.RandomNumberGenerator]::Fill($resultKey)
+          [System.Security.Cryptography.RandomNumberGenerator]::Fill($resultNonce)
+          $resultCiphertext = [byte[]]::new($resultPlaintext.Length)
+          $resultTag = [byte[]]::new(16)
+          $resultAes = [System.Security.Cryptography.AesGcm]::new($resultKey, 16)
+          $resultAes.Encrypt($resultNonce, $resultPlaintext, $resultCiphertext, $resultTag, $aad)
+          $resultAes.Dispose()
+
+          $reportPem = [IO.File]::ReadAllText((Join-Path $work 'report-public.pem'))
+          $reportRsa = [System.Security.Cryptography.RSA]::Create()
+          $reportRsa.ImportFromPem($reportPem)
+          $wrappedResultKey = $reportRsa.Encrypt(
+            $resultKey,
+            [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          $reportRsa.Dispose()
+          [System.Security.Cryptography.CryptographicOperations]::ZeroMemory($resultKey)
+          [System.Security.Cryptography.CryptographicOperations]::ZeroMemory($resultPlaintext)
+
+          $resultEnvelope = [ordered]@{
+            session = [string]$env:GITHUB_RUN_ID
+            encryptedKey = [Convert]::ToBase64String($wrappedResultKey)
+            nonce = [Convert]::ToBase64String($resultNonce)
+            tag = [Convert]::ToBase64String($resultTag)
+            ciphertext = [Convert]::ToBase64String($resultCiphertext)
+          } | ConvertTo-Json -Compress
+
+          git pull --rebase origin $env:GITHUB_REF_NAME
+          $exchange = Join-Path $env:GITHUB_WORKSPACE 'exchange'
+          [IO.File]::WriteAllText(
+            (Join-Path $exchange 'result-envelope.json'),
+            $resultEnvelope,
+            [Text.Encoding]::UTF8)
+          git add exchange/result-envelope.json
+          git commit -m 'publish encrypted validation result [skip ci]'
+          git push origin "HEAD:refs/heads/$env:GITHUB_REF_NAME"
+          Write-Output 'ENCRYPTED_RESULT_PUBLISHED'
+
+          if (($results | Where-Object { $_.exitCode -ne 0 }).Count -ne 0) {
+            throw 'One or more private validation targets returned a non-zero status.'
+          }
