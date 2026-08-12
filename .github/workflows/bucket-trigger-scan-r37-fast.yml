@@ -1,0 +1,152 @@
+name: Bucket Fast Config and Package Delta Gate R37
+
+on:
+  push:
+    branches: [agent/bucket-trigger-scan-r37-20260812]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan-fast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare current core objects with August 9 baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-trigger-fast-r37
+          mkdir -p bucket-trigger-fast-r37/raw
+          cat > bucket-trigger-fast-r37/scan.py <<'PY'
+          import json, pathlib, time, urllib.request
+
+          OUT=pathlib.Path('bucket-trigger-fast-r37'); RAW=OUT/'raw'
+          RPCS=['https://sui-mainnet-endpoint.blockvision.org','https://fullnode.mainnet.sui.io:443']
+          BASELINE_MS=1786270404000
+          ENTRY='0x03e79aa64ac007d200aefdcb445e31e24f460279bab6c73babfb031b7464072e'
+          BASELINE_VERSION='869774190'
+          BASELINE_DIGEST='29vJxmUhv4yoMSUcRrkBQ5JaZqEL33e7C47BH2oRYkyz'
+          BASELINE_VECTOR=[
+            '0x929c394fd2e140e157d7d618a4f7ecdbaab0928ac454ec57654ef6cb62c78338',
+            '0xcb6a035cb6621626eab35d60b10f6c49a2638ab6ac13fc9836d79c6c58cdbd51',
+            '0xdcf2054cdce3258e0f808ed2456b84cda0a57ac77b16c7e97fbf218d1adb4a6f',
+            '0x654251ce3f37a0ec1895b8052cef32dfbf88a5f592c6be7891726a6b0f82f0c8',
+            '0x7db45f918fe2bc8efbb5b544b955aec93df4cc4432b7fc21232e4d563fb4d916',
+            '0x5a73da42eb064695ba15854aa62b4a0368430eab83995ac3ca238ca713402ff9',
+            '0x152805bfb0b6d9b1cefd4a51e42c6c8220c3cc7a4f2659c0a19ae39421cde50b',
+            '0x7f8ec209420823c1eab1a47e18e5fb425d19203185956d10ed8c78af97111236',
+          ]
+          PACKAGES={
+            'onchain_config':'0x1906a868f05cec861532d92aa49059580caf72d900ba2c387d5135b6a9727f52',
+            'cdp_origin':'0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e',
+            'cdp_current':'0xc1dd29778f3fccd19a4ac79d1c35a14bf9d65a0b48f1c5bba98a949cacc53e26',
+            'oracle_core':'0xf2ab9aa60c5e879675351a1a89f47131de9dea7cc927327dd0e7282e295c7f5e',
+            'pyth_rule_current':'0x5bc4f912b59c5cfcc86dfc90419837b9c3f9d3a3a94cef7a198838fa196bac4a',
+          }
+
+          def post(url,payload,retries=4):
+            data=json.dumps(payload).encode(); last=None
+            for n in range(retries):
+              try:
+                req=urllib.request.Request(url,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-trigger-fast-r37/1'})
+                with urllib.request.urlopen(req,timeout=60) as r: return json.loads(r.read().decode())
+              except Exception as e:
+                last=e; time.sleep(2**n)
+            raise RuntimeError(f'{url}: {last}')
+
+          def rpc(method,params):
+            errors=[]
+            for ep in RPCS:
+              try:
+                body=post(ep,{'jsonrpc':'2.0','id':1,'method':method,'params':params})
+                if body.get('error'): raise RuntimeError(json.dumps(body['error']))
+                return {'endpoint':ep,'result':body.get('result')}
+              except Exception as e: errors.append({'endpoint':ep,'error':str(e)})
+            return {'failures':errors}
+
+          ids=[ENTRY,*BASELINE_VECTOR,*PACKAGES.values()]
+          objects=rpc('sui_multiGetObjects',[ids,{
+            'showType':True,'showOwner':True,'showPreviousTransaction':True,
+            'showDisplay':False,'showContent':True,'showBcs':True,
+          }])
+          rows=objects.get('result') if isinstance(objects,dict) else None
+          if not isinstance(rows,list): raise RuntimeError(json.dumps(objects))
+          txs={}; records=[]
+          for oid,obj in zip(ids,rows):
+            data=(obj or {}).get('data') or {}
+            digest=data.get('previousTransaction'); ts=None
+            if digest:
+              if digest not in txs:
+                txs[digest]=rpc('sui_getTransactionBlock',[digest,{
+                  'showInput':False,'showRawInput':False,'showEffects':True,
+                  'showEvents':False,'showObjectChanges':True,'showBalanceChanges':False,
+                }])
+              txr=(txs[digest].get('result') or {}) if isinstance(txs[digest],dict) else {}
+              try: ts=int(txr.get('timestampMs')) if txr.get('timestampMs') is not None else None
+              except Exception: ts=None
+            records.append({
+              'objectId':oid,'version':str(data.get('version')) if data.get('version') is not None else None,
+              'digest':data.get('digest'),'dataType':data.get('dataType'),'type':data.get('type'),
+              'previousTransaction':digest,'timestampMs':ts,
+              'changedAfterBaseline':bool(ts and ts>BASELINE_MS),
+            })
+
+          entry=rows[0].get('data') or {}
+          fields=((entry.get('content') or {}).get('fields') or {})
+          vector=fields.get('id_vector') or []
+          if isinstance(vector,dict): vector=vector.get('contents') or []
+          vector=[str(x) for x in vector]
+          entry_changed=(str(entry.get('version'))!=BASELINE_VERSION or entry.get('digest')!=BASELINE_DIGEST or vector!=BASELINE_VECTOR)
+          changed=[r for r in records if r['changedAfterBaseline']]
+          summary={
+            'schema':'bucket-trigger-fast-r37/v1','network':'sui-mainnet','baselineUnixMs':BASELINE_MS,
+            'entry':{
+              'baselineVersion':BASELINE_VERSION,'currentVersion':str(entry.get('version')),
+              'baselineDigest':BASELINE_DIGEST,'currentDigest':entry.get('digest'),
+              'baselineVector':BASELINE_VECTOR,'currentVector':vector,'changed':entry_changed,
+              'newIds':sorted(set(vector)-set(BASELINE_VECTOR)),
+              'removedIds':sorted(set(BASELINE_VECTOR)-set(vector)),
+            },
+            'records':records,'changedAfterBaseline':changed,
+            'trigger':bool(entry_changed or changed),
+            'writes':0,'transactionsConstructed':0,'generatedUnix':int(time.time()),
+          }
+          (RAW/'objects.json').write_text(json.dumps(objects,indent=2,sort_keys=True)+'\n')
+          (RAW/'transactions.json').write_text(json.dumps(txs,indent=2,sort_keys=True)+'\n')
+          (OUT/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({
+            'entryChanged':entry_changed,'currentVersion':summary['entry']['currentVersion'],
+            'currentDigest':summary['entry']['currentDigest'],'newIds':summary['entry']['newIds'],
+            'removedIds':summary['entry']['removedIds'],'changedAfterBaseline':changed,
+            'trigger':summary['trigger'],
+          },indent=2))
+          PY
+          python3 bucket-trigger-fast-r37/scan.py | tee bucket-trigger-fast-r37/run.log
+          find bucket-trigger-fast-r37 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-trigger-fast-r37/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-trigger-fast-r37 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          s=json.load(open('bucket-trigger-fast-r37/SUMMARY.json'))
+          assert s['writes']==0 and s['transactionsConstructed']==0
+          assert len(s['records'])==14
+          print('BUCKET_TRIGGER_FAST_R37_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-trigger-fast-r37
+          path: bucket-trigger-fast-r37
+          if-no-files-found: error
+          retention-days: 3
