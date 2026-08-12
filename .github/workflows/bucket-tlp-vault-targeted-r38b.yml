@@ -1,0 +1,385 @@
+name: Bucket TLP Vault Targeted Audit R38B
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-deployment-trigger-r37-20260812]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect live TLP Vault and rule evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-tlp-vault-r38b
+          mkdir -p bucket-tlp-vault-r38b/{raw,asm,analysis}
+          cat > bucket-tlp-vault-r38b/audit.py <<'PY'
+          import json
+          import pathlib
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-tlp-vault-r38b')
+          RAW = OUT / 'raw'
+          ASM = OUT / 'asm'
+          ANALYSIS = OUT / 'analysis'
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+          RPCS = [
+              'https://sui-mainnet-endpoint.blockvision.org',
+              'https://fullnode.mainnet.sui.io:443',
+          ]
+
+          VAULT_ID = '0xf4b852ec580fb15da542b191d5fefe96939f718b43dc0240062fa83b35f06da1'
+          TLP_TYPE = '0xe27969a70f93034de9ce16e6ad661b480324574e68d15a64b513fd90eb2423e5::tlp::TLP'
+          AGGREGATOR_ID = '0x487e76e8c9a321cc0131bfcf6e5a4d87fbc0beb8f6384f8c7e1658cde6076798'
+          PACKAGES = {
+              'tlp': '0xe27969a70f93034de9ce16e6ad661b480324574e68d15a64b513fd90eb2423e5',
+              'tlp_rule': '0x499b930751ecbbfbbc3b76cde04486787a6e99752df3b5d765bd5f1f441934b8',
+              'liquidation_rule': '0xbe1457c92f8e8c39e85fa4f77bfcd8cfbda30d1861286ba64c76a94773138b5d',
+              'oracle': '0xf2ab9aa60c5e879675351a1a89f47131de9dea7cc927327dd0e7282e295c7f5e',
+          }
+          INDEX_MAP_TYPE = PACKAGES['tlp_rule'] + '::tlp_rule::IndexMap'
+          LISTING_CAP_TYPE = PACKAGES['oracle'] + '::listing::ListingCap'
+
+          def post(url, payload, retries=6, timeout=180):
+              encoded = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      request = urllib.request.Request(
+                          url,
+                          data=encoded,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-tlp-vault-r38b/1',
+                          },
+                      )
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2 ** attempt)
+              raise RuntimeError(f'POST failed {url}: {last}')
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': type(exc).__name__, 'message': str(exc)})
+              return {'failures': failures}
+
+          def result(wrapper):
+              return wrapper.get('result') if isinstance(wrapper, dict) else None
+
+          def gql(query, variables=None):
+              body = post(GQL, {'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          def dump(path, value):
+              path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def get_object(object_id):
+              return rpc('sui_getObject', [object_id, {
+                  'showType': True,
+                  'showOwner': True,
+                  'showPreviousTransaction': True,
+                  'showDisplay': True,
+                  'showContent': True,
+                  'showBcs': True,
+              }])
+
+          def object_data(wrapper):
+              response = result(wrapper)
+              return (response or {}).get('data') if isinstance(response, dict) else None
+
+          def object_fields(wrapper):
+              data = object_data(wrapper) or {}
+              return ((data.get('content') or {}).get('fields') or {})
+
+          def object_type(wrapper):
+              return (object_data(wrapper) or {}).get('type')
+
+          def as_int(value):
+              try:
+                  return int(value)
+              except Exception:
+                  return None
+
+          def objects_by_type(type_name):
+              query = '''query Objects($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+              rows = []
+              cursor = None
+              for _ in range(20):
+                  connection = gql(query, {'type': type_name, 'after': cursor})['objects']
+                  rows.extend(connection.get('nodes') or [])
+                  page = connection.get('pageInfo') or {}
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('endCursor')
+              return rows
+
+          def tx_pages(object_id, max_pages=10):
+              options = {
+                  'showInput': True,
+                  'showRawInput': False,
+                  'showEffects': True,
+                  'showEvents': True,
+                  'showObjectChanges': True,
+                  'showBalanceChanges': True,
+              }
+              rows = []
+              cursor = None
+              for _ in range(max_pages):
+                  page = result(rpc('suix_queryTransactionBlocks', [{
+                      'filter': {'InputObject': object_id},
+                      'options': options,
+                  }, cursor, 50, True]))
+                  if not isinstance(page, dict):
+                      break
+                  rows.extend(page.get('data') or [])
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('nextCursor')
+              return rows
+
+          package_query = '''query Package($address:SuiAddress!){object(address:$address){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}modules{nodes{name fileFormatVersion disassembly functions(first:50){nodes{name visibility isEntry parameters{repr}return{repr}typeParameters{constraints}}}structs(first:50){nodes{name abilities fields{name type{repr}}typeParameters{constraints}}}}}}}}'''
+
+          package_results = {}
+          public_functions = []
+          for label, package_id in PACKAGES.items():
+              response = gql(package_query, {'address': package_id})
+              package_results[label] = response
+              package = ((response.get('object') or {}).get('asMovePackage'))
+              target = ASM / label
+              target.mkdir(parents=True, exist_ok=True)
+              if not package:
+                  continue
+              for module in package.get('modules', {}).get('nodes', []):
+                  module_name = module.get('name')
+                  disassembly = module.get('disassembly') or ''
+                  (target / f'{module_name}.asm').write_text(disassembly)
+                  for function in (module.get('functions') or {}).get('nodes', []):
+                      if str(function.get('visibility')).upper() == 'PUBLIC' or function.get('isEntry'):
+                          public_functions.append({
+                              'packageLabel': label,
+                              'packageId': package_id,
+                              'module': module_name,
+                              'name': function.get('name'),
+                              'visibility': function.get('visibility'),
+                              'isEntry': function.get('isEntry'),
+                              'parameters': [row.get('repr') for row in function.get('parameters') or []],
+                              'returns': [row.get('repr') for row in function.get('return') or []],
+                          })
+
+          vault = get_object(VAULT_ID)
+          aggregator = get_object(AGGREGATOR_ID)
+          metadata = rpc('suix_getCoinMetadata', [TLP_TYPE])
+          index_maps = objects_by_type(INDEX_MAP_TYPE)
+          listing_caps = objects_by_type(LISTING_CAP_TYPE)
+
+          vault_fields = object_fields(vault)
+          position_table = vault_fields.get('position_table') or {}
+          table_id = position_table.get('id') if isinstance(position_table, dict) else None
+          dynamic_fields = []
+          cursor = None
+          if table_id:
+              for _ in range(10):
+                  page = result(rpc('suix_getDynamicFields', [table_id, cursor, 50]))
+                  if not isinstance(page, dict):
+                      break
+                  dynamic_fields.extend(page.get('data') or [])
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('nextCursor')
+
+          positions = []
+          for field_row in dynamic_fields:
+              field_id = field_row.get('objectId')
+              if not field_id:
+                  continue
+              wrapper = get_object(field_id)
+              positions.append({
+                  'dynamicField': field_row,
+                  'object': wrapper,
+                  'fields': object_fields(wrapper),
+              })
+
+          vault_txs = tx_pages(VAULT_ID)
+          aggregator_txs = tx_pages(AGGREGATOR_ID)
+          calls = []
+          input_ids = set()
+          for source, transactions in [('vault', vault_txs), ('aggregator', aggregator_txs)]:
+              for tx in transactions:
+                  try:
+                      programmable = tx['transaction']['data']['transaction']
+                      inputs = programmable.get('inputs') or []
+                      commands = programmable.get('transactions') or []
+                  except Exception:
+                      inputs = []
+                      commands = []
+                  for value in inputs:
+                      if isinstance(value, dict) and value.get('objectId'):
+                          input_ids.add(value['objectId'])
+                  for index, command in enumerate(commands):
+                      move = command.get('MoveCall') if isinstance(command, dict) else None
+                      if move:
+                          calls.append({
+                              'source': source,
+                              'digest': tx.get('digest'),
+                              'timestampMs': tx.get('timestampMs'),
+                              'sender': (((tx.get('transaction') or {}).get('data') or {}).get('sender')),
+                              'status': ((tx.get('effects') or {}).get('status')),
+                              'commandIndex': index,
+                              'package': move.get('package'),
+                              'module': move.get('module'),
+                              'function': move.get('function'),
+                              'typeArguments': move.get('type_arguments'),
+                              'arguments': move.get('arguments'),
+                          })
+
+          input_objects = {object_id: get_object(object_id) for object_id in sorted(input_ids)}
+
+          index_entries = []
+          for row in index_maps:
+              content = (((row.get('asMoveObject') or {}).get('contents') or {}).get('json') or {})
+              for item in ((content.get('inner') or {}).get('contents') or []):
+                  index_entries.append({
+                      'indexMapId': row.get('address'),
+                      'owner': row.get('owner'),
+                      'key': item.get('key'),
+                      'value': item.get('value'),
+                  })
+          tlp_entries = [row for row in index_entries if '::tlp::TLP' in str(row.get('key'))]
+
+          listing_owners = {}
+          for cap in listing_caps:
+              kind = (cap.get('owner') or {}).get('__typename') or 'unknown'
+              listing_owners[kind] = listing_owners.get(kind, 0) + 1
+
+          mutator_terms = ('set', 'add', 'remove', 'mint', 'burn', 'withdraw', 'deposit', 'swap', 'liquidat')
+          capability_terms = ('Cap', 'Admin', 'Manager', 'Witness', 'Version')
+          capability_risks = []
+          for row in public_functions:
+              if any(term in str(row.get('name') or '').lower() for term in mutator_terms):
+                  serialized = json.dumps(row)
+                  if not any(term in serialized for term in capability_terms):
+                      capability_risks.append(row)
+
+          liquidation_functions = [row for row in public_functions if row['packageLabel'] == 'liquidation_rule']
+          tlp_functions = [row for row in public_functions if row['packageLabel'] == 'tlp']
+          tlp_rule_functions = [row for row in public_functions if row['packageLabel'] == 'tlp_rule']
+
+          dump(RAW / 'packages.json', package_results)
+          dump(RAW / 'vault.json', vault)
+          dump(RAW / 'aggregator.json', aggregator)
+          dump(RAW / 'metadata.json', metadata)
+          dump(RAW / 'index_maps.json', index_maps)
+          dump(RAW / 'listing_caps.json', listing_caps)
+          dump(RAW / 'positions.json', positions)
+          dump(RAW / 'vault_transactions.json', vault_txs)
+          dump(RAW / 'aggregator_transactions.json', aggregator_txs)
+          dump(RAW / 'input_objects.json', input_objects)
+          dump(ANALYSIS / 'public_functions.json', public_functions)
+          dump(ANALYSIS / 'calls.json', calls)
+          dump(ANALYSIS / 'capability_risks.json', capability_risks)
+
+          summary = {
+              'schema': 'bucket-tlp-vault-r38b/v1',
+              'network': 'sui-mainnet',
+              'readOnly': True,
+              'vaultId': VAULT_ID,
+              'vaultType': object_type(vault),
+              'vaultFields': vault_fields,
+              'tlpMetadata': result(metadata),
+              'aggregatorId': AGGREGATOR_ID,
+              'aggregatorType': object_type(aggregator),
+              'aggregatorFields': object_fields(aggregator),
+              'positionCount': len(positions),
+              'positions': positions,
+              'indexMapCount': len(index_maps),
+              'tlpIndexEntries': tlp_entries,
+              'listingCapCount': len(listing_caps),
+              'listingCapOwnerKinds': listing_owners,
+              'publicFunctionCount': len(public_functions),
+              'tlpFunctions': tlp_functions,
+              'tlpRuleFunctions': tlp_rule_functions,
+              'liquidationFunctions': liquidation_functions,
+              'capabilityRiskCandidates': capability_risks,
+              'vaultTransactionCount': len(vault_txs),
+              'aggregatorTransactionCount': len(aggregator_txs),
+              'callCount': len(calls),
+              'gates': {
+                  'activeDebtPresent': (as_int(vault_fields.get('total_debt_amount')) or 0) > 0,
+                  'positionsPresent': len(positions) > 0,
+                  'tlpIndexMapped': bool(tlp_entries),
+                  'listingCapSharedOrImmutable': any(kind in listing_owners for kind in ('Shared', 'Immutable')),
+                  'unprotectedMutatorCandidate': bool(capability_risks),
+              },
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'vaultId': summary['vaultId'],
+              'vaultType': summary['vaultType'],
+              'positionCount': summary['positionCount'],
+              'tlpMetadata': summary['tlpMetadata'],
+              'aggregatorFields': summary['aggregatorFields'],
+              'tlpIndexEntries': summary['tlpIndexEntries'],
+              'listingCapOwnerKinds': summary['listingCapOwnerKinds'],
+              'tlpFunctions': summary['tlpFunctions'],
+              'tlpRuleFunctions': summary['tlpRuleFunctions'],
+              'liquidationFunctions': summary['liquidationFunctions'],
+              'capabilityRiskCandidates': summary['capabilityRiskCandidates'],
+              'gates': summary['gates'],
+          }, indent=2))
+          PY
+          python3 bucket-tlp-vault-r38b/audit.py | tee bucket-tlp-vault-r38b/run.log
+          find bucket-tlp-vault-r38b -type f -print0 | sort -z | xargs -0 sha256sum > bucket-tlp-vault-r38b/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-tlp-vault-r38b && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-tlp-vault-r38b/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          assert summary['gates']['activeDebtPresent'] is True
+          print('BUCKET_TLP_VAULT_R38B_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-tlp-vault-r38b
+          path: bucket-tlp-vault-r38b
+          if-no-files-found: error
+          retention-days: 5
