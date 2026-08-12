@@ -1,0 +1,340 @@
+name: Bucket TLP Linked Package and Position Audit R39
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-deployment-trigger-r37-20260812]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve linked TLP package, four positions, and live control objects
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-tlp-linked-state-r39
+          mkdir -p bucket-tlp-linked-state-r39/{raw,asm,analysis}
+          cat > bucket-tlp-linked-state-r39/audit.py <<'PY'
+          import json
+          import pathlib
+          import re
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-tlp-linked-state-r39')
+          RAW = OUT / 'raw'
+          ASM = OUT / 'asm'
+          ANALYSIS = OUT / 'analysis'
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+          RPCS = [
+              'https://sui-mainnet-endpoint.blockvision.org',
+              'https://fullnode.mainnet.sui.io:443',
+          ]
+
+          VAULT_ID = '0xf4b852ec580fb15da542b191d5fefe96939f718b43dc0240062fa83b35f06da1'
+          TLP_ORIGIN = '0xe27969a70f93034de9ce16e6ad661b480324574e68d15a64b513fd90eb2423e5'
+          TLP_LINKED_V20 = '0x21d5e2291c0c40cad074a702cde333a388fb592b7cf5949dd1250bcd72d7cbfa'
+          LIQUIDATION_PACKAGE = '0xbe1457c92f8e8c39e85fa4f77bfcd8cfbda30d1861286ba64c76a94773138b5d'
+          TYPES = {
+              'version': TLP_ORIGIN + '::admin::Version',
+              'registry': TLP_ORIGIN + '::lp_pool::Registry',
+              'treasury_caps': TLP_ORIGIN + '::treasury_caps::TreasuryCaps',
+              'liquidation_config': LIQUIDATION_PACKAGE + '::liquidation_rule::Config',
+          }
+
+          def post(url, payload, retries=6, timeout=180):
+              encoded = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      request = urllib.request.Request(
+                          url,
+                          data=encoded,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-tlp-linked-state-r39/1',
+                          },
+                      )
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2 ** attempt)
+              raise RuntimeError(f'POST failed {url}: {last}')
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': type(exc).__name__, 'message': str(exc)})
+              return {'failures': failures}
+
+          def result(wrapper):
+              return wrapper.get('result') if isinstance(wrapper, dict) else None
+
+          def gql(query, variables=None):
+              body = post(GQL, {'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          def dump(path, value):
+              path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def get_object(object_id):
+              return rpc('sui_getObject', [object_id, {
+                  'showType': True,
+                  'showOwner': True,
+                  'showPreviousTransaction': True,
+                  'showDisplay': True,
+                  'showContent': True,
+                  'showBcs': True,
+              }])
+
+          def object_data(wrapper):
+              response = result(wrapper)
+              return (response or {}).get('data') if isinstance(response, dict) else None
+
+          def object_fields(wrapper):
+              return (((object_data(wrapper) or {}).get('content') or {}).get('fields') or {})
+
+          def owner_kind(owner):
+              if not isinstance(owner, dict):
+                  return 'unknown'
+              for key in ('Shared', 'AddressOwner', 'ObjectOwner', 'Immutable'):
+                  if key in owner:
+                      return key
+              return owner.get('__typename') or 'unknown'
+
+          def objects_by_type(type_name):
+              query = '''query Objects($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+              rows = []
+              cursor = None
+              for _ in range(20):
+                  connection = gql(query, {'type': type_name, 'after': cursor})['objects']
+                  rows.extend(connection.get('nodes') or [])
+                  page = connection.get('pageInfo') or {}
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('endCursor')
+              return rows
+
+          package_query = '''query Package($address:SuiAddress!){object(address:$address){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}modules{nodes{name fileFormatVersion disassembly functions(first:50){nodes{name visibility isEntry parameters{repr}return{repr}typeParameters{constraints}}}structs(first:50){nodes{name abilities fields{name type{repr}}typeParameters{constraints}}}}}}}}'''
+          package = gql(package_query, {'address': TLP_LINKED_V20})
+          package_data = ((package.get('object') or {}).get('asMovePackage')) or {}
+          functions = []
+          function_snippets = {}
+          for module in package_data.get('modules', {}).get('nodes', []):
+              name = module.get('name')
+              text = module.get('disassembly') or ''
+              (ASM / f'{name}.asm').write_text(text)
+              for function in (module.get('functions') or {}).get('nodes', []):
+                  row = {
+                      'module': name,
+                      'name': function.get('name'),
+                      'visibility': function.get('visibility'),
+                      'isEntry': function.get('isEntry'),
+                      'parameters': [value.get('repr') for value in function.get('parameters') or []],
+                      'returns': [value.get('repr') for value in function.get('return') or []],
+                  }
+                  functions.append(row)
+              if name == 'lp_pool':
+                  wanted = [
+                      'get_pool_liquidity', 'get_pool_liquidity_value',
+                      'update_liquidity_value', 'mint_lp', 'burn_lp',
+                      'manager_flash_remove_liquidity', 'manager_flash_repay_liquidity',
+                      'calculate_mint_lp', 'calculate_burn_lp',
+                  ]
+                  starts = []
+                  for fn_name in wanted:
+                      match = re.search(r'(?m)^(?:public(?:\(friend\))?\s+|entry\s+|)(?:fun\s+)?' + re.escape(fn_name) + r'(?:<[^\n]*?>)?\(', text)
+                      if match:
+                          starts.append((match.start(), fn_name))
+                  starts.sort()
+                  all_headers = [match.start() for match in re.finditer(r'(?m)^(?:public(?:\(friend\))?\s+|entry\s+|)(?:fun\s+)?[A-Za-z_][A-Za-z0-9_]*(?:<[^\n]*?>)?\(', text)]
+                  for start, fn_name in starts:
+                      end_candidates = [value for value in all_headers if value > start]
+                      end = min(end_candidates) if end_candidates else len(text)
+                      function_snippets[fn_name] = text[start:end]
+
+          vault = get_object(VAULT_ID)
+          vault_fields = object_fields(vault)
+          position_table = vault_fields.get('position_table') or {}
+          table_fields = position_table.get('fields') if isinstance(position_table, dict) else {}
+          table_id = (((table_fields or {}).get('id') or {}).get('id'))
+          expected_size = int((table_fields or {}).get('size') or 0)
+
+          dynamic_fields = []
+          cursor = None
+          if table_id:
+              for _ in range(20):
+                  page = result(rpc('suix_getDynamicFields', [table_id, cursor, 50]))
+                  if not isinstance(page, dict):
+                      break
+                  dynamic_fields.extend(page.get('data') or [])
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('nextCursor')
+
+          positions = []
+          debtor_objects = {}
+          for row in dynamic_fields:
+              field_id = row.get('objectId')
+              if not field_id:
+                  continue
+              wrapper = get_object(field_id)
+              fields = object_fields(wrapper)
+              name = fields.get('name')
+              debtor = None
+              if isinstance(name, str):
+                  debtor = name
+              elif isinstance(name, dict):
+                  debtor = name.get('value') or name.get('address')
+              value = fields.get('value') or {}
+              position = {
+                  'dynamicField': row,
+                  'fieldObjectId': field_id,
+                  'debtor': debtor,
+                  'fields': fields,
+                  'value': value,
+              }
+              positions.append(position)
+              if isinstance(debtor, str) and debtor.startswith('0x'):
+                  debtor_objects[debtor] = get_object(debtor)
+
+          controls = {label: objects_by_type(type_name) for label, type_name in TYPES.items()}
+          control_summaries = {}
+          for label, rows in controls.items():
+              control_summaries[label] = [
+                  {
+                      'id': row.get('address'),
+                      'version': row.get('version'),
+                      'digest': row.get('digest'),
+                      'owner': row.get('owner'),
+                      'ownerKind': (row.get('owner') or {}).get('__typename') or 'unknown',
+                      'fields': (((row.get('asMoveObject') or {}).get('contents') or {}).get('json') or {}),
+                  }
+                  for row in rows
+              ]
+
+          config_rows = control_summaries.get('liquidation_config') or []
+          liquidator_count = 0
+          protected_count = 0
+          unswappable_count = 0
+          for row in config_rows:
+              fields = row.get('fields') or {}
+              for name, destination in (
+                  ('liquidators', 'liquidator'),
+                  ('protected_debtors', 'protected'),
+                  ('unswappable_coin_types', 'unswappable'),
+              ):
+                  value = fields.get(name) or {}
+                  contents = ((value.get('fields') or {}).get('contents') if isinstance(value, dict) else None) or []
+                  if destination == 'liquidator': liquidator_count += len(contents)
+                  if destination == 'protected': protected_count += len(contents)
+                  if destination == 'unswappable': unswappable_count += len(contents)
+
+          dump(RAW / 'linked_package.json', package)
+          dump(RAW / 'vault.json', vault)
+          dump(RAW / 'dynamic_fields.json', dynamic_fields)
+          dump(RAW / 'positions.json', positions)
+          dump(RAW / 'debtor_objects.json', debtor_objects)
+          dump(RAW / 'control_objects.json', controls)
+          dump(ANALYSIS / 'functions.json', functions)
+          dump(ANALYSIS / 'function_snippets.json', function_snippets)
+
+          summary = {
+              'schema': 'bucket-tlp-linked-state-r39/v1',
+              'network': 'sui-mainnet',
+              'readOnly': True,
+              'linkedPackageId': TLP_LINKED_V20,
+              'linkedPackageVersion': package_data.get('version'),
+              'linkedPackageLinkage': package_data.get('linkage'),
+              'functionCount': len(functions),
+              'functionSnippets': function_snippets,
+              'vaultId': VAULT_ID,
+              'positionTableId': table_id,
+              'expectedPositionCount': expected_size,
+              'enumeratedPositionCount': len(positions),
+              'positions': positions,
+              'debtorObjects': debtor_objects,
+              'controlObjects': control_summaries,
+              'liquidatorCount': liquidator_count,
+              'protectedDebtorCount': protected_count,
+              'unswappableCoinTypeCount': unswappable_count,
+              'gates': {
+                  'allPositionsEnumerated': expected_size == len(positions),
+                  'anySharedDebtorObject': any(
+                      owner_kind(((object_data(wrapper) or {}).get('owner'))) == 'Shared'
+                      for wrapper in debtor_objects.values()
+                  ),
+                  'versionObjectShared': any(row.get('ownerKind') == 'Shared' for row in control_summaries.get('version') or []),
+                  'registryObjectShared': any(row.get('ownerKind') == 'Shared' for row in control_summaries.get('registry') or []),
+                  'treasuryCapsShared': any(row.get('ownerKind') == 'Shared' for row in control_summaries.get('treasury_caps') or []),
+                  'liquidationConfigShared': any(row.get('ownerKind') == 'Shared' for row in config_rows),
+                  'liquidatorsConfigured': liquidator_count > 0,
+              },
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'linkedPackageId': summary['linkedPackageId'],
+              'linkedPackageVersion': summary['linkedPackageVersion'],
+              'expectedPositionCount': summary['expectedPositionCount'],
+              'enumeratedPositionCount': summary['enumeratedPositionCount'],
+              'positions': summary['positions'],
+              'controlObjects': summary['controlObjects'],
+              'liquidatorCount': summary['liquidatorCount'],
+              'protectedDebtorCount': summary['protectedDebtorCount'],
+              'unswappableCoinTypeCount': summary['unswappableCoinTypeCount'],
+              'functionSnippets': summary['functionSnippets'],
+              'gates': summary['gates'],
+          }, indent=2))
+          PY
+          python3 bucket-tlp-linked-state-r39/audit.py | tee bucket-tlp-linked-state-r39/run.log
+          find bucket-tlp-linked-state-r39 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-tlp-linked-state-r39/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-tlp-linked-state-r39 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-tlp-linked-state-r39/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          assert summary['gates']['allPositionsEnumerated'] is True
+          print('BUCKET_TLP_LINKED_STATE_R39_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-tlp-linked-state-r39
+          path: bucket-tlp-linked-state-r39
+          if-no-files-found: error
+          retention-days: 5
