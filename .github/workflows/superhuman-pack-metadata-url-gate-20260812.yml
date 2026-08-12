@@ -1,0 +1,166 @@
+name: Temporary Superhuman Pack metadata URL stability gate
+
+on:
+  push:
+    branches: [research/superhuman-pack-metadata-url-20260812]
+    paths: [.github/workflows/superhuman-pack-metadata-url-gate-20260812.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+
+      - name: Fetch current official extension and public Pack listings
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf metadata-url-gate public-intake-status
+          mkdir -p metadata-url-gate/raw metadata-url-gate/evidence public-intake-status
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, struct, urllib.error, urllib.request, zipfile
+
+          root = pathlib.Path('metadata-url-gate')
+          raw = root / 'raw'
+          ev = root / 'evidence'
+          ua = 'Mozilla/5.0 authorized Superhuman bug-bounty public metadata gate'
+
+          def fetch(name, url, max_bytes=30_000_000):
+              req = urllib.request.Request(url, headers={
+                  'User-Agent': ua,
+                  'Accept': 'application/json,*/*;q=0.8',
+                  'Cache-Control': 'no-cache',
+              })
+              body = b''
+              meta = {'name': name, 'url': url}
+              try:
+                  with urllib.request.urlopen(req, timeout=45) as response:
+                      body = response.read(max_bytes)
+                      meta.update(status=response.status, finalUrl=response.geturl(), headers=dict(response.headers.items()))
+              except urllib.error.HTTPError as error:
+                  body = error.read(max_bytes)
+                  meta.update(status=error.code, finalUrl=error.geturl(), headers=dict(error.headers.items()) if error.headers else {}, error=str(error))
+              except Exception as error:
+                  meta.update(status=0, error=repr(error))
+              meta.update(size=len(body), sha256=hashlib.sha256(body).hexdigest())
+              (raw / f'{name}.body').write_bytes(body)
+              (raw / f'{name}.json').write_text(json.dumps(meta, indent=2) + '\n')
+              return meta, body
+
+          crx_url = ('https://clients2.google.com/service/update2/crx?response=redirect'
+                     '&prod=chromium&prodversion=151.0.0.0&acceptformat=crx3'
+                     '&x=id%3Dkbfnbcaeplbcioakkpcpgfkobkghlhen%26installsource%3Dondemand%26uc')
+          crx_meta, crx = fetch('current-crx', crx_url, 200_000_000)
+          extension = {'download': crx_meta, 'validCrx3': False}
+          if crx[:4] == b'Cr24' and len(crx) >= 12:
+              version = struct.unpack_from('<I', crx, 4)[0]
+              header_len = struct.unpack_from('<I', crx, 8)[0]
+              payload = crx[12 + header_len:]
+              if version == 3 and payload[:2] == b'PK':
+                  extension['validCrx3'] = True
+                  archive = raw / 'current-crx.zip'
+                  archive.write_bytes(payload)
+                  with zipfile.ZipFile(archive) as zf:
+                      manifest = json.loads(zf.read('manifest.json'))
+                  extension.update({
+                      'extensionId': 'kbfnbcaeplbcioakkpcpgfkobkghlhen',
+                      'extensionVersion': manifest.get('version'),
+                      'manifestVersion': manifest.get('manifest_version'),
+                      'crxSha256': hashlib.sha256(crx).hexdigest(),
+                  })
+
+          pack_ids = [1003, 1013, 1052, 33623]
+          listings = []
+          metadata = []
+          for pack_id in pack_ids:
+              entry = {'packId': pack_id, 'attempts': []}
+              for host in ('https://coda.io', 'https://docs.superhuman.com'):
+                  name = f'listing-{pack_id}-{host.split("//",1)[1].split(".",1)[0]}'
+                  meta, body = fetch(name, f'{host}/apis/v1/packs/{pack_id}/listing')
+                  attempt = {'host': host, 'http': meta}
+                  try:
+                      obj = json.loads(body)
+                  except Exception:
+                      obj = None
+                  if isinstance(obj, dict):
+                      attempt['json'] = obj
+                      url = obj.get('externalMetadataUrl')
+                      attempt['externalMetadataUrl'] = url
+                      attempt['packVersion'] = obj.get('packVersion')
+                      attempt['releaseId'] = obj.get('releaseId')
+                      attempt['lastReleasedAt'] = obj.get('lastReleasedAt')
+                      if isinstance(url, str) and url.startswith('https://'):
+                          mmeta, mbody = fetch(f'metadata-{pack_id}-{len(metadata)}', url)
+                          metadata.append({
+                              'packId': pack_id,
+                              'url': url,
+                              'http': mmeta,
+                              'jsonParseable': False,
+                          })
+                          try:
+                              json.loads(mbody)
+                              metadata[-1]['jsonParseable'] = True
+                          except Exception:
+                              pass
+                      entry['attempts'].append(attempt)
+                      break
+                  entry['attempts'].append(attempt)
+              listings.append(entry)
+
+          stable_unversioned = []
+          for entry in listings:
+              for attempt in entry['attempts']:
+                  url = attempt.get('externalMetadataUrl')
+                  if not isinstance(url, str):
+                      continue
+                  version_tokens = [
+                      str(attempt.get('packVersion') or ''),
+                      str(attempt.get('releaseId') or ''),
+                  ]
+                  has_version = any(token and token in url for token in version_tokens)
+                  stable_unversioned.append({
+                      'packId': entry['packId'],
+                      'url': url,
+                      'packVersion': attempt.get('packVersion'),
+                      'releaseId': attempt.get('releaseId'),
+                      'urlContainsVersionOrRelease': has_version,
+                  })
+
+          result = {
+              'workflowRunId': int(os.environ['GITHUB_RUN_ID']),
+              'sourceCommit': os.environ['GITHUB_SHA'],
+              'extension': extension,
+              'listings': listings,
+              'metadataFetches': metadata,
+              'stableUrlAnalysis': stable_unversioned,
+              'publicListingSuccessCount': sum(1 for row in stable_unversioned),
+              'unversionedExternalMetadataUrlCount': sum(1 for row in stable_unversioned if not row['urlContainsVersionOrRelease']),
+              'candidateDecision': 'REVIEW_STABLE_URL_CACHE_RISK' if any(not row['urlContainsVersionOrRelease'] for row in stable_unversioned) else 'NO_STABLE_PUBLIC_URL_PROOF',
+              'productionStateChangeCount': 0,
+          }
+          (ev / 'RESULT.json').write_text(json.dumps(result, indent=2) + '\n')
+          pathlib.Path('public-intake-status/superhuman-pack-metadata-url-result.json').write_text(json.dumps(result, indent=2) + '\n')
+          PY
+          find metadata-url-gate/evidence -type f -print0 | sort -z | xargs -0 sha256sum > metadata-url-gate/evidence/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-pack-metadata-url-gate
+          path: metadata-url-gate/evidence/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Commit compact result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-pack-metadata-url-result.json
+          git commit -m 'chore: record Superhuman Pack metadata URL gate'
+          git push
