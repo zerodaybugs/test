@@ -1,0 +1,140 @@
+name: Temporary secure validation relay run3b
+
+on:
+  push:
+    branches: [tmp-secure-ci-20260814-icp1]
+    paths:
+      - ".github/workflows/tmp-secure-ci-relay-run3b-20260814.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tmp-secure-ci-run3b-20260814
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate one-time runner key
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/relay-public"
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 \
+            -out "$RUNNER_TEMP/runner-private.pem" >/dev/null 2>&1
+          openssl pkey -in "$RUNNER_TEMP/runner-private.pem" -pubout \
+            -out "$RUNNER_TEMP/relay-public/runner-public.pem" >/dev/null 2>&1
+          chmod 600 "$RUNNER_TEMP/runner-private.pem"
+          sha256sum "$RUNNER_TEMP/relay-public/runner-public.pem" \
+            > "$RUNNER_TEMP/relay-public/runner-public.pem.sha256"
+
+      - name: Publish runner public key
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay3b-public-key
+          path: ${{ runner.temp }}/relay-public/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Wait for encrypted payload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/secure-ci"
+          found=0
+          for _ in $(seq 1 180); do
+            all=1
+            for item in payload-v4.enc.b64 payload-v4.key.enc.b64 payload-v4.SHA256SUMS.txt; do
+              code=$(curl -sS -o "$RUNNER_TEMP/${item}.json" -w '%{http_code}' \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H 'Accept: application/vnd.github+json' \
+                "${api}/${item}?ref=${GITHUB_REF_NAME}")
+              if [[ "$code" != 200 ]]; then all=0; break; fi
+            done
+            if [[ "$all" == 1 ]]; then found=1; break; fi
+            sleep 5
+          done
+          [[ "$found" == 1 ]]
+          for item in payload-v4.enc.b64 payload-v4.key.enc.b64 payload-v4.SHA256SUMS.txt; do
+            jq -r '.content' "$RUNNER_TEMP/${item}.json" | tr -d '\n' | base64 -d \
+              > "$RUNNER_TEMP/$item"
+          done
+          base64 -d "$RUNNER_TEMP/payload-v4.enc.b64" > "$RUNNER_TEMP/payload.enc"
+          base64 -d "$RUNNER_TEMP/payload-v4.key.enc.b64" > "$RUNNER_TEMP/payload.key.enc"
+          cd "$RUNNER_TEMP"
+          cp payload-v4.SHA256SUMS.txt payload.SHA256SUMS.txt
+          sha256sum -c payload.SHA256SUMS.txt
+
+      - name: Decrypt and execute isolated payload
+        shell: bash
+        env:
+          SECURE_RESULT_DIR: ${{ runner.temp }}/secure-result
+        run: |
+          set -u
+          mkdir -p "$SECURE_RESULT_DIR" "$RUNNER_TEMP/secure-payload"
+          rc=0
+          openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/runner-private.pem" \
+            -in "$RUNNER_TEMP/payload.key.enc" -out "$RUNNER_TEMP/payload.pass" \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+            >"$SECURE_RESULT_DIR/relay.stdout.log" \
+            2>"$SECURE_RESULT_DIR/relay.stderr.log" || rc=10
+          if [[ "$rc" == 0 ]]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+              -in "$RUNNER_TEMP/payload.enc" -out "$RUNNER_TEMP/payload.tar.gz" \
+              -pass file:"$RUNNER_TEMP/payload.pass" || rc=11
+          fi
+          if [[ "$rc" == 0 ]]; then gzip -t "$RUNNER_TEMP/payload.tar.gz" || rc=12; fi
+          if [[ "$rc" == 0 ]]; then
+            tar -xzf "$RUNNER_TEMP/payload.tar.gz" -C "$RUNNER_TEMP/secure-payload" \
+              --no-same-owner --no-same-permissions || rc=13
+          fi
+          if [[ "$rc" == 0 && ! -x "$RUNNER_TEMP/secure-payload/run.sh" ]]; then rc=14; fi
+          if [[ "$rc" == 0 ]]; then
+            set +e
+            bash "$RUNNER_TEMP/secure-payload/run.sh" \
+              >"$SECURE_RESULT_DIR/driver.stdout.log" \
+              2>"$SECURE_RESULT_DIR/driver.stderr.log"
+            rc=$?
+            set -e
+          fi
+          printf '%s\n' "$rc" > "$SECURE_RESULT_DIR/driver.exit"
+          printf 'relay_run_id=%s\nrelay_commit=%s\n' "$GITHUB_RUN_ID" "$GITHUB_SHA" \
+            > "$SECURE_RESULT_DIR/relay.env"
+          exit 0
+
+      - name: Encrypt result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/secure-result" "$RUNNER_TEMP/encrypted-result"
+          tar -czf "$RUNNER_TEMP/result.tar.gz" -C "$RUNNER_TEMP/secure-result" .
+          openssl rand -hex 32 > "$RUNNER_TEMP/result.pass"
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+            -in "$RUNNER_TEMP/result.tar.gz" \
+            -out "$RUNNER_TEMP/encrypted-result/result.enc" \
+            -pass file:"$RUNNER_TEMP/result.pass"
+          openssl pkeyutl -encrypt -pubin -inkey secure-ci/researcher-public.pem \
+            -in "$RUNNER_TEMP/result.pass" \
+            -out "$RUNNER_TEMP/encrypted-result/result.key.enc" \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          sha256sum "$RUNNER_TEMP/encrypted-result/result.enc" \
+            "$RUNNER_TEMP/encrypted-result/result.key.enc" \
+            > "$RUNNER_TEMP/encrypted-result/SHA256SUMS.txt"
+
+      - name: Upload encrypted result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay3b-encrypted-result
+          path: ${{ runner.temp }}/encrypted-result/
+          if-no-files-found: error
+          retention-days: 1
