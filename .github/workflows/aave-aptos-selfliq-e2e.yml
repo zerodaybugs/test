@@ -1,0 +1,215 @@
+name: Aave Aptos self-liquidation E2E
+
+on:
+  push:
+    branches:
+      - aave-aptos-selfliq-e2e-20260814
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      AAVE_COMMIT: 919362ba93c6291b25a31282b25d3def6e6357b9
+      MOVE_VERSION: "2.3"
+      COMPILER_VERSION: "2.0"
+    steps:
+      - name: Checkout exact Aave source
+        uses: actions/checkout@v4
+        with:
+          repository: aave/aptos-aave-v3
+          ref: ${{ env.AAVE_COMMIT }}
+          path: aave
+          persist-credentials: false
+
+      - name: Install Aptos CLI 9.5.0
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o /tmp/aptos.zip \
+            https://github.com/aptos-labs/aptos-core/releases/download/aptos-cli-v9.5.0/aptos-cli-9.5.0-Linux-x86_64.zip
+          unzip -q /tmp/aptos.zip -d "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/aptos"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/aptos" --version
+
+      - name: Prepare deterministic named addresses
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ORACLE=0x40
+          ORACLE_RACC=$(aptos account derive-resource-account-address \
+            --address "$ORACLE" \
+            --seed "AAVE_ORACLE" \
+            --seed-encoding Utf8 | jq -r '.Result')
+          NAMED="aave_acl=0x10,aave_config=0x20,aave_math=0x30,aave_oracle=${ORACLE},aave_pool=0x50,aave_large_packages=0x60,aave_mock_underlyings=0x70,aave_data=0x80,data_feeds=0x90,platform=0xa0,aave_oracle_racc_address=${ORACLE_RACC}"
+          echo "AAVE_NAMED_ADDRESSES=$NAMED" >> "$GITHUB_ENV"
+          mkdir -p evidence
+          printf '%s\n' "$NAMED" > evidence/named_addresses.txt
+
+      - name: Run upstream self-liquidation baseline
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          set -o pipefail
+          aptos move test \
+            --package-dir aave/aave-core \
+            --ignore-compile-warnings \
+            --skip-attribute-checks \
+            --language-version "$MOVE_VERSION" \
+            --compiler-version "$COMPILER_VERSION" \
+            --named-addresses "$AAVE_NAMED_ADDRESSES" \
+            --filter test_liquidation_receive_a_token_when_liquidator_is_borrower \
+            2>&1 | tee evidence/upstream_baseline.log
+
+      - name: Patch test with deficit and retained-collateral invariants
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > patch_test.py <<'PY'
+          from pathlib import Path
+
+          path = Path("aave/aave-core/tests/aave-logic/liquidation_logic_tests.move")
+          text = path.read_text(encoding="utf-8")
+          old_name = "fun test_liquidation_receive_a_token_when_liquidator_is_borrower("
+          new_name = "fun zdb_test_self_liquidation_deficit_retains_collateral("
+          start = text.index(old_name)
+          brace_start = text.index("{", start)
+          depth = 0
+          end = None
+          for i in range(brace_start, len(text)):
+              char = text[i]
+              if char == "{":
+                  depth += 1
+              elif char == "}":
+                  depth -= 1
+                  if depth == 0:
+                      end = i + 1
+                      break
+          if end is None:
+              raise RuntimeError("target function boundary not found")
+
+          block = text[start:end].replace(old_name, new_name, 1)
+
+          before_anchor = """        let u1_liquidity_rate_before =
+              pool::get_reserve_current_liquidity_rate(u1_reserve_data);"""
+          if before_anchor not in block:
+              raise RuntimeError("before-state anchor not found")
+          block = block.replace(
+              before_anchor,
+              before_anchor
+              + "\n        let u1_deficit_before = pool::get_reserve_deficit(u1_reserve_data);",
+              1,
+          )
+
+          after_anchor = """        let u1_liquidity_rate_after =
+              pool::get_reserve_current_liquidity_rate(u1_reserve_data);"""
+          if after_anchor not in block:
+              raise RuntimeError("after-state anchor not found")
+          block = block.replace(
+              after_anchor,
+              after_anchor
+              + "\n        let u1_deficit_after = pool::get_reserve_deficit(u1_reserve_data);",
+              1,
+          )
+
+          close = block.rfind("\n    }")
+          if close < 0:
+              raise RuntimeError("target function closing brace not found")
+
+          invariants = r'''
+
+              let borrower_config_after = pool::get_user_configuration(borrower_address);
+              let u2_reserve_data = pool::get_reserve_data(underlying_u2_token_address);
+              let u2_reserve_id = pool::get_reserve_id(u2_reserve_data);
+
+              aptos_std::debug::print(&u1_deficit_before);
+              aptos_std::debug::print(&u1_deficit_after);
+              aptos_std::debug::print(&u2_current_a_token_balance_before);
+              aptos_std::debug::print(&u2_current_a_token_balance_after);
+              aptos_std::debug::print(&u1_current_variable_debt_before);
+              aptos_std::debug::print(&u1_current_variable_debt_after);
+
+              // Critical post-state gate: protocol deficit increases while the
+              // self-liquidating borrower retains most of the collateral and has no debt.
+              assert!(u1_deficit_after > u1_deficit_before, 0xA001);
+              assert!(u2_current_a_token_balance_after > 0, 0xA002);
+              assert!(
+                  u2_current_a_token_balance_after * 100
+                      > u2_current_a_token_balance_before * 90,
+                  0xA003
+              );
+              assert!(u1_current_variable_debt_after == 0, 0xA004);
+              assert!(
+                  !user_config::is_using_as_collateral(
+                      &borrower_config_after, (u2_reserve_id as u256)
+                  ),
+                  0xA005
+              );
+          '''
+          block = block[:close] + invariants + block[close:]
+          text = text[:start] + block + text[end:]
+          path.write_text(text, encoding="utf-8")
+          PY
+          python3 patch_test.py
+          git -C aave diff --check
+          git -C aave diff -- aave-core/tests/aave-logic/liquidation_logic_tests.move | tee evidence/test_patch.diff
+
+      - name: Run enhanced E2E test three times
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          set -o pipefail
+          for i in 1 2 3; do
+            echo "=== ENHANCED RUN $i ===" | tee -a evidence/enhanced_repeats.log
+            aptos move test \
+              --package-dir aave/aave-core \
+              --ignore-compile-warnings \
+              --skip-attribute-checks \
+              --language-version "$MOVE_VERSION" \
+              --compiler-version "$COMPILER_VERSION" \
+              --named-addresses "$AAVE_NAMED_ADDRESSES" \
+              --filter zdb_test_self_liquidation_deficit_retains_collateral \
+              2>&1 | tee -a evidence/enhanced_repeats.log
+          done
+
+      - name: Run liquidation module regression set
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          set -o pipefail
+          aptos move test \
+            --package-dir aave/aave-core \
+            --ignore-compile-warnings \
+            --skip-attribute-checks \
+            --language-version "$MOVE_VERSION" \
+            --compiler-version "$COMPILER_VERSION" \
+            --named-addresses "$AAVE_NAMED_ADDRESSES" \
+            --filter liquidation_logic_tests \
+            2>&1 | tee evidence/liquidation_module_regression.log
+
+      - name: Record source and environment
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          git -C aave rev-parse HEAD > evidence/source_commit.txt
+          aptos --version > evidence/aptos_version.txt 2>&1
+          cp patch_test.py evidence/patch_test.py 2>/dev/null || true
+          cp aave/aave-core/tests/aave-logic/liquidation_logic_tests.move \
+            evidence/liquidation_logic_tests.patched.move 2>/dev/null || true
+          sha256sum evidence/* > evidence/SHA256SUMS.txt 2>/dev/null || true
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aave-aptos-selfliq-e2e-evidence
+          path: evidence
+          if-no-files-found: error
+          retention-days: 30
