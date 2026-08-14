@@ -1,0 +1,280 @@
+name: Aave Aptos live configuration snapshot
+
+on:
+  push:
+    branches:
+      - aave-aptos-live-config-20260814
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout validation repository
+        uses: actions/checkout@v4
+
+      - name: Query live Aptos mainnet configuration
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p evidence/raw
+          cat > query_live.py <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import json
+          import time
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+
+          FULLNODES = [
+              "https://api.mainnet.aptoslabs.com/v1",
+              "https://fullnode.mainnet.aptoslabs.com/v1",
+          ]
+          POOL = "0x39ddcd9e1a39fa14f25e3f9ec8a86074d05cc0881cbf667df8a6ee70942016fb"
+          ORACLE = "0x763dcdab3f6bb62a9095e9fe6740d8a97a196493056cf96d373dd7f8f2dab2d2"
+          OUT = Path("evidence")
+          RAW = OUT / "raw"
+          SESSION = requests.Session()
+          SESSION.headers.update({"User-Agent": "ZeroDayBugs-Aave-Aptos-validation/1.0"})
+
+          def request_json(method: str, path: str, *, payload: dict[str, Any] | None = None) -> Any:
+              errors: list[str] = []
+              for base in FULLNODES:
+                  url = base + path
+                  for attempt in range(5):
+                      try:
+                          response = SESSION.request(method, url, json=payload, timeout=30)
+                          if response.status_code == 200:
+                              return response.json()
+                          errors.append(f"{url} status={response.status_code} body={response.text[:300]}")
+                          if response.status_code not in (429, 500, 502, 503, 504):
+                              break
+                      except Exception as exc:
+                          errors.append(f"{url} {type(exc).__name__}: {exc}")
+                      time.sleep(1.5 * (attempt + 1))
+              raise RuntimeError(" | ".join(errors))
+
+          call_index = 0
+          def view(address: str, module: str, function: str, arguments: list[Any] | None = None) -> Any:
+              global call_index
+              call_index += 1
+              payload = {
+                  "function": f"{address}::{module}::{function}",
+                  "type_arguments": [],
+                  "arguments": arguments or [],
+              }
+              result = request_json("POST", "/view", payload=payload)
+              (RAW / f"{call_index:03d}_{module}_{function}.json").write_text(
+                  json.dumps({"payload": payload, "result": result}, indent=2),
+                  encoding="utf-8",
+              )
+              return result
+
+          def single(value: Any) -> Any:
+              if isinstance(value, list) and len(value) == 1:
+                  return value[0]
+              return value
+
+          def flat_tuple(value: Any, expected: int) -> list[Any]:
+              if isinstance(value, list) and len(value) == expected:
+                  return value
+              if isinstance(value, list) and len(value) == 1 and isinstance(value[0], list) and len(value[0]) == expected:
+                  return value[0]
+              raise ValueError(f"unexpected tuple shape expected={expected}: {value!r}")
+
+          def to_int(value: Any) -> int:
+              if isinstance(value, bool):
+                  return int(value)
+              if isinstance(value, str):
+                  return int(value, 0)
+              return int(value)
+
+          def normalize_address(value: str) -> str:
+              raw = value.lower()
+              if raw.startswith("0x"):
+                  raw = raw[2:]
+              return "0x" + raw.rjust(64, "0")
+
+          def metadata(asset: str) -> dict[str, Any]:
+              try:
+                  data = request_json(
+                      "GET",
+                      f"/accounts/{asset}/resource/0x1::fungible_asset::Metadata",
+                  )["data"]
+                  return {
+                      "name": data.get("name"),
+                      "symbol": data.get("symbol"),
+                      "metadata_decimals": to_int(data.get("decimals", 0)),
+                  }
+              except Exception as exc:
+                  return {"metadata_error": str(exc)}
+
+          ledger = request_json("GET", "")
+          (OUT / "ledger.json").write_text(json.dumps(ledger, indent=2), encoding="utf-8")
+
+          reserve_token_records: dict[str, dict[str, Any]] = {}
+          try:
+              token_result = single(view(POOL, "pool_data_provider", "get_all_reserves_tokens"))
+              if isinstance(token_result, list):
+                  for item in token_result:
+                      if isinstance(item, dict) and item.get("token_address"):
+                          reserve_token_records[normalize_address(item["token_address"])] = item
+          except Exception as exc:
+              (OUT / "get_all_reserves_tokens_error.txt").write_text(str(exc), encoding="utf-8")
+
+          reserves = single(view(POOL, "pool", "get_reserves_list"))
+          if not isinstance(reserves, list):
+              raise RuntimeError(f"unexpected reserve list: {reserves!r}")
+
+          rows: list[dict[str, Any]] = []
+          for raw_asset in reserves:
+              asset = normalize_address(str(raw_asset))
+              cfg = flat_tuple(
+                  view(POOL, "pool_data_provider", "get_reserve_configuration_data", [asset]),
+                  9,
+              )
+              caps = flat_tuple(view(POOL, "pool_data_provider", "get_reserve_caps", [asset]), 2)
+              reserve_data = flat_tuple(view(POOL, "pool_data_provider", "get_reserve_data", [asset]), 8)
+              config_obj = single(view(POOL, "pool", "get_reserve_configuration", [asset]))
+              config_bits = to_int(config_obj.get("data", 0) if isinstance(config_obj, dict) else config_obj)
+              reserve_object = single(view(POOL, "pool", "get_reserve_data", [asset]))
+              isolation_total = to_int(single(view(POOL, "pool", "get_reserve_isolation_mode_total_debt", [reserve_object])))
+              token_meta = metadata(asset)
+              token_record = reserve_token_records.get(asset, {})
+
+              symbol = token_record.get("symbol") or token_meta.get("symbol") or "UNKNOWN"
+              name = token_meta.get("name") or ""
+              decimals = to_int(cfg[0])
+              debt_ceiling = to_int(single(view(POOL, "pool_data_provider", "get_debt_ceiling", [asset])))
+              emode_category = to_int(single(view(POOL, "pool_data_provider", "get_reserve_emode_category", [asset])))
+              oracle_price = to_int(single(view(ORACLE, "oracle", "get_asset_price", [asset])))
+              deficit = to_int(single(view(POOL, "pool_data_provider", "get_reserve_deficit", [asset])))
+
+              row = {
+                  "asset": asset,
+                  "symbol": symbol,
+                  "name": name,
+                  "decimals": decimals,
+                  "ltv_bps": to_int(cfg[1]),
+                  "liquidation_threshold_bps": to_int(cfg[2]),
+                  "liquidation_bonus_bps": to_int(cfg[3]),
+                  "reserve_factor_bps": to_int(cfg[4]),
+                  "collateral_enabled": bool(cfg[5]),
+                  "borrowing_enabled": bool(cfg[6]),
+                  "active": bool(cfg[7]),
+                  "frozen": bool(cfg[8]),
+                  "borrow_cap_tokens": to_int(caps[0]),
+                  "supply_cap_tokens": to_int(caps[1]),
+                  "debt_ceiling_units": debt_ceiling,
+                  "debt_ceiling_usd": debt_ceiling / 100,
+                  "isolation_mode_total_debt_units": isolation_total,
+                  "isolation_mode_total_debt_usd": isolation_total / 100,
+                  "borrowable_in_isolation": bool((config_bits >> 61) & 1),
+                  "siloed_borrowing": bool((config_bits >> 62) & 1),
+                  "flashloan_enabled": bool((config_bits >> 63) & 1),
+                  "emode_category": emode_category,
+                  "oracle_price_1e18": oracle_price,
+                  "oracle_price": oracle_price / 10**18,
+                  "accrued_to_treasury_scaled": to_int(reserve_data[0]),
+                  "a_token_total_supply_base_units": to_int(reserve_data[1]),
+                  "a_token_total_supply_tokens": to_int(reserve_data[1]) / (10**decimals),
+                  "variable_debt_base_units": to_int(reserve_data[2]),
+                  "variable_debt_tokens": to_int(reserve_data[2]) / (10**decimals),
+                  "deficit_base_units": deficit,
+                  "deficit_tokens": deficit / (10**decimals),
+                  "configuration_bits": str(config_bits),
+              }
+              rows.append(row)
+
+          debt_ceiling_decimals = to_int(single(view(POOL, "pool_data_provider", "get_debt_ceiling_decimals")))
+          active_isolation_collaterals = [
+              row for row in rows
+              if row["active"] and row["collateral_enabled"] and row["debt_ceiling_units"] > 0
+          ]
+          borrowable_isolation_assets = [
+              row for row in rows
+              if row["active"] and row["borrowing_enabled"] and row["borrowable_in_isolation"]
+          ]
+          gho_rows = [row for row in rows if str(row["symbol"]).upper() == "GHO"]
+          gho_collateral_rows = [
+              row for row in gho_rows
+              if row["active"] and row["collateral_enabled"] and row["ltv_bps"] > 0
+          ]
+
+          decision = {
+              "queried_at_ledger_timestamp": ledger.get("ledger_timestamp"),
+              "ledger_version": ledger.get("ledger_version"),
+              "chain_id": ledger.get("chain_id"),
+              "pool": POOL,
+              "oracle": ORACLE,
+              "reserve_count": len(rows),
+              "debt_ceiling_decimals": debt_ceiling_decimals,
+              "isolation_live": bool(active_isolation_collaterals and borrowable_isolation_assets),
+              "active_isolation_collaterals": active_isolation_collaterals,
+              "borrowable_isolation_assets": borrowable_isolation_assets,
+              "gho_live": bool(gho_rows),
+              "gho_live_collateral": bool(gho_collateral_rows),
+              "gho_rows": gho_rows,
+          }
+
+          (OUT / "live_reserve_matrix.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
+          (OUT / "decision.json").write_text(json.dumps(decision, indent=2), encoding="utf-8")
+          if rows:
+              with (OUT / "live_reserve_matrix.csv").open("w", newline="", encoding="utf-8") as handle:
+                  writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          summary = [
+              "# Aave Aptos live configuration decision",
+              "",
+              f"- ledger version: `{ledger.get('ledger_version')}`",
+              f"- reserve count: `{len(rows)}`",
+              f"- active isolation collateral count: `{len(active_isolation_collaterals)}`",
+              f"- borrowable-in-isolation asset count: `{len(borrowable_isolation_assets)}`",
+              f"- isolation rounding candidate live: `{decision['isolation_live']}`",
+              f"- GHO listed: `{decision['gho_live']}`",
+              f"- GHO enabled as collateral: `{decision['gho_live_collateral']}`",
+              "",
+              "## Active isolation collaterals",
+          ]
+          for row in active_isolation_collaterals:
+              summary.append(
+                  f"- {row['symbol']} `{row['asset']}`: ceiling ${row['debt_ceiling_usd']:,.2f}, tracked ${row['isolation_mode_total_debt_usd']:,.2f}"
+              )
+          summary.append("")
+          summary.append("## Borrowable in isolation")
+          for row in borrowable_isolation_assets:
+              summary.append(
+                  f"- {row['symbol']} `{row['asset']}`: variable debt {row['variable_debt_tokens']:,.8f}"
+              )
+          summary.append("")
+          summary.append("## GHO")
+          for row in gho_rows:
+              summary.append(
+                  f"- active={row['active']} collateral={row['collateral_enabled']} LTV={row['ltv_bps']} supply={row['a_token_total_supply_tokens']} debt={row['variable_debt_tokens']} oracle={row['oracle_price']}"
+              )
+          (OUT / "summary.md").write_text("\n".join(summary) + "\n", encoding="utf-8")
+          print(json.dumps(decision, indent=2))
+          PY
+
+          python3 query_live.py | tee evidence/console.log
+          cp query_live.py evidence/
+          sha256sum evidence/* > evidence/SHA256SUMS.txt
+
+      - name: Upload live configuration evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aave-aptos-live-configuration-evidence
+          path: evidence
+          if-no-files-found: error
+          retention-days: 14
