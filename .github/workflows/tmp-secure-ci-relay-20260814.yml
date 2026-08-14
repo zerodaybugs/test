@@ -45,7 +45,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      - name: Wait for encrypted payload
+      - name: Wait for ASCII-armored encrypted payload
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -57,55 +57,82 @@ jobs:
             code_payload=$(curl -sS -o "$RUNNER_TEMP/payload.json" -w '%{http_code}' \
               -H "Authorization: Bearer ${GH_TOKEN}" \
               -H 'Accept: application/vnd.github+json' \
-              "${api}/payload.enc?ref=${GITHUB_REF_NAME}")
+              "${api}/payload-v2.enc.b64?ref=${GITHUB_REF_NAME}")
             code_key=$(curl -sS -o "$RUNNER_TEMP/payload-key.json" -w '%{http_code}' \
               -H "Authorization: Bearer ${GH_TOKEN}" \
               -H 'Accept: application/vnd.github+json' \
-              "${api}/payload.key.enc?ref=${GITHUB_REF_NAME}")
-            if [[ "$code_payload" == 200 && "$code_key" == 200 ]]; then
+              "${api}/payload-v2.key.enc.b64?ref=${GITHUB_REF_NAME}")
+            code_sums=$(curl -sS -o "$RUNNER_TEMP/payload-sums.json" -w '%{http_code}' \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H 'Accept: application/vnd.github+json' \
+              "${api}/payload-v2.SHA256SUMS.txt?ref=${GITHUB_REF_NAME}")
+            if [[ "$code_payload" == 200 && "$code_key" == 200 && "$code_sums" == 200 ]]; then
               jq -r '.content' "$RUNNER_TEMP/payload.json" | tr -d '\n' | base64 -d \
-                > "$RUNNER_TEMP/payload.enc"
+                > "$RUNNER_TEMP/payload.enc.b64"
               jq -r '.content' "$RUNNER_TEMP/payload-key.json" | tr -d '\n' | base64 -d \
-                > "$RUNNER_TEMP/payload.key.enc"
+                > "$RUNNER_TEMP/payload.key.enc.b64"
+              jq -r '.content' "$RUNNER_TEMP/payload-sums.json" | tr -d '\n' | base64 -d \
+                > "$RUNNER_TEMP/payload.SHA256SUMS.txt"
+              base64 -d "$RUNNER_TEMP/payload.enc.b64" > "$RUNNER_TEMP/payload.enc"
+              base64 -d "$RUNNER_TEMP/payload.key.enc.b64" > "$RUNNER_TEMP/payload.key.enc"
               found=1
               break
             fi
             sleep 5
           done
           [[ "$found" == 1 ]]
-          test -s "$RUNNER_TEMP/payload.enc"
-          test -s "$RUNNER_TEMP/payload.key.enc"
+          cd "$RUNNER_TEMP"
+          sha256sum -c payload.SHA256SUMS.txt
+          test -s payload.enc
+          test -s payload.key.enc
 
       - name: Decrypt and execute isolated payload
         shell: bash
         env:
           SECURE_RESULT_DIR: ${{ runner.temp }}/secure-result
         run: |
-          set -euo pipefail
+          set -u
           mkdir -p "$SECURE_RESULT_DIR" "$RUNNER_TEMP/secure-payload"
-          openssl pkeyutl -decrypt \
-            -inkey "$RUNNER_TEMP/runner-private.pem" \
-            -in "$RUNNER_TEMP/payload.key.enc" \
-            -out "$RUNNER_TEMP/payload.pass" \
-            -pkeyopt rsa_padding_mode:oaep \
-            -pkeyopt rsa_oaep_md:sha256
-          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
-            -in "$RUNNER_TEMP/payload.enc" \
-            -out "$RUNNER_TEMP/payload.tar.gz" \
-            -pass file:"$RUNNER_TEMP/payload.pass"
-          tar -xzf "$RUNNER_TEMP/payload.tar.gz" \
-            -C "$RUNNER_TEMP/secure-payload" \
-            --no-same-owner --no-same-permissions
-          test -x "$RUNNER_TEMP/secure-payload/run.sh"
-          set +e
-          bash "$RUNNER_TEMP/secure-payload/run.sh" \
-            >"$SECURE_RESULT_DIR/driver.stdout.log" \
-            2>"$SECURE_RESULT_DIR/driver.stderr.log"
-          rc=$?
-          set -e
+          relay_out="$SECURE_RESULT_DIR/relay.stdout.log"
+          relay_err="$SECURE_RESULT_DIR/relay.stderr.log"
+          rc=0
+          {
+            openssl pkeyutl -decrypt \
+              -inkey "$RUNNER_TEMP/runner-private.pem" \
+              -in "$RUNNER_TEMP/payload.key.enc" \
+              -out "$RUNNER_TEMP/payload.pass" \
+              -pkeyopt rsa_padding_mode:oaep \
+              -pkeyopt rsa_oaep_md:sha256 || rc=10
+            if [[ "$rc" == 0 ]]; then
+              openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+                -in "$RUNNER_TEMP/payload.enc" \
+                -out "$RUNNER_TEMP/payload.tar.gz" \
+                -pass file:"$RUNNER_TEMP/payload.pass" || rc=11
+            fi
+            if [[ "$rc" == 0 ]]; then
+              gzip -t "$RUNNER_TEMP/payload.tar.gz" || rc=12
+            fi
+            if [[ "$rc" == 0 ]]; then
+              tar -xzf "$RUNNER_TEMP/payload.tar.gz" \
+                -C "$RUNNER_TEMP/secure-payload" \
+                --no-same-owner --no-same-permissions || rc=13
+            fi
+            if [[ "$rc" == 0 && ! -x "$RUNNER_TEMP/secure-payload/run.sh" ]]; then
+              rc=14
+            fi
+          } >"$relay_out" 2>"$relay_err"
+          if [[ "$rc" == 0 ]]; then
+            set +e
+            bash "$RUNNER_TEMP/secure-payload/run.sh" \
+              >"$SECURE_RESULT_DIR/driver.stdout.log" \
+              2>"$SECURE_RESULT_DIR/driver.stderr.log"
+            rc=$?
+            set -e
+          fi
           printf '%s\n' "$rc" > "$SECURE_RESULT_DIR/driver.exit"
           printf 'relay_run_id=%s\nrelay_commit=%s\n' \
             "$GITHUB_RUN_ID" "$GITHUB_SHA" > "$SECURE_RESULT_DIR/relay.env"
+          exit 0
 
       - name: Encrypt result for the researcher
         if: always()
