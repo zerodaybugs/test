@@ -1,0 +1,141 @@
+name: Ethereum client post-release sibling diff
+on:
+  push:
+    paths:
+      - '.github/workflows/ethereum-postrelease-sibling-diff-20260814.yml'
+permissions:
+  contents: read
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Collect exact public release-to-head diffs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/repos
+          cat > /tmp/collect.py <<'PY'
+          import json, os, pathlib, re, subprocess, urllib.request
+
+          OUT = pathlib.Path('out')
+          repos = [
+              ('geth', 'ethereum/go-ethereum'),
+              ('reth', 'paradigmxyz/reth'),
+              ('besu', 'besu-eth/besu'),
+              ('nethermind', 'NethermindEth/nethermind'),
+              ('prysm', 'OffchainLabs/prysm'),
+              ('lighthouse', 'sigp/lighthouse'),
+          ]
+          keywords = re.compile(
+              r'(fix|invalid|consensus|engine|payload|forkchoice|state root|receipt|trie|'
+              r'overflow|panic|crash|deadlock|race|dos|resource|peer|gossip|sidecar|blob|'
+              r'custody|availability|finality|reorg|cache|validation|rlp|ssz|kzg|authorization)',
+              re.I,
+          )
+
+          def run(args, cwd=None, check=True):
+              p = subprocess.run(args, cwd=cwd, text=True, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT)
+              if check and p.returncode:
+                  raise RuntimeError(f'{args}: {p.returncode}: {p.stdout[-4000:]}')
+              return p
+
+          def api(path):
+              req = urllib.request.Request(
+                  'https://api.github.com' + path,
+                  headers={
+                      'Accept': 'application/vnd.github+json',
+                      'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                      'X-GitHub-Api-Version': '2022-11-28',
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return json.load(r)
+
+          report = {'schema': 'ethereum-postrelease-sibling-diff-v1', 'repos': {}}
+          for short, full in repos:
+              item = {'repository': full}
+              try:
+                  release = api(f'/repos/{full}/releases/latest')
+                  tag = release['tag_name']
+                  item['latest_release'] = {
+                      'tag': tag,
+                      'published_at': release.get('published_at'),
+                      'html_url': release.get('html_url'),
+                  }
+                  path = OUT / 'repos' / short
+                  run(['git', 'clone', '--filter=blob:none', '--no-checkout',
+                       f'https://github.com/{full}.git', str(path)])
+                  run(['git', 'fetch', '--depth=1', 'origin', f'refs/tags/{tag}:refs/tags/{tag}'], cwd=path)
+                  run(['git', 'fetch', '--depth=250', 'origin'], cwd=path)
+                  default = api(f'/repos/{full}')['default_branch']
+                  item['default_branch'] = default
+                  head = run(['git', 'rev-parse', f'origin/{default}'], cwd=path).stdout.strip()
+                  base = run(['git', 'rev-parse', tag], cwd=path).stdout.strip()
+                  item['release_commit'] = base
+                  item['head_commit'] = head
+
+                  log = run([
+                      'git', 'log', '--no-merges', '--date=iso-strict',
+                      '--pretty=format:%H%x09%ad%x09%s', f'{tag}..origin/{default}'
+                  ], cwd=path, check=False).stdout.splitlines()
+                  commits = []
+                  for line in log:
+                      parts = line.split('\t', 2)
+                      if len(parts) != 3:
+                          continue
+                      sha, date, subject = parts
+                      files = run(['git', 'diff-tree', '--no-commit-id', '--name-only', '-r', sha],
+                                  cwd=path, check=False).stdout.splitlines()
+                      match = bool(keywords.search(subject + '\n' + '\n'.join(files)))
+                      commits.append({
+                          'sha': sha, 'date': date, 'subject': subject,
+                          'files': files, 'security_keyword_match': match,
+                      })
+                  item['commit_count_since_release'] = len(commits)
+                  item['security_relevant_commits'] = [c for c in commits if c['security_keyword_match']]
+                  item['all_commits'] = commits
+
+                  diff_names = run(['git', 'diff', '--name-status', tag, f'origin/{default}'],
+                                   cwd=path, check=False).stdout
+                  (OUT / f'{short}_name_status.txt').write_text(diff_names)
+                  sec_lines = []
+                  for c in item['security_relevant_commits']:
+                      sec_lines.append(f"{c['sha']}\t{c['date']}\t{c['subject']}")
+                      sec_lines.extend('  ' + f for f in c['files'])
+                  (OUT / f'{short}_security_commits.txt').write_text('\n'.join(sec_lines) + '\n')
+                  run(['git', 'bundle', 'create', str((OUT / f'{short}_public_diff.bundle').resolve()),
+                       tag, f'origin/{default}'], cwd=path, check=False)
+              except Exception as exc:
+                  item['error'] = repr(exc)
+              report['repos'][short] = item
+
+          (OUT / 'POSTRELEASE_DIFF_REPORT.json').write_text(json.dumps(report, indent=2))
+          summary = ['# Ethereum client post-release public diff summary', '']
+          for short, item in report['repos'].items():
+              summary += [f'## {short}', f"- repo: `{item['repository']}`"]
+              if 'error' in item:
+                  summary += [f"- error: `{item['error']}`", '']
+                  continue
+              summary += [
+                  f"- latest release: `{item['latest_release']['tag']}`",
+                  f"- release commit: `{item['release_commit']}`",
+                  f"- head commit: `{item['head_commit']}`",
+                  f"- commits since release: `{item['commit_count_since_release']}`",
+                  f"- keyword-ranked commits: `{len(item['security_relevant_commits'])}`",
+                  '',
+              ]
+          (OUT / 'SUMMARY.md').write_text('\n'.join(summary))
+          PY
+          python /tmp/collect.py
+          find out -type f -maxdepth 2 -print0 | sort -z | xargs -0 sha256sum > out/SHA256SUMS.txt
+      - name: Upload public diff evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: ethereum-postrelease-public-diffs-20260814
+          path: out/
+          retention-days: 1
+          if-no-files-found: error
