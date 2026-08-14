@@ -1,0 +1,146 @@
+name: Temporary secure validation relay v8b
+
+on:
+  push:
+    branches:
+      - tmp-secure-ci-20260814-icp1
+    paths:
+      - ".github/workflows/tmp-secure-ci-relay-v8b-20260814.yml"
+      - "secure-ci/bootstrap-v8b.txt"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tmp-secure-ci-20260814-icp1-v8b
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout relay repository
+        uses: actions/checkout@v4
+        with:
+          ref: tmp-secure-ci-20260814-icp1
+
+      - name: Generate and publish one-time runner public key
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 \
+            -out "$RUNNER_TEMP/runner-private.pem" >/dev/null 2>&1
+          openssl pkey -in "$RUNNER_TEMP/runner-private.pem" -pubout \
+            -out "$RUNNER_TEMP/runner-v8b-public.pem" >/dev/null 2>&1
+          chmod 600 "$RUNNER_TEMP/runner-private.pem"
+          sha256sum "$RUNNER_TEMP/runner-v8b-public.pem" \
+            > "$RUNNER_TEMP/runner-v8b-public.pem.sha256"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git pull --rebase origin "$GITHUB_REF_NAME"
+          mkdir -p secure-ci
+          cp "$RUNNER_TEMP/runner-v8b-public.pem" secure-ci/runner-v8b-public.pem
+          cp "$RUNNER_TEMP/runner-v8b-public.pem.sha256" secure-ci/runner-v8b-public.pem.sha256
+          git add secure-ci/runner-v8b-public.pem secure-ci/runner-v8b-public.pem.sha256
+          git commit -m 'ci: publish one-time encrypted relay key v8b'
+          git push origin "HEAD:$GITHUB_REF_NAME"
+
+      - name: Wait for encrypted payload v8b
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/secure-ci"
+          found=0
+          for _ in $(seq 1 360); do
+            p=$(curl -sS -o "$RUNNER_TEMP/payload.json" -w '%{http_code}' \
+              -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' \
+              "${api}/payload-v8b.enc.b64?ref=${GITHUB_REF_NAME}")
+            k=$(curl -sS -o "$RUNNER_TEMP/key.json" -w '%{http_code}' \
+              -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' \
+              "${api}/payload-v8b.key.enc.b64?ref=${GITHUB_REF_NAME}")
+            s=$(curl -sS -o "$RUNNER_TEMP/sums.json" -w '%{http_code}' \
+              -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' \
+              "${api}/payload-v8b.SHA256SUMS.txt?ref=${GITHUB_REF_NAME}")
+            if [[ "$p" == 200 && "$k" == 200 && "$s" == 200 ]]; then
+              jq -r '.content' "$RUNNER_TEMP/payload.json" | tr -d '\n' | base64 -d > "$RUNNER_TEMP/payload.enc.b64"
+              jq -r '.content' "$RUNNER_TEMP/key.json" | tr -d '\n' | base64 -d > "$RUNNER_TEMP/payload.key.enc.b64"
+              jq -r '.content' "$RUNNER_TEMP/sums.json" | tr -d '\n' | base64 -d > "$RUNNER_TEMP/payload.SHA256SUMS.txt"
+              base64 -d "$RUNNER_TEMP/payload.enc.b64" > "$RUNNER_TEMP/payload.enc"
+              base64 -d "$RUNNER_TEMP/payload.key.enc.b64" > "$RUNNER_TEMP/payload.key.enc"
+              found=1
+              break
+            fi
+            sleep 5
+          done
+          [[ "$found" == 1 ]]
+          cd "$RUNNER_TEMP"
+          sha256sum -c payload.SHA256SUMS.txt
+
+      - name: Decrypt and execute isolated payload
+        shell: bash
+        env:
+          SECURE_RESULT_DIR: ${{ runner.temp }}/secure-result
+        run: |
+          set -u
+          mkdir -p "$SECURE_RESULT_DIR" "$RUNNER_TEMP/secure-payload"
+          rc=0
+          {
+            openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/runner-private.pem" \
+              -in "$RUNNER_TEMP/payload.key.enc" -out "$RUNNER_TEMP/payload.pass" \
+              -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 || rc=10
+            if [[ "$rc" == 0 ]]; then
+              openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+                -in "$RUNNER_TEMP/payload.enc" -out "$RUNNER_TEMP/payload.tar.gz" \
+                -pass file:"$RUNNER_TEMP/payload.pass" || rc=11
+            fi
+            if [[ "$rc" == 0 ]]; then gzip -t "$RUNNER_TEMP/payload.tar.gz" || rc=12; fi
+            if [[ "$rc" == 0 ]]; then
+              tar -xzf "$RUNNER_TEMP/payload.tar.gz" -C "$RUNNER_TEMP/secure-payload" \
+                --no-same-owner --no-same-permissions || rc=13
+            fi
+            if [[ "$rc" == 0 && ! -x "$RUNNER_TEMP/secure-payload/run.sh" ]]; then rc=14; fi
+          } >"$SECURE_RESULT_DIR/relay.stdout.log" 2>"$SECURE_RESULT_DIR/relay.stderr.log"
+          if [[ "$rc" == 0 ]]; then
+            set +e
+            bash "$RUNNER_TEMP/secure-payload/run.sh" \
+              >"$SECURE_RESULT_DIR/driver.stdout.log" 2>"$SECURE_RESULT_DIR/driver.stderr.log"
+            rc=$?
+            set -e
+          fi
+          printf '%s\n' "$rc" > "$SECURE_RESULT_DIR/driver.exit"
+          printf 'relay_run_id=%s\nrelay_commit=%s\n' "$GITHUB_RUN_ID" "$GITHUB_SHA" > "$SECURE_RESULT_DIR/relay.env"
+          exit 0
+
+      - name: Encrypt and publish result for the researcher
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          result_dir="$RUNNER_TEMP/secure-result"
+          mkdir -p "$result_dir" "$RUNNER_TEMP/encrypted-result"
+          if [[ ! -f "$result_dir/driver.exit" ]]; then
+            printf 'relay execution did not reach driver completion\n' > "$result_dir/relay_failure.txt"
+          fi
+          tar -czf "$RUNNER_TEMP/result.tar.gz" -C "$result_dir" .
+          openssl rand -hex 32 > "$RUNNER_TEMP/result.pass"
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+            -in "$RUNNER_TEMP/result.tar.gz" -out "$RUNNER_TEMP/encrypted-result/result.enc" \
+            -pass file:"$RUNNER_TEMP/result.pass"
+          openssl pkeyutl -encrypt -pubin -inkey secure-ci/researcher-public.pem \
+            -in "$RUNNER_TEMP/result.pass" -out "$RUNNER_TEMP/encrypted-result/result.key.enc" \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          sha256sum "$RUNNER_TEMP/encrypted-result/result.enc" \
+            "$RUNNER_TEMP/encrypted-result/result.key.enc" > "$RUNNER_TEMP/encrypted-result/SHA256SUMS.txt"
+          git pull --rebase origin "$GITHUB_REF_NAME"
+          rm -rf secure-ci/result-v8b
+          mkdir -p secure-ci/result-v8b
+          cp "$RUNNER_TEMP/encrypted-result/result.enc" secure-ci/result-v8b/
+          cp "$RUNNER_TEMP/encrypted-result/result.key.enc" secure-ci/result-v8b/
+          cp "$RUNNER_TEMP/encrypted-result/SHA256SUMS.txt" secure-ci/result-v8b/
+          git add secure-ci/result-v8b
+          git commit -m 'ci: publish encrypted validation result v8b'
+          git push origin "HEAD:$GITHUB_REF_NAME"
