@@ -1,0 +1,107 @@
+name: Aave Aptos live reserve inventory
+
+on:
+  push:
+    branches:
+      - aave-aptos-live-reserve-inventory-20260815
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Query live Aave Aptos reserve data
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p evidence
+          cat > /tmp/body.json <<'JSON'
+          {
+            "function": "0x39ddcd9e1a39fa14f25e3f9ec8a86074d05cc0881cbf667df8a6ee70942016fb::ui_pool_data_provider_v3::get_reserves_data",
+            "type_arguments": [],
+            "arguments": []
+          }
+          JSON
+          endpoints=(
+            "https://api.mainnet.aptoslabs.com/v1/view"
+            "https://fullnode.mainnet.aptoslabs.com/v1/view"
+          )
+          ok=0
+          for endpoint in "${endpoints[@]}"; do
+            if curl --retry 3 --retry-all-errors --connect-timeout 15 --max-time 120 \
+              -fsS -X POST "$endpoint" \
+              -H 'Content-Type: application/json' \
+              --data-binary @/tmp/body.json \
+              -o evidence/reserves_raw.json; then
+              printf '%s\n' "$endpoint" > evidence/endpoint.txt
+              ok=1
+              break
+            fi
+          done
+          test "$ok" = 1
+          python3 -m json.tool evidence/reserves_raw.json > evidence/reserves_pretty.json
+
+      - name: Extract isolation configuration
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(Path('evidence/reserves_raw.json').read_text())
+          rows = []
+
+          def walk(value):
+              if isinstance(value, dict):
+                  keys = set(value)
+                  if 'debt_ceiling' in keys or 'isolation_mode_total_debt' in keys:
+                      rows.append({
+                          'underlying_asset': value.get('underlying_asset'),
+                          'name': value.get('name'),
+                          'symbol': value.get('symbol'),
+                          'decimals': value.get('decimals'),
+                          'debt_ceiling': value.get('debt_ceiling'),
+                          'debt_ceiling_decimals': value.get('debt_ceiling_decimals'),
+                          'isolation_mode_total_debt': value.get('isolation_mode_total_debt'),
+                          'borrowable_in_isolation': value.get('borrowable_in_isolation'),
+                          'borrowing_enabled': value.get('borrowing_enabled'),
+                          'borrow_cap': value.get('borrow_cap'),
+                          'supply_cap': value.get('supply_cap'),
+                      })
+                  for child in value.values():
+                      walk(child)
+              elif isinstance(value, list):
+                  for child in value:
+                      walk(child)
+
+          walk(data)
+          Path('evidence/isolation_rows.json').write_text(json.dumps(rows, indent=2))
+          active = []
+          for row in rows:
+              try:
+                  ceiling = int(str(row.get('debt_ceiling') or '0'))
+              except Exception:
+                  ceiling = -1
+              if ceiling != 0:
+                  active.append(row)
+          Path('evidence/nonzero_debt_ceilings.json').write_text(json.dumps(active, indent=2))
+          Path('evidence/summary.txt').write_text(
+              f"reserve_rows={len(rows)}\nnonzero_debt_ceilings={len(active)}\n"
+          )
+          print(Path('evidence/summary.txt').read_text())
+          print(Path('evidence/nonzero_debt_ceilings.json').read_text())
+          PY
+          sha256sum evidence/* > evidence/SHA256SUMS.txt
+
+      - name: Upload inventory
+        uses: actions/upload-artifact@v4
+        with:
+          name: aave-aptos-live-reserve-inventory
+          path: evidence
+          retention-days: 7
+          if-no-files-found: error
