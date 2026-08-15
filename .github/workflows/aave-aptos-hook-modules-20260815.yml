@@ -1,0 +1,106 @@
+name: Aave Aptos hook module inspection
+
+on:
+  push:
+    branches:
+      - aave-aptos-underlying-hooks-20260815
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FULLNODE: https://api.mainnet.aptoslabs.com/v1
+    steps:
+      - name: Install Aptos CLI 9.5.0
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o /tmp/aptos.zip \
+            https://github.com/aptos-labs/aptos-core/releases/download/aptos-cli-v9.5.0/aptos-cli-9.5.0-Linux-x86_64.zip
+          unzip -q /tmp/aptos.zip -d "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/aptos"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          aptos --version
+
+      - name: List and download hook packages
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p evidence/downloads evidence/decompiled evidence/disassembled
+          cat > evidence/accounts.tsv <<'EOF'
+          USDC	0xe5c5befe31ce06bc1f2fd31210988aac08af6d821b039935557a6f14c03471be
+          USDt	0xf73e887a8754f540ee6e1a93bdc6dde2af69fc7ca5de32013e89dd44244473cb
+          EOF
+          while IFS=$'\t' read -r symbol account; do
+            mkdir -p "evidence/downloads/$symbol" "evidence/decompiled/$symbol" "evidence/disassembled/$symbol"
+            aptos move list --account "$account" --url "$FULLNODE" \
+              --connection-timeout-secs 120 > "evidence/${symbol}_packages.txt" 2>&1
+            curl --retry 3 --retry-all-errors -fsS \
+              "$FULLNODE/accounts/$account/resource/0x1::code::PackageRegistry" \
+              -o "evidence/${symbol}_package_registry.json"
+            jq -r '.data.packages[].name' "evidence/${symbol}_package_registry.json" \
+              > "evidence/${symbol}_package_names.txt"
+            while IFS= read -r package; do
+              [ -n "$package" ] || continue
+              out="evidence/downloads/$symbol"
+              aptos move download --account "$account" --package "$package" \
+                --bytecode --output-dir "$out" --url "$FULLNODE" \
+                --connection-timeout-secs 120 \
+                > "evidence/${symbol}_${package}_download.log" 2>&1
+            done < "evidence/${symbol}_package_names.txt"
+            find "evidence/downloads/$symbol" -type d -name bytecode_modules -print0 | while IFS= read -r -d '' dir; do
+              rel=${dir#evidence/downloads/$symbol/}
+              safe=$(printf '%s' "$rel" | tr '/ ' '__')
+              mkdir -p "evidence/decompiled/$symbol/$safe" "evidence/disassembled/$symbol/$safe"
+              aptos move decompile --package-dir "$dir" --output-dir "evidence/decompiled/$symbol/$safe" --assume-yes \
+                > "evidence/${symbol}_${safe}_decompile.log" 2>&1 || true
+              aptos move disassemble --package-dir "$dir" --output-dir "evidence/disassembled/$symbol/$safe" --assume-yes \
+                > "evidence/${symbol}_${safe}_disassemble.log" 2>&1 || true
+            done
+          done < evidence/accounts.tsv
+
+      - name: Extract hook functions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          needles=('override_deposit','override_withdraw','fun deposit','fun withdraw','transfer_fee','fee','deny','block','pause','freeze')
+          hits=[]
+          for root in (Path('evidence/decompiled'),Path('evidence/disassembled')):
+              for p in root.rglob('*'):
+                  if not p.is_file():
+                      continue
+                  try: text=p.read_text(errors='replace')
+                  except Exception: continue
+                  low=text.lower()
+                  if any(n.lower() in low for n in needles):
+                      hits.append({'path':str(p),'matches':[n for n in needles if n.lower() in low]})
+          Path('evidence/hook_hits.json').write_text(json.dumps(hits,indent=2))
+          with Path('evidence/hook_excerpt.txt').open('w') as out:
+              for hit in hits:
+                  p=Path(hit['path']); text=p.read_text(errors='replace')
+                  out.write(f"\n===== {p} =====\n")
+                  lines=text.splitlines()
+                  for i,line in enumerate(lines):
+                      if any(n.lower() in line.lower() for n in needles):
+                          lo=max(0,i-10); hi=min(len(lines),i+35)
+                          out.write('\n'.join(lines[lo:hi])+'\n')
+          print(Path('evidence/hook_excerpt.txt').read_text()[:30000])
+          PY
+          find evidence -type f -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS.txt
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: aave-aptos-hook-module-inspection
+          path: evidence
+          retention-days: 7
+          if-no-files-found: error
