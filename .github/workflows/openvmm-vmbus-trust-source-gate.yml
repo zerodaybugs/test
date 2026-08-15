@@ -1,0 +1,231 @@
+name: openvmm-vmbus-trust-source-gate
+
+on:
+  push:
+    branches:
+      - research/openvmm-vmbus-trust-fixkill-20260815-v2
+    paths:
+      - .github/workflows/openvmm-vmbus-trust-source-gate.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  exact-source-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out research branch
+        uses: actions/checkout@v4
+        with:
+          ref: research/openvmm-vmbus-trust-fixkill-20260815-v2
+
+      - name: Clone exact Microsoft OpenVMM source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/microsoft/openvmm.git openvmm
+          git -C openvmm fetch --depth 1 origin 61fd38fe6114d0955a082aa717a8e16e722b8490
+          git -C openvmm checkout --detach 61fd38fe6114d0955a082aa717a8e16e722b8490
+          test "$(git -C openvmm rev-parse HEAD)" = "61fd38fe6114d0955a082aa717a8e16e722b8490"
+
+      - name: Run upstream vmbus_server library tests
+        id: tests
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          cd openvmm
+          cargo test -p vmbus_server --lib --no-fail-fast > ../vmbus_server_tests.stdout 2> ../vmbus_server_tests.stderr
+          rc=$?
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Build exact-source trust/provenance audit
+        shell: bash
+        env:
+          TEST_EXIT: ${{ steps.tests.outputs.exit_code }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p results/source results/logs
+          cp vmbus_server_tests.stdout results/logs/
+          cp vmbus_server_tests.stderr results/logs/
+          cp openvmm/vm/devices/vmbus/vmbus_server/src/channels.rs results/source/
+          cp openvmm/vm/devices/vmbus/vmbus_server/src/channels/saved_state.rs results/source/channels_saved_state.rs
+          cp openvmm/vm/devices/vmbus/vmbus_server/src/lib.rs results/source/vmbus_server_lib.rs
+          cp openvmm/vm/devices/vmbus/vmbus_channel/src/bus.rs results/source/vmbus_channel_bus.rs
+          cp openvmm/vm/vmcore/src/synic.rs results/source/synic.rs
+
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          import hashlib, json, os, re
+
+          root = Path('openvmm')
+          out = Path('results')
+          files = {
+              'channels': root/'vm/devices/vmbus/vmbus_server/src/channels.rs',
+              'saved_state': root/'vm/devices/vmbus/vmbus_server/src/channels/saved_state.rs',
+              'server_lib': root/'vm/devices/vmbus/vmbus_server/src/lib.rs',
+              'bus': root/'vm/devices/vmbus/vmbus_channel/src/bus.rs',
+              'synic': root/'vm/vmcore/src/synic.rs',
+              'tests': root/'vm/devices/vmbus/vmbus_server/src/channels/tests.rs',
+          }
+          text = {k:p.read_text(encoding='utf-8', errors='replace') for k,p in files.items()}
+
+          def lines_matching(blob: str, patterns: list[str], limit: int = 120):
+              rows=[]
+              for i,line in enumerate(blob.splitlines(),1):
+                  if any(re.search(p,line,re.I) for p in patterns):
+                      rows.append({'line':i,'text':line.strip()})
+                      if len(rows)>=limit: break
+              return rows
+
+          production_reserved=[]
+          production_memory=[]
+          for path in root.rglob('*.rs'):
+              rel=path.relative_to(root).as_posix()
+              low=rel.lower()
+              if any(seg in low for seg in ('/test/','/tests/','test.rs','tests.rs')):
+                  continue
+              blob=path.read_text(encoding='utf-8',errors='ignore')
+              if re.search(r'OpenReservedChannel|open_reserved_channel|reserved_state',blob):
+                  production_reserved.append(rel)
+              if re.search(r'\.ring_memory\(|\.guest_memory\(',blob):
+                  production_memory.append(rel)
+
+          ch=text['channels']
+          saved=text['saved_state']
+          server=text['server_lib']
+          bus=text['bus']
+          tests=text['tests']
+
+          facts={
+              'exact_commit':'61fd38fe6114d0955a082aa717a8e16e722b8490',
+              'upstream_test_exit':int(os.environ.get('TEST_EXIT') or -1),
+              'public_todo_present':"Don't allow trusted messages if an untrusted connection was ever used" in ch,
+              'one_way_trust_guard_present':bool(re.search(r'is_trusted\(\)\s*&&\s*!message\.trusted',ch)),
+              'synic_trusted_definition_present':'without using host-visible' in text['synic'],
+              'confidential_features_trusted_gate_present':bool(re.search(r'with_confidential_channels\(request\.trusted\)',ch)),
+              'reserved_state_struct_present':'struct ReservedState' in ch,
+              'reserved_open_handler_present':'handle_open_reserved_channel' in ch,
+              'reserved_independent_comment_present':'Reserved channels are independent of the connection state' in ch,
+              'offer_resources_memory_selector_present':'pub fn guest_memory' in bus and 'pub(crate) fn ring_memory' in bus,
+              'do_not_retain_memory_warning_present':'should not retain the guest memory after it is closed' in bus,
+              'gpa_pinning_open_flag_present':'is_external_memory_pinned' in bus,
+              'saved_state_mentions_trusted':bool(re.search(r'\btrusted\b',saved)),
+              'saved_state_mentions_gpa_pinning':bool(re.search(r'is_external_memory_pinned|gpa_pinning|require_pinned',saved)),
+              'production_reserved_files':sorted(set(production_reserved)),
+              'production_memory_selector_files':sorted(set(production_memory)),
+              'test_untrusted_occurrences':tests.lower().count('untrusted'),
+              'test_reserved_occurrences':tests.lower().count('reserved'),
+          }
+
+          source_primitive=(
+              facts['public_todo_present']
+              and facts['one_way_trust_guard_present']
+              and facts['confidential_features_trusted_gate_present']
+              and facts['reserved_open_handler_present']
+              and facts['reserved_independent_comment_present']
+              and facts['offer_resources_memory_selector_present']
+          )
+          production_consumer_files=[p for p in facts['production_reserved_files'] if not p.endswith('channels.rs') and not p.endswith('protocol.rs')]
+          facts['production_reserved_consumer_files']=production_consumer_files
+          impact_reachable=bool(production_consumer_files)
+
+          classification=(
+              'SOURCE_PRIMITIVE_REPRODUCED_PRODUCTION_CONSUMER_REVIEW_REQUIRED'
+              if source_primitive and impact_reachable else
+              'SOURCE_PRIMITIVE_REPRODUCED_NO_PRODUCTION_CONSUMER_PROOF'
+              if source_primitive else
+              'SOURCE_PRIMITIVE_NOT_REPRODUCED'
+          )
+          verdict={
+              'schema':1,
+              'classification':classification,
+              'source_primitive_reproduced':source_primitive,
+              'production_impact_proven':False,
+              'submission_ready':False,
+              'critical_defensible':False,
+              'high_defensible':False,
+              'facts':facts,
+              'mandatory_missing':[
+                  'source-native combined transition regression test',
+                  'unmodified-versus-patched fix-kill',
+                  'actual OpenHCL confidential-VM boot reproduction',
+                  'production reserved-channel consumer with concrete confidentiality or integrity impact',
+                  'official scope and current eligible-build confirmation',
+                  'exact public/private duplicate clearance',
+              ],
+          }
+          (out/'MACHINE_VERDICT.json').write_text(json.dumps(verdict,indent=2)+'\n')
+
+          excerpts={
+              'channels':lines_matching(ch,[r"Don't allow trusted",r'is_trusted\(\)',r'handle_open_reserved_channel',r'Reserved channels are independent',r'confidential_channels',r'handle_unload']),
+              'saved_state':lines_matching(saved,[r'trusted',r'feature_flags',r'reserved',r'connection']),
+              'server_lib':lines_matching(server,[r'Action::Open',r'OpenRequest::new',r'ring_memory',r'guest_memory',r'is_external_memory_pinned']),
+              'bus':lines_matching(bus,[r'guest_memory',r'ring_memory',r'do not retain',r'is_external_memory_pinned']),
+          }
+          (out/'SOURCE_EXCERPTS.json').write_text(json.dumps(excerpts,indent=2)+'\n')
+
+          status=f'''# OpenVMM / OpenHCL VMBus trust-transition exact-source gate
+
+- Exact commit: `61fd38fe6114d0955a082aa717a8e16e722b8490`
+- Classification: `{classification}`
+- Upstream `vmbus_server` test exit: `{facts['upstream_test_exit']}`
+- Source primitive reproduced: `{str(source_primitive).lower()}`
+- Production impact proven: `false`
+- Submission-ready: `false`
+- Critical defensible: `false`
+- High defensible: `false`
+
+## Decisive facts
+
+- Public one-way trust TODO present: `{facts['public_todo_present']}`
+- Untrusted-on-trusted rejection present: `{facts['one_way_trust_guard_present']}`
+- Trusted-only confidential feature negotiation present: `{facts['confidential_features_trusted_gate_present']}`
+- Reserved channel persistence/independence evidence present: `{facts['reserved_independent_comment_present']}`
+- Memory provenance selector and anti-retention warning present: `{facts['offer_resources_memory_selector_present'] and facts['do_not_retain_memory_warning_present']}`
+- Non-core production reserved-channel consumer candidates: `{len(production_consumer_files)}`
+
+## Verdict
+
+`HOLD_NOT_FOR_SUBMISSION`
+
+The code-level invariant is real, but a bounty report is prohibited until an actual
+OpenHCL/Azure confidential-VM path demonstrates a production reserved channel retaining
+host-visible memory across the trust transition with concrete confidentiality or integrity
+impact. The public TODO materially increases known-issue/duplicate risk.
+'''
+          (out/'STATUS.md').write_text(status)
+
+          manifest=[]
+          for p in sorted(x for x in out.rglob('*') if x.is_file() and x.name!='SHA256SUMS.txt'):
+              manifest.append(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(out).as_posix()}")
+          (out/'SHA256SUMS.txt').write_text('\n'.join(manifest)+'\n')
+          PY
+
+      - name: Commit authoritative source-gate result
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p research-results/openvmm-vmbus-trust-source-gate
+          rm -rf research-results/openvmm-vmbus-trust-source-gate/*
+          cp -R results/. research-results/openvmm-vmbus-trust-source-gate/
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add research-results/openvmm-vmbus-trust-source-gate
+          git commit -m 'research: record exact-source VMBus trust-transition gate' || true
+          git push origin HEAD:research/openvmm-vmbus-trust-fixkill-20260815-v2
+
+      - name: Upload raw source-gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openvmm-vmbus-trust-source-gate
+          path: results
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
