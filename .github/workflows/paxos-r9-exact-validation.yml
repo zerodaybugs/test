@@ -1,0 +1,430 @@
+name: Paxos R9 exact-source Solana rate-limit validation
+
+on:
+  push:
+    branches:
+      - paxos-public-toolchain-bootstrap-20260815
+    paths:
+      - '.github/workflows/paxos-r9-exact-validation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-r9:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone exact Paxos Solana source twice
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone https://github.com/paxosglobal/solana-programs.git solana-vulnerable
+          cd solana-vulnerable
+          git checkout --detach 90325c53ddb2dc25d924a7f4aaf877eca1ea9f23
+          test "$(git rev-parse HEAD)" = "90325c53ddb2dc25d924a7f4aaf877eca1ea9f23"
+          cd ..
+          cp -a solana-vulnerable solana-patched
+          mkdir -p evidence
+
+      - name: Add exact vulnerable state-transition tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >> solana-vulnerable/programs/minter-controller/src/instructions/mint_token.rs <<'RS'
+
+          #[cfg(test)]
+          mod r9_rate_reconfiguration_tests {
+              use super::*;
+
+              fn prospective_checkpoint(
+                  mut rl: RateLimit,
+                  now: u64,
+                  new_capacity: u64,
+                  new_refill: u64,
+              ) -> RateLimit {
+                  let accrued_under_old_policy = rl.refill(now).unwrap();
+                  rl.remaining_amount = std::cmp::min(accrued_under_old_policy, new_capacity);
+                  rl.last_refill_time = now;
+                  rl.capacity = new_capacity;
+                  rl.refill_per_second = new_refill;
+                  rl
+              }
+
+              #[test]
+              fn r9_vulnerable_update_retroactively_applies_new_rate() {
+                  let original = RateLimit {
+                      capacity: 2_000_000,
+                      remaining_amount: 0,
+                      refill_per_second: 1,
+                      last_refill_time: 1_000,
+                  };
+                  let update_time = 2_000;
+                  let new_capacity = 2_000_000;
+                  let new_refill = 1_000;
+
+                  // Exact current update_rate_limit semantics: assign only these two fields.
+                  let mut vulnerable = original.clone();
+                  vulnerable.capacity = new_capacity;
+                  vulnerable.refill_per_second = new_refill;
+                  let vulnerable_available = vulnerable.refill(update_time).unwrap();
+
+                  let mut patched = prospective_checkpoint(
+                      original,
+                      update_time,
+                      new_capacity,
+                      new_refill,
+                  );
+                  let patched_available = patched.refill(update_time).unwrap();
+
+                  assert_eq!(vulnerable_available, 1_000_000);
+                  assert_eq!(patched_available, 1_000);
+                  assert_eq!(vulnerable_available - patched_available, 999_000);
+              }
+
+              #[test]
+              fn r9_differential_campaign_has_no_patched_excess() {
+                  let mut strict_cases: u64 = 0;
+                  let mut cases: u64 = 0;
+                  for elapsed in [1_u64, 7, 60, 3_600, 86_400, 604_800] {
+                      for old_rate in [0_u64, 1, 7, 100, 10_000] {
+                          for new_rate in [1_u64, 10, 1_000, 1_000_000] {
+                              for remaining in [0_u64, 1, 100, 10_000] {
+                                  for capacity in [1_000_u64, 1_000_000, u32::MAX as u64] {
+                                      cases += 1;
+                                      let original = RateLimit {
+                                          capacity,
+                                          remaining_amount: std::cmp::min(remaining, capacity),
+                                          refill_per_second: old_rate,
+                                          last_refill_time: 10_000,
+                                      };
+                                      let now = 10_000 + elapsed;
+                                      let mut vulnerable = original.clone();
+                                      vulnerable.capacity = capacity;
+                                      vulnerable.refill_per_second = new_rate;
+                                      let vulnerable_available = vulnerable.refill(now).unwrap();
+
+                                      let mut patched = prospective_checkpoint(
+                                          original,
+                                          now,
+                                          capacity,
+                                          new_rate,
+                                      );
+                                      let patched_available = patched.refill(now).unwrap();
+                                      assert!(vulnerable_available >= patched_available || new_rate < old_rate);
+                                      if new_rate > old_rate && vulnerable_available > patched_available {
+                                          strict_cases += 1;
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  assert_eq!(cases, 1_440);
+                  assert!(strict_cases > 500, "strict differential must be material");
+                  println!("R9_CASES={} R9_STRICT_CASES={}", cases, strict_cases);
+              }
+          }
+          RS
+
+      - name: Run vulnerable exact-source tests
+        working-directory: solana-vulnerable
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test r9_ --workspace -- --nocapture 2>&1 | tee ../evidence/R9_VULNERABLE_EXACT.log
+          grep -q 'r9_vulnerable_update_retroactively_applies_new_rate ... ok' ../evidence/R9_VULNERABLE_EXACT.log
+          grep -q 'r9_differential_campaign_has_no_patched_excess ... ok' ../evidence/R9_VULNERABLE_EXACT.log
+          printf 'PASS\n' > ../evidence/R9_VULNERABLE_EXACT.PASS
+
+      - name: Apply minimal checkpoint-before-update patch and tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('solana-patched/programs/minter-controller/src/instructions/update_rate_limit.rs')
+          s = p.read_text()
+          old = '''pub fn update_rate_limit(ctx: Context<UpdateRateLimit>, capacity: u64, refill_per_second: u64) -> Result<()> {
+              ctx.accounts.minter.rate_limit.capacity = capacity;
+              ctx.accounts.minter.rate_limit.refill_per_second = refill_per_second;
+              emit!(RateLimitUpdated{'''
+          new = '''fn checkpoint_and_update_rate_limit(
+              rate_limit: &mut RateLimit,
+              capacity: u64,
+              refill_per_second: u64,
+              current_time: u64,
+          ) -> Result<()> {
+              let accrued_under_old_policy = rate_limit.refill(current_time)?;
+              rate_limit.remaining_amount = std::cmp::min(accrued_under_old_policy, capacity);
+              rate_limit.last_refill_time = current_time;
+              rate_limit.capacity = capacity;
+              rate_limit.refill_per_second = refill_per_second;
+              Ok(())
+          }
+
+          pub fn update_rate_limit(ctx: Context<UpdateRateLimit>, capacity: u64, refill_per_second: u64) -> Result<()> {
+              let current_time: u64 = Clock::get()?.unix_timestamp.try_into().unwrap();
+              checkpoint_and_update_rate_limit(
+                  &mut ctx.accounts.minter.rate_limit,
+                  capacity,
+                  refill_per_second,
+                  current_time,
+              )?;
+              emit!(RateLimitUpdated{'''
+          if old not in s:
+              raise SystemExit('exact update_rate_limit source pattern not found')
+          s = s.replace(old, new, 1)
+          s += r'''
+
+          #[cfg(test)]
+          mod r9_patch_regression_tests {
+              use super::*;
+
+              #[test]
+              fn r9_patched_update_checkpoints_old_policy_before_new_rate() {
+                  let mut rl = RateLimit {
+                      capacity: 2_000_000,
+                      remaining_amount: 0,
+                      refill_per_second: 1,
+                      last_refill_time: 1_000,
+                  };
+                  checkpoint_and_update_rate_limit(&mut rl, 2_000_000, 1_000, 2_000).unwrap();
+                  assert_eq!(rl.remaining_amount, 1_000);
+                  assert_eq!(rl.last_refill_time, 2_000);
+                  assert_eq!(rl.capacity, 2_000_000);
+                  assert_eq!(rl.refill_per_second, 1_000);
+                  assert_eq!(rl.refill(2_000).unwrap(), 1_000);
+                  assert_eq!(rl.refill(2_001).unwrap(), 2_000);
+              }
+
+              #[test]
+              fn r9_patched_capacity_decrease_clamps_checkpoint() {
+                  let mut rl = RateLimit {
+                      capacity: 10_000,
+                      remaining_amount: 9_000,
+                      refill_per_second: 10,
+                      last_refill_time: 100,
+                  };
+                  checkpoint_and_update_rate_limit(&mut rl, 5_000, 1, 200).unwrap();
+                  assert_eq!(rl.remaining_amount, 5_000);
+                  assert_eq!(rl.last_refill_time, 200);
+              }
+          }
+          '''
+          p.write_text(s)
+          PY
+          diff -u \
+            solana-vulnerable/programs/minter-controller/src/instructions/update_rate_limit.rs \
+            solana-patched/programs/minter-controller/src/instructions/update_rate_limit.rs \
+            > evidence/R9_MINIMAL_PATCH.diff || true
+          test -s evidence/R9_MINIMAL_PATCH.diff
+
+      - name: Run patched exact-source regression and full workspace baseline
+        working-directory: solana-patched
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test r9_ --workspace -- --nocapture 2>&1 | tee ../evidence/R9_PATCHED_EXACT.log
+          grep -q 'r9_patched_update_checkpoints_old_policy_before_new_rate ... ok' ../evidence/R9_PATCHED_EXACT.log
+          grep -q 'r9_patched_capacity_decrease_clamps_checkpoint ... ok' ../evidence/R9_PATCHED_EXACT.log
+          cargo test --workspace 2>&1 | tee ../evidence/R9_PATCHED_FULL_WORKSPACE.log
+          printf 'PASS\n' > ../evidence/R9_PATCHED_EXACT.PASS
+          printf 'PASS\n' > ../evidence/R9_PATCHED_FULL_WORKSPACE.PASS
+
+      - name: Read-only Solana mainnet account and instruction census
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, re, time, urllib.request
+          from pathlib import Path
+
+          root = Path('solana-vulnerable')
+          lib = (root/'programs/minter-controller/src/lib.rs').read_text()
+          m = re.search(r'declare_id!\("([1-9A-HJ-NP-Za-km-z]+)"\)', lib)
+          if not m:
+              raise SystemExit('declare_id not found')
+          program_id = m.group(1)
+          rpc = 'https://api.mainnet-beta.solana.com'
+
+          def rpc_call(method, params):
+              body = json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
+              req = urllib.request.Request(rpc, data=body, headers={'content-type':'application/json'})
+              with urllib.request.urlopen(req, timeout=45) as r:
+                  out = json.loads(r.read())
+              if 'error' in out:
+                  raise RuntimeError(out['error'])
+              return out['result']
+
+          disc = hashlib.sha256(b'account:Minter').digest()[:8]
+          alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+          def b58encode(b):
+              n = int.from_bytes(b, 'big')
+              out = ''
+              while n:
+                  n, rem = divmod(n, 58)
+                  out = alphabet[rem] + out
+              zeros = len(b) - len(b.lstrip(b'\0'))
+              return '1'*zeros + (out or '')
+          def b58decode(s):
+              n=0
+              for ch in s:
+                  n=n*58+alphabet.index(ch)
+              raw=n.to_bytes((n.bit_length()+7)//8, 'big') if n else b''
+              return b'\0'*(len(s)-len(s.lstrip('1'))) + raw
+
+          result = {
+              'program_id': program_id,
+              'rpc': rpc,
+              'read_only': True,
+              'minter_accounts': [],
+              'recent_update_rate_limit_instructions': [],
+              'errors': [],
+          }
+          try:
+              accounts = rpc_call('getProgramAccounts', [program_id, {
+                  'encoding':'base64',
+                  'filters':[{'memcmp':{'offset':0,'bytes':b58encode(disc)}}]
+              }])
+              for row in accounts:
+                  data = base64.b64decode(row['account']['data'][0])
+                  off=8
+                  minter_authority=b58encode(data[off:off+32]); off+=32
+                  mint_account=b58encode(data[off:off+32]); off+=32
+                  admin=b58encode(data[off:off+32]); off+=32
+                  tag=data[off]; off+=1
+                  pending=None
+                  if tag==1:
+                      pending=b58encode(data[off:off+32]); off+=32
+                  bump=data[off]; off+=1
+                  vals=[]
+                  for _ in range(4):
+                      vals.append(int.from_bytes(data[off:off+8],'little')); off+=8
+                  result['minter_accounts'].append({
+                      'address':row['pubkey'], 'minter_authority':minter_authority,
+                      'mint_account':mint_account, 'admin':admin, 'pending_admin':pending,
+                      'bump':bump, 'capacity':vals[0], 'remaining_amount':vals[1],
+                      'refill_per_second':vals[2], 'last_refill_time':vals[3],
+                      'lamports':row['account']['lamports'],
+                  })
+          except Exception as e:
+              result['errors'].append({'stage':'getProgramAccounts','error':repr(e)})
+
+          try:
+              update_disc=hashlib.sha256(b'global:update_rate_limit').digest()[:8]
+              sigs=rpc_call('getSignaturesForAddress',[program_id,{'limit':50}])
+              for sigrow in sigs:
+                  try:
+                      tx=rpc_call('getTransaction',[sigrow['signature'],{
+                          'encoding':'jsonParsed','maxSupportedTransactionVersion':0,
+                          'commitment':'confirmed'
+                      }])
+                      if not tx: continue
+                      msg=tx['transaction']['message']
+                      for ix in msg.get('instructions',[]):
+                          if ix.get('programId') != program_id or 'data' not in ix: continue
+                          raw=b58decode(ix['data'])
+                          if raw[:8]==update_disc:
+                              result['recent_update_rate_limit_instructions'].append({
+                                  'signature':sigrow['signature'],
+                                  'slot':sigrow['slot'],
+                                  'blockTime':sigrow.get('blockTime'),
+                                  'data_base58':ix['data'],
+                              })
+                  except Exception as inner:
+                      result['errors'].append({'stage':'getTransaction','signature':sigrow['signature'],'error':repr(inner)})
+                  time.sleep(0.12)
+          except Exception as e:
+              result['errors'].append({'stage':'history','error':repr(e)})
+
+          Path('evidence/R9_MAINNET_READONLY_CENSUS.json').write_text(json.dumps(result,indent=2,sort_keys=True))
+          print(json.dumps({
+              'program_id':program_id,
+              'minter_account_count':len(result['minter_accounts']),
+              'positive_refill_count':sum(1 for x in result['minter_accounts'] if x['refill_per_second']>0),
+              'recent_update_count':len(result['recent_update_rate_limit_instructions']),
+              'error_count':len(result['errors'])
+          },indent=2))
+          PY
+
+      - name: Public audit and source duplicate scan
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          {
+            echo '# Public source search'
+            grep -RniE 'update_rate_limit|last_refill_time|refill_per_second|retroactive|checkpoint' solana-vulnerable --exclude-dir=target || true
+            echo '# Audit inventory'
+            find solana-vulnerable -type f \( -iname '*.pdf' -o -path '*/audits/*' \) -print || true
+          } > evidence/R9_PUBLIC_SCAN.txt
+
+      - name: Build fail-closed decision and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          e=Path('evidence')
+          census={}
+          p=e/'R9_MAINNET_READONLY_CENSUS.json'
+          if p.exists():
+              try: census=json.loads(p.read_text())
+              except Exception: pass
+          gates={
+              'exact_source_commit': True,
+              'exact_vulnerable_test': (e/'R9_VULNERABLE_EXACT.PASS').exists(),
+              'minimal_patch_control': (e/'R9_PATCHED_EXACT.PASS').exists(),
+              'patched_full_workspace': (e/'R9_PATCHED_FULL_WORKSPACE.PASS').exists(),
+              'mainnet_program_account_reachability': len(census.get('minter_accounts',[]))>0,
+              'material_positive_refill_configuration': any(x.get('refill_per_second',0)>0 and x.get('capacity',0)>0 for x in census.get('minter_accounts',[])),
+              'observed_update_rate_limit_history': len(census.get('recent_update_rate_limit_instructions',[]))>0,
+              'authenticated_current_scope': False,
+              'privileged_actor_policy_clear': False,
+              'official_audit_duplicate_clear': False,
+          }
+          technical=all(gates[k] for k in ['exact_source_commit','exact_vulnerable_test','minimal_patch_control','patched_full_workspace'])
+          submit=all(gates.values())
+          decision={
+              'finding':'Solana minter rate-limit reconfiguration retroactively applies new refill rate',
+              'technical_status':'CONFIRMED_SOURCE_LEVEL' if technical else 'NOT_CONFIRMED',
+              'suggested_severity':'HIGH_CANDIDATE' if technical else 'NONE',
+              'critical_supported':False,
+              'submit_ready':submit,
+              'decision':'SUBMIT_HIGH' if submit else 'HOLD_DO_NOT_SUBMIT',
+              'production_state_changing_transactions':0,
+              'gates':gates,
+          }
+          (e/'R9_DECISION.json').write_text(json.dumps(decision,indent=2,sort_keys=True))
+          (e/'R9_DECISION.txt').write_text('\n'.join([
+              f"TECHNICAL_STATUS={decision['technical_status']}",
+              f"SUGGESTED_SEVERITY={decision['suggested_severity']}",
+              f"CRITICAL_SUPPORTED={decision['critical_supported']}",
+              f"SUBMIT_READY={decision['submit_ready']}",
+              f"DECISION={decision['decision']}",
+          ])+'\n')
+          PY
+          cp solana-vulnerable/programs/minter-controller/src/instructions/mint_token.rs evidence/R9_VULNERABLE_TEST_SOURCE.rs
+          cp solana-patched/programs/minter-controller/src/instructions/update_rate_limit.rs evidence/R9_PATCHED_SOURCE.rs
+          sha256sum evidence/* > evidence/SHA256SUMS.txt
+          tar -czf PAXOS_R9_EXACT_VALIDATION_2026-08-15.tar.gz evidence
+          sha256sum PAXOS_R9_EXACT_VALIDATION_2026-08-15.tar.gz > PAXOS_R9_EXACT_VALIDATION_2026-08-15.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paxos-r9-exact-validation
+          path: |
+            PAXOS_R9_EXACT_VALIDATION_2026-08-15.tar.gz
+            PAXOS_R9_EXACT_VALIDATION_2026-08-15.tar.gz.sha256
+            evidence/R9_DECISION.json
+            evidence/R9_DECISION.txt
+            evidence/R9_MAINNET_READONLY_CENSUS.json
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
