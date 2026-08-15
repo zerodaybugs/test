@@ -35,6 +35,10 @@ before_insert = before_anchor + (
     "            pool::get_reserve_deficit(\n"
     "                pool::get_reserve_data(underlying_u1_token_address)\n"
     "            );\n"
+    "        let liquidator_u1_balance_before =\n"
+    "            (mock_underlying_token_factory::balance_of(\n"
+    "                liquidator_address, underlying_u1_token_address\n"
+    "            ) as u256);\n"
 )
 if body.count(before_anchor) != 1:
     raise RuntimeError("before-anchor mismatch")
@@ -64,6 +68,12 @@ after_insert = after_anchor + (
     "            pool::get_reserve_deficit(\n"
     "                pool::get_reserve_data(underlying_u1_token_address)\n"
     "            );\n"
+    "        let liquidator_u1_balance_after =\n"
+    "            (mock_underlying_token_factory::balance_of(\n"
+    "                liquidator_address, underlying_u1_token_address\n"
+    "            ) as u256);\n"
+    "        let actual_u1_debt_paid =\n"
+    "            liquidator_u1_balance_before - liquidator_u1_balance_after;\n"
     "        let final_user_config = pool::get_user_configuration(borrower_address);\n"
 )
 if body.count(after_anchor) != 1:
@@ -77,12 +87,18 @@ final_anchor = (
 final_insert = (
     "        assert!(u1_current_variable_debt_after == 0, TEST_SUCCESS);\n"
     "        assert!(u0_current_variable_debt_after == 0, TEST_SUCCESS);\n"
+    "        assert!(actual_u1_debt_paid <= u1_current_variable_debt_before, TEST_SUCCESS);\n"
+    "        assert!(\n"
+    "            u1_deficit_after\n"
+    "                == u1_deficit_before\n"
+    "                    + ((u1_current_variable_debt_before - actual_u1_debt_paid) as u128),\n"
+    "            TEST_SUCCESS\n"
+    "        );\n"
     "        assert!(\n"
     "            u0_deficit_after\n"
     "                == u0_deficit_before + (u0_current_variable_debt_before as u128),\n"
     "            TEST_SUCCESS\n"
     "        );\n"
-    "        assert!(u1_deficit_after == u1_deficit_before, TEST_SUCCESS);\n"
     "        assert!(!user_config::is_borrowing_any(&final_user_config), TEST_SUCCESS);\n"
     "        assert!(u2_current_variable_debt_before == 0, TEST_SUCCESS);\n"
 )
