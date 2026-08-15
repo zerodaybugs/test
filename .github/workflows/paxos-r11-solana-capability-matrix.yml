@@ -1,0 +1,117 @@
+name: Paxos R11 Solana capability-transition audit
+
+on:
+  push:
+    branches:
+      - paxos-public-toolchain-bootstrap-20260815
+    paths:
+      - '.github/workflows/paxos-r11-solana-capability-matrix.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: paxos-public-toolchain-bootstrap-20260815
+      - name: Clone exact source
+        run: |
+          set -euo pipefail
+          git clone https://github.com/paxosglobal/solana-programs.git solana
+          cd solana
+          git checkout --detach 90325c53ddb2dc25d924a7f4aaf877eca1ea9f23
+          test "$(git rev-parse HEAD)" = 90325c53ddb2dc25d924a7f4aaf877eca1ea9f23
+          cd ..
+          mkdir -p r11-evidence
+      - name: Build instruction capability matrix
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,re
+          from pathlib import Path
+          base=Path('solana/programs/minter-controller/src/instructions')
+          rows=[]
+          for p in sorted(base.glob('*.rs')):
+              s=p.read_text(errors='replace')
+              structs=[]
+              for m in re.finditer(r'#\[derive\(Accounts\)\]\s*pub struct\s+(\w+)',s): structs.append(m.group(1))
+              signers=re.findall(r'pub\s+(\w+)\s*:\s*Signer',s)
+              unchecked=re.findall(r'pub\s+(\w+)\s*:\s*UncheckedAccount',s)
+              has_one=re.findall(r'has_one\s*=\s*(\w+)',s)
+              closes=re.findall(r'close\s*=\s*(\w+)',s)
+              funcs=re.findall(r'pub fn\s+(\w+)\s*\(',s)
+              rows.append({'file':str(p),'account_structs':structs,'signers':signers,'unchecked':unchecked,'has_one':has_one,'close_targets':closes,'functions':funcs,'source':s})
+          Path('r11-evidence/CAPABILITY_MATRIX.json').write_text(json.dumps(rows,indent=2))
+
+          by_file={Path(x['file']).name:x for x in rows}
+          checks={}
+          def src(name): return by_file.get(name,{}).get('source','')
+          accept=src('accept_admin_transfer.rs')
+          start=src('start_admin_transfer.rs')
+          remove_minter=src('remove_minter.rs')
+          remove_white=src('remove_whitelisted_address.rs')
+          add_white=src('add_whitelisted_address.rs')
+
+          checks['accept_requires_pending_admin_signer']=bool(re.search(r'pending_admin\s*:\s*Signer',accept))
+          checks['accept_binds_current_pending_value']=bool(re.search(r'pending_admin',accept) and re.search(r'has_one\s*=\s*admin|constraint\s*=.*pending_admin|require.*pending_admin',accept,re.S))
+          checks['accept_clears_pending']=bool(re.search(r'pending_admin\s*=\s*None',accept))
+          checks['accept_sets_new_admin']=bool(re.search(r'\.admin\s*=.*pending_admin|\.admin\s*=.*key\(\)',accept))
+          checks['start_requires_current_admin']=bool(re.search(r'admin\s*:\s*Signer',start) and re.search(r'has_one\s*=\s*admin',start))
+          checks['remove_minter_requires_admin']=bool(re.search(r'admin\s*:\s*Signer',remove_minter) and re.search(r'has_one\s*=\s*admin',remove_minter))
+          checks['remove_whitelist_requires_admin']=bool(re.search(r'admin\s*:\s*Signer',remove_white) and re.search(r'has_one\s*=\s*admin',remove_white))
+          checks['add_whitelist_requires_admin']=bool(re.search(r'admin\s*:\s*Signer',add_white) and re.search(r'has_one\s*=\s*admin',add_white))
+          Path('r11-evidence/CAPABILITY_CHECKS.json').write_text(json.dumps(checks,indent=2,sort_keys=True))
+          PY
+      - name: Run baseline workspace and clippy
+        working-directory: solana
+        run: |
+          set -euo pipefail
+          cargo test --workspace 2>&1 | tee ../r11-evidence/BASELINE_TESTS.log
+          cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee ../r11-evidence/CLIPPY.log || true
+      - name: Build decision
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          c=json.loads(Path('r11-evidence/CAPABILITY_CHECKS.json').read_text())
+          failed=[k for k,v in c.items() if not v]
+          high_signal=[k for k in failed if k in {
+            'accept_requires_pending_admin_signer','accept_binds_current_pending_value',
+            'accept_sets_new_admin','start_requires_current_admin',
+            'remove_minter_requires_admin','remove_whitelist_requires_admin','add_whitelist_requires_admin'}]
+          decision={
+            'candidate':'Solana minter-controller capability transition authorization gap',
+            'failed_static_invariants':failed,
+            'high_signal_failures':high_signal,
+            'technical_status':'STATIC_CANDIDATE' if high_signal else 'KILL_AUTHORIZATION_INVARIANTS_PRESENT',
+            'critical_supported':False,
+            'submit_ready':False,
+            'decision':'HOLD_NEEDS_E2E' if high_signal else 'KILL',
+            'production_state_changing_transactions':0,
+          }
+          Path('r11-evidence/R11_DECISION.json').write_text(json.dumps(decision,indent=2,sort_keys=True))
+          Path('r11-evidence/R11_DECISION.txt').write_text('\n'.join(f'{k}={v}' for k,v in decision.items())+'\n')
+          PY
+          sha256sum r11-evidence/* > r11-evidence/SHA256SUMS.txt
+          mkdir -p paxos-results/r11
+          cp r11-evidence/R11_DECISION.* paxos-results/r11/
+      - name: Publish
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add paxos-results/r11
+          git commit -m 'Publish Paxos R11 capability audit decision'
+          git push origin HEAD:paxos-public-toolchain-bootstrap-20260815
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paxos-r11-solana-capability-audit
+          path: r11-evidence
+          retention-days: 1
+          if-no-files-found: error
