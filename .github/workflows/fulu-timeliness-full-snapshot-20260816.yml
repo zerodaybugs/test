@@ -1,0 +1,146 @@
+name: Fulu timeliness full source snapshot
+
+on:
+  push:
+    branches:
+      - tmp/fulu-timeliness-differential-20260816
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Clone exact stable releases and preserve control-flow files
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          base="research/fulu_timeliness_full/results"
+          rm -rf work-full "$base"
+          mkdir -p work-full "$base/snapshots"
+          : > "$base/RELEASES.tsv"
+
+          fetch_release() {
+            local name="$1" repo="$2" json tag sha
+            json="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/${repo}/releases/latest")"
+            tag="$(jq -r '.tag_name // empty' <<<"$json")"
+            [[ -n "$tag" ]]
+            git clone --quiet --filter=blob:none --depth 1 --branch "$tag" "https://github.com/${repo}.git" "work-full/${name}"
+            sha="$(git -C "work-full/${name}" rev-parse HEAD)"
+            printf '%s\t%s\t%s\t%s\n' "$name" "$repo" "$tag" "$sha" >> "$base/RELEASES.tsv"
+          }
+
+          fetch_release prysm OffchainLabs/prysm
+          fetch_release lighthouse sigp/lighthouse
+          fetch_release teku Consensys/teku
+          fetch_release nimbus status-im/nimbus-eth2
+          fetch_release lodestar ChainSafe/lodestar
+
+          TIMELY='block.?timeliness|timeliness|is[_A-Za-z]*timely|timely[_A-Za-z]*block|block[_A-Za-z]*timely|proposer.?boost|late.?block|reorg.?late'
+          DA='data.?availab|availability.?check|is_data_available|data.?column|column.?sidecar|blob.?sidecar|peer.?das|peerdas|availabilityChecker'
+
+          for dir in work-full/*; do
+            [[ -d "$dir/.git" ]] || continue
+            name="${dir#work-full/}"
+            out="$base/${name}"
+            snap="$base/snapshots/${name}"
+            mkdir -p "$out" "$snap/timeliness" "$snap/availability"
+
+            git -C "$dir" log --since='2026-01-01' --format='%H%x09%ad%x09%s' --date=iso \
+              --grep='timely\|timeliness\|proposer boost\|data availability\|PeerDAS\|late block' -i \
+              > "$out/RECENT_RELEVANT_COMMITS.tsv" || true
+
+            rg -n -i --hidden -g '!**/.git/**' -g '!**/node_modules/**' -g '!**/vendor/**' \
+              -g '!**/target/**' -g '!**/build/**' -g '!**/dist/**' "$TIMELY" "$dir" \
+              > "$out/TIMELINESS_MATCHES.txt" || true
+            rg -n -i --hidden -g '!**/.git/**' -g '!**/node_modules/**' -g '!**/vendor/**' \
+              -g '!**/target/**' -g '!**/build/**' -g '!**/dist/**' "$DA" "$dir" \
+              > "$out/AVAILABILITY_MATCHES.txt" || true
+
+            mapfile -t t_files < <(rg -l -i --hidden -g '!**/.git/**' -g '!**/node_modules/**' \
+              -g '!**/vendor/**' -g '!**/target/**' -g '!**/build/**' -g '!**/dist/**' \
+              "$TIMELY" "$dir" | grep -Ev '(testdata|fixtures|generated|CHANGELOG|README|\.md$)' | head -n 80 || true)
+            mapfile -t d_files < <(rg -l -i --hidden -g '!**/.git/**' -g '!**/node_modules/**' \
+              -g '!**/vendor/**' -g '!**/target/**' -g '!**/build/**' -g '!**/dist/**' \
+              "$DA" "$dir" | grep -Ev '(testdata|fixtures|generated|CHANGELOG|README|\.md$)' | head -n 80 || true)
+
+            : > "$out/TIMELINESS_FILES.txt"
+            : > "$out/AVAILABILITY_FILES.txt"
+            for f in "${t_files[@]}"; do
+              rel="${f#${dir}/}"
+              printf '%s\n' "$rel" >> "$out/TIMELINESS_FILES.txt"
+              mkdir -p "$snap/timeliness/$(dirname "$rel")"
+              cp "$f" "$snap/timeliness/$rel"
+            done
+            for f in "${d_files[@]}"; do
+              rel="${f#${dir}/}"
+              printf '%s\n' "$rel" >> "$out/AVAILABILITY_FILES.txt"
+              mkdir -p "$snap/availability/$(dirname "$rel")"
+              cp "$f" "$snap/availability/$rel"
+            done
+          done
+
+      - name: Index likely ordering functions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+          import json, re
+          from pathlib import Path
+
+          base = Path('research/fulu_timeliness_full/results')
+          findings = []
+          for client_dir in (base / 'snapshots').iterdir():
+              client = client_dir.name
+              troot = client_dir / 'timeliness'
+              aroot = client_dir / 'availability'
+              tpaths = {p.relative_to(troot) for p in troot.rglob('*') if p.is_file()}
+              apaths = {p.relative_to(aroot) for p in aroot.rglob('*') if p.is_file()}
+              for rel in sorted(tpaths | apaths):
+                  p = (troot / rel) if (troot / rel).exists() else (aroot / rel)
+                  text = p.read_text(errors='replace')
+                  tl = [i+1 for i,s in enumerate(text.splitlines()) if re.search(r'(?i)(timeliness|timely|proposer.?boost|late.?block)',s)]
+                  dl = [i+1 for i,s in enumerate(text.splitlines()) if re.search(r'(?i)(data.?availab|availability.?check|data.?column|column.?sidecar|peer.?das|peerdas)',s)]
+                  findings.append({
+                      'client': client,
+                      'path': str(rel),
+                      'timeliness_lines': tl[:100],
+                      'availability_lines': dl[:100],
+                      'present_in_both_sets': rel in tpaths and rel in apaths,
+                  })
+          report = {
+              'schema': 'fulu-timeliness-full-snapshot-v1',
+              'normative_order': ['data availability succeeds', 'block is imported into fork choice', 'timeliness is measured/recorded'],
+              'files': findings,
+              'gate': 'HOLD_EXACT_CONTROL_FLOW_AND_RUNTIME_REQUIRED'
+          }
+          (base / 'INDEX.json').write_text(json.dumps(report, indent=2))
+          PY
+
+      - name: Persist source snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add research/fulu_timeliness_full/results
+          if ! git diff --cached --quiet; then
+            git commit -m "research: record Fulu timeliness full snapshot [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Upload snapshot
+        uses: actions/upload-artifact@v7
+        with:
+          name: fulu-timeliness-full-source-snapshot
+          retention-days: 1
+          path: research/fulu_timeliness_full/results
