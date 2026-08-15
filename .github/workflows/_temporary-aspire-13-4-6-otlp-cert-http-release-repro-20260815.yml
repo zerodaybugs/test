@@ -1,0 +1,158 @@
+name: Temporary Aspire 13.4.6 OTLP Certificate HTTP Release Repro
+
+on:
+  push:
+    branches:
+      - agent/dotnet10-toolchain-20260815
+    paths:
+      - .github/workflows/_temporary-aspire-13-4-6-otlp-cert-http-release-repro-20260815.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-aspire-13-4-6-otlp-cert-http-release-repro-20260815
+  cancel-in-progress: false
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+
+    steps:
+      - name: Download and verify official Aspire 13.4.6 release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release evidence
+          base='https://github.com/microsoft/aspire/releases/download/v13.4.6'
+          archive='aspire-cli-linux-x64-13.4.6.tar.gz'
+          curl --fail --location --retry 4 --retry-all-errors "$base/$archive" -o "release/$archive"
+          curl --fail --location --retry 4 --retry-all-errors "$base/$archive.sha512" -o "release/$archive.sha512"
+          expected="$(tr -d '\r\n ' < "release/$archive.sha512")"
+          actual="$(sha512sum "release/$archive" | awk '{print $1}')"
+          printf 'EXPECTED_SHA512=%s\nACTUAL_SHA512=%s\n' "$expected" "$actual" | tee evidence/RELEASE_INTEGRITY.env
+          test "$expected" = "$actual"
+          tar -xzf "release/$archive" -C release
+          find release -maxdepth 3 -type f -printf '%P\n' | sort > evidence/RELEASE_FILE_LIST.txt
+          aspire_bin="$(find release -type f -name aspire -perm -u+x -print -quit)"
+          test -n "$aspire_bin"
+          printf 'ASPIRE_BIN=%s\n' "$aspire_bin" | tee evidence/ASPIRE_BINARY.env
+          "$aspire_bin" --version | tee evidence/ASPIRE_VERSION.txt
+          cp "release/$archive.sha512" evidence/
+
+      - name: Reproduce on official release bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          aspire_bin="$(cut -d= -f2- evidence/ASPIRE_BINARY.env)"
+          export CI=true
+          export NO_COLOR=1
+          export ASPIRE_INTERACTIVITY_ENABLED=false
+          export ASPIRE_CLI_TELEMETRY_OPTOUT=1
+          export DOTNET_CLI_TELEMETRY_OPTOUT=1
+          export DOTNET_NOLOGO=1
+
+          run_case() {
+            local name="$1"
+            local auth_mode="$2"
+            local api_key="$3"
+            local base_port="$4"
+            local frontend_port="$base_port"
+            local grpc_port="$((base_port + 1))"
+            local http_port="$((base_port + 2))"
+            local log="evidence/${name}.dashboard.log"
+            local response_headers="evidence/${name}.response.headers"
+            local response_body="evidence/${name}.response.body"
+            local env_file="evidence/${name}.environment.txt"
+
+            (
+              export DASHBOARD__OTLP__AUTHMODE="$auth_mode"
+              if [[ -n "$api_key" ]]; then
+                export DASHBOARD__OTLP__PRIMARYAPIKEY="$api_key"
+              else
+                unset DASHBOARD__OTLP__PRIMARYAPIKEY || true
+              fi
+              env | sort > "$env_file"
+              exec setsid "$aspire_bin" dashboard run \
+                --frontend-url "http://127.0.0.1:$frontend_port" \
+                --otlp-grpc-url "http://127.0.0.1:$grpc_port" \
+                --otlp-http-url "http://127.0.0.1:$http_port"
+            ) > "$log" 2>&1 &
+            local launcher_pid=$!
+            echo "$launcher_pid" > "evidence/${name}.pid"
+
+            local ready=0
+            for _ in $(seq 1 240); do
+              if curl --silent --output /dev/null --connect-timeout 1 "http://127.0.0.1:$frontend_port/"; then
+                ready=1
+                break
+              fi
+              if ! kill -0 "$launcher_pid" 2>/dev/null; then
+                break
+              fi
+              sleep 0.25
+            done
+            echo "READY=$ready" > "evidence/${name}.verdict.env"
+
+            local status='000'
+            if [[ "$ready" -eq 1 ]]; then
+              status="$(curl --silent --show-error \
+                --connect-timeout 3 \
+                --max-time 10 \
+                --request POST \
+                --header 'Content-Type: application/x-protobuf' \
+                --data-binary '' \
+                --dump-header "$response_headers" \
+                --output "$response_body" \
+                --write-out '%{http_code}' \
+                "http://127.0.0.1:$http_port/v1/logs" || true)"
+            fi
+            echo "HTTP_STATUS=$status" >> "evidence/${name}.verdict.env"
+
+            kill -TERM -- "-$launcher_pid" 2>/dev/null || true
+            kill -TERM "$launcher_pid" 2>/dev/null || true
+            for _ in $(seq 1 40); do
+              kill -0 "$launcher_pid" 2>/dev/null || break
+              sleep 0.1
+            done
+            kill -KILL -- "-$launcher_pid" 2>/dev/null || true
+            kill -KILL "$launcher_pid" 2>/dev/null || true
+            wait "$launcher_pid" 2>/dev/null || true
+
+            cat "evidence/${name}.verdict.env"
+            tail -200 "$log" || true
+          }
+
+          run_case '01-client-certificate-http-no-certificate' 'ClientCertificate' '' 35180
+          run_case '02-api-key-http-missing-key-control' 'ApiKey' 'control-secret-20260815' 35280
+
+          cert_status="$(sed -n 's/^HTTP_STATUS=//p' evidence/01-client-certificate-http-no-certificate.verdict.env)"
+          api_status="$(sed -n 's/^HTTP_STATUS=//p' evidence/02-api-key-http-missing-key-control.verdict.env)"
+          cert_ready="$(sed -n 's/^READY=//p' evidence/01-client-certificate-http-no-certificate.verdict.env)"
+          api_ready="$(sed -n 's/^READY=//p' evidence/02-api-key-http-missing-key-control.verdict.env)"
+
+          candidate=0
+          if [[ "$cert_ready" = 1 && "$api_ready" = 1 && "$cert_status" = 200 && "$api_status" = 401 ]]; then
+            candidate=1
+          fi
+          printf 'CERT_HTTP_STATUS=%s\nAPIKEY_CONTROL_STATUS=%s\nCANDIDATE_AUTH_BYPASS=%s\n' \
+            "$cert_status" "$api_status" "$candidate" | tee evidence/FINAL_VERDICT.env
+
+          (
+            cd evidence
+            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          )
+
+          test "$candidate" -eq 1
+
+      - name: Upload exact release evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: aspire-13.4.6-otlp-cert-http-release-repro-20260815
+          path: evidence
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 9
+          include-hidden-files: true
