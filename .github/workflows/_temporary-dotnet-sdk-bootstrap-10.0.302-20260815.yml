@@ -13,7 +13,7 @@ permissions:
 jobs:
   export:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
     env:
       DOTNET_NOLOGO: '1'
       DOTNET_CLI_TELEMETRY_OPTOUT: '1'
@@ -21,16 +21,40 @@ jobs:
       NUGET_XMLDOC_MODE: skip
 
     steps:
-      - name: Install exact SDK
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.302'
-
-      - name: Resolve exact Negotiate package
+      - name: Install isolated exact SDK
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p work/project export/evidence
+          mkdir -p work/project export/evidence export/dotnet export/nuget
+          curl --fail --silent --show-error --location https://dot.net/v1/dotnet-install.sh -o work/dotnet-install.sh
+          sha256sum work/dotnet-install.sh | tee export/evidence/dotnet-install-script.sha256
+          bash work/dotnet-install.sh \
+            --version 10.0.302 \
+            --install-dir "$PWD/export/dotnet" \
+            --architecture x64 \
+            --os linux \
+            --no-path
+
+          export DOTNET_ROOT="$PWD/export/dotnet"
+          export PATH="$DOTNET_ROOT:$PATH"
+          export DOTNET_MULTILEVEL_LOOKUP=0
+          export NUGET_PACKAGES="$PWD/export/nuget"
+
+          dotnet --info | tee export/evidence/dotnet-info.txt
+          test -d "$DOTNET_ROOT/sdk/10.0.302"
+          test -d "$DOTNET_ROOT/shared/Microsoft.NETCore.App/10.0.10"
+          test -d "$DOTNET_ROOT/shared/Microsoft.AspNetCore.App/10.0.10"
+          test "$(dotnet --version)" = "10.0.302"
+
+      - name: Resolve exact Negotiate package in isolated cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DOTNET_ROOT="$PWD/export/dotnet"
+          export PATH="$DOTNET_ROOT:$PATH"
+          export DOTNET_MULTILEVEL_LOOKUP=0
+          export NUGET_PACKAGES="$PWD/export/nuget"
+
           cat > work/project/Bootstrap.csproj <<'EOF'
           <Project Sdk="Microsoft.NET.Sdk">
             <PropertyGroup>
@@ -43,43 +67,48 @@ jobs:
             </ItemGroup>
           </Project>
           EOF
-          dotnet --info | tee export/evidence/dotnet-info.txt
+
           dotnet restore work/project/Bootstrap.csproj --force-evaluate --verbosity normal 2>&1 | tee export/evidence/restore.log
           cp work/project/packages.lock.json export/evidence/
+
           grep -F 'Microsoft.AspNetCore.Authentication.Negotiate' work/project/packages.lock.json
           grep -F '10.0.10' work/project/packages.lock.json
 
-      - name: Archive exact SDK and package cache
+          negotiate_dll="$(find "$NUGET_PACKAGES/microsoft.aspnetcore.authentication.negotiate/10.0.10" -type f -name 'Microsoft.AspNetCore.Authentication.Negotiate.dll' | sort | head -n 1)"
+          protocols_dll="$(find "$NUGET_PACKAGES/system.directoryservices.protocols/10.0.10" -type f -name 'System.DirectoryServices.Protocols.dll' | sort | head -n 1)"
+          test -n "$negotiate_dll"
+          test -n "$protocols_dll"
+          printf 'negotiate_dll=%s\nprotocols_dll=%s\n' "$negotiate_dll" "$protocols_dll" | tee export/evidence/package-layout.txt
+          sha256sum "$negotiate_dll" "$protocols_dll" | tee export/evidence/package-dlls.sha256
+
+      - name: Archive isolated SDK and exact package cache
         shell: bash
         run: |
           set -euo pipefail
-          dotnet_bin="$(readlink -f "$(command -v dotnet)")"
-          dotnet_root="$(dirname "$dotnet_bin")"
-          printf 'dotnet_bin=%s\ndotnet_root=%s\n' "$dotnet_bin" "$dotnet_root" | tee export/evidence/layout.txt
+          tar -C export -czf dotnet-sdk-10.0.302-linux-x64.tar.gz dotnet
+          tar -C export -czf nuget-cache-net10-negotiate-10.0.10.tar.gz nuget
 
-          test -d "$dotnet_root/sdk/10.0.302"
-          test -d "$dotnet_root/shared/Microsoft.NETCore.App/10.0.10"
-          test -d "$dotnet_root/shared/Microsoft.AspNetCore.App/10.0.10"
-          test -f "$dotnet_root/shared/Microsoft.AspNetCore.App/10.0.10/Microsoft.AspNetCore.Authentication.Negotiate.dll"
-
-          tar -C "$dotnet_root" -czf export/dotnet-sdk-10.0.302-linux-x64.tar.gz .
-
-          package_root="$HOME/.nuget/packages"
-          mkdir -p export/nuget-cache
-          while IFS= read -r package_dir; do
-            relative="${package_dir#${package_root}/}"
-            mkdir -p "export/nuget-cache/$(dirname "$relative")"
-            cp -a "$package_dir" "export/nuget-cache/$relative"
-          done < <(find "$package_root" -mindepth 2 -maxdepth 2 -type d | sort)
-          tar -C export -czf export/nuget-cache-net10-negotiate-10.0.10.tar.gz nuget-cache
-          rm -rf export/nuget-cache
+          mv dotnet-sdk-10.0.302-linux-x64.tar.gz export/
+          mv nuget-cache-net10-negotiate-10.0.10.tar.gz export/
 
           sha256sum \
             export/dotnet-sdk-10.0.302-linux-x64.tar.gz \
             export/nuget-cache-net10-negotiate-10.0.10.tar.gz \
-            "$dotnet_root/shared/Microsoft.AspNetCore.App/10.0.10/Microsoft.AspNetCore.Authentication.Negotiate.dll" \
-            > export/evidence/SHA256SUMS.txt
+            | tee export/evidence/archive-files.sha256
+
+          rm -rf export/dotnet export/nuget
+
+          {
+            echo "commit=${GITHUB_SHA}"
+            echo "ref=${GITHUB_REF}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "runner_os=${RUNNER_OS}"
+            echo "utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > export/evidence/ci-provenance.txt
+
           find export -maxdepth 2 -type f -printf '%P %s bytes\n' | sort | tee export/evidence/inventory.txt
+          find export/evidence -type f -print0 | sort -z | xargs -0 sha256sum > export/evidence/SHA256SUMS.txt
 
       - name: Upload bootstrap bundle
         uses: actions/upload-artifact@v4
