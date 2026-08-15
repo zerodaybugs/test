@@ -1,0 +1,143 @@
+name: Duplicate blob versioned-hash REST exact-release scan
+
+on:
+  push:
+    branches:
+      - tmp/blob-query-duplicate-differential-20260816
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Clone exact stable releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          base="research/blob_query_duplicates/results"
+          rm -rf work-blob "$base"
+          mkdir -p work-blob "$base/snapshots"
+          : > "$base/RELEASES.tsv"
+
+          fetch_release() {
+            local name="$1" repo="$2" json tag sha
+            json="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/${repo}/releases/latest")"
+            tag="$(jq -r '.tag_name // empty' <<<"$json")"
+            [[ -n "$tag" ]]
+            git clone --quiet --filter=blob:none --depth 1 --branch "$tag" "https://github.com/${repo}.git" "work-blob/${name}"
+            sha="$(git -C "work-blob/${name}" rev-parse HEAD)"
+            printf '%s\t%s\t%s\t%s\n' "$name" "$repo" "$tag" "$sha" >> "$base/RELEASES.tsv"
+          }
+
+          fetch_release prysm OffchainLabs/prysm
+          fetch_release lighthouse sigp/lighthouse
+          fetch_release teku Consensys/teku
+          fetch_release nimbus status-im/nimbus-eth2
+          fetch_release lodestar ChainSafe/lodestar
+
+      - name: Extract blob query implementations
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="research/blob_query_duplicates/results"
+          P='versioned.?hash|versionedHashes|beacon/blobs|blob_sidecar|BlobSidecar|blob.?query'
+          RISK='with_capacity|make\(|capacity|missing.?hash|indices|index|dedup|unique|HashSet|set\('
+          : > "$base/CANDIDATES.tsv"
+
+          for dir in work-blob/*; do
+            [[ -d "$dir/.git" ]] || continue
+            name="${dir#work-blob/}"
+            out="$base/${name}"
+            snap="$base/snapshots/${name}"
+            mkdir -p "$out" "$snap"
+
+            rg -n -i --hidden -g '!**/.git/**' -g '!**/node_modules/**' -g '!**/vendor/**' \
+              -g '!**/target/**' -g '!**/build/**' -g '!**/dist/**' "$P" "$dir" \
+              > "$out/BLOB_QUERY_MATCHES.txt" || true
+
+            mapfile -t files < <(rg -l -i --hidden -g '!**/.git/**' -g '!**/node_modules/**' \
+              -g '!**/vendor/**' -g '!**/target/**' -g '!**/build/**' -g '!**/dist/**' \
+              "$P" "$dir" | grep -Ev '(testdata|fixtures|generated|CHANGELOG|README|\.md$)' | head -n 140 || true)
+
+            for f in "${files[@]}"; do
+              rel="${f#${dir}/}"
+              mkdir -p "$snap/$(dirname "$rel")"
+              cp "$f" "$snap/$rel"
+              if rg -q -i "$RISK" "$f"; then
+                printf '%s\t%s\tRISK_TERMS_PRESENT\n' "$name" "$rel" >> "$base/CANDIDATES.tsv"
+              fi
+            done
+          done
+
+      - name: Detect count-subtraction and dedup mismatches
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+          import json, re
+          from pathlib import Path
+
+          base = Path('research/blob_query_duplicates/results')
+          records = []
+          for client_dir in (base / 'snapshots').iterdir():
+              client = client_dir.name
+              for p in client_dir.rglob('*'):
+                  if not p.is_file():
+                      continue
+                  text = p.read_text(errors='replace')
+                  lines = text.splitlines()
+                  vh = [i+1 for i,s in enumerate(lines) if re.search(r'(?i)versioned.?hash',s)]
+                  duplicate = [i+1 for i,s in enumerate(lines) if re.search(r'(?i)(dedup|unique|HashSet|set\()',s)]
+                  subtract = [i+1 for i,s in enumerate(lines) if re.search(r'(len\([^\n]+\)\s*-\s*len\(|\.Count\s*-\s*|\.Length\s*-\s*|with_capacity\([^\n]*-)',s)]
+                  cap = [i+1 for i,s in enumerate(lines) if re.search(r'(?i)(with_capacity|make\([^\n]*,\s*0\s*,|capacity)',s)]
+                  if vh:
+                      records.append({
+                          'client':client,
+                          'path':str(p.relative_to(client_dir)),
+                          'versioned_hash_lines':vh[:100],
+                          'dedup_lines':duplicate[:100],
+                          'subtraction_lines':subtract[:100],
+                          'capacity_lines':cap[:100],
+                          'high_risk_shape':bool(subtract and cap),
+                      })
+          result={
+              'schema':'duplicate-blob-versioned-hash-scan-v1',
+              'known_prysm_baseline':{
+                  'commit':'5744c60727b5b509f6ed65dd4a136ba0a98863e3',
+                  'root_cause':'unique requested hashes compared against per-matching-commitment indices; negative makeslice capacity on duplicates'
+              },
+              'files':records,
+              'high_risk_files':[x for x in records if x['high_risk_shape']],
+              'gate':'HOLD_EXACT_ENDPOINT_RUNTIME_REQUIRED'
+          }
+          (base/'SCAN.json').write_text(json.dumps(result,indent=2))
+          PY
+
+      - name: Persist scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add research/blob_query_duplicates/results
+          if ! git diff --cached --quiet; then
+            git commit -m "research: record duplicate blob query scan [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: duplicate-blob-versioned-hash-exact-scan
+          retention-days: 1
+          path: research/blob_query_duplicates/results
