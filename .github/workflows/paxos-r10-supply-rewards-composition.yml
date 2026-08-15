@@ -1,0 +1,189 @@
+name: Paxos R10 supply-controller rewards composition
+
+on:
+  push:
+    branches:
+      - paxos-public-toolchain-bootstrap-20260815
+    paths:
+      - '.github/workflows/paxos-r10-supply-rewards-composition.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      URL_ETH_MAINNET: http://127.0.0.1:8545
+      URL_ETH_SEPOLIA: http://127.0.0.1:8545
+      URL_INK_MAINNET: http://127.0.0.1:8545
+      URL_INK_SEPOLIA: http://127.0.0.1:8545
+      URL_ARB_MAINNET: http://127.0.0.1:8545
+      URL_ARB_SEPOLIA: http://127.0.0.1:8545
+      URL_XLAYER_TESTNET: http://127.0.0.1:8545
+      URL_XLAYER_MAINNET: http://127.0.0.1:8545
+      GAS_REPORTING: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: paxos-public-toolchain-bootstrap-20260815
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.19.4'
+      - name: Clone exact token and cross-chain source
+        run: |
+          set -euo pipefail
+          git clone https://github.com/paxosglobal/paxos-token-contracts.git token
+          cd token
+          git checkout --detach 674ac1046a0a40bfd2b6b892192998af9ac3b171
+          git submodule update --init --recursive
+          npm ci --no-audit --no-fund
+          npm run compile
+          cd ..
+          git clone https://github.com/paxosglobal/cross-chain-contracts.git crosschain
+          cd crosschain
+          git checkout --detach b4a1c2b2537b187e63acf5c717b7d943abb0a75f
+          npm ci --no-audit --no-fund
+          npx hardhat compile
+          cd ..
+          mkdir -p r10-evidence
+      - name: Extract exact function bodies and accounting signals
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,re
+          from pathlib import Path
+
+          roots=[Path('token/contracts'),Path('crosschain/contracts')]
+          funcs={}
+          def extract(text,name):
+              out=[]
+              for m in re.finditer(r'function\s+'+re.escape(name)+r'\s*\(',text):
+                  brace=text.find('{',m.end())
+                  if brace<0: continue
+                  depth=0
+                  for i in range(brace,len(text)):
+                      if text[i]=='{': depth+=1
+                      elif text[i]=='}':
+                          depth-=1
+                          if depth==0:
+                              out.append(text[m.start():i+1]); break
+              return out
+          names=['increaseSupplyToAddress','decreaseSupplyFromAddress','increaseSupply','decreaseSupply','transfer','transferFrom','_transfer','_setBalanceData','_debit','_credit']
+          for root in roots:
+              for p in root.rglob('*.sol'):
+                  text=p.read_text(errors='replace')
+                  for n in names:
+                      for body in extract(text,n):
+                          funcs.setdefault(n,[]).append({'file':str(p),'body':body})
+
+          accounting_terms=[
+            '_setBalanceData','updateShares','updatePayout','payoutGroup','SharesLib',
+            'handleClaimAllDetection','_updatePayoutGroup','wallet.shares','balanceData'
+          ]
+          checks={}
+          for n in ['increaseSupplyToAddress','decreaseSupplyFromAddress','increaseSupply','decreaseSupply','_transfer','_debit','_credit']:
+              rows=[]
+              for x in funcs.get(n,[]):
+                  body=x['body']
+                  rows.append({
+                    'file':x['file'],
+                    'has_reward_accounting':any(t in body for t in accounting_terms),
+                    'has_freeze_check':bool(re.search(r'frozen|_isAddrFrozen|AddressFrozen',body,re.I)),
+                    'has_pause_check':bool(re.search(r'whenNotPaused|paused\(',body,re.I)),
+                    'calls':sorted(set(re.findall(r'\b([A-Za-z_]\w*)\s*\(',body))),
+                  })
+              checks[n]=rows
+
+          # Search tests for the exact composition: supply-controller operation while registered for rewards.
+          test_hits=[]
+          patterns=['decreaseSupplyFromAddress','increaseSupplyToAddress','payoutGroup','availableRewardsOf','registerBySig']
+          for p in Path('token/test').rglob('*.js'):
+              text=p.read_text(errors='replace')
+              present=[x for x in patterns if x in text]
+              if ('decreaseSupplyFromAddress' in present or 'increaseSupplyToAddress' in present) and ('payoutGroup' in present or 'availableRewardsOf' in present):
+                  test_hits.append({'file':str(p),'present':present})
+
+          result={'token_commit':'674ac1046a0a40bfd2b6b892192998af9ac3b171','crosschain_commit':'b4a1c2b2537b187e63acf5c717b7d943abb0a75f','functions':funcs,'checks':checks,'exact_composition_test_hits':test_hits}
+          Path('r10-evidence/STATIC_COMPOSITION.json').write_text(json.dumps(result,indent=2))
+          PY
+      - name: Run existing supply and system invariant tests
+        working-directory: token
+        run: |
+          set -euo pipefail
+          mapfile -t tests < <(find test -maxdepth 1 -type f -name '*.js' | grep -Ei 'Supply|SystemInvariant|Reward|Payout|Mint|Burn' | sort)
+          printf '%s\n' "${tests[@]}" > ../r10-evidence/BASELINE_TEST_SELECTION.txt
+          if [ ${#tests[@]} -gt 0 ]; then
+            npx hardhat test "${tests[@]}" 2>&1 | tee ../r10-evidence/BASELINE_RELEVANT_TESTS.log
+          else
+            echo 'NO_MATCHING_TEST_FILES' | tee ../r10-evidence/BASELINE_RELEVANT_TESTS.log
+          fi
+      - name: Extract official audit text and exact-root duplicate signals
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+          mkdir -p r10-evidence/audit-text
+          while IFS= read -r -d '' pdf; do
+            base=$(basename "$pdf" .pdf | tr ' /' '__')
+            pdftotext -layout "$pdf" "r10-evidence/audit-text/${base}.txt" || true
+          done < <(find token/audits crosschain/audits -type f -iname '*.pdf' -print0 2>/dev/null)
+          grep -RniEi 'supply controller|increaseSupplyToAddress|decreaseSupplyFromAddress|reward shares|payout group|bridge.*reward|burn.*share|mint.*share' r10-evidence/audit-text > r10-evidence/AUDIT_HITS.txt || true
+      - name: Build fail-closed R10 decision
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d=json.loads(Path('r10-evidence/STATIC_COMPOSITION.json').read_text())
+          def rows(name): return d['checks'].get(name,[])
+          dec=rows('decreaseSupplyFromAddress')
+          inc=rows('increaseSupplyToAddress')
+          debit=rows('_debit')
+          credit=rows('_credit')
+          static_burn_gap=bool(dec and debit) and not any(x['has_reward_accounting'] for x in dec)
+          static_mint_gap=bool(inc and credit) and not any(x['has_reward_accounting'] for x in inc)
+          existing_test=bool(d['exact_composition_test_hits'])
+          audit_hits=Path('r10-evidence/AUDIT_HITS.txt').read_text(errors='replace').strip() if Path('r10-evidence/AUDIT_HITS.txt').exists() else ''
+          decision={
+            'candidate':'OFT supply-controller mint/burn may bypass USDG reward-share accounting',
+            'static_burn_gap':static_burn_gap,
+            'static_mint_gap':static_mint_gap,
+            'existing_exact_composition_test':existing_test,
+            'audit_keyword_hits_present':bool(audit_hits),
+            'technical_status':'STATIC_CANDIDATE' if static_burn_gap or static_mint_gap else 'KILL_COMMON_ACCOUNTING_PATH_PRESENT',
+            'critical_supported':False,
+            'submit_ready':False,
+            'decision':'HOLD_NEEDS_EXACT_STATE_MACHINE_POC' if static_burn_gap or static_mint_gap else 'KILL',
+            'production_state_changing_transactions':0,
+          }
+          Path('r10-evidence/R10_DECISION.json').write_text(json.dumps(decision,indent=2,sort_keys=True))
+          Path('r10-evidence/R10_DECISION.txt').write_text('\n'.join(f'{k}={v}' for k,v in decision.items())+'\n')
+          PY
+          sha256sum r10-evidence/* 2>/dev/null > r10-evidence/SHA256SUMS.txt || true
+          tar -czf PAXOS_R10_SUPPLY_REWARDS_COMPOSITION.tar.gz r10-evidence
+          sha256sum PAXOS_R10_SUPPLY_REWARDS_COMPOSITION.tar.gz > PAXOS_R10_SUPPLY_REWARDS_COMPOSITION.tar.gz.sha256
+          mkdir -p paxos-results/r10
+          cp r10-evidence/R10_DECISION.* paxos-results/r10/
+          cp PAXOS_R10_SUPPLY_REWARDS_COMPOSITION.tar.gz.sha256 paxos-results/r10/
+      - name: Publish decision
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add paxos-results/r10
+          git commit -m 'Publish Paxos R10 supply-rewards composition decision'
+          git push origin HEAD:paxos-public-toolchain-bootstrap-20260815
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paxos-r10-supply-rewards-composition
+          path: |
+            PAXOS_R10_SUPPLY_REWARDS_COMPOSITION.tar.gz
+            PAXOS_R10_SUPPLY_REWARDS_COMPOSITION.tar.gz.sha256
+            r10-evidence/R10_DECISION.json
+            r10-evidence/R10_DECISION.txt
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
