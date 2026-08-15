@@ -1,0 +1,150 @@
+name: Weak-subjectivity canonicality exact-release scan
+
+on:
+  push:
+    branches:
+      - tmp/weak-subjectivity-differential-20260816
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Clone exact stable releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          base="research/weak_subjectivity/results"
+          rm -rf work-ws "$base"
+          mkdir -p work-ws "$base/snapshots"
+          : > "$base/RELEASES.tsv"
+
+          fetch_release() {
+            local name="$1" repo="$2" json tag sha
+            json="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/${repo}/releases/latest")"
+            tag="$(jq -r '.tag_name // empty' <<<"$json")"
+            [[ -n "$tag" ]]
+            git clone --quiet --filter=blob:none --depth 1 --branch "$tag" "https://github.com/${repo}.git" "work-ws/${name}"
+            sha="$(git -C "work-ws/${name}" rev-parse HEAD)"
+            printf '%s\t%s\t%s\t%s\n' "$name" "$repo" "$tag" "$sha" >> "$base/RELEASES.tsv"
+          }
+
+          fetch_release prysm OffchainLabs/prysm
+          fetch_release lighthouse sigp/lighthouse
+          fetch_release teku Consensys/teku
+          fetch_release nimbus status-im/nimbus-eth2
+          fetch_release lodestar ChainSafe/lodestar
+
+      - name: Extract WS verification paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="research/weak_subjectivity/results"
+          WS='weak.?subjectiv|weak_subjectiv|WeakSubjectiv|ws.?checkpoint|checkpoint.?sync'
+          CANON='canonical|finalized|finalised|finality|block.?root.?index|ancestor|is.?main.?chain|contains.?block'
+
+          : > "$base/COOCCURRENCE.tsv"
+          for dir in work-ws/*; do
+            [[ -d "$dir/.git" ]] || continue
+            name="${dir#work-ws/}"
+            out="$base/${name}"
+            snap="$base/snapshots/${name}"
+            mkdir -p "$out" "$snap"
+
+            rg -n -i --hidden -g '!**/.git/**' -g '!**/node_modules/**' -g '!**/vendor/**' \
+              -g '!**/target/**' -g '!**/build/**' -g '!**/dist/**' "$WS" "$dir" \
+              > "$out/WS_MATCHES.txt" || true
+            git -C "$dir" log --since='2025-01-01' --format='%H%x09%ad%x09%s' --date=iso \
+              --grep='weak subjectivity\|weak-subjectivity\|checkpoint canonical\|finalized canonical' -i \
+              > "$out/RECENT_RELEVANT_COMMITS.tsv" || true
+
+            mapfile -t files < <(rg -l -i --hidden -g '!**/.git/**' -g '!**/node_modules/**' \
+              -g '!**/vendor/**' -g '!**/target/**' -g '!**/build/**' -g '!**/dist/**' \
+              "$WS" "$dir" | grep -Ev '(testdata|fixtures|generated|CHANGELOG|README|\.md$)' | head -n 120 || true)
+
+            : > "$out/WS_FILES.txt"
+            for f in "${files[@]}"; do
+              rel="${f#${dir}/}"
+              printf '%s\n' "$rel" >> "$out/WS_FILES.txt"
+              mkdir -p "$snap/$(dirname "$rel")"
+              cp "$f" "$snap/$rel"
+              if rg -q -i "$CANON" "$f"; then
+                printf '%s\t%s\tCANONICALITY_TERMS_PRESENT\n' "$name" "$rel" >> "$base/COOCCURRENCE.tsv"
+              else
+                printf '%s\t%s\tNO_CANONICALITY_TERMS_IN_FILE\n' "$name" "$rel" >> "$base/COOCCURRENCE.tsv"
+              fi
+            done
+          done
+
+      - name: Build triage index
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+          import json, re
+          from pathlib import Path
+
+          base = Path('research/weak_subjectivity/results')
+          files = []
+          for client_dir in (base / 'snapshots').iterdir():
+              client = client_dir.name
+              for p in client_dir.rglob('*'):
+                  if not p.is_file():
+                      continue
+                  text = p.read_text(errors='replace')
+                  lines = text.splitlines()
+                  ws = [i+1 for i,s in enumerate(lines) if re.search(r'(?i)(weak.?subjectiv|ws.?checkpoint|checkpoint.?sync)',s)]
+                  canon = [i+1 for i,s in enumerate(lines) if re.search(r'(?i)(canonical|finalized|finalised|finality|ancestor|main.?chain)',s)]
+                  files.append({
+                      'client': client,
+                      'path': str(p.relative_to(client_dir)),
+                      'weak_subjectivity_lines': ws[:100],
+                      'canonicality_lines': canon[:100],
+                      'manual_questions': [
+                          'Does verification resolve the configured root from the finalized canonical chain?',
+                          'Can an orphan/non-canonical stored block satisfy the check?',
+                          'Does verification wait until finality is beyond the checkpoint epoch?',
+                          'Is the path reachable from an untrusted checkpoint-sync provider without operator choosing an attacker root?'
+                      ]
+                  })
+          result = {
+              'schema': 'weak-subjectivity-canonicality-scan-v1',
+              'baseline_public_fix': {
+                  'client': 'prysm',
+                  'commit': '5bf86e4faab5a5b453271c949baf66acfc0c9659',
+                  'root_cause': 'stored non-canonical block could satisfy weak-subjectivity verification'
+              },
+              'files': files,
+              'severity_gate': 'HOLD_MANUAL_CONTROL_FLOW_AND_PERMISSIONLESS_REACHABILITY'
+          }
+          (base / 'SCAN.json').write_text(json.dumps(result, indent=2))
+          PY
+
+      - name: Persist scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add research/weak_subjectivity/results
+          if ! git diff --cached --quiet; then
+            git commit -m "research: record weak-subjectivity canonicality scan [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: weak-subjectivity-canonicality-exact-scan
+          retention-days: 1
+          path: research/weak_subjectivity/results
