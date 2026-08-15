@@ -1,0 +1,198 @@
+name: Temporary OpenVMM VMGS policy differential PoC
+
+on:
+  push:
+    branches:
+      - openvmm-source-61fd-20260815
+    paths:
+      - '.github/workflows/_temporary-openvmm-vmgs-policy-poc-20260815.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  poc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUST_BACKTRACE: '1'
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Clone exact OpenVMM source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-tags https://github.com/microsoft/openvmm.git repo
+          cd repo
+          git checkout 61fd38fe6114d0955a082aa717a8e16e722b8490
+          test "$(git rev-parse HEAD)" = '61fd38fe6114d0955a082aa717a8e16e722b8490'
+
+      - name: Install exact Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup override set 1.95.0
+          rustc --version
+          cargo --version
+
+      - name: Inject isolated regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p export
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('repo/openhcl/underhill_attestation/src/lib.rs')
+          text = path.read_text()
+          marker = '    // --- initialize_platform_security tests ---\n'
+          assert marker in text
+          tests = r'''
+
+              #[async_test]
+              async fn zdb_stateful_none_strict_persists_tpm_data_plaintext(driver: DefaultDriver) {
+                  let disk = new_test_file();
+                  let mut vmgs = Vmgs::format_new(disk.clone(), None).await.unwrap();
+                  assert!(!vmgs.encrypted());
+
+                  let mut plan = IgvmAgentTestPlan::default();
+                  plan.insert(
+                      IgvmAttestRequestType::WRAPPED_KEY_REQUEST,
+                      VecDeque::from([IgvmAgentAction::RespondFailure]),
+                  );
+                  let get_pair = new_test_get(driver, true, Some(plan)).await;
+
+                  let bios_guid = Guid::new_random();
+                  let att_cfg = new_attestation_vm_config();
+                  assert!(att_cfg.tpm_persisted, "control requires stateful mode");
+                  let tee = MockTeeCall::new([0x12u8; 32]);
+                  let ldriver = pal_async::local::block_with_io(|ld| async move { ld });
+
+                  let result = initialize_platform_security(
+                      &get_pair.client,
+                      bios_guid,
+                      &att_cfg,
+                      &mut vmgs,
+                      Some(&tee),
+                      false, // stateful: attestation is not suppressed
+                      ldriver,
+                      GuestStateEncryptionPolicy::None,
+                      true, // strict: actively require no encryption
+                  )
+                  .await;
+
+                  assert!(result.is_ok(), "None+strict unexpectedly failed: {result:?}");
+                  assert!(!vmgs.encrypted(), "VMGS unexpectedly encrypted");
+                  assert!(key_protector_is_empty(&mut vmgs).await);
+                  assert!(key_protector_by_id_is_empty(&mut vmgs).await);
+                  assert!(hardware_key_protector_is_empty(&mut vmgs).await);
+
+                  // This is the exact semantic used by VmgsFileHandle(..., true):
+                  // write_file_encrypted falls back to a plaintext write when the
+                  // datastore has no encryption key configured.
+                  const TPM_SENTINEL: &[u8] = b"ZDB_TPM_NVRAM_STATEFUL_PLAINTEXT_SENTINEL_20260815";
+                  vmgs.write_file_encrypted(FileId::TPM_NVRAM, TPM_SENTINEL)
+                      .await
+                      .unwrap();
+                  drop(vmgs);
+
+                  // Model the host reopening the host-owned VMGS backing disk with
+                  // no tenant/TEE/GSP key. The TPM data is directly readable.
+                  let mut host_view = Vmgs::open(disk, None).await.unwrap();
+                  assert!(!host_view.encrypted());
+                  let recovered = host_view.read_file(FileId::TPM_NVRAM).await.unwrap();
+                  assert_eq!(recovered, TPM_SENTINEL);
+              }
+
+              #[async_test]
+              async fn zdb_stateful_gspkey_strict_fails_closed_control(driver: DefaultDriver) {
+                  let disk = new_test_file();
+                  let mut vmgs = Vmgs::format_new(disk, None).await.unwrap();
+
+                  let mut plan = IgvmAgentTestPlan::default();
+                  plan.insert(
+                      IgvmAttestRequestType::WRAPPED_KEY_REQUEST,
+                      VecDeque::from([IgvmAgentAction::RespondFailure]),
+                  );
+                  let get_pair = new_test_get(driver, true, Some(plan)).await;
+
+                  let bios_guid = Guid::new_random();
+                  let att_cfg = new_attestation_vm_config();
+                  let tee = MockTeeCall::new([0x12u8; 32]);
+                  let ldriver = pal_async::local::block_with_io(|ld| async move { ld });
+
+                  let result = initialize_platform_security(
+                      &get_pair.client,
+                      bios_guid,
+                      &att_cfg,
+                      &mut vmgs,
+                      Some(&tee),
+                      false,
+                      ldriver,
+                      GuestStateEncryptionPolicy::GspKey,
+                      true,
+                  )
+                  .await;
+
+                  assert!(result.is_err(), "GspKey+strict must fail closed without a key");
+                  assert!(!vmgs.encrypted());
+              }
+
+              #[test]
+              fn zdb_attestation_claims_omit_vmgs_policy_and_strictness() {
+                  let value = serde_json::to_value(new_attestation_vm_config()).unwrap();
+                  assert!(value.get("guest-state-encryption-policy").is_none());
+                  assert!(value.get("strict-encryption-policy").is_none());
+                  assert!(value.get("tpm-persisted").is_some());
+              }
+          '''
+          text = text.replace(marker, marker + tests, 1)
+          path.write_text(text)
+
+          worker = Path('repo/openhcl/underhill_core/src/worker.rs').read_text()
+          start = worker.index('fn validate_isolated_configuration')
+          end = worker.index('\n}\n\n/// Builds VP register state', start) + 2
+          body = worker[start:end]
+          assert 'guest_state_encryption_policy: _' in body
+          assert 'encryption policy not supported' not in body
+          Path('export/current-validation-function.rs').write_text(body)
+
+          claims = Path('repo/openhcl/openhcl_attestation_protocol/src/igvm_attest/get.rs').read_text()
+          cstart = claims.index('pub struct AttestationVmConfig')
+          cend = claims.index('\n    impl Default for AttestationVmConfig', cstart)
+          Path('export/attestation-vm-config.rs').write_text(claims[cstart:cend])
+          PY
+          cd repo
+          git diff -- openhcl/underhill_attestation/src/lib.rs > ../export/injected-tests.patch
+          git status --short > ../export/git-status.txt
+
+      - name: Run exact-source differential PoC
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd repo
+          rustc --version | tee ../export/rustc-version.txt
+          cargo --version | tee ../export/cargo-version.txt
+          git rev-parse HEAD | tee ../export/source-commit.txt
+          cargo test -p underhill_attestation zdb_ -- --nocapture --test-threads=1 2>&1 | tee ../export/cargo-test.log
+
+      - name: Build evidence manifest
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f repo/target/debug/deps/underhill_attestation-* ]; then
+            find repo/target/debug/deps -maxdepth 1 -type f -name 'underhill_attestation-*' -printf '%f %s bytes\n' | sort > export/test-binaries.txt
+          fi
+          sha256sum export/* > export/SHA256SUMS.txt
+          find export -maxdepth 1 -type f -printf '%f %s bytes\n' | sort > export/INVENTORY.txt
+
+      - name: Upload PoC evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openvmm-vmgs-policy-poc
+          path: export
+          if-no-files-found: error
+          retention-days: 3
