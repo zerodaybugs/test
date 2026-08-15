@@ -1,0 +1,224 @@
+name: Aave Aptos Chainlink cross receiver scan
+
+on:
+  push:
+    branches:
+      - aave-aptos-underlying-hooks-20260815
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      REST: "https://api.mainnet.aptoslabs.com/v1"
+      GRAPHQL: "https://api.mainnet.aptoslabs.com/v1/graphql"
+      PLATFORM: "0x9976bb288ed9177b542d568fa1ac386819dc99141630e582315804840f41928a"
+      DATA_FEEDS: "0x3f985798ce4975f430ef5c75776ff98a77b9f9d0fb38184d225adc9c1cc6b79b"
+    steps:
+      - name: Query recent forwarder events and transactions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p evidence/transactions
+          python3 - <<'PY'
+          import json, os, pathlib, time, urllib.request
+
+          graphql=os.environ['GRAPHQL']
+          rest=os.environ['REST']
+          platform=os.environ['PLATFORM']
+          event_type=f"{platform}::forwarder::ReportProcessed"
+          query='''query RecentReports($event_type: String!) {
+            events(
+              where: {type: {_eq: $event_type}}
+              order_by: {transaction_version: desc}
+              limit: 150
+            ) {
+              transaction_version
+              sequence_number
+              type
+              data
+            }
+          }'''
+          body=json.dumps({'query':query,'variables':{'event_type':event_type}}).encode()
+          req=urllib.request.Request(graphql,data=body,headers={'Content-Type':'application/json','User-Agent':'aave-chainlink-cross-receiver-scan'})
+          with urllib.request.urlopen(req,timeout=120) as r:
+              response=json.loads(r.read())
+          pathlib.Path('evidence/report_events_graphql.json').write_text(json.dumps(response,indent=2))
+          if response.get('errors'):
+              raise RuntimeError(response['errors'])
+          events=response.get('data',{}).get('events',[])
+          versions=[]
+          for event in events:
+              v=str(event['transaction_version'])
+              if v not in versions:
+                  versions.append(v)
+          errors=[]
+          for i,v in enumerate(versions):
+              target=pathlib.Path(f'evidence/transactions/{v}.json')
+              for attempt in range(4):
+                  try:
+                      req=urllib.request.Request(f'{rest}/transactions/by_version/{v}',headers={'User-Agent':'aave-chainlink-cross-receiver-scan'})
+                      with urllib.request.urlopen(req,timeout=90) as r:
+                          target.write_bytes(r.read())
+                      break
+                  except Exception as exc:
+                      errors.append({'version':v,'attempt':attempt,'error':repr(exc)})
+                      time.sleep(0.5*(attempt+1))
+              if not target.exists():
+                  raise RuntimeError(f'failed transaction {v}')
+          pathlib.Path('evidence/fetch_errors.json').write_text(json.dumps(errors,indent=2))
+          pathlib.Path('evidence/event_count.txt').write_text(f'events={len(events)}\ntransactions={len(versions)}\n')
+          PY
+
+      - name: Query Aave feed and workflow state
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for item in workflow feeds; do
+            if [ "$item" = workflow ]; then fn=get_workflow_config; else fn=get_feeds; fi
+            printf '{"function":"%s::registry::%s","type_arguments":[],"arguments":[]}' "$DATA_FEEDS" "$fn" > "/tmp/${item}.json"
+            curl --retry 4 --retry-all-errors --connect-timeout 15 --max-time 120 \
+              -fsS -X POST "$REST/view" -H 'Content-Type: application/json' \
+              --data-binary @"/tmp/${item}.json" -o "evidence/${item}.json"
+          done
+
+      - name: Parse replay candidates
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          AAVE=os.environ['DATA_FEEDS'].lower()
+          PLATFORM=os.environ['PLATFORM'].lower()
+
+          def as_bytes(value):
+              if value is None:
+                  return b''
+              if isinstance(value,str):
+                  s=value[2:] if value.startswith('0x') else value
+                  try: return bytes.fromhex(s)
+                  except ValueError: return value.encode()
+              if isinstance(value,list):
+                  return bytes(int(x) for x in value)
+              raise TypeError(type(value))
+
+          def parse_data(data):
+              if len(data)<64:
+                  return []
+              def u256(x): return int.from_bytes(x,'big')
+              if u256(data[:32])!=32:
+                  return []
+              count=u256(data[32:64])
+              if count>100:
+                  return []
+              offset=64+32*count
+              rows=[]
+              for _ in range(count):
+                  if offset+96>len(data): break
+                  outer=data[offset:offset+32]; offset+=32
+                  marker=u256(data[offset:offset+32]); offset+=32
+                  length=u256(data[offset:offset+32]); offset+=32
+                  if marker!=64 or offset+length>len(data): break
+                  report=data[offset:offset+length]; offset+=length
+                  inner=report[:32] if len(report)>=32 else b''
+                  schema=int.from_bytes(inner[:2],'big') if len(inner)>=2 else None
+                  ts=int.from_bytes(report[92:96],'big') if len(report)>=96 and schema in (3,4) else None
+                  benchmark=int.from_bytes(report[192:224],'big') if len(report)>=224 and schema in (3,4) else None
+                  rows.append({'outer':'0x'+outer.hex(),'inner':'0x'+inner.hex(),'schema':schema,'timestamp':ts,'benchmark':str(benchmark) if benchmark is not None else None,'report_len':len(report)})
+              return rows
+
+          workflow=json.loads(Path('evidence/workflow.json').read_text())[0]
+          allowed_owners={'0x'+as_bytes(x).hex() for x in workflow.get('allowed_workflow_owners',[])}
+          allowed_names={'0x'+as_bytes(x).hex() for x in workflow.get('allowed_workflow_names',[])}
+          feed_values=json.loads(Path('evidence/feeds.json').read_text())[0]
+          aave_feeds={}
+          for entry in feed_values:
+              outer='0x'+as_bytes(entry.get('feed_id')).hex()
+              feed=entry.get('feed',{})
+              report=as_bytes(feed.get('report'))
+              aave_feeds[outer]={
+                  'description':feed.get('description'),
+                  'timestamp':int(str(feed.get('observation_timestamp') or 0)),
+                  'benchmark':str(feed.get('benchmark')),
+                  'inner':'0x'+report[:32].hex() if len(report)>=32 else None,
+              }
+
+          parsed=[]
+          candidates=[]
+          for p in sorted(Path('evidence/transactions').glob('*.json'),reverse=True):
+              tx=json.loads(p.read_text())
+              payload=tx.get('payload',{})
+              function=str(payload.get('function','')).lower()
+              args=payload.get('arguments',[])
+              if not function.endswith('::forwarder::report') or len(args)<3:
+                  continue
+              receiver=str(args[0]).lower()
+              raw=as_bytes(args[1])
+              if len(raw)<205:
+                  continue
+              report=raw[96:]
+              if not report or report[0]!=1 or len(report)<109:
+                  continue
+              workflow_execution_id='0x'+report[1:33].hex()
+              report_ts=int.from_bytes(report[33:37],'big')
+              don_id=int.from_bytes(report[37:41],'big')
+              config_version=int.from_bytes(report[41:45],'big')
+              metadata=report[45:109]
+              workflow_cid='0x'+metadata[:32].hex()
+              workflow_name='0x'+metadata[32:42].hex()
+              workflow_owner='0x'+metadata[42:62].hex()
+              metadata_report_id=int.from_bytes(metadata[62:64],'big')
+              feeds=parse_data(report[109:])
+              intersections=[]
+              for feed in feeds:
+                  if feed['outer'] in aave_feeds:
+                      current=aave_feeds[feed['outer']]
+                      item={**feed,**{'aave_description':current['description'],'aave_current_timestamp':current['timestamp'],'aave_current_benchmark':current['benchmark'],'aave_current_inner':current['inner'],'newer_than_aave':feed['timestamp'] is not None and feed['timestamp']>current['timestamp'],'inner_differs_from_aave':current['inner'] is not None and feed['inner']!=current['inner']}}
+                      intersections.append(item)
+              row={
+                  'version':str(tx.get('version')),
+                  'sender':tx.get('sender'),
+                  'receiver':receiver,
+                  'receiver_is_aave':receiver==AAVE,
+                  'workflow_execution_id':workflow_execution_id,
+                  'report_header_timestamp':report_ts,
+                  'don_id':don_id,
+                  'config_version':config_version,
+                  'workflow_cid':workflow_cid,
+                  'workflow_name':workflow_name,
+                  'workflow_owner':workflow_owner,
+                  'owner_allowed_by_aave':workflow_owner in allowed_owners,
+                  'name_allowed_by_aave':not allowed_names or workflow_name in allowed_names,
+                  'metadata_report_id':metadata_report_id,
+                  'feeds':feeds,
+                  'aave_intersections':intersections,
+              }
+              parsed.append(row)
+              if (receiver!=AAVE and row['owner_allowed_by_aave'] and row['name_allowed_by_aave'] and intersections):
+                  candidates.append(row)
+
+          Path('evidence/parsed_reports.json').write_text(json.dumps(parsed,indent=2))
+          Path('evidence/cross_receiver_candidates.json').write_text(json.dumps(candidates,indent=2))
+          summary=[f'parsed_reports={len(parsed)}',f'cross_receiver_candidates={len(candidates)}']
+          for c in candidates:
+              summary.append(f"version={c['version']} receiver={c['receiver']} owner={c['workflow_owner']} intersections={len(c['aave_intersections'])}")
+              for f in c['aave_intersections']:
+                  summary.append(f"  {f['aave_description']}: newer={f['newer_than_aave']} inner_differs={f['inner_differs_from_aave']} ts={f['timestamp']} current={f['aave_current_timestamp']}")
+          Path('evidence/summary.txt').write_text('\n'.join(summary)+'\n')
+          print(Path('evidence/summary.txt').read_text())
+          PY
+          find evidence -type f -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS.txt
+
+      - name: Upload scan evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: aave-aptos-chainlink-cross-receiver-scan
+          path: evidence
+          retention-days: 7
+          if-no-files-found: error
