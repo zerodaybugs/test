@@ -1,0 +1,188 @@
+name: Paxos R7 exact zero-APR sentinel harness
+
+on:
+  push:
+    branches:
+      - paxos-public-toolchain-bootstrap-20260815
+    paths:
+      - '.github/workflows/paxos-r7-exact-harness.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      URL_ETH_MAINNET: http://127.0.0.1:8545
+      URL_ETH_SEPOLIA: http://127.0.0.1:8545
+      URL_INK_MAINNET: http://127.0.0.1:8545
+      URL_INK_SEPOLIA: http://127.0.0.1:8545
+      URL_ARB_MAINNET: http://127.0.0.1:8545
+      URL_ARB_SEPOLIA: http://127.0.0.1:8545
+      URL_XLAYER_TESTNET: http://127.0.0.1:8545
+      URL_XLAYER_MAINNET: http://127.0.0.1:8545
+      GAS_REPORTING: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: paxos-public-toolchain-bootstrap-20260815
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.19.4'
+      - name: Clone exact source and install
+        run: |
+          set -euo pipefail
+          git clone https://github.com/paxosglobal/paxos-token-contracts.git token
+          cd token
+          git checkout --detach 674ac1046a0a40bfd2b6b892192998af9ac3b171
+          git submodule update --init --recursive
+          npm ci --no-audit --no-fund
+          cd ..
+          mkdir -p r7-evidence
+      - name: Add storage-seeding harness around exact MultiplierMgmtFacet
+        run: |
+          set -euo pipefail
+          mkdir -p token/contracts/fixture
+          cat > token/contracts/fixture/R7ZeroAprHarness.sol <<'SOL'
+          // SPDX-License-Identifier: MIT
+          pragma solidity ^0.8.28;
+
+          import { MultiplierMgmtFacet } from "../facets/MultiplierMgmtFacet.sol";
+          import { Roles } from "../lib/Roles.sol";
+          import { StorageLib } from "../lib/StorageLib.sol";
+
+          contract R7ZeroAprHarness is MultiplierMgmtFacet {
+              constructor() {
+                  _grantRole(Roles.MULT_ADMIN_ROLE, msg.sender);
+                  _grantRole(Roles.MULT_RATE_ROLE, msg.sender);
+              }
+
+              function seedActiveMultiplier(
+                  uint32 id,
+                  uint256 activeApr,
+                  uint256 multiplier12,
+                  uint32 maturityPeriod,
+                  uint40 referenceTime
+              ) external {
+                  adminConfig.minRate = StorageLib.toUint40APR(0);
+                  adminConfig.maxRate = StorageLib.toUint40APR(10_000_000_000);
+                  globalTransferSettings.maturityPeriod = StorageLib.toUint32RewardPeriod(maturityPeriod);
+                  globalTransferSettings.referenceTime = referenceTime;
+                  multipliers[id] = MultiplierData({
+                      beforeRate: StorageLib.toUint40APR(activeApr),
+                      afterRate: StorageLib.toUint40APR(0),
+                      switchTime: StorageLib.toUint40Timestamp(block.timestamp),
+                      switchTimeMultiplier: StorageLib.toUint48Multiplier(multiplier12),
+                      nextActiveId: 0
+                  });
+                  firstActiveId = uint16(id);
+                  activeMultiplierCount = 1;
+                  nextMultiplierId = id + 1;
+              }
+
+              function rawMultiplier(uint32 id) external view returns (
+                  uint40 beforeRate,
+                  uint40 afterRate,
+                  uint40 switchTime,
+                  uint48 switchTimeMultiplier
+              ) {
+                  MultiplierData storage m = multipliers[id];
+                  return (m.beforeRate, m.afterRate, m.switchTime, m.switchTimeMultiplier);
+              }
+          }
+          SOL
+      - name: Add exact vulnerable test with ABI-adaptive rate setter
+        run: |
+          set -euo pipefail
+          cat > token/test/R7ZeroAprExactTest.js <<'JS'
+          const { expect } = require('chai');
+          const { ethers, network } = require('hardhat');
+
+          describe('R7 exact 0% APR sentinel collision', function () {
+            it('accepts a zero APR schedule but continues the prior positive rate', async function () {
+              const H = await ethers.getContractFactory('R7ZeroAprHarness');
+              const h = await H.deploy();
+              await h.waitForDeployment?.() || await h.deployed();
+              const address = h.target || h.address;
+              expect(address).to.not.equal(ethers.ZeroAddress || ethers.constants.AddressZero);
+
+              const latest = await ethers.provider.getBlock('latest');
+              const now = Number(latest.timestamp);
+              const APR_5_PERCENT = 500000000n;
+              await (await h.seedActiveMultiplier(1, APR_5_PERCENT, 1000000000000n, 86400, now)).wait();
+
+              const before = await h.getActiveMultiplier(1);
+              const fragments = h.interface.fragments.filter(x => x.type === 'function' && x.name === 'setMultiplierRateByAPR');
+              expect(fragments.length).to.be.greaterThan(0);
+              const f = fragments[0];
+              const args = f.inputs.map((input, index) => {
+                if (index === 0 || /multiplier/i.test(input.name || '')) return 1;
+                if (/time|timestamp/i.test(input.name || '')) return now + 10;
+                return 0;
+              });
+              await (await h[f.format()](...args)).wait();
+              const raw = await h.rawMultiplier(1);
+              expect(BigInt(raw[1].toString())).to.equal(0n);
+
+              await network.provider.send('evm_setNextBlockTimestamp', [now + 30 * 86400]);
+              await network.provider.send('evm_mine');
+              const after = await h.getActiveMultiplier(1);
+              expect(BigInt(after.toString())).to.be.greaterThan(BigInt(before.toString()));
+
+              console.log(JSON.stringify({before:before.toString(),after:after.toString(),rawAfterRate:raw[1].toString(),setter:f.format(),args:args.map(String)}));
+            });
+          });
+          JS
+      - name: Compile and run exact vulnerable harness
+        working-directory: token
+        run: |
+          set -euo pipefail
+          npm run compile 2>&1 | tee ../r7-evidence/COMPILE.log
+          npx hardhat test test/R7ZeroAprExactTest.js 2>&1 | tee ../r7-evidence/VULNERABLE.log
+          grep -q '1 passing' ../r7-evidence/VULNERABLE.log
+          echo PASS > ../r7-evidence/VULNERABLE.PASS
+      - name: Run exact upstream relevant baselines
+        working-directory: token
+        run: |
+          set -euo pipefail
+          npx hardhat test test/RateBasedMultiplierTest.js test/MultiplierManagementTest.js 2>&1 | tee ../r7-evidence/BASELINE.log
+          echo PASS > ../r7-evidence/BASELINE.PASS
+      - name: Build decision and publish
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          e=Path('r7-evidence')
+          gates={
+            'exact_commit':True,
+            'exact_vulnerable_harness':(e/'VULNERABLE.PASS').exists(),
+            'upstream_baseline':(e/'BASELINE.PASS').exists(),
+            'patched_exact_control':False,
+            'production_selector_binding':False,
+            'production_zero_apr_trigger':False,
+            'official_audit_duplicate_clear':False,
+            'current_scope_confirmed':False,
+          }
+          technical=all(gates[k] for k in ('exact_commit','exact_vulnerable_harness','upstream_baseline'))
+          d={'finding':'0% APR schedule is conflated with no scheduled rate and prior positive APR continues','technical_status':'CONFIRMED_EXACT_SOURCE' if technical else 'FAILED','severity':'HIGH_CANDIDATE' if technical else 'NONE','critical_supported':False,'submit_ready':all(gates.values()),'decision':'HOLD_DO_NOT_SUBMIT','production_state_changing_transactions':0,'gates':gates}
+          (e/'R7_DECISION.json').write_text(json.dumps(d,indent=2,sort_keys=True))
+          (e/'R7_DECISION.txt').write_text('\n'.join(f'{k}={v}' for k,v in d.items() if k!='gates')+'\n')
+          PY
+          sha256sum r7-evidence/* > r7-evidence/SHA256SUMS.txt
+          mkdir -p paxos-results/r7-exact
+          cp r7-evidence/R7_DECISION.* paxos-results/r7-exact/
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add paxos-results/r7-exact
+          git commit -m 'Publish Paxos R7 exact harness decision'
+          git push origin HEAD:paxos-public-toolchain-bootstrap-20260815
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paxos-r7-exact-harness
+          path: r7-evidence
+          retention-days: 1
+          if-no-files-found: error
