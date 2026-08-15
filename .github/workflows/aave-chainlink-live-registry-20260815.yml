@@ -1,0 +1,119 @@
+name: Aave Aptos Chainlink live registry inspection
+
+on:
+  push:
+    branches:
+      - aave-aptos-underlying-hooks-20260815
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FULLNODE: https://api.mainnet.aptoslabs.com/v1
+      DATA_FEEDS: 0x3f985798ce4975f430ef5c75776ff98a77b9f9d0fb38184d225adc9c1cc6b79b
+    steps:
+      - name: Query workflow and feed configuration
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p evidence
+          cat > /tmp/workflow.json <<JSON
+          {"function":"${DATA_FEEDS}::registry::get_workflow_config","type_arguments":[],"arguments":[]}
+          JSON
+          cat > /tmp/feeds.json <<JSON
+          {"function":"${DATA_FEEDS}::registry::get_feeds","type_arguments":[],"arguments":[]}
+          JSON
+          for item in workflow feeds; do
+            curl --retry 4 --retry-all-errors --connect-timeout 15 --max-time 120 \
+              -fsS -X POST "$FULLNODE/view" \
+              -H 'Content-Type: application/json' \
+              --data-binary @"/tmp/${item}.json" \
+              -o "evidence/${item}_raw.json"
+            python3 -m json.tool "evidence/${item}_raw.json" > "evidence/${item}_pretty.json"
+          done
+
+      - name: Parse report bindings
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          def b(value):
+              if value is None:
+                  return b''
+              if isinstance(value, str):
+                  s=value[2:] if value.startswith('0x') else value
+                  try: return bytes.fromhex(s)
+                  except ValueError: return value.encode()
+              if isinstance(value, list):
+                  return bytes(int(x) for x in value)
+              raise TypeError(type(value))
+
+          workflow=json.loads(Path('evidence/workflow_raw.json').read_text())
+          feeds=json.loads(Path('evidence/feeds_raw.json').read_text())
+          workflow_value=workflow[0] if isinstance(workflow,list) and workflow else workflow
+          feeds_value=feeds[0] if isinstance(feeds,list) and feeds else feeds
+
+          out_workflow={
+              'allowed_workflow_owners_hex':[b(x).hex() for x in workflow_value.get('allowed_workflow_owners',[])],
+              'allowed_workflow_names_hex':[b(x).hex() for x in workflow_value.get('allowed_workflow_names',[])],
+              'allowed_workflow_names_ascii':[b(x).rstrip(b'\x00').decode('utf-8','replace') for x in workflow_value.get('allowed_workflow_names',[])],
+          }
+          Path('evidence/workflow_parsed.json').write_text(json.dumps(out_workflow,indent=2))
+
+          rows=[]
+          for entry in feeds_value:
+              outer=b(entry.get('feed_id'))
+              feed=entry.get('feed',{})
+              report=b(feed.get('report'))
+              inner=report[:32] if len(report)>=32 else b''
+              schema=int.from_bytes(inner[:2],'big') if len(inner)>=2 else None
+              timestamp=None
+              benchmark=None
+              if len(report)>=224 and schema in (3,4):
+                  timestamp=int.from_bytes(report[92:96],'big')
+                  benchmark=int.from_bytes(report[192:224],'big')
+              rows.append({
+                  'description':feed.get('description'),
+                  'outer_feed_id':'0x'+outer.hex(),
+                  'inner_report_feed_id':'0x'+inner.hex(),
+                  'outer_equals_inner':outer==inner,
+                  'schema':schema,
+                  'stored_observation_timestamp':str(feed.get('observation_timestamp')),
+                  'parsed_observation_timestamp':timestamp,
+                  'stored_benchmark':str(feed.get('benchmark')),
+                  'parsed_benchmark':str(benchmark) if benchmark is not None else None,
+                  'config_id':'0x'+b(feed.get('config_id')).hex(),
+                  'report_length':len(report),
+                  'report_hex':'0x'+report.hex(),
+              })
+          Path('evidence/feed_report_bindings.json').write_text(json.dumps(rows,indent=2))
+          summary=[]
+          summary.append('workflow_owners='+','.join(out_workflow['allowed_workflow_owners_hex']))
+          summary.append('workflow_names='+','.join(out_workflow['allowed_workflow_names_ascii']))
+          for r in rows:
+              summary.append(
+                  f"{r['description']}: outer_equals_inner={r['outer_equals_inner']} "
+                  f"schema={r['schema']} report_len={r['report_length']} "
+                  f"stored_ts={r['stored_observation_timestamp']} parsed_ts={r['parsed_observation_timestamp']} "
+                  f"stored_benchmark_equals_parsed={r['stored_benchmark']==r['parsed_benchmark']}"
+              )
+          Path('evidence/summary.txt').write_text('\n'.join(summary)+'\n')
+          print(Path('evidence/summary.txt').read_text())
+          PY
+          find evidence -type f -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS.txt
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: aave-aptos-chainlink-live-registry
+          path: evidence
+          retention-days: 7
+          if-no-files-found: error
