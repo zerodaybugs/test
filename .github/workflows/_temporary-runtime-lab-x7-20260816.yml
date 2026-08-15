@@ -1,0 +1,133 @@
+name: temporary-runtime-lab-x7
+
+on:
+  push:
+    branches:
+      - runtime-lab-20260816-x7
+    paths:
+      - .github/workflows/_temporary-runtime-lab-x7-20260816.yml
+      - .ci/runtime-lab-x7/payload.json
+
+permissions:
+  contents: read
+
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore branch-scoped ephemeral private key
+        id: keycache
+        uses: actions/cache@v4
+        with:
+          path: .runner-key/private.pem
+          key: runtime-lab-x7-ed64898f228407684877b7c000ce65e3
+
+      - name: Prepare key channel
+        id: prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .runner-key
+          if [[ ! -s .runner-key/private.pem ]]; then
+            openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out .runner-key/private.pem >/dev/null 2>&1
+            chmod 600 .runner-key/private.pem
+            echo "generated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "generated=false" >> "$GITHUB_OUTPUT"
+          fi
+          openssl pkey -in .runner-key/private.pem -pubout -out .runner-key/public.pem >/dev/null 2>&1
+          echo "LAB_PUBLIC_KEY_B64=$(base64 -w0 .runner-key/public.pem)"
+          if [[ -s .ci/runtime-lab-x7/payload.json ]]; then
+            echo "has_payload=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_payload=false" >> "$GITHUB_OUTPUT"
+            echo "LAB_PHASE=KEY_READY"
+          fi
+
+      - uses: actions/setup-dotnet@v4
+        if: steps.prepare.outputs.has_payload == 'true'
+        with:
+          dotnet-version: 10.0.302
+
+      - name: Decrypt and execute isolated payload
+        id: execute
+        if: steps.prepare.outputs.has_payload == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c 'import cryptography' 2>/dev/null || python3 -m pip install --user --disable-pip-version-check cryptography >/dev/null
+          python3 - <<'PY'
+          import base64, io, json, pathlib, tarfile
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.asymmetric import padding
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+          payload = json.loads(pathlib.Path('.ci/runtime-lab-x7/payload.json').read_text())
+          private_key = serialization.load_pem_private_key(pathlib.Path('.runner-key/private.pem').read_bytes(), password=None)
+          key = private_key.decrypt(
+              base64.b64decode(payload['encrypted_key']),
+              padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=b'runtime-lab-x7-key'))
+          plaintext = AESGCM(key).decrypt(
+              base64.b64decode(payload['nonce']),
+              base64.b64decode(payload['ciphertext']),
+              b'runtime-lab-x7-payload')
+          root = pathlib.Path('/tmp/runtime-lab-x7')
+          root.mkdir(parents=True, exist_ok=True)
+          with tarfile.open(fileobj=io.BytesIO(plaintext), mode='r:gz') as archive:
+              for member in archive.getmembers():
+                  candidate = (root / member.name).resolve()
+                  if root.resolve() not in candidate.parents and candidate != root.resolve():
+                      raise RuntimeError('unsafe archive path')
+                  if member.issym() or member.islnk():
+                      raise RuntimeError('links are forbidden')
+              archive.extractall(root, filter='data')
+          PY
+
+          set +e
+          dotnet run --project /tmp/runtime-lab-x7/MsrcBlazorCircuitBinding.csproj -c Release > /tmp/runtime-lab-x7-output.txt 2>&1
+          status=$?
+          set -e
+
+          LAB_STATUS="$status" python3 - <<'PY'
+          import base64, json, os, pathlib
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.asymmetric import padding
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+          private_key = serialization.load_pem_private_key(pathlib.Path('.runner-key/private.pem').read_bytes(), password=None)
+          public_key = private_key.public_key()
+          raw = json.dumps({
+              'exit_code': int(os.environ['LAB_STATUS']),
+              'output': pathlib.Path('/tmp/runtime-lab-x7-output.txt').read_text(errors='replace'),
+          }, separators=(',', ':')).encode()
+          key = os.urandom(32)
+          nonce = os.urandom(12)
+          ciphertext = AESGCM(key).encrypt(nonce, raw, b'runtime-lab-x7-result')
+          encrypted_key = public_key.encrypt(
+              key,
+              padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=b'runtime-lab-x7-result-key'))
+          pathlib.Path('/tmp/runtime-lab-x7-result.json').write_text(json.dumps({
+              'encrypted_key': base64.b64encode(encrypted_key).decode(),
+              'nonce': base64.b64encode(nonce).decode(),
+              'ciphertext': base64.b64encode(ciphertext).decode(),
+          }, separators=(',', ':')))
+          PY
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          echo "has_result=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload encrypted result
+        if: always() && steps.execute.outputs.has_result == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-lab-x7-result
+          path: /tmp/runtime-lab-x7-result.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Propagate harness status
+        if: always() && steps.execute.outputs.has_result == 'true'
+        shell: bash
+        run: exit "${{ steps.execute.outputs.exit_code }}"
