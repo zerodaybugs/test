@@ -1,0 +1,248 @@
+name: Paxos Solana read-only full history census
+
+on:
+  push:
+    branches:
+      - paxos-public-toolchain-bootstrap-20260815
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run finalized read-only history census
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > history_census.py <<'PY'
+          import base64, hashlib, json, struct, time, urllib.error, urllib.request
+          from pathlib import Path
+
+          PROGRAM_ID = 'G1SRHec1Mig66xKJ169kmmVRy4WX81VLKCUfdExThQdo'
+          ENDPOINTS = [
+              'https://api.mainnet-beta.solana.com',
+              'https://solana-rpc.publicnode.com',
+              'https://rpc.ankr.com/solana',
+          ]
+          ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+          ALPHABET_MAP = {c:i for i,c in enumerate(ALPHABET)}
+          UPDATE_DISC = hashlib.sha256(b'global:update_rate_limit').digest()[:8]
+          ADD_DISC = hashlib.sha256(b'global:add_minter').digest()[:8]
+          UPDATE_EVENT_DISC = hashlib.sha256(b'event:RateLimitUpdated').digest()[:8]
+          ADD_EVENT_DISC = hashlib.sha256(b'event:MinterAdded').digest()[:8]
+          rpc_id = 0
+          endpoint_cursor = 0
+
+          def b58decode(s):
+              n = 0
+              for c in s:
+                  n = n * 58 + ALPHABET_MAP[c]
+              raw = n.to_bytes((n.bit_length()+7)//8, 'big') if n else b''
+              pad = 0
+              for c in s:
+                  if c == '1': pad += 1
+                  else: break
+              return b'\0'*pad + raw
+
+          def b58encode(data):
+              n = int.from_bytes(data, 'big')
+              out = ''
+              while n:
+                  n, rem = divmod(n, 58)
+                  out = ALPHABET[rem] + out
+              pad = 0
+              for x in data:
+                  if x == 0: pad += 1
+                  else: break
+              return '1'*pad + (out or '')
+
+          def request_json(payload, timeout=60):
+              global endpoint_cursor
+              last = None
+              for offset in range(len(ENDPOINTS)):
+                  ep = ENDPOINTS[(endpoint_cursor + offset) % len(ENDPOINTS)]
+                  req = urllib.request.Request(
+                      ep,
+                      data=json.dumps(payload).encode(),
+                      headers={'content-type':'application/json','user-agent':'paxos-readonly-history-census/1.0'},
+                  )
+                  try:
+                      with urllib.request.urlopen(req, timeout=timeout) as r:
+                          obj = json.loads(r.read())
+                      endpoint_cursor = (endpoint_cursor + offset) % len(ENDPOINTS)
+                      return obj, ep
+                  except Exception as e:
+                      last = e
+                      time.sleep(0.5 + offset)
+              raise RuntimeError(f'all RPC endpoints failed: {last}')
+
+          def rpc(method, params, retries=8):
+              global rpc_id
+              last = None
+              for attempt in range(retries):
+                  rpc_id += 1
+                  try:
+                      obj, ep = request_json({'jsonrpc':'2.0','id':rpc_id,'method':method,'params':params})
+                      if 'error' in obj:
+                          raise RuntimeError(obj['error'])
+                      return obj['result'], ep
+                  except Exception as e:
+                      last = e
+                      time.sleep(min(8, 0.5 * (2 ** attempt)))
+              raise RuntimeError(f'{method} failed: {last}')
+
+          signatures = []
+          before = None
+          endpoint_used = None
+          for page in range(30):
+              cfg = {'limit':1000,'commitment':'finalized'}
+              if before: cfg['before'] = before
+              batch, ep = rpc('getSignaturesForAddress', [PROGRAM_ID, cfg])
+              endpoint_used = ep
+              if not batch: break
+              signatures.extend(batch)
+              before = batch[-1]['signature']
+              print(f'page={page+1} batch={len(batch)} total={len(signatures)} before={before}', flush=True)
+              if len(batch) < 1000: break
+              time.sleep(0.25)
+
+          # Deduplicate while preserving newest-to-oldest order.
+          seen = set(); sig_rows = []
+          for row in signatures:
+              if row['signature'] in seen: continue
+              seen.add(row['signature']); sig_rows.append(row)
+          signatures = sig_rows
+
+          def account_key_strings(message, meta):
+              keys = []
+              for x in message.get('accountKeys', []):
+                  keys.append(x if isinstance(x, str) else x.get('pubkey'))
+              loaded = (meta or {}).get('loadedAddresses') or {}
+              keys.extend(loaded.get('writable') or [])
+              keys.extend(loaded.get('readonly') or [])
+              return keys
+
+          update_instructions = []
+          add_instructions = []
+          update_events = []
+          add_events = []
+          tx_fetch_errors = []
+
+          for index, sigrow in enumerate(signatures):
+              sig = sigrow['signature']
+              try:
+                  tx, ep = rpc('getTransaction', [sig, {
+                      'encoding':'json', 'commitment':'finalized',
+                      'maxSupportedTransactionVersion':0,
+                  }], retries=5)
+              except Exception as e:
+                  tx_fetch_errors.append({'signature':sig,'error':str(e)})
+                  continue
+              if not tx: continue
+              meta = tx.get('meta') or {}
+              msg = ((tx.get('transaction') or {}).get('message') or {})
+              keys = account_key_strings(msg, meta)
+              ixs = list(msg.get('instructions') or [])
+              for inner in meta.get('innerInstructions') or []:
+                  ixs.extend(inner.get('instructions') or [])
+              for ix in ixs:
+                  try:
+                      pid = keys[ix['programIdIndex']]
+                  except Exception:
+                      continue
+                  if pid != PROGRAM_ID or 'data' not in ix:
+                      continue
+                  try:
+                      data = b58decode(ix['data'])
+                  except Exception:
+                      continue
+                  target = None
+                  kind = None
+                  if data.startswith(UPDATE_DISC) and len(data) >= 24:
+                      target = update_instructions; kind = 'update_rate_limit'
+                  elif data.startswith(ADD_DISC) and len(data) >= 24:
+                      target = add_instructions; kind = 'add_minter'
+                  if target is None: continue
+                  capacity, refill = struct.unpack_from('<QQ', data, 8)
+                  account_indexes = ix.get('accounts') or []
+                  resolved = [keys[i] if i < len(keys) else None for i in account_indexes]
+                  target.append({
+                      'kind':kind, 'signature':sig, 'slot':tx.get('slot'),
+                      'block_time':tx.get('blockTime'), 'success':meta.get('err') is None,
+                      'error':meta.get('err'), 'capacity':capacity,
+                      'refill_per_second':refill, 'accounts':resolved,
+                      'payer':resolved[0] if len(resolved)>0 else None,
+                      'admin':resolved[1] if len(resolved)>1 else None,
+                      'minter_authority':resolved[2] if len(resolved)>2 else None,
+                      'mint_account':resolved[3] if len(resolved)>3 else None,
+                      'minter':resolved[4] if len(resolved)>4 else None,
+                  })
+
+              for line in meta.get('logMessages') or []:
+                  if not line.startswith('Program data: '): continue
+                  try: data = base64.b64decode(line.split(': ',1)[1])
+                  except Exception: continue
+                  if data.startswith(UPDATE_EVENT_DISC) and len(data) >= 88:
+                      o=8; ma=b58encode(data[o:o+32]); o+=32; mint=b58encode(data[o:o+32]); o+=32
+                      capacity, refill=struct.unpack_from('<QQ',data,o)
+                      update_events.append({'signature':sig,'slot':tx.get('slot'),'block_time':tx.get('blockTime'),'minter_authority':ma,'mint_account':mint,'capacity':capacity,'refill_per_second':refill})
+                  elif data.startswith(ADD_EVENT_DISC) and len(data) >= 120:
+                      o=8; ma=b58encode(data[o:o+32]); o+=32; mint=b58encode(data[o:o+32]); o+=32; admin=b58encode(data[o:o+32]); o+=32
+                      capacity, refill=struct.unpack_from('<QQ',data,o)
+                      add_events.append({'signature':sig,'slot':tx.get('slot'),'block_time':tx.get('blockTime'),'minter_authority':ma,'mint_account':mint,'admin':admin,'capacity':capacity,'refill_per_second':refill})
+              if (index+1) % 100 == 0:
+                  print(f'transactions={index+1}/{len(signatures)} updates={len(update_instructions)} adds={len(add_instructions)} errors={len(tx_fetch_errors)}', flush=True)
+              time.sleep(0.08)
+
+          # For each minter, calculate whether any update was preceded by idle time under an old policy.
+          histories = {}
+          for row in sorted(add_instructions + update_instructions, key=lambda x:(x.get('block_time') or 0, x.get('slot') or 0)):
+              key = row.get('minter') or f"{row.get('minter_authority')}::{row.get('mint_account')}"
+              histories.setdefault(key, []).append(row)
+
+          out = {
+              'program_id':PROGRAM_ID,
+              'read_only':True,
+              'production_transactions_sent':0,
+              'rpc_endpoint_last_used':endpoint_used,
+              'generated_at_unix':int(time.time()),
+              'signatures_scanned':len(signatures),
+              'newest_signature_time':signatures[0].get('blockTime') if signatures else None,
+              'oldest_signature_time':signatures[-1].get('blockTime') if signatures else None,
+              'successful_update_instruction_count':sum(1 for x in update_instructions if x['success']),
+              'failed_update_instruction_count':sum(1 for x in update_instructions if not x['success']),
+              'successful_add_minter_count':sum(1 for x in add_instructions if x['success']),
+              'failed_add_minter_count':sum(1 for x in add_instructions if not x['success']),
+              'update_event_count':len(update_events),
+              'add_event_count':len(add_events),
+              'transaction_fetch_error_count':len(tx_fetch_errors),
+              'update_instructions':update_instructions,
+              'add_minter_instructions':add_instructions,
+              'update_events':update_events,
+              'add_events':add_events,
+              'histories':histories,
+              'transaction_fetch_errors':tx_fetch_errors,
+          }
+          Path('PAXOS_SOLANA_FULL_HISTORY_CENSUS.json').write_text(json.dumps(out, indent=2))
+          Path('PAXOS_SOLANA_RATE_UPDATES.json').write_text(json.dumps(update_instructions, indent=2))
+          Path('PAXOS_SOLANA_ADD_MINTERS.json').write_text(json.dumps(add_instructions, indent=2))
+          print(json.dumps({k:v for k,v in out.items() if k not in ('update_instructions','add_minter_instructions','update_events','add_events','histories','transaction_fetch_errors')}, indent=2))
+          PY
+          python3 history_census.py 2>&1 | tee PAXOS_SOLANA_FULL_HISTORY_CENSUS.log
+          sha256sum PAXOS_SOLANA_FULL_HISTORY_CENSUS.json PAXOS_SOLANA_RATE_UPDATES.json PAXOS_SOLANA_ADD_MINTERS.json PAXOS_SOLANA_FULL_HISTORY_CENSUS.log > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paxos-solana-full-history-census
+          path: |
+            PAXOS_SOLANA_FULL_HISTORY_CENSUS.json
+            PAXOS_SOLANA_RATE_UPDATES.json
+            PAXOS_SOLANA_ADD_MINTERS.json
+            PAXOS_SOLANA_FULL_HISTORY_CENSUS.log
+            SHA256SUMS.txt
+          retention-days: 1
+          if-no-files-found: error
