@@ -1,0 +1,266 @@
+name: Paxos bridge freeze-pause exact behavior explorer
+
+on:
+  push:
+    branches:
+      - paxos-public-toolchain-bootstrap-20260815
+    paths:
+      - '.github/workflows/paxos-bridge-behavior-explorer.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  explore:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      URL_ETH_MAINNET: http://127.0.0.1:8545
+      URL_ETH_SEPOLIA: http://127.0.0.1:8545
+      URL_INK_MAINNET: http://127.0.0.1:8545
+      URL_INK_SEPOLIA: http://127.0.0.1:8545
+      URL_ARB_MAINNET: http://127.0.0.1:8545
+      URL_ARB_SEPOLIA: http://127.0.0.1:8545
+      URL_XLAYER_TESTNET: http://127.0.0.1:8545
+      URL_XLAYER_MAINNET: http://127.0.0.1:8545
+      GAS_REPORTING: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: paxos-public-toolchain-bootstrap-20260815
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.19.4'
+      - name: Clone and compile exact source
+        run: |
+          set -euo pipefail
+          git clone https://github.com/paxosglobal/cross-chain-contracts.git cc
+          cd cc
+          git checkout --detach b4a1c2b2537b187e63acf5c717b7d943abb0a75f
+          npm ci --no-audit --no-fund
+          npx hardhat compile
+          mkdir -p ../bridge-evidence
+      - name: Static privilege-boundary extraction
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,re
+          from pathlib import Path
+          roots=[Path('cc/contracts'),Path('cc/node_modules/PaxosToken/contracts')]
+          files=[]
+          for root in roots:
+              if root.exists(): files.extend(root.rglob('*.sol'))
+          names=['decreaseSupplyFromAddress','increaseSupplyToAddress','transfer','transferFrom','_debit','_credit','freeze','pause']
+          found={}
+          for p in files:
+              text=p.read_text(errors='replace')
+              for name in names:
+                  for m in re.finditer(r'function\s+'+re.escape(name)+r'\s*\(',text):
+                      start=m.start(); brace=text.find('{',m.end())
+                      if brace<0: continue
+                      depth=0; end=None
+                      for i in range(brace,len(text)):
+                          if text[i]=='{': depth+=1
+                          elif text[i]=='}':
+                              depth-=1
+                              if depth==0: end=i+1; break
+                      if end:
+                          found.setdefault(name,[]).append({'file':str(p),'body':text[start:end]})
+          checks={
+            'decrease_has_freeze_check':any(re.search(r'frozen|_isAddrFrozen|AddressFrozen',x['body'],re.I) for x in found.get('decreaseSupplyFromAddress',[])),
+            'decrease_has_pause_check':any(re.search(r'whenNotPaused|paused\(|Pausable',x['body'],re.I) for x in found.get('decreaseSupplyFromAddress',[])),
+            'increase_has_freeze_check':any(re.search(r'frozen|_isAddrFrozen|AddressFrozen',x['body'],re.I) for x in found.get('increaseSupplyToAddress',[])),
+            'increase_has_pause_check':any(re.search(r'whenNotPaused|paused\(|Pausable',x['body'],re.I) for x in found.get('increaseSupplyToAddress',[])),
+            'wrapper_debit_has_freeze_check':any(re.search(r'frozen|_isAddrFrozen|AddressFrozen',x['body'],re.I) for x in found.get('_debit',[]) if 'OFTWrapper' in x['file']),
+            'wrapper_debit_has_pause_check':any(re.search(r'whenNotPaused|paused\(',x['body'],re.I) for x in found.get('_debit',[]) if 'OFTWrapper' in x['file']),
+            'wrapper_credit_has_freeze_check':any(re.search(r'frozen|_isAddrFrozen|AddressFrozen',x['body'],re.I) for x in found.get('_credit',[]) if 'OFTWrapper' in x['file']),
+            'wrapper_credit_has_pause_check':any(re.search(r'whenNotPaused|paused\(',x['body'],re.I) for x in found.get('_credit',[]) if 'OFTWrapper' in x['file']),
+          }
+          Path('bridge-evidence/STATIC_BOUNDARY.json').write_text(json.dumps({'found':found,'checks':checks},indent=2))
+          PY
+      - name: Generic local deployment and ABI behavior exploration
+        working-directory: cc
+        run: |
+          set -euo pipefail
+          cat > scripts/exploreBoundary.js <<'JS'
+          const hre = require('hardhat');
+          const { ethers, upgrades } = hre;
+          const fs = require('fs');
+
+          function valFor(input, ctx) {
+            const t=input.type, n=(input.name||'').toLowerCase();
+            if(t==='address') {
+              if(n.includes('token')) return ctx.token || ctx.owner.address;
+              if(n.includes('endpoint')) return ctx.endpoint || ctx.owner.address;
+              if(n.includes('delegate') || n.includes('owner') || n.includes('admin')) return ctx.owner.address;
+              return ctx.user.address;
+            }
+            if(t==='bool') return false;
+            if(t==='string') return n.includes('symbol') ? 'TST' : 'Test Token';
+            if(t==='bytes') return '0x';
+            if(t==='bytes32') return ethers.constants.HashZero;
+            if(/^uint/.test(t) || /^int/.test(t)) {
+              if(n.includes('decimal')) return 6;
+              if(n.includes('capacity') || n.includes('limit')) return 1000000;
+              if(n.includes('window')) return 86400;
+              return 0;
+            }
+            if(t.endsWith('[]')) return [];
+            if(t.startsWith('tuple')) {
+              if(t.endsWith('[]')) return [];
+              return (input.components||[]).map(x=>valFor(x,ctx));
+            }
+            return 0;
+          }
+
+          async function deployByName(name, ctx) {
+            const art=await hre.artifacts.readArtifact(name);
+            const ctor=art.abi.find(x=>x.type==='constructor');
+            const args=(ctor?.inputs||[]).map(x=>valFor(x,ctx));
+            const F=await ethers.getContractFactory(name);
+            const c=await F.deploy(...args);
+            await c.deployed();
+            return {c,args,abi:art.abi};
+          }
+
+          async function tryTx(label, fn) {
+            try { const tx=await fn(); if(tx?.wait) await tx.wait(); return {label,ok:true}; }
+            catch(e){ return {label,ok:false,error:String(e.message||e).slice(0,900)}; }
+          }
+
+          async function main(){
+            const [owner,user,other]=await ethers.getSigners();
+            const out={owner:owner.address,user:user.address,contracts:{},attempts:[],observations:{}};
+            const ctx={owner,user,other};
+
+            for(const name of ['LzEndpointFixture','PaxosTokenFixture']){
+              try{
+                const d=await deployByName(name,ctx); out.contracts[name]={address:d.c.address,args:d.args,functions:d.abi.filter(x=>x.type==='function').map(x=>x.name)};
+                if(name==='LzEndpointFixture') ctx.endpoint=d.c.address;
+                if(name==='PaxosTokenFixture') {ctx.token=d.c.address; ctx.tokenContract=d.c;}
+              }catch(e){out.contracts[name]={deployError:String(e.message||e)};}
+            }
+
+            const token=ctx.tokenContract;
+            if(token){
+              const fnNames=Object.keys(token.functions).map(x=>x.split('(')[0]);
+              for(const init of [...new Set(fnNames.filter(x=>/^initialize/.test(x)))]){
+                const frag=token.interface.fragments.find(x=>x.type==='function'&&x.name===init);
+                const args=frag.inputs.map(x=>valFor(x,ctx));
+                out.attempts.push(await tryTx(`token.${init}`,()=>token[init](...args)));
+              }
+              for(const roleView of [...new Set(fnNames.filter(x=>/_ROLE$/.test(x)))]){
+                try{
+                  const role=await token[roleView]();
+                  if(fnNames.includes('grantRole')) out.attempts.push(await tryTx(`grant ${roleView}`,()=>token.grantRole(role,owner.address)));
+                }catch(e){}
+              }
+            }
+
+            let wrapper=null;
+            for(const name of ['OFTWrapperFixture','OFTWrapperUpgradeableFixture']){
+              if(wrapper) break;
+              try{
+                const d=await deployByName(name,ctx); wrapper=d.c; out.contracts[name]={address:d.c.address,args:d.args,functions:d.abi.filter(x=>x.type==='function').map(x=>x.name)};
+                const fnNames=Object.keys(wrapper.functions).map(x=>x.split('(')[0]);
+                for(const init of [...new Set(fnNames.filter(x=>/^initialize/.test(x)))]){
+                  const frag=wrapper.interface.fragments.find(x=>x.type==='function'&&x.name===init);
+                  const args=frag.inputs.map(x=>valFor(x,ctx));
+                  out.attempts.push(await tryTx(`wrapper.${init}`,()=>wrapper[init](...args)));
+                }
+              }catch(e){out.contracts[name]={deployError:String(e.message||e)};}
+            }
+
+            if(token && wrapper){
+              const tokenNames=[...new Set(Object.keys(token.functions).map(x=>x.split('(')[0]))];
+              const wrapperNames=[...new Set(Object.keys(wrapper.functions).map(x=>x.split('(')[0]))];
+              const controllerSetters=tokenNames.filter(x=>/supplycontroller|controller/i.test(x)&&/^set|^propose|^accept/i.test(x));
+              for(const n of controllerSetters){
+                const frag=token.interface.fragments.find(x=>x.type==='function'&&x.name===n);
+                if(!frag) continue;
+                const args=frag.inputs.map(i=>i.type==='address'?wrapper.address:valFor(i,ctx));
+                out.attempts.push(await tryTx(`token.${n}`,()=>token[n](...args)));
+              }
+              const mintFns=tokenNames.filter(x=>/increaseSupplyToAddress|mint/i.test(x));
+              for(const n of mintFns){
+                const frag=token.interface.fragments.find(x=>x.type==='function'&&x.name===n);
+                if(!frag) continue;
+                const args=frag.inputs.map(i=>i.type==='address'?user.address:(/^uint/.test(i.type)?1000000:valFor(i,ctx)));
+                const r=await tryTx(`token.${n}`,()=>token[n](...args)); out.attempts.push(r); if(r.ok) break;
+              }
+              const freezeFns=tokenNames.filter(x=>/^freeze|freezeAddress|setFrozen/i.test(x));
+              for(const n of freezeFns){
+                const frag=token.interface.fragments.find(x=>x.type==='function'&&x.name===n);
+                if(!frag) continue;
+                const args=frag.inputs.map(i=>i.type==='address'?user.address:(i.type==='bool'?true:valFor(i,ctx)));
+                const r=await tryTx(`token.${n}`,()=>token[n](...args)); out.attempts.push(r); if(r.ok) break;
+              }
+              if(tokenNames.includes('balanceOf')) out.observations.balanceBefore=String(await token.balanceOf(user.address));
+              for(const n of wrapperNames.filter(x=>/debit|send/i.test(x))){
+                const frag=wrapper.interface.fragments.find(x=>x.type==='function'&&x.name===n);
+                if(!frag) continue;
+                const args=frag.inputs.map(i=>{
+                  if(i.type==='address') return user.address;
+                  if(/^uint/.test(i.type)) return i.name?.toLowerCase().includes('eid')?30101:1000;
+                  if(i.type==='bytes32') return ethers.utils.hexZeroPad(user.address,32);
+                  if(i.type==='bytes') return '0x';
+                  if(i.type.startsWith('tuple')) return valFor(i,ctx);
+                  return valFor(i,ctx);
+                });
+                const r=await tryTx(`user.wrapper.${n}`,()=>wrapper.connect(user)[n](...args)); out.attempts.push(r);
+              }
+              if(tokenNames.includes('balanceOf')) out.observations.balanceAfter=String(await token.balanceOf(user.address));
+            }
+            fs.writeFileSync('../bridge-evidence/BEHAVIOR.json',JSON.stringify(out,null,2));
+          }
+          main().then(()=>process.exit(0)).catch(e=>{console.error(e);process.exit(1)});
+          JS
+          npx hardhat run --network hardhat scripts/exploreBoundary.js 2>&1 | tee ../bridge-evidence/BEHAVIOR.log
+      - name: Build machine decision
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          static=json.loads(Path('bridge-evidence/STATIC_BOUNDARY.json').read_text())
+          behavior=json.loads(Path('bridge-evidence/BEHAVIOR.json').read_text()) if Path('bridge-evidence/BEHAVIOR.json').exists() else {}
+          attempts=behavior.get('attempts',[])
+          successful=[x['label'] for x in attempts if x.get('ok')]
+          bridge_success=any(x.startswith('user.wrapper.') for x in successful)
+          freeze_success=any('.freeze' in x.lower() or 'frozen' in x.lower() for x in successful)
+          checks=static['checks']
+          static_chain=(not checks['wrapper_debit_has_freeze_check'] and not checks['wrapper_debit_has_pause_check'])
+          decision={
+            'candidate':'Frozen or paused token holder may reach OFT supply-controller debit path',
+            'static_chain':static_chain,
+            'local_freeze_configured':freeze_success,
+            'local_bridge_after_freeze_succeeded':bridge_success,
+            'technical_status':'CONFIRMED_LOCAL' if freeze_success and bridge_success else ('STATIC_CANDIDATE' if static_chain else 'KILL'),
+            'critical_supported':False,
+            'submit_ready':False,
+            'decision':'HOLD_DO_NOT_SUBMIT',
+            'successful_attempts':successful,
+            'production_state_changing_transactions':0,
+          }
+          Path('bridge-evidence/DECISION.json').write_text(json.dumps(decision,indent=2,sort_keys=True))
+          PY
+          sha256sum bridge-evidence/* > bridge-evidence/SHA256SUMS.txt
+          mkdir -p paxos-results/bridge-freeze
+          cp bridge-evidence/DECISION.json paxos-results/bridge-freeze/
+          cp bridge-evidence/STATIC_BOUNDARY.json paxos-results/bridge-freeze/
+          cp bridge-evidence/BEHAVIOR.json paxos-results/bridge-freeze/ || true
+      - name: Publish result
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add paxos-results/bridge-freeze
+          git commit -m 'Publish Paxos bridge freeze boundary exploration'
+          git push origin HEAD:paxos-public-toolchain-bootstrap-20260815
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paxos-bridge-freeze-exploration
+          path: bridge-evidence
+          retention-days: 1
+          if-no-files-found: error
