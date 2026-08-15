@@ -1,0 +1,296 @@
+name: Aave Aptos Chainlink cross receiver scan v3
+
+on:
+  push:
+    branches:
+      - aave-aptos-underlying-hooks-20260815
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      REST_PRIMARY: "https://api.mainnet.aptoslabs.com/v1"
+      REST_SECONDARY: "https://fullnode.mainnet.aptoslabs.com/v1"
+      GRAPHQL: "https://indexer.mainnet.aptoslabs.com/v1/graphql"
+      PLATFORM: "0x9976bb288ed9177b542d568fa1ac386819dc99141630e582315804840f41928a"
+      DATA_FEEDS: "0x3f985798ce4975f430ef5c75776ff98a77b9f9d0fb38184d225adc9c1cc6b79b"
+    steps:
+      - name: Scan signed reports
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p evidence/candidate_transactions
+          python3 - <<'PY'
+          import concurrent.futures
+          import collections
+          import json
+          import os
+          import pathlib
+          import time
+          import urllib.error
+          import urllib.request
+
+          GQL=os.environ['GRAPHQL']
+          RESTS=[os.environ['REST_PRIMARY'],os.environ['REST_SECONDARY']]
+          PLATFORM=os.environ['PLATFORM'].lower()
+          AAVE=os.environ['DATA_FEEDS'].lower()
+          ROOT=pathlib.Path('evidence')
+
+          def request_json(url, body=None, attempts=6):
+              last=None
+              for attempt in range(attempts):
+                  try:
+                      headers={'User-Agent':'aave-chainlink-cross-receiver-scan-v3'}
+                      if body is not None:
+                          headers['Content-Type']='application/json'
+                          req=urllib.request.Request(url,data=json.dumps(body).encode(),headers=headers)
+                      else:
+                          req=urllib.request.Request(url,headers=headers)
+                      with urllib.request.urlopen(req,timeout=120) as response:
+                          return json.loads(response.read())
+                  except Exception as exc:
+                      last=exc
+                      time.sleep(0.3*(attempt+1))
+              raise RuntimeError(f'{url}: {last!r}')
+
+          def view(function):
+              body={'function':f'{AAVE}::registry::{function}','type_arguments':[],'arguments':[]}
+              last=None
+              for rest in RESTS:
+                  try:
+                      return request_json(rest+'/view',body)
+                  except Exception as exc:
+                      last=exc
+              raise RuntimeError(last)
+
+          def as_bytes(value):
+              if value is None:
+                  return b''
+              if isinstance(value,str):
+                  s=value[2:] if value.startswith('0x') else value
+                  try:
+                      return bytes.fromhex(s)
+                  except ValueError:
+                      return value.encode()
+              if isinstance(value,list):
+                  return bytes(int(x) for x in value)
+              raise TypeError(type(value))
+
+          workflow=view('get_workflow_config')[0]
+          feeds=view('get_feeds')[0]
+          (ROOT/'workflow.json').write_text(json.dumps(workflow,indent=2))
+          (ROOT/'feeds.json').write_text(json.dumps(feeds,indent=2))
+          allowed_owners={'0x'+as_bytes(x).hex() for x in workflow.get('allowed_workflow_owners',[])}
+          allowed_names={'0x'+as_bytes(x).hex() for x in workflow.get('allowed_workflow_names',[])}
+          aave_feeds={}
+          for entry in feeds:
+              outer='0x'+as_bytes(entry.get('feed_id')).hex()
+              feed=entry.get('feed',{})
+              aave_feeds[outer]={
+                  'description':feed.get('description'),
+                  'timestamp':int(str(feed.get('observation_timestamp') or 0)),
+                  'benchmark':str(feed.get('benchmark')),
+              }
+
+          query='''query Reports($platform: String!, $limit: Int!, $offset: Int!) {
+            user_transactions(
+              where: {
+                entry_function_contract_address: {_eq: $platform},
+                entry_function_module_name: {_eq: "forwarder"},
+                entry_function_function_name: {_eq: "report"}
+              },
+              order_by: {version: desc},
+              limit: $limit,
+              offset: $offset
+            ) {
+              version
+              sender
+              timestamp
+            }
+          }'''
+          rows=[]
+          page_size=100
+          max_rows=10000
+          for offset in range(0,max_rows,page_size):
+              payload=request_json(GQL,{'query':query,'variables':{'platform':PLATFORM,'limit':page_size,'offset':offset}})
+              if payload.get('errors'):
+                  raise RuntimeError(payload['errors'])
+              page=payload.get('data',{}).get('user_transactions',[])
+              rows.extend(page)
+              if offset % 1000 == 0:
+                  print(f'INDEXER offset={offset} page={len(page)} total={len(rows)}')
+              if len(page)<page_size:
+                  break
+          (ROOT/'indexer_rows.json').write_text(json.dumps(rows,indent=2))
+          versions=[]
+          seen=set()
+          for row in rows:
+              version=str(row['version'])
+              if version not in seen:
+                  seen.add(version); versions.append(version)
+
+          def fetch_tx(version):
+              last=None
+              for rest in RESTS:
+                  try:
+                      return version,request_json(f'{rest}/transactions/by_version/{version}',attempts=4),None
+                  except Exception as exc:
+                      last=exc
+              return version,None,repr(last)
+
+          def parse_data(data):
+              if len(data)<64:
+                  return [],'invalid'
+              u=lambda x:int.from_bytes(x,'big')
+              if u(data[:32])!=32:
+                  return [],'invalid'
+              count=u(data[32:64])
+              if count>100:
+                  return [],'invalid'
+              compact_len=64+count*96
+              v03_len=64+count*416
+              parsed=[]
+              if len(data)==compact_len:
+                  offset=64
+                  for _ in range(count):
+                      outer=data[offset:offset+32]; offset+=32
+                      report=data[offset:offset+64]; offset+=64
+                      timestamp=int.from_bytes(report[28:32],'big')
+                      benchmark=int.from_bytes(report[32:64],'big')
+                      parsed.append({'outer':'0x'+outer.hex(),'timestamp':timestamp,'benchmark':str(benchmark),'format':'benchmark64','report_hex':'0x'+report.hex()})
+                  return parsed,'benchmark64'
+              if len(data)==v03_len:
+                  offset=64+32*count
+                  for _ in range(count):
+                      outer=data[offset:offset+32]; offset+=32
+                      marker=u(data[offset:offset+32]); offset+=32
+                      length=u(data[offset:offset+32]); offset+=32
+                      if marker!=64 or length!=288 or offset+length>len(data):
+                          return [],'invalid-v03'
+                      report=data[offset:offset+length]; offset+=length
+                      timestamp=int.from_bytes(report[92:96],'big')
+                      benchmark=int.from_bytes(report[192:224],'big')
+                      parsed.append({'outer':'0x'+outer.hex(),'timestamp':timestamp,'benchmark':str(benchmark),'format':'v03-288','inner':'0x'+report[:32].hex(),'report_hex':'0x'+report.hex()})
+                  return parsed,'v03-288'
+              return [],f'unknown-{len(data)}-count-{count}'
+
+          parsed=[]
+          candidates=[]
+          errors=[]
+          receiver_counts=collections.Counter()
+          owner_counts=collections.Counter()
+          format_counts=collections.Counter()
+          time_min=None
+          time_max=None
+
+          with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+              for index,(version,tx,error) in enumerate(executor.map(fetch_tx,versions),1):
+                  if error is not None:
+                      errors.append({'version':version,'error':error})
+                      continue
+                  payload=tx.get('payload',{})
+                  args=payload.get('arguments',[])
+                  if len(args)<3:
+                      continue
+                  receiver=str(args[0]).lower()
+                  raw=as_bytes(args[1])
+                  if len(raw)<205:
+                      continue
+                  report=raw[96:]
+                  if len(report)<109 or report[0]!=1:
+                      continue
+                  metadata=report[45:109]
+                  owner='0x'+metadata[42:62].hex()
+                  name='0x'+metadata[32:42].hex()
+                  report_rows,fmt=parse_data(report[109:])
+                  receiver_counts[receiver]+=1
+                  owner_counts[owner]+=1
+                  format_counts[fmt]+=1
+                  tx_timestamp=tx.get('timestamp')
+                  if tx_timestamp is not None:
+                      try:
+                          micros=int(str(tx_timestamp))
+                          time_min=micros if time_min is None else min(time_min,micros)
+                          time_max=micros if time_max is None else max(time_max,micros)
+                      except ValueError:
+                          pass
+                  intersections=[]
+                  for feed in report_rows:
+                      current=aave_feeds.get(feed['outer'])
+                      if current is None:
+                          continue
+                      intersections.append({
+                          **feed,
+                          'aave_description':current['description'],
+                          'aave_current_timestamp':current['timestamp'],
+                          'aave_current_benchmark':current['benchmark'],
+                          'different_from_current':feed['benchmark']!=current['benchmark'],
+                          'newer_than_current':feed['timestamp']>current['timestamp'],
+                      })
+                  row={
+                      'version':version,
+                      'success':tx.get('success'),
+                      'sender':tx.get('sender'),
+                      'receiver':receiver,
+                      'receiver_is_aave':receiver==AAVE,
+                      'workflow_owner':owner,
+                      'workflow_name':name,
+                      'owner_allowed_by_aave':owner in allowed_owners,
+                      'name_allowed_by_aave':not allowed_names or name in allowed_names,
+                      'workflow_execution_id':'0x'+report[1:33].hex(),
+                      'report_header_timestamp':int.from_bytes(report[33:37],'big'),
+                      'don_id':int.from_bytes(report[37:41],'big'),
+                      'config_version':int.from_bytes(report[41:45],'big'),
+                      'metadata_report_id':int.from_bytes(metadata[62:64],'big'),
+                      'format':fmt,
+                      'feed_count':len(report_rows),
+                      'aave_intersections':intersections,
+                  }
+                  parsed.append(row)
+                  if receiver!=AAVE and row['owner_allowed_by_aave'] and row['name_allowed_by_aave'] and intersections:
+                      candidate={**row,'raw_report_context_and_report':args[1],'signatures':args[2]}
+                      candidates.append(candidate)
+                      (ROOT/'candidate_transactions'/f'{version}.json').write_text(json.dumps(tx,indent=2))
+                  if index % 1000 == 0:
+                      print(f'FETCHED {index}/{len(versions)} candidates={len(candidates)} errors={len(errors)}')
+
+          (ROOT/'parsed_reports.json').write_text(json.dumps(parsed,indent=2))
+          (ROOT/'cross_receiver_candidates.json').write_text(json.dumps(candidates,indent=2))
+          (ROOT/'fetch_errors.json').write_text(json.dumps(errors,indent=2))
+          summary={
+              'indexer_rows':len(rows),
+              'unique_versions':len(versions),
+              'parsed_reports':len(parsed),
+              'fetch_errors':len(errors),
+              'cross_receiver_candidates':len(candidates),
+              'allowed_owners':sorted(allowed_owners),
+              'allowed_names':sorted(allowed_names),
+              'receiver_counts':dict(receiver_counts),
+              'owner_counts':dict(owner_counts),
+              'format_counts':dict(format_counts),
+              'min_transaction_timestamp_microseconds':time_min,
+              'max_transaction_timestamp_microseconds':time_max,
+          }
+          (ROOT/'summary.json').write_text(json.dumps(summary,indent=2))
+          lines=[f'{key}={value}' for key,value in summary.items()]
+          for candidate in candidates:
+              lines.append(f"CANDIDATE version={candidate['version']} receiver={candidate['receiver']} owner={candidate['workflow_owner']} intersections={len(candidate['aave_intersections'])}")
+              for item in candidate['aave_intersections']:
+                  lines.append(f"  {item['aave_description']} ts={item['timestamp']} value={item['benchmark']} current_ts={item['aave_current_timestamp']} current_value={item['aave_current_benchmark']}")
+          (ROOT/'summary.txt').write_text('\n'.join(lines)+'\n')
+          print((ROOT/'summary.txt').read_text())
+          PY
+          find evidence -type f -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS.txt
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: aave-aptos-chainlink-cross-receiver-scan-v3
+          path: evidence
+          retention-days: 7
+          if-no-files-found: error
