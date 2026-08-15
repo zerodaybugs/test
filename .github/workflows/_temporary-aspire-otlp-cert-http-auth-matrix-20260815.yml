@@ -1,0 +1,276 @@
+name: Temporary Aspire OTLP Certificate HTTP Auth Matrix
+
+on:
+  push:
+    branches:
+      - agent/dotnet10-toolchain-20260815
+    paths:
+      - .github/workflows/_temporary-aspire-otlp-cert-http-auth-matrix-20260815.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-aspire-otlp-cert-http-auth-matrix-20260815
+  cancel-in-progress: false
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Install exact .NET SDK
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: 10.0.302
+          cache: false
+
+      - name: Create exact framework integration harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p harness evidence
+          cat > harness/harness.csproj <<'EOF'
+          <Project Sdk="Microsoft.NET.Sdk.Web">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net10.0</TargetFramework>
+              <ImplicitUsings>enable</ImplicitUsings>
+              <Nullable>enable</Nullable>
+              <Deterministic>true</Deterministic>
+              <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+            </PropertyGroup>
+            <ItemGroup>
+              <PackageReference Include="Microsoft.AspNetCore.Authentication.Certificate" Version="10.0.10" />
+            </ItemGroup>
+          </Project>
+          EOF
+
+          cat > harness/Program.cs <<'EOF'
+          using System.Net;
+          using System.Security.Claims;
+          using System.Text.Encodings.Web;
+          using System.Text.Json;
+          using Microsoft.AspNetCore.Authentication;
+          using Microsoft.AspNetCore.Authentication.Certificate;
+          using Microsoft.AspNetCore.Hosting.Server;
+          using Microsoft.AspNetCore.Hosting.Server.Features;
+          using Microsoft.Extensions.Options;
+
+          const string ConnectionScheme = "ConnectionOtlp";
+          const string ApiKeyScheme = "OtlpApiKey";
+          const string CompositeScheme = "OtlpComposite";
+          const string PatchedCompositeScheme = "OtlpCompositePatched";
+
+          var results = new List<object>();
+          results.Add(await RunCaseAsync("client-certificate-http-exact", AuthMode.ClientCertificate, patched: false));
+          results.Add(await RunCaseAsync("api-key-http-missing-key-control", AuthMode.ApiKey, patched: false));
+          results.Add(await RunCaseAsync("client-certificate-http-patched-control", AuthMode.ClientCertificate, patched: true));
+
+          Console.WriteLine(JsonSerializer.Serialize(results, new JsonSerializerOptions { WriteIndented = true }));
+
+          var exactStatus = GetStatus(results[0]);
+          var apiControlStatus = GetStatus(results[1]);
+          var patchedStatus = GetStatus(results[2]);
+          bool candidate = exactStatus == 200 && apiControlStatus == 401 && patchedStatus == 401;
+          Console.WriteLine($"CANDIDATE_AUTH_BYPASS={(candidate ? 1 : 0)}");
+          return candidate ? 0 : 90;
+
+          static int GetStatus(object value)
+          {
+              return (int)value.GetType().GetProperty("Status")!.GetValue(value)!;
+          }
+
+          static async Task<object> RunCaseAsync(string name, AuthMode mode, bool patched)
+          {
+              var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+              {
+                  EnvironmentName = Environments.Production,
+                  ApplicationName = typeof(Program).Assembly.FullName
+              });
+
+              builder.WebHost.UseUrls("http://127.0.0.1:0");
+              builder.Services.Configure<MatrixOptions>(o => o.Mode = mode);
+
+              var authentication = builder.Services
+                  .AddAuthentication(options =>
+                  {
+                      options.DefaultAuthenticateScheme = patched ? PatchedCompositeScheme : CompositeScheme;
+                      options.DefaultChallengeScheme = patched ? PatchedCompositeScheme : CompositeScheme;
+                  })
+                  .AddScheme<AuthenticationSchemeOptions, ConnectionNoResultHandler>(ConnectionScheme, _ => { })
+                  .AddScheme<AuthenticationSchemeOptions, MissingApiKeyFailureHandler>(ApiKeyScheme, _ => { })
+                  .AddScheme<AuthenticationSchemeOptions, ExactAspireCompositeHandler>(CompositeScheme, _ => { })
+                  .AddScheme<AuthenticationSchemeOptions, PatchedCompositeHandler>(PatchedCompositeScheme, _ => { });
+
+              authentication.AddCertificate(CertificateAuthenticationDefaults.AuthenticationScheme, _ => { });
+              builder.Services.AddAuthorization();
+
+              await using var app = builder.Build();
+              app.UseAuthentication();
+              app.UseAuthorization();
+              app.MapPost("/v1/logs", (HttpContext context) => Results.Json(new
+              {
+                  authenticated = context.User.Identity?.IsAuthenticated,
+                  otlpClaim = context.User.FindFirst("Aspire.Dashboard.Otlp")?.Value
+              })).RequireAuthorization();
+
+              await app.StartAsync();
+              var addresses = app.Services.GetRequiredService<IServer>()
+                  .Features.Get<IServerAddressesFeature>()?.Addresses
+                  ?? throw new InvalidOperationException("No server addresses.");
+              string address = addresses.Single();
+
+              using var client = new HttpClient { BaseAddress = new Uri(address) };
+              using var content = new ByteArrayContent(Array.Empty<byte>());
+              content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/x-protobuf");
+              using var response = await client.PostAsync("/v1/logs", content);
+              string body = await response.Content.ReadAsStringAsync();
+              await app.StopAsync();
+
+              return new
+              {
+                  Name = name,
+                  Mode = mode.ToString(),
+                  Patched = patched,
+                  Scheme = patched ? PatchedCompositeScheme : CompositeScheme,
+                  Address = address,
+                  IsHttps = address.StartsWith("https://", StringComparison.OrdinalIgnoreCase),
+                  Status = (int)response.StatusCode,
+                  StatusText = response.StatusCode.ToString(),
+                  Body = body
+              };
+          }
+
+          enum AuthMode
+          {
+              ClientCertificate,
+              ApiKey
+          }
+
+          sealed class MatrixOptions
+          {
+              public AuthMode Mode { get; set; }
+          }
+
+          sealed class ConnectionNoResultHandler(
+              IOptionsMonitor<AuthenticationSchemeOptions> options,
+              ILoggerFactory logger,
+              UrlEncoder encoder)
+              : AuthenticationHandler<AuthenticationSchemeOptions>(options, logger, encoder)
+          {
+              protected override Task<AuthenticateResult> HandleAuthenticateAsync()
+                  => Task.FromResult(AuthenticateResult.NoResult());
+          }
+
+          sealed class MissingApiKeyFailureHandler(
+              IOptionsMonitor<AuthenticationSchemeOptions> options,
+              ILoggerFactory logger,
+              UrlEncoder encoder)
+              : AuthenticationHandler<AuthenticationSchemeOptions>(options, logger, encoder)
+          {
+              protected override Task<AuthenticateResult> HandleAuthenticateAsync()
+                  => Task.FromResult(AuthenticateResult.Fail("Missing API key control."));
+          }
+
+          // Semantically identical to Aspire commit ca553196 OtlpCompositeAuthenticationHandler:
+          // iterate relevant schemes, reject only result.Failure, then mint OTLP identity.
+          sealed class ExactAspireCompositeHandler(
+              IOptionsMonitor<MatrixOptions> matrixOptions,
+              IOptionsMonitor<AuthenticationSchemeOptions> options,
+              ILoggerFactory logger,
+              UrlEncoder encoder)
+              : AuthenticationHandler<AuthenticationSchemeOptions>(options, logger, encoder)
+          {
+              protected override async Task<AuthenticateResult> HandleAuthenticateAsync()
+              {
+                  foreach (string scheme in GetRelevantSchemes(matrixOptions.CurrentValue.Mode))
+                  {
+                      AuthenticateResult result = await Context.AuthenticateAsync(scheme);
+                      if (result.Failure is not null)
+                      {
+                          return result;
+                      }
+                  }
+
+                  var identity = new ClaimsIdentity(
+                      [new Claim("Aspire.Dashboard.Otlp", bool.TrueString)],
+                      Scheme.Name);
+                  return AuthenticateResult.Success(
+                      new AuthenticationTicket(new ClaimsPrincipal(identity), Scheme.Name));
+              }
+          }
+
+          // Security control: every required scheme must explicitly succeed.
+          sealed class PatchedCompositeHandler(
+              IOptionsMonitor<MatrixOptions> matrixOptions,
+              IOptionsMonitor<AuthenticationSchemeOptions> options,
+              ILoggerFactory logger,
+              UrlEncoder encoder)
+              : AuthenticationHandler<AuthenticationSchemeOptions>(options, logger, encoder)
+          {
+              protected override async Task<AuthenticateResult> HandleAuthenticateAsync()
+              {
+                  foreach (string scheme in GetRelevantSchemes(matrixOptions.CurrentValue.Mode))
+                  {
+                      AuthenticateResult result = await Context.AuthenticateAsync(scheme);
+                      if (!result.Succeeded)
+                      {
+                          return result.Failure is not null
+                              ? result
+                              : AuthenticateResult.Fail($"Required scheme {scheme} returned NoResult.");
+                      }
+                  }
+
+                  var identity = new ClaimsIdentity(
+                      [new Claim("Aspire.Dashboard.Otlp", bool.TrueString)],
+                      Scheme.Name);
+                  return AuthenticateResult.Success(
+                      new AuthenticationTicket(new ClaimsPrincipal(identity), Scheme.Name));
+              }
+          }
+
+          static IEnumerable<string> GetRelevantSchemes(AuthMode mode)
+          {
+              yield return ConnectionScheme;
+              yield return mode == AuthMode.ApiKey
+                  ? ApiKeyScheme
+                  : CertificateAuthenticationDefaults.AuthenticationScheme;
+          }
+          EOF
+
+          dotnet restore harness/harness.csproj --nologo
+          dotnet build harness/harness.csproj -c Release --no-restore --nologo
+
+      - name: Run deterministic auth matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet --info > evidence/DOTNET_INFO.txt
+          dotnet list harness/harness.csproj package --include-transitive > evidence/PACKAGES.txt
+          set +e
+          dotnet run --project harness/harness.csproj -c Release --no-build \
+            > evidence/MATRIX.log 2>&1
+          rc=$?
+          set -e
+          echo "HARNESS_RC=$rc" | tee evidence/VERDICT.env
+          grep '^CANDIDATE_AUTH_BYPASS=' evidence/MATRIX.log | tee -a evidence/VERDICT.env
+          cat evidence/MATRIX.log
+          test "$rc" -eq 0
+          grep -q '^CANDIDATE_AUTH_BYPASS=1$' evidence/MATRIX.log
+          cp harness/Program.cs harness/harness.csproj evidence/
+          (
+            cd evidence
+            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          )
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: aspire-otlp-cert-http-auth-matrix-20260815
+          path: evidence
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 9
