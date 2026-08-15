@@ -1,0 +1,124 @@
+name: Persist Paxos Solana read-only census
+
+on:
+  push:
+    branches:
+      - paxos-public-toolchain-bootstrap-20260815
+    paths:
+      - .github/workflows/paxos-solana-mainnet-census-commit.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: paxos-public-toolchain-bootstrap-20260815
+      - name: Clone exact source and perform read-only census
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone https://github.com/paxosglobal/solana-programs.git /tmp/solana-programs
+          cd /tmp/solana-programs
+          git checkout --detach 90325c53ddb2dc25d924a7f4aaf877eca1ea9f23
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p research-results
+          cat > /tmp/census.py <<'PY'
+          import base64, csv, hashlib, json, re, struct, time, urllib.request
+          from pathlib import Path
+          src=Path('/tmp/solana-programs/programs/minter-controller/src/lib.rs').read_text()
+          m=re.search(r'declare_id!\(\s*"([1-9A-HJ-NP-Za-km-z]+)"\s*\)',src)
+          if not m: raise SystemExit('declare_id not found')
+          program_id=m.group(1)
+          endpoints=['https://api.mainnet-beta.solana.com','https://solana-rpc.publicnode.com','https://rpc.ankr.com/solana']
+          rid=0; used=None
+          def rpc(method,params,endpoint=None,timeout=45):
+            global rid,used
+            last=None
+            for ep in ([endpoint] if endpoint else endpoints):
+              if not ep: continue
+              rid+=1
+              req=urllib.request.Request(ep,data=json.dumps({'jsonrpc':'2.0','id':rid,'method':method,'params':params}).encode(),headers={'content-type':'application/json','user-agent':'paxos-readonly-census/1.0'})
+              try:
+                with urllib.request.urlopen(req,timeout=timeout) as r: obj=json.loads(r.read())
+                if 'error' in obj: raise RuntimeError(str(obj['error']))
+                used=ep; return obj['result']
+              except Exception as e: last=e
+            raise RuntimeError(f'{method} failed: {last}')
+          alphabet='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+          def b58(data):
+            n=int.from_bytes(data,'big'); out=''
+            while n: n,rem=divmod(n,58); out=alphabet[rem]+out
+            pad=0
+            for x in data:
+              if x==0: pad+=1
+              else: break
+            return '1'*pad+(out or '')
+          disc=hashlib.sha256(b'account:Minter').digest()[:8]
+          accounts=rpc('getProgramAccounts',[program_id,{'encoding':'base64','commitment':'finalized'}])
+          rows=[]
+          for e in accounts:
+            raw=base64.b64decode(e['account']['data'][0])
+            if len(raw)<8 or raw[:8]!=disc: continue
+            o=8
+            def pk():
+              nonlocal o
+              v=b58(raw[o:o+32]); o+=32; return v
+            def u8():
+              nonlocal o
+              v=raw[o]; o+=1; return v
+            def u64():
+              nonlocal o
+              v=struct.unpack_from('<Q',raw,o)[0]; o+=8; return v
+            ma=pk(); mint=pk(); admin=pk(); tag=u8(); pending=pk() if tag==1 else None
+            bump=u8(); cap=u64(); remaining=u64(); refill=u64(); last=u64()
+            rows.append({'account':e['pubkey'],'lamports':e['account']['lamports'],'minter_authority':ma,'mint_account':mint,'admin':admin,'pending_admin':pending,'bump':bump,'capacity':cap,'remaining_amount':remaining,'refill_per_second':refill,'last_refill_time':last,'data_len':len(raw)})
+          event_disc=hashlib.sha256(b'event:RateLimitUpdated').digest()[:8]
+          sigs=rpc('getSignaturesForAddress',[program_id,{'limit':500,'commitment':'finalized'}])
+          events=[]
+          for item in sigs:
+            sig=item['signature']
+            try: tx=rpc('getTransaction',[sig,{'encoding':'json','commitment':'finalized','maxSupportedTransactionVersion':0}],endpoint=used,timeout=30)
+            except Exception: continue
+            if not tx: continue
+            for line in ((tx.get('meta') or {}).get('logMessages') or []):
+              if not line.startswith('Program data: '): continue
+              try: data=base64.b64decode(line.split(': ',1)[1])
+              except Exception: continue
+              if not data.startswith(event_disc) or len(data)<88: continue
+              o=8; ma=b58(data[o:o+32]); o+=32; mint=b58(data[o:o+32]); o+=32
+              cap=struct.unpack_from('<Q',data,o)[0]; o+=8; refill=struct.unpack_from('<Q',data,o)[0]
+              events.append({'signature':sig,'slot':tx.get('slot'),'block_time':tx.get('blockTime'),'minter_authority':ma,'mint_account':mint,'capacity':cap,'refill_per_second':refill})
+          latest={}
+          for ev in sorted(events,key=lambda x:(x.get('block_time') or 0,x.get('slot') or 0)): latest[(ev['minter_authority'],ev['mint_account'])]=ev
+          now=int(time.time())
+          for r in rows:
+            ev=latest.get((r['minter_authority'],r['mint_account']))
+            r['latest_rate_update_time']=ev.get('block_time') if ev else None
+            r['latest_rate_update_signature']=ev.get('signature') if ev else None
+            r['last_refill_predates_latest_update']=bool(ev and r['last_refill_time']<(ev.get('block_time') or 0))
+            elapsed=max(0,now-r['last_refill_time'])
+            r['elapsed_since_last_refill']=elapsed
+            r['current_amount_under_code']=min(r['capacity'],r['remaining_amount']+elapsed*r['refill_per_second'])
+          out={'source_commit':'90325c53ddb2dc25d924a7f4aaf877eca1ea9f23','program_id':program_id,'rpc_endpoint_used':used,'read_only':True,'production_transactions_sent':0,'program_account_count':len(accounts),'minter_account_count':len(rows),'signatures_scanned':len(sigs),'rate_limit_update_events_found':len(events),'generated_at_unix':now,'minters':rows,'events':events}
+          Path('research-results/PAXOS_SOLANA_MAINNET_CENSUS.json').write_text(json.dumps(out,indent=2))
+          with open('research-results/PAXOS_SOLANA_MAINNET_MINTERS.csv','w',newline='') as f:
+            fields=list(rows[0]) if rows else ['account']; w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(rows)
+          print(json.dumps({k:v for k,v in out.items() if k not in ('minters','events')},indent=2))
+          PY
+          python3 /tmp/census.py
+          sha256sum research-results/PAXOS_SOLANA_MAINNET_CENSUS.json research-results/PAXOS_SOLANA_MAINNET_MINTERS.csv > research-results/PAXOS_SOLANA_MAINNET_SHA256SUMS.txt
+      - name: Commit census output
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add research-results/PAXOS_SOLANA_MAINNET_CENSUS.json research-results/PAXOS_SOLANA_MAINNET_MINTERS.csv research-results/PAXOS_SOLANA_MAINNET_SHA256SUMS.txt
+          git commit -m 'Persist Paxos Solana read-only census [skip ci]'
+          git push origin HEAD:paxos-public-toolchain-bootstrap-20260815
