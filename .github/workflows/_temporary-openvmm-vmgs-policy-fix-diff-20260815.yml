@@ -1,0 +1,196 @@
+name: Temporary OpenVMM VMGS policy fix differential
+
+on:
+  push:
+    branches:
+      - openvmm-source-61fd-20260815
+    paths:
+      - '.github/workflows/_temporary-openvmm-vmgs-policy-fix-diff-20260815.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RUST_BACKTRACE: '1'
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - name: Clone exact source and install prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-tags https://github.com/microsoft/openvmm.git repo
+          cd repo
+          git checkout 61fd38fe6114d0955a082aa717a8e16e722b8490
+          test "$(git rev-parse HEAD)" = '61fd38fe6114d0955a082aa717a8e16e722b8490'
+          cd ..
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup override set 1.95.0
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          mkdir -p repo/.packages/Google.Protobuf.Tools/tools
+          ln -sf "$(command -v protoc)" repo/.packages/Google.Protobuf.Tools/tools/protoc
+          mkdir -p export
+          rustc --version | tee export/rustc-version.txt
+          cargo --version | tee export/cargo-version.txt
+          repo/.packages/Google.Protobuf.Tools/tools/protoc --version | tee export/protoc-version.txt
+          git -C repo rev-parse HEAD | tee export/source-commit.txt
+
+      - name: Run unmodified full crate baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd repo
+          cargo test -p underhill_attestation -- --test-threads=1 2>&1 | tee ../export/baseline-full.log
+
+      - name: Apply minimal CVM fail-closed patch and regression test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('repo/openhcl/underhill_attestation/src/lib.rs')
+          text = path.read_text()
+
+          old = '''            GuestStateEncryptionPolicy::Auto | GuestStateEncryptionPolicy::None => {
+                          tracing::info!(CVM_ALLOWED, "No VMGS encryption used.");
+
+                          return Ok(DerivedKeyResult {
+          '''
+          new = '''            GuestStateEncryptionPolicy::Auto => {
+                          tracing::info!(CVM_ALLOWED, "No VMGS encryption used.");
+
+                          return Ok(DerivedKeyResult {
+          '''
+          assert text.count(old) == 1
+          text = text.replace(old, new, 1)
+
+          close = '''                    hardware_key_protector: None,
+                          });
+                      }
+                  }
+              }
+          '''
+          replacement = '''                    hardware_key_protector: None,
+                          });
+                      }
+                      GuestStateEncryptionPolicy::None if tee_call.is_none() => {
+                          tracing::info!(CVM_ALLOWED, "No VMGS encryption used for a non-confidential VM.");
+
+                          return Ok(DerivedKeyResult {
+                              derived_keys: None,
+                              key_protector_settings,
+                              gsp_extended_status_flags: gsp_response.extended_status_flags,
+                              hardware_key_protector: None,
+                          });
+                      }
+                      GuestStateEncryptionPolicy::None => {
+                          // A confidential VM in stateful mode must not continue when
+                          // the host asks to disable VMGS encryption. Stateless CVMs
+                          // return before this function, preserving NonPersistedTPM.
+                          Err(GetDerivedKeysError::EncryptionRequiredButNotFound)?
+                      }
+                  }
+              }
+          '''
+          # Anchor only the no-key policy block immediately following the changed arm.
+          start = text.index('            GuestStateEncryptionPolicy::Auto => {')
+          idx = text.index(close, start)
+          text = text[:idx] + text[idx:].replace(close, replacement, 1)
+
+          marker = '    // --- initialize_platform_security tests ---\n'
+          assert marker in text
+          test = r'''
+
+              #[async_test]
+              async fn zdb_patched_stateful_none_strict_fails_closed(driver: DefaultDriver) {
+                  let disk = new_test_file();
+                  let mut vmgs = Vmgs::format_new(disk, None).await.unwrap();
+
+                  let mut plan = IgvmAgentTestPlan::default();
+                  plan.insert(
+                      IgvmAttestRequestType::WRAPPED_KEY_REQUEST,
+                      VecDeque::from([IgvmAgentAction::RespondFailure]),
+                  );
+                  let get_pair = new_test_get(driver, true, Some(plan)).await;
+
+                  let att_cfg = new_attestation_vm_config();
+                  assert!(att_cfg.tpm_persisted);
+                  let tee = MockTeeCall::new([0x12u8; 32]);
+                  let ldriver = pal_async::local::block_with_io(|ld| async move { ld });
+
+                  let result = initialize_platform_security(
+                      &get_pair.client,
+                      Guid::new_random(),
+                      &att_cfg,
+                      &mut vmgs,
+                      Some(&tee),
+                      false,
+                      ldriver,
+                      GuestStateEncryptionPolicy::None,
+                      true,
+                  )
+                  .await;
+
+                  assert!(result.is_err(), "patched stateful CVM must fail closed");
+                  assert!(!vmgs.encrypted());
+                  assert!(key_protector_is_empty(&mut vmgs).await);
+              }
+          '''
+          text = text.replace(marker, marker + test, 1)
+          path.write_text(text)
+          PY
+          git -C repo diff -- openhcl/underhill_attestation/src/lib.rs > export/product-fix-and-regression.patch
+          grep -n "zdb_patched_stateful_none_strict_fails_closed" export/product-fix-and-regression.patch
+
+      - name: Run patched full crate regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd repo
+          cargo test -p underhill_attestation -- --test-threads=1 2>&1 | tee ../export/patched-full.log
+
+      - name: Build differential verdict
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          baseline = Path('export/baseline-full.log').read_text(errors='replace') if Path('export/baseline-full.log').exists() else ''
+          patched = Path('export/patched-full.log').read_text(errors='replace') if Path('export/patched-full.log').exists() else ''
+          verdict = {
+              'source_commit': '61fd38fe6114d0955a082aa717a8e16e722b8490',
+              'baseline_full_pass': 'test result: ok.' in baseline and 'FAILED' not in baseline,
+              'patched_full_pass': 'test result: ok.' in patched and 'FAILED' not in patched,
+              'patched_regression_observed': 'zdb_patched_stateful_none_strict_fails_closed ... ok' in patched,
+              'fix_invariant': 'stateful confidential VM cannot continue with GuestStateEncryptionPolicy::None when no VMGS key is available',
+          }
+          verdict['verdict'] = 'PASS' if all([
+              verdict['baseline_full_pass'],
+              verdict['patched_full_pass'],
+              verdict['patched_regression_observed'],
+          ]) else 'FAIL'
+          Path('export/fix-differential.json').write_text(json.dumps(verdict, indent=2) + '\n')
+          print(json.dumps(verdict, indent=2))
+          if verdict['verdict'] != 'PASS':
+              raise SystemExit(1)
+          PY
+          sha256sum export/* > export/SHA256SUMS.txt
+          find export -maxdepth 1 -type f -printf '%f %s bytes\n' | sort > export/INVENTORY.txt
+
+      - name: Upload fix differential evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openvmm-vmgs-policy-fix-differential
+          path: export
+          if-no-files-found: error
+          retention-days: 3
