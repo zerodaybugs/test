@@ -1,0 +1,138 @@
+name: Paxos R9 public scope audit duplicate gate
+
+on:
+  push:
+    branches:
+      - paxos-public-toolchain-bootstrap-20260815
+    paths:
+      - '.github/workflows/paxos-r9-scope-audit-gate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: read
+  pull-requests: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: paxos-public-toolchain-bootstrap-20260815
+      - name: Clone exact public Paxos repositories
+        run: |
+          set -euo pipefail
+          git clone https://github.com/paxosglobal/solana-programs.git solana
+          cd solana && git checkout --detach 90325c53ddb2dc25d924a7f4aaf877eca1ea9f23 && cd ..
+          git clone https://github.com/paxosglobal/paxos-token-contracts.git token
+          cd token && git checkout --detach 674ac1046a0a40bfd2b6b892192998af9ac3b171 && cd ..
+          git clone https://github.com/paxosglobal/cross-chain-contracts.git crosschain
+          cd crosschain && git checkout --detach b4a1c2b2537b187e63acf5c717b7d943abb0a75f && cd ..
+          mkdir -p r9-scope-audit/audit-text r9-scope-audit/public-search
+      - name: Extract and search all official audit PDFs
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+          while IFS= read -r -d '' pdf; do
+            rel=${pdf#./}; base=$(echo "$rel" | tr '/ ' '__' | sed 's/\.pdf$/.txt/I')
+            pdftotext -layout "$pdf" "r9-scope-audit/audit-text/$base" || true
+          done < <(find token crosschain solana -type f -iname '*.pdf' -print0)
+          grep -RniEi 'update[_ -]?rate[_ -]?limit|last[_ -]?refill[_ -]?time|refill[_ -]?per[_ -]?second|retroactive.{0,80}refill|checkpoint.{0,80}rate|rate.{0,80}reconfiguration' r9-scope-audit/audit-text > r9-scope-audit/EXACT_AUDIT_HITS.txt || true
+          grep -RniEi 'rate limit|refill|capacity|mint controller|minter controller' r9-scope-audit/audit-text > r9-scope-audit/BROAD_AUDIT_HITS.txt || true
+          find r9-scope-audit/audit-text -type f -printf '%f\t%s\n' | sort > r9-scope-audit/AUDIT_INVENTORY.txt
+      - name: Public issue PR commit and code search
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          queries=(
+            'repo:paxosglobal/solana-programs "update_rate_limit" refill'
+            'repo:paxosglobal/solana-programs "last_refill_time"'
+            'repo:paxosglobal/solana-programs retroactive rate limit'
+            'repo:paxosglobal/solana-programs refill_per_second checkpoint'
+          )
+          : > r9-scope-audit/public-search/ISSUES_PRS.jsonl
+          for q in "${queries[@]}"; do
+            gh api -X GET search/issues -f q="$q" -f per_page=100 >> r9-scope-audit/public-search/ISSUES_PRS.jsonl || true
+            echo >> r9-scope-audit/public-search/ISSUES_PRS.jsonl
+          done
+          git -C solana log --all --oneline --grep='rate limit\|refill\|checkpoint\|retroactive' -i > r9-scope-audit/public-search/COMMIT_GREP.txt || true
+          grep -RniEi 'retroactive|checkpoint.*refill|update_rate_limit.*last_refill|last_refill.*update_rate_limit' solana --exclude-dir=.git --exclude-dir=target > r9-scope-audit/public-search/CODE_EXACT_HITS.txt || true
+      - name: Capture current public Cantina page
+        run: |
+          set -euo pipefail
+          URL='https://cantina.xyz/bounties/6a6ef71c-383d-4357-85c1-a0d1dbb6659b'
+          curl -fL --retry 3 --connect-timeout 20 -A 'Mozilla/5.0' "$URL" -o r9-scope-audit/CANTINA_PUBLIC.html || true
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p=Path('r9-scope-audit/CANTINA_PUBLIC.html')
+          text=p.read_text(errors='replace') if p.exists() else ''
+          text=re.sub(r'<script[^>]*>.*?</script>',' ',text,flags=re.S|re.I)
+          text=re.sub(r'<style[^>]*>.*?</style>',' ',text,flags=re.S|re.I)
+          text=re.sub(r'<[^>]+>',' ',text)
+          text=re.sub(r'\s+',' ',text)
+          Path('r9-scope-audit/CANTINA_PUBLIC_TEXT.txt').write_text(text)
+          needles=['paxosglobal/solana-programs','solana-programs','privileged','trusted','admin','minter','known issue','out of scope','mainnet','proof of concept']
+          excerpts=[]
+          low=text.lower()
+          for n in needles:
+              pos=low.find(n.lower())
+              if pos>=0: excerpts.append(f'[{n}] '+text[max(0,pos-220):pos+520])
+          Path('r9-scope-audit/CANTINA_EXCERPTS.txt').write_text('\n\n'.join(excerpts))
+          PY
+      - name: Build conservative scope-audit decision
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,re
+          from pathlib import Path
+          exact=Path('r9-scope-audit/EXACT_AUDIT_HITS.txt').read_text(errors='replace').strip()
+          code=Path('r9-scope-audit/public-search/CODE_EXACT_HITS.txt').read_text(errors='replace').strip()
+          html=(Path('r9-scope-audit/CANTINA_PUBLIC.html').read_text(errors='replace') if Path('r9-scope-audit/CANTINA_PUBLIC.html').exists() else '')
+          lower=html.lower()
+          repo_scope=('paxosglobal/solana-programs' in lower or 'solana-programs' in lower)
+          # Absence of an exclusion is not treated as permission. Exact authenticated rules remain required.
+          explicit_privileged_acceptance=bool(re.search(r'(privileged|minter|trusted).{0,180}(accepted|eligible|in scope)',lower,re.S))
+          decision={
+            'official_audit_exact_root_hit':bool(exact),
+            'public_code_exact_root_hit':bool(code),
+            'public_scope_mentions_solana_repo':repo_scope,
+            'public_rules_explicitly_accept_limited_minter_threat_model':explicit_privileged_acceptance,
+            'official_audit_duplicate_clear':not bool(exact),
+            'public_duplicate_clear':not bool(code),
+            'current_scope_repo_confirmed':repo_scope,
+            'privileged_actor_policy_clear':explicit_privileged_acceptance,
+            'authenticated_rules_snapshot_available':False,
+          }
+          decision['scope_audit_gate_pass']=all([
+            decision['official_audit_duplicate_clear'],
+            decision['public_duplicate_clear'],
+            decision['current_scope_repo_confirmed'],
+            decision['privileged_actor_policy_clear'],
+            decision['authenticated_rules_snapshot_available'],
+          ])
+          Path('r9-scope-audit/SCOPE_AUDIT_GATE.json').write_text(json.dumps(decision,indent=2,sort_keys=True))
+          PY
+          sha256sum $(find r9-scope-audit -type f -maxdepth 3 | sort) > r9-scope-audit/SHA256SUMS.txt
+          mkdir -p paxos-results/r9-scope-audit
+          cp r9-scope-audit/SCOPE_AUDIT_GATE.json paxos-results/r9-scope-audit/
+          cp r9-scope-audit/CANTINA_EXCERPTS.txt paxos-results/r9-scope-audit/ || true
+          cp r9-scope-audit/EXACT_AUDIT_HITS.txt paxos-results/r9-scope-audit/ || true
+      - name: Publish
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add paxos-results/r9-scope-audit
+          git commit -m 'Publish Paxos R9 public scope audit gate'
+          git push origin HEAD:paxos-public-toolchain-bootstrap-20260815
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paxos-r9-scope-audit-gate
+          path: r9-scope-audit
+          retention-days: 1
+          if-no-files-found: error
