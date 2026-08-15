@@ -1,0 +1,113 @@
+name: Aave Aptos deployed Chainlink bytecode inspection
+
+on:
+  push:
+    branches:
+      - aave-aptos-underlying-hooks-20260815
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FULLNODE: "https://api.mainnet.aptoslabs.com/v1"
+    steps:
+      - name: Install Aptos CLI 9.5.0
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o /tmp/aptos.zip \
+            https://github.com/aptos-labs/aptos-core/releases/download/aptos-cli-v9.5.0/aptos-cli-9.5.0-Linux-x86_64.zip
+          unzip -q /tmp/aptos.zip -d "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/aptos"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          aptos --version
+
+      - name: Download deployed packages
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p evidence/downloads evidence/decompiled evidence/disassembled
+          cat > evidence/accounts.tsv <<'EOF'
+          DATA_FEEDS	0x3f985798ce4975f430ef5c75776ff98a77b9f9d0fb38184d225adc9c1cc6b79b
+          PLATFORM	0x9976bb288ed9177b542d568fa1ac386819dc99141630e582315804840f41928a
+          EOF
+          while IFS=$'\t' read -r label account; do
+            mkdir -p "evidence/downloads/$label" "evidence/decompiled/$label" "evidence/disassembled/$label"
+            curl --retry 4 --retry-all-errors -fsS \
+              "$FULLNODE/accounts/$account/resource/0x1::code::PackageRegistry" \
+              -o "evidence/${label}_package_registry.json"
+            jq -r '.data.packages[].name' "evidence/${label}_package_registry.json" \
+              > "evidence/${label}_package_names.txt"
+            aptos move list --account "$account" --url "$FULLNODE" \
+              --connection-timeout-secs 120 > "evidence/${label}_module_list.txt" 2>&1
+            while IFS= read -r package; do
+              [ -n "$package" ] || continue
+              aptos move download --account "$account" --package "$package" \
+                --bytecode --output-dir "evidence/downloads/$label" \
+                --url "$FULLNODE" --connection-timeout-secs 120 \
+                > "evidence/${label}_${package}_download.log" 2>&1
+            done < "evidence/${label}_package_names.txt"
+            find "evidence/downloads/$label" -type d -name bytecode_modules -print0 | while IFS= read -r -d '' dir; do
+              rel=${dir#evidence/downloads/$label/}
+              safe=$(printf '%s' "$rel" | tr '/ ' '__')
+              mkdir -p "evidence/decompiled/$label/$safe" "evidence/disassembled/$label/$safe"
+              aptos move decompile --package-dir "$dir" --output-dir "evidence/decompiled/$label/$safe" --assume-yes \
+                > "evidence/${label}_${safe}_decompile.log" 2>&1 || true
+              aptos move disassemble --package-dir "$dir" --output-dir "evidence/disassembled/$label/$safe" --assume-yes \
+                > "evidence/${label}_${safe}_disassemble.log" 2>&1 || true
+            done
+          done < evidence/accounts.tsv
+
+      - name: Extract security-critical functions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          needles=(
+              'fun report','validate_and_process_report','transmission_id','workflow_owner',
+              'workflow_name','parse_raw_report','perform_update','observation_timestamp',
+              'benchmark','receiver','signature_verify','already_processed','feed_id',
+              'set_workflow_config','on_report','stale','config_id'
+          )
+          hits=[]
+          for root in (Path('evidence/decompiled'),Path('evidence/disassembled')):
+              for p in root.rglob('*'):
+                  if not p.is_file():
+                      continue
+                  text=p.read_text(errors='replace')
+                  matched=[n for n in needles if n.lower() in text.lower()]
+                  if matched:
+                      hits.append({'path':str(p),'matches':matched})
+          Path('evidence/security_hits.json').write_text(json.dumps(hits,indent=2))
+          with Path('evidence/security_excerpts.txt').open('w') as out:
+              for hit in hits:
+                  p=Path(hit['path']); lines=p.read_text(errors='replace').splitlines()
+                  out.write(f'\n===== {p} =====\n')
+                  emitted=set()
+                  for i,line in enumerate(lines):
+                      if any(n.lower() in line.lower() for n in needles):
+                          lo=max(0,i-12); hi=min(len(lines),i+55)
+                          key=(lo,hi)
+                          if key in emitted:
+                              continue
+                          emitted.add(key)
+                          out.write('\n'.join(lines[lo:hi])+'\n')
+          print(Path('evidence/security_excerpts.txt').read_text()[:50000])
+          PY
+          find evidence -type f -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS.txt
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: aave-aptos-deployed-chainlink-bytecode
+          path: evidence
+          retention-days: 7
+          if-no-files-found: error
