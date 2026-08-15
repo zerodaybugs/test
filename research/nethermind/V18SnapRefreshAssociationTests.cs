@@ -49,7 +49,7 @@ public class V18SnapRefreshAssociationTests
 
         // A malicious snap/1 peer returns valid root-node RLPs in the opposite order.
         using IByteArrayList response = new ByteArrayListAdapter(
-            new byte[][] { storageRootNodeB, storageRootNodeA }.ToPooledList());
+            new ArrayPoolList<byte[]>(2) { storageRootNodeB, storageRootNodeA });
 
         provider.RefreshAccounts(request, response);
 
@@ -89,7 +89,7 @@ public class V18SnapRefreshAssociationTests
         };
 
         using IByteArrayList response = new ByteArrayListAdapter(
-            new byte[][] { attackerChosenNode }.ToPooledList());
+            new ArrayPoolList<byte[]>(1) { attackerChosenNode });
 
         provider.RefreshAccounts(request, response);
 
