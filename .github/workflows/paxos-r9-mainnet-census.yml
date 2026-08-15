@@ -1,0 +1,182 @@
+name: Paxos R9 read-only Solana mainnet census
+
+on:
+  push:
+    branches:
+      - paxos-public-toolchain-bootstrap-20260815
+    paths:
+      - '.github/workflows/paxos-r9-mainnet-census.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: paxos-public-toolchain-bootstrap-20260815
+      - name: Clone exact source
+        run: |
+          set -euo pipefail
+          git clone https://github.com/paxosglobal/solana-programs.git solana
+          cd solana
+          git checkout --detach 90325c53ddb2dc25d924a7f4aaf877eca1ea9f23
+          cd ..
+          mkdir -p r9-mainnet
+      - name: Run multi-provider read-only census
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, re, time, urllib.request, urllib.error
+          from pathlib import Path
+
+          source=Path('solana/programs/minter-controller/src/lib.rs').read_text()
+          m=re.search(r'declare_id!\("([1-9A-HJ-NP-Za-km-z]+)"\)',source)
+          if not m: raise SystemExit('program id missing')
+          program=m.group(1)
+          providers=['https://api.mainnet-beta.solana.com','https://solana-rpc.publicnode.com']
+          alphabet='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+          def b58e(b):
+              n=int.from_bytes(b,'big'); s=''
+              while n: n,r=divmod(n,58); s=alphabet[r]+s
+              z=len(b)-len(b.lstrip(b'\0'))
+              return '1'*z+(s or '')
+          def b58d(s):
+              n=0
+              for c in s: n=n*58+alphabet.index(c)
+              r=n.to_bytes((n.bit_length()+7)//8,'big') if n else b''
+              return b'\0'*(len(s)-len(s.lstrip('1')))+r
+          def call(url,method,params,timeout=60):
+              payload=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
+              req=urllib.request.Request(url,data=payload,headers={'content-type':'application/json','user-agent':'paxos-readonly-research'})
+              with urllib.request.urlopen(req,timeout=timeout) as resp: out=json.loads(resp.read())
+              if 'error' in out: raise RuntimeError(out['error'])
+              return out['result']
+
+          result={'program_id':program,'source_commit':'90325c53ddb2dc25d924a7f4aaf877eca1ea9f23','read_only':True,'providers':{},'merged_minter_accounts':{},'update_rate_limit_transactions':[],'mint_token_transactions':[],'errors':[]}
+          minter_disc=hashlib.sha256(b'account:Minter').digest()[:8]
+          update_disc=hashlib.sha256(b'global:update_rate_limit').digest()[:8]
+          mint_disc=hashlib.sha256(b'global:mint_token').digest()[:8]
+
+          def parse_minter(data):
+              if data[:8]!=minter_disc: raise ValueError('discriminator mismatch')
+              off=8
+              ma=b58e(data[off:off+32]); off+=32
+              mint=b58e(data[off:off+32]); off+=32
+              admin=b58e(data[off:off+32]); off+=32
+              tag=data[off]; off+=1
+              pending=None
+              if tag==1: pending=b58e(data[off:off+32]); off+=32
+              bump=data[off]; off+=1
+              vals=[]
+              for _ in range(4): vals.append(int.from_bytes(data[off:off+8],'little')); off+=8
+              return {'minter_authority':ma,'mint_account':mint,'admin':admin,'pending_admin':pending,'bump':bump,'capacity':vals[0],'remaining_amount':vals[1],'refill_per_second':vals[2],'last_refill_time':vals[3]}
+
+          for url in providers:
+              pr={'program_account':None,'minter_count':0,'signature_count':0,'errors':[]}
+              result['providers'][url]=pr
+              try:
+                  pr['program_account']=call(url,'getAccountInfo',[program,{'encoding':'base64','commitment':'confirmed'}])
+              except Exception as e: pr['errors'].append({'stage':'program','error':repr(e)})
+              try:
+                  rows=call(url,'getProgramAccounts',[program,{'encoding':'base64','commitment':'confirmed','filters':[{'memcmp':{'offset':0,'bytes':b58e(minter_disc)}}]}])
+                  pr['minter_count']=len(rows)
+                  for row in rows:
+                      try:
+                          parsed=parse_minter(base64.b64decode(row['account']['data'][0])); parsed.update({'address':row['pubkey'],'lamports':row['account']['lamports'],'provider':url})
+                          result['merged_minter_accounts'][row['pubkey']]=parsed
+                      except Exception as e: pr['errors'].append({'stage':'parse_minter','address':row.get('pubkey'),'error':repr(e)})
+              except Exception as e: pr['errors'].append({'stage':'getProgramAccounts','error':repr(e)})
+              try:
+                  sigs=call(url,'getSignaturesForAddress',[program,{'limit':200}],timeout=90)
+                  pr['signature_count']=len(sigs)
+                  # Scan newest 80 to remain within public RPC limits.
+                  for index,srow in enumerate(sigs[:80]):
+                      try:
+                          tx=call(url,'getTransaction',[srow['signature'],{'encoding':'json','commitment':'confirmed','maxSupportedTransactionVersion':0}],timeout=60)
+                          if not tx: continue
+                          msg=tx['transaction']['message']; keys=msg['accountKeys']
+                          for ix in msg.get('instructions',[]):
+                              pi=ix.get('programIdIndex')
+                              if pi is None or keys[pi]!=program: continue
+                              raw=b58d(ix.get('data',''))
+                              common={'signature':srow['signature'],'slot':srow['slot'],'blockTime':srow.get('blockTime'),'provider':url,'data_base58':ix.get('data','')}
+                              if raw[:8]==update_disc:
+                                  if len(raw)>=24:
+                                      common['capacity']=int.from_bytes(raw[8:16],'little'); common['refill_per_second']=int.from_bytes(raw[16:24],'little')
+                                  result['update_rate_limit_transactions'].append(common)
+                              elif raw[:8]==mint_disc:
+                                  if len(raw)>=17:
+                                      common['amount']=int.from_bytes(raw[8:16],'little'); common['decimals']=raw[16]
+                                  result['mint_token_transactions'].append(common)
+                      except Exception as e:
+                          if index<10: pr['errors'].append({'stage':'transaction','signature':srow['signature'],'error':repr(e)})
+                      time.sleep(0.15)
+              except Exception as e: pr['errors'].append({'stage':'history','error':repr(e)})
+
+          # Deduplicate transactions by signature/data.
+          for key in ['update_rate_limit_transactions','mint_token_transactions']:
+              unique={}
+              for x in result[key]: unique[(x['signature'],x.get('data_base58',''))]=x
+              result[key]=list(unique.values())
+          accounts=list(result['merged_minter_accounts'].values())
+          for a in accounts:
+              # Read mint decimals using any working provider.
+              for url in providers:
+                  try:
+                      info=call(url,'getAccountInfo',[a['mint_account'],{'encoding':'base64','commitment':'confirmed'}])
+                      if info and info.get('value'):
+                          raw=base64.b64decode(info['value']['data'][0]); a['mint_decimals']=raw[44] if len(raw)>44 else None; a['mint_supply_raw']=int.from_bytes(raw[36:44],'little') if len(raw)>=44 else None; a['mint_program_owner']=info['value']['owner']; break
+                  except Exception: pass
+          result['merged_minter_accounts']=accounts
+          result['summary']={
+              'program_executable_any':any((p.get('program_account') or {}).get('value',{}).get('executable') for p in result['providers'].values()),
+              'minter_account_count':len(accounts),
+              'positive_capacity_count':sum(1 for a in accounts if a['capacity']>0),
+              'positive_refill_count':sum(1 for a in accounts if a['refill_per_second']>0),
+              'update_rate_limit_tx_count':len(result['update_rate_limit_transactions']),
+              'mint_token_tx_count':len(result['mint_token_transactions']),
+          }
+          Path('r9-mainnet/CENSUS.json').write_text(json.dumps(result,indent=2,sort_keys=True))
+          Path('r9-mainnet/SUMMARY.json').write_text(json.dumps(result['summary'],indent=2,sort_keys=True))
+          print(json.dumps(result['summary'],indent=2))
+          PY
+      - name: Build production gate
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          s=json.loads(Path('r9-mainnet/SUMMARY.json').read_text())
+          gates={
+            'program_executable':bool(s['program_executable_any']),
+            'live_minter_accounts':s['minter_account_count']>0,
+            'material_capacity_configured':s['positive_capacity_count']>0,
+            'positive_refill_configured':s['positive_refill_count']>0,
+            'observed_rate_update_transaction':s['update_rate_limit_tx_count']>0,
+            'observed_mint_transaction':s['mint_token_tx_count']>0,
+          }
+          out={'gates':gates,'production_reachability_pass':all(gates.values()),'read_only':True,'production_state_changing_transactions':0}
+          Path('r9-mainnet/PRODUCTION_GATE.json').write_text(json.dumps(out,indent=2,sort_keys=True))
+          PY
+          sha256sum r9-mainnet/* > r9-mainnet/SHA256SUMS.txt
+          mkdir -p paxos-results/r9-mainnet
+          cp r9-mainnet/*.json paxos-results/r9-mainnet/
+      - name: Publish
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add paxos-results/r9-mainnet
+          git commit -m 'Publish Paxos R9 read-only mainnet census'
+          git push origin HEAD:paxos-public-toolchain-bootstrap-20260815
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paxos-r9-mainnet-census
+          path: r9-mainnet
+          retention-days: 1
+          if-no-files-found: error
