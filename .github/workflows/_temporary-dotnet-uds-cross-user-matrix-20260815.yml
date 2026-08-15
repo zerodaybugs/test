@@ -1,0 +1,183 @@
+name: Temporary .NET UDS Cross-User Matrix
+
+on:
+  push:
+    branches:
+      - agent/dotnet10-toolchain-20260815
+    paths:
+      - .github/workflows/_temporary-dotnet-uds-cross-user-matrix-20260815.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-dotnet-uds-cross-user-matrix-20260815
+  cancel-in-progress: false
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+
+    steps:
+      - name: Install exact .NET SDK
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: 10.0.302
+          cache: false
+
+      - name: Build exact UDS permission probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p probe
+          cat > probe/probe.csproj <<'EOF'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net10.0</TargetFramework>
+              <ImplicitUsings>enable</ImplicitUsings>
+              <Nullable>enable</Nullable>
+              <Deterministic>true</Deterministic>
+            </PropertyGroup>
+          </Project>
+          EOF
+          cat > probe/Program.cs <<'EOF'
+          using System.Net.Sockets;
+          using System.Text;
+
+          if (args.Length != 2)
+          {
+              Console.Error.WriteLine("usage: server|client PATH");
+              return 64;
+          }
+
+          string mode = args[0];
+          string path = args[1];
+
+          if (mode == "server")
+          {
+              if (File.Exists(path)) File.Delete(path);
+              Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+              using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+              socket.Bind(new UnixDomainSocketEndPoint(path));
+              socket.Listen(4);
+              Console.WriteLine($"READY path={path}");
+              Console.WriteLine($"DIR_MODE={File.GetUnixFileMode(Path.GetDirectoryName(path)!)}");
+              Console.WriteLine($"SOCKET_MODE={File.GetUnixFileMode(path)}");
+              Console.Out.Flush();
+              using var accepted = await socket.AcceptAsync().WaitAsync(TimeSpan.FromSeconds(25));
+              byte[] data = Encoding.ASCII.GetBytes("accepted");
+              await accepted.SendAsync(data);
+              Console.WriteLine("ACCEPTED=1");
+              return 0;
+          }
+
+          if (mode == "client")
+          {
+              using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+              try
+              {
+                  await socket.ConnectAsync(new UnixDomainSocketEndPoint(path)).WaitAsync(TimeSpan.FromSeconds(10));
+                  byte[] data = new byte[32];
+                  int read = await socket.ReceiveAsync(data);
+                  Console.WriteLine($"CONNECTED=1 READ={read} DATA={Encoding.ASCII.GetString(data, 0, read)}");
+                  return 0;
+              }
+              catch (Exception ex)
+              {
+                  Console.WriteLine($"CONNECTED=0 TYPE={ex.GetType().FullName} MESSAGE={ex.Message}");
+                  return 77;
+              }
+          }
+
+          return 65;
+          EOF
+          dotnet publish probe/probe.csproj -c Release -o probe/out --nologo
+
+      - name: Run victim/attacker cross-user probe
+        shell: bash
+        run: |
+          set -u
+          OUT="$GITHUB_WORKSPACE/evidence"
+          mkdir -p "$OUT"
+          echo "OS=$(uname -a)" > "$OUT/environment.txt"
+          dotnet --info >> "$OUT/environment.txt" 2>&1
+
+          VICTIM_HOME="/tmp/aspire-victim-home"
+          SOCKET_DIR="$VICTIM_HOME/.aspire/cli/bch"
+          SOCKET_PATH="$SOCKET_DIR/testsocket.4242"
+
+          if [[ "$(uname -s)" == "Darwin" ]]; then
+            sudo dscl . -delete /Users/aspirevictim >/dev/null 2>&1 || true
+            sudo dscl . -delete /Users/aspireattacker >/dev/null 2>&1 || true
+            sudo dscl . -create /Users/aspirevictim
+            sudo dscl . -create /Users/aspirevictim UserShell /bin/bash
+            sudo dscl . -create /Users/aspirevictim UniqueID 601
+            sudo dscl . -create /Users/aspirevictim PrimaryGroupID 20
+            sudo dscl . -create /Users/aspirevictim NFSHomeDirectory "$VICTIM_HOME"
+            sudo dscl . -create /Users/aspireattacker
+            sudo dscl . -create /Users/aspireattacker UserShell /bin/bash
+            sudo dscl . -create /Users/aspireattacker UniqueID 602
+            sudo dscl . -create /Users/aspireattacker PrimaryGroupID 20
+            sudo dscl . -create /Users/aspireattacker NFSHomeDirectory /tmp/aspire-attacker-home
+            RUN_VICTIM=(sudo -u aspirevictim env HOME="$VICTIM_HOME")
+            RUN_ATTACKER=(sudo -u aspireattacker env HOME=/tmp/aspire-attacker-home)
+          else
+            sudo userdel -r aspirevictim >/dev/null 2>&1 || true
+            sudo userdel -r aspireattacker >/dev/null 2>&1 || true
+            sudo useradd -m -d "$VICTIM_HOME" -s /bin/bash aspirevictim
+            sudo useradd -m -d /tmp/aspire-attacker-home -s /bin/bash aspireattacker
+            RUN_VICTIM=(sudo -u aspirevictim env HOME="$VICTIM_HOME")
+            RUN_ATTACKER=(sudo -u aspireattacker env HOME=/tmp/aspire-attacker-home)
+          fi
+
+          sudo mkdir -p "$SOCKET_DIR"
+          sudo chown -R aspirevictim "$VICTIM_HOME"
+          sudo chmod 0755 "$VICTIM_HOME" "$VICTIM_HOME/.aspire" "$VICTIM_HOME/.aspire/cli" "$SOCKET_DIR"
+          chmod -R a+rX probe/out
+
+          (
+            umask 022
+            "${RUN_VICTIM[@]}" dotnet "$GITHUB_WORKSPACE/probe/out/probe.dll" server "$SOCKET_PATH"
+          ) > "$OUT/server.log" 2>&1 &
+          SERVER_PID=$!
+
+          for i in $(seq 1 100); do
+            [[ -S "$SOCKET_PATH" ]] && break
+            sleep 0.1
+          done
+
+          ls -ld "$VICTIM_HOME" "$VICTIM_HOME/.aspire" "$VICTIM_HOME/.aspire/cli" "$SOCKET_DIR" > "$OUT/modes.txt" 2>&1
+          ls -l "$SOCKET_PATH" >> "$OUT/modes.txt" 2>&1 || true
+          stat "$SOCKET_PATH" >> "$OUT/modes.txt" 2>&1 || true
+
+          set +e
+          "${RUN_ATTACKER[@]}" dotnet "$GITHUB_WORKSPACE/probe/out/probe.dll" client "$SOCKET_PATH" > "$OUT/attacker.log" 2>&1
+          ATTACKER_RC=$?
+          set -e
+          echo "ATTACKER_RC=$ATTACKER_RC" > "$OUT/verdict.env"
+          if [[ "$ATTACKER_RC" -eq 0 ]]; then
+            echo "CROSS_USER_CONNECT=1" >> "$OUT/verdict.env"
+          else
+            echo "CROSS_USER_CONNECT=0" >> "$OUT/verdict.env"
+          fi
+
+          wait "$SERVER_PID" || true
+          cat "$OUT/verdict.env"
+          cat "$OUT/server.log"
+          cat "$OUT/attacker.log"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dotnet-uds-cross-user-${{ matrix.os }}
+          path: evidence
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 9
