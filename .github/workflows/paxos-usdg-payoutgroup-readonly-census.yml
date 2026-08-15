@@ -1,0 +1,96 @@
+name: Paxos USDG payout-group read-only mainnet census
+
+on:
+  push:
+    branches:
+      - paxos-public-toolchain-bootstrap-20260815
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      URL_ETH_MAINNET: http://127.0.0.1:8545
+      URL_ETH_SEPOLIA: http://127.0.0.1:8545
+      URL_INK_MAINNET: http://127.0.0.1:8545
+      URL_INK_SEPOLIA: http://127.0.0.1:8545
+      URL_ARB_MAINNET: http://127.0.0.1:8545
+      URL_ARB_SEPOLIA: http://127.0.0.1:8545
+      URL_XLAYER_TESTNET: http://127.0.0.1:8545
+      URL_XLAYER_MAINNET: http://127.0.0.1:8545
+      GAS_REPORTING: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.19.4'
+      - name: Clone and compile exact source
+        run: |
+          git clone https://github.com/paxosglobal/paxos-token-contracts.git paxos-token-contracts
+          cd paxos-token-contracts
+          git checkout --detach 674ac1046a0a40bfd2b6b892192998af9ac3b171
+          git submodule update --init --recursive
+          npm ci --no-audit --no-fund
+          npm run compile
+      - name: Run generic ABI-driven read-only census
+        run: |
+          cd paxos-token-contracts
+          cat > ../payoutgroup_census.js <<'NODE'
+          const { ethers } = require('ethers');
+          const fs = require('fs');
+          const path = require('path');
+          const crypto = require('crypto');
+          const TOKEN = '0xe343167631d89b6ffc58b88d6b7fb0228795491d';
+          const RPCS = ['https://eth.llamarpc.com','https://1rpc.io/eth','https://ethereum-rpc.publicnode.com'];
+          function walk(dir) { let out=[]; for (const e of fs.readdirSync(dir,{withFileTypes:true})) { const p=path.join(dir,e.name); if(e.isDirectory()) out=out.concat(walk(p)); else if(e.name.endsWith('.json')) out.push(p); } return out; }
+          function ser(v) { if(typeof v==='bigint') return v.toString(); if(Array.isArray(v)) return v.map(ser); if(v && typeof v==='object') { const o={}; for(const [k,x] of Object.entries(v)) if(!/^\d+$/.test(k)) o[k]=ser(x); return Object.keys(o).length?o:v.toString(); } return v; }
+          (async()=>{
+            let provider,rpc;
+            for(const url of RPCS){try{const p=new ethers.JsonRpcProvider(url,1,{staticNetwork:true});if((await p.getBlockNumber())>1){provider=p;rpc=url;break;}}catch(e){}}
+            if(!provider) throw new Error('no RPC');
+            const fragments=[]; const seen=new Set();
+            for(const f of walk('artifacts/contracts')){
+              try{const j=JSON.parse(fs.readFileSync(f)); if(!Array.isArray(j.abi)) continue; for(const x of j.abi){const key=JSON.stringify(x); if(!seen.has(key)){seen.add(key);fragments.push(x);}}}catch(e){}
+            }
+            fragments.push({type:'function',name:'getFacet',stateMutability:'view',inputs:[{name:'selector',type:'bytes4'}],outputs:[{name:'',type:'address'}]});
+            const iface=new ethers.Interface(fragments); const token=new ethers.Contract(TOKEN,fragments,provider);
+            const result={generatedAt:new Date().toISOString(),rpc,latestBlock:await provider.getBlockNumber(),token:TOKEN,productionStateChangingTransactions:0,functions:[],facets:{},zeroArgViews:{},idViews:{},errors:[]};
+            const funcs=iface.fragments.filter(x=>x.type==='function' && /payout|reward|manager|claimer/i.test(x.name));
+            for(const f of funcs){
+              const sig=f.format('sighash'); const selector=ethers.id(sig).slice(0,10);
+              result.functions.push({name:f.name,signature:sig,selector,stateMutability:f.stateMutability,inputs:f.inputs.map(x=>x.type),outputs:f.outputs.map(x=>x.type)});
+              try{result.facets[sig]=await token.getFacet(selector);}catch(e){result.facets[sig]={error:e.message};}
+            }
+            const candidateIds=new Set();
+            for(const f of funcs.filter(x=>x.stateMutability==='view' && x.inputs.length===0)){
+              const sig=f.format('sighash');
+              try{const v=ser(await token.getFunction(sig).staticCall()); result.zeroArgViews[sig]=v; const scan=(x)=>{if(typeof x==='string' && /^\d+$/.test(x)){const n=BigInt(x);if(n>0n&&n<=0xffffffffn)candidateIds.add(Number(n));}else if(Array.isArray(x))x.forEach(scan);else if(x&&typeof x==='object')Object.values(x).forEach(scan);};scan(v);}catch(e){result.zeroArgViews[sig]={error:e.message};}
+            }
+            for(const id of [...candidateIds].slice(0,500)){
+              result.idViews[id]={};
+              for(const f of funcs.filter(x=>x.stateMutability==='view' && x.inputs.length===1 && /^uint(16|32|64|256)?$/.test(x.inputs[0].type))){
+                const sig=f.format('sighash');
+                try{result.idViews[id][sig]=ser(await token.getFunction(sig).staticCall(id));}catch(e){}
+              }
+            }
+            result.candidateIds=[...candidateIds];
+            fs.writeFileSync('../PAXOS_USDG_PAYOUTGROUP_MAINNET_CENSUS.json',JSON.stringify(result,null,2));
+            console.log(JSON.stringify({latestBlock:result.latestBlock,functionCount:result.functions.length,candidateIds:result.candidateIds,facetCount:Object.keys(result.facets).length,errors:result.errors},null,2));
+          })().catch(e=>{console.error(e);process.exit(1)});
+          NODE
+          node ../payoutgroup_census.js 2>&1 | tee ../PAXOS_USDG_PAYOUTGROUP_MAINNET_CENSUS.log
+          cd ..
+          sha256sum PAXOS_USDG_PAYOUTGROUP_MAINNET_CENSUS.json PAXOS_USDG_PAYOUTGROUP_MAINNET_CENSUS.log > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paxos-usdg-payoutgroup-mainnet-readonly-census
+          path: |
+            PAXOS_USDG_PAYOUTGROUP_MAINNET_CENSUS.json
+            PAXOS_USDG_PAYOUTGROUP_MAINNET_CENSUS.log
+            SHA256SUMS.txt
+          retention-days: 1
+          if-no-files-found: error
