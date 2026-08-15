@@ -1,0 +1,136 @@
+name: SNAP StorageRanges cardinality exact-release scan
+
+on:
+  push:
+    branches:
+      - tmp/snap-storage-range-count-differential-20260816
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Clone exact stable execution-client releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          base="research/snap_storage_ranges/results"
+          rm -rf work-snap "$base"
+          mkdir -p work-snap "$base/snapshots"
+          : > "$base/RELEASES.tsv"
+
+          fetch_release() {
+            local name="$1" repo="$2" json tag sha
+            json="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/${repo}/releases/latest")"
+            tag="$(jq -r '.tag_name // empty' <<<"$json")"
+            [[ -n "$tag" ]]
+            git clone --quiet --filter=blob:none --depth 1 --branch "$tag" "https://github.com/${repo}.git" "work-snap/${name}"
+            sha="$(git -C "work-snap/${name}" rev-parse HEAD)"
+            printf '%s\t%s\t%s\t%s\n' "$name" "$repo" "$tag" "$sha" >> "$base/RELEASES.tsv"
+          }
+
+          fetch_release geth ethereum/go-ethereum
+          fetch_release reth paradigmxyz/reth
+          fetch_release besu besu-eth/besu
+          fetch_release nethermind NethermindEth/nethermind
+          fetch_release erigon erigontech/erigon
+
+      - name: Extract StorageRanges request correlation code
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="research/snap_storage_ranges/results"
+          P='StorageRanges|storage.?ranges|storage_ranges|GetStorageRanges|get_storage_ranges'
+          CORR='account.?hash|accounts|slots|storages|response|request|range'
+
+          for dir in work-snap/*; do
+            [[ -d "$dir/.git" ]] || continue
+            name="${dir#work-snap/}"
+            out="$base/${name}"
+            snap="$base/snapshots/${name}"
+            mkdir -p "$out" "$snap"
+            rg -n -i --hidden -g '!**/.git/**' -g '!**/vendor/**' -g '!**/target/**' \
+              -g '!**/build/**' -g '!**/dist/**' "$P" "$dir" > "$out/MATCHES.txt" || true
+            mapfile -t files < <(rg -l -i --hidden -g '!**/.git/**' -g '!**/vendor/**' \
+              -g '!**/target/**' -g '!**/build/**' -g '!**/dist/**' "$P" "$dir" \
+              | grep -Ev '(testdata|fixtures|generated|CHANGELOG|README|\.md$)' | head -n 160 || true)
+            for f in "${files[@]}"; do
+              rel="${f#${dir}/}"
+              if rg -q -i "$CORR" "$f"; then
+                mkdir -p "$snap/$(dirname "$rel")"
+                cp "$f" "$snap/$rel"
+              fi
+            done
+          done
+
+      - name: Detect unchecked response-count indexing shapes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+          import json, re
+          from pathlib import Path
+
+          base=Path('research/snap_storage_ranges/results')
+          records=[]
+          for client_dir in (base/'snapshots').iterdir():
+              client=client_dir.name
+              for p in client_dir.rglob('*'):
+                  if not p.is_file(): continue
+                  text=p.read_text(errors='replace')
+                  lines=text.splitlines()
+                  storage=[i+1 for i,s in enumerate(lines) if re.search(r'(?i)storage.?ranges',s)]
+                  loops=[i+1 for i,s in enumerate(lines) if re.search(r'(?i)(for .*range|for\s*\(|foreach|while)',s)]
+                  indexes=[i+1 for i,s in enumerate(lines) if re.search(r'\[[A-Za-z_][A-Za-z0-9_]*\]',s)]
+                  guards=[i+1 for i,s in enumerate(lines) if re.search(r'(?i)(len|length|count|size).*(>|>=|<=|<|!=|==).*(len|length|count|size)',s)]
+                  if storage:
+                      records.append({
+                          'client':client,
+                          'path':str(p.relative_to(client_dir)),
+                          'storage_range_lines':storage[:100],
+                          'loop_lines':loops[:100],
+                          'index_lines':indexes[:100],
+                          'count_guard_lines':guards[:100],
+                          'risk_shape':bool(loops and indexes and not guards),
+                      })
+          result={
+              'schema':'snap-storage-ranges-cardinality-scan-v1',
+              'known_nethermind_fix':{
+                  'commit':'8934dc2229b0abc4dc66a4fe1da65340e9f78776',
+                  'root_cause':'response slot-list count greater than requested account count reached unchecked request indexing'
+              },
+              'files':records,
+              'risk_files':[x for x in records if x['risk_shape']],
+              'gate':'HOLD_EXACT_UNIT_AND_NETWORK_BOUNDARY_TEST_REQUIRED'
+          }
+          (base/'SCAN.json').write_text(json.dumps(result,indent=2))
+          PY
+
+      - name: Persist scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add research/snap_storage_ranges/results
+          if ! git diff --cached --quiet; then
+            git commit -m "research: record SNAP storage range cardinality scan [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: snap-storage-ranges-cardinality-exact-scan
+          retention-days: 1
+          path: research/snap_storage_ranges/results
