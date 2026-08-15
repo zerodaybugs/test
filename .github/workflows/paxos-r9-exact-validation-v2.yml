@@ -1,0 +1,261 @@
+name: Paxos R9 exact validation v2
+
+on:
+  push:
+    branches:
+      - paxos-public-toolchain-bootstrap-20260815
+    paths:
+      - '.github/workflows/paxos-r9-exact-validation-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: paxos-public-toolchain-bootstrap-20260815
+
+      - name: Clone exact source
+        run: |
+          set -euo pipefail
+          git clone https://github.com/paxosglobal/solana-programs.git vulnerable
+          cd vulnerable
+          git checkout --detach 90325c53ddb2dc25d924a7f4aaf877eca1ea9f23
+          test "$(git rev-parse HEAD)" = 90325c53ddb2dc25d924a7f4aaf877eca1ea9f23
+          cd ..
+          cp -a vulnerable patched
+          mkdir -p r9-evidence
+
+      - name: Inject exact vulnerable regression
+        run: |
+          set -euo pipefail
+          cat >> vulnerable/programs/minter-controller/src/instructions/mint_token.rs <<'RS'
+
+          #[cfg(test)]
+          mod r9_exact_tests {
+              use super::*;
+
+              fn make_rate_limit(capacity: u64, remaining: u64, rate: u64, last: u64) -> RateLimit {
+                  RateLimit {
+                      capacity,
+                      remaining_amount: remaining,
+                      refill_per_second: rate,
+                      last_refill_time: last,
+                  }
+              }
+
+              fn prospective_update(
+                  mut rl: RateLimit,
+                  now: u64,
+                  new_capacity: u64,
+                  new_rate: u64,
+              ) -> RateLimit {
+                  let old_policy_available = rl.refill(now).unwrap();
+                  rl.remaining_amount = std::cmp::min(old_policy_available, new_capacity);
+                  rl.last_refill_time = now;
+                  rl.capacity = new_capacity;
+                  rl.refill_per_second = new_rate;
+                  rl
+              }
+
+              #[test]
+              fn r9_exact_vulnerable_retroactive_refill() {
+                  let now = 2_000;
+                  let mut vulnerable = make_rate_limit(2_000_000, 0, 1, 1_000);
+                  vulnerable.capacity = 2_000_000;
+                  vulnerable.refill_per_second = 1_000;
+                  let vulnerable_available = vulnerable.refill(now).unwrap();
+
+                  let mut patched = prospective_update(
+                      make_rate_limit(2_000_000, 0, 1, 1_000),
+                      now,
+                      2_000_000,
+                      1_000,
+                  );
+                  let patched_available = patched.refill(now).unwrap();
+
+                  assert_eq!(vulnerable_available, 1_000_000);
+                  assert_eq!(patched_available, 1_000);
+                  assert_eq!(vulnerable_available - patched_available, 999_000);
+              }
+
+              #[test]
+              fn r9_exact_differential_matrix() {
+                  let mut total = 0_u64;
+                  let mut strict = 0_u64;
+                  for elapsed in [1_u64, 7, 60, 3_600, 86_400, 604_800] {
+                      for old_rate in [0_u64, 1, 7, 100, 10_000] {
+                          for new_rate in [1_u64, 10, 1_000, 1_000_000] {
+                              for remaining in [0_u64, 1, 100, 10_000] {
+                                  for capacity in [1_000_u64, 1_000_000, u32::MAX as u64] {
+                                      total += 1;
+                                      let old_remaining = std::cmp::min(remaining, capacity);
+                                      let now = 10_000 + elapsed;
+
+                                      let mut vulnerable = make_rate_limit(
+                                          capacity, old_remaining, old_rate, 10_000
+                                      );
+                                      vulnerable.capacity = capacity;
+                                      vulnerable.refill_per_second = new_rate;
+                                      let v = vulnerable.refill(now).unwrap();
+
+                                      let mut patched = prospective_update(
+                                          make_rate_limit(capacity, old_remaining, old_rate, 10_000),
+                                          now,
+                                          capacity,
+                                          new_rate,
+                                      );
+                                      let p = patched.refill(now).unwrap();
+
+                                      if new_rate >= old_rate {
+                                          assert!(v >= p);
+                                          if v > p { strict += 1; }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  assert_eq!(total, 1_440);
+                  assert!(strict > 500);
+                  println!("R9_TOTAL={} R9_STRICT={}", total, strict);
+              }
+          }
+          RS
+
+      - name: Run vulnerable exact-source gate
+        working-directory: vulnerable
+        run: |
+          set -euo pipefail
+          cargo test r9_exact_ --workspace -- --nocapture 2>&1 | tee ../r9-evidence/VULNERABLE.log
+          grep -q 'r9_exact_vulnerable_retroactive_refill ... ok' ../r9-evidence/VULNERABLE.log
+          grep -q 'r9_exact_differential_matrix ... ok' ../r9-evidence/VULNERABLE.log
+          echo PASS > ../r9-evidence/VULNERABLE.PASS
+
+      - name: Apply checkpoint-before-reconfiguration patch
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('patched/programs/minter-controller/src/instructions/update_rate_limit.rs')
+          s=p.read_text()
+          needle='''pub fn update_rate_limit(ctx: Context<UpdateRateLimit>, capacity: u64, refill_per_second: u64) -> Result<()> {\n    ctx.accounts.minter.rate_limit.capacity = capacity;\n    ctx.accounts.minter.rate_limit.refill_per_second = refill_per_second;\n    emit!(RateLimitUpdated{'''
+          replacement='''fn checkpoint_and_update_rate_limit(\n    rate_limit: &mut RateLimit,\n    capacity: u64,\n    refill_per_second: u64,\n    current_time: u64,\n) -> Result<()> {\n    let old_policy_available = rate_limit.refill(current_time)?;\n    rate_limit.remaining_amount = std::cmp::min(old_policy_available, capacity);\n    rate_limit.last_refill_time = current_time;\n    rate_limit.capacity = capacity;\n    rate_limit.refill_per_second = refill_per_second;\n    Ok(())\n}\n\npub fn update_rate_limit(ctx: Context<UpdateRateLimit>, capacity: u64, refill_per_second: u64) -> Result<()> {\n    let current_time: u64 = Clock::get()?.unix_timestamp.try_into().unwrap();\n    checkpoint_and_update_rate_limit(\n        &mut ctx.accounts.minter.rate_limit,\n        capacity,\n        refill_per_second,\n        current_time,\n    )?;\n    emit!(RateLimitUpdated{'''
+          if needle not in s:
+              raise SystemExit('exact vulnerable function body not found')
+          s=s.replace(needle,replacement,1)
+          s += r'''
+
+          #[cfg(test)]
+          mod r9_patch_tests {
+              use super::*;
+
+              #[test]
+              fn r9_patch_applies_new_rate_only_after_checkpoint() {
+                  let mut rl = RateLimit {
+                      capacity: 2_000_000,
+                      remaining_amount: 0,
+                      refill_per_second: 1,
+                      last_refill_time: 1_000,
+                  };
+                  checkpoint_and_update_rate_limit(&mut rl, 2_000_000, 1_000, 2_000).unwrap();
+                  assert_eq!(rl.remaining_amount, 1_000);
+                  assert_eq!(rl.last_refill_time, 2_000);
+                  assert_eq!(rl.refill(2_000).unwrap(), 1_000);
+                  assert_eq!(rl.refill(2_001).unwrap(), 2_000);
+              }
+
+              #[test]
+              fn r9_patch_clamps_when_capacity_decreases() {
+                  let mut rl = RateLimit {
+                      capacity: 10_000,
+                      remaining_amount: 9_000,
+                      refill_per_second: 10,
+                      last_refill_time: 100,
+                  };
+                  checkpoint_and_update_rate_limit(&mut rl, 5_000, 1, 200).unwrap();
+                  assert_eq!(rl.remaining_amount, 5_000);
+                  assert_eq!(rl.capacity, 5_000);
+                  assert_eq!(rl.last_refill_time, 200);
+              }
+          }
+          '''
+          p.write_text(s)
+          PY
+          diff -u vulnerable/programs/minter-controller/src/instructions/update_rate_limit.rs patched/programs/minter-controller/src/instructions/update_rate_limit.rs > r9-evidence/PATCH.diff || true
+          test -s r9-evidence/PATCH.diff
+
+      - name: Run patched regression and full workspace
+        working-directory: patched
+        run: |
+          set -euo pipefail
+          cargo test r9_patch_ --workspace -- --nocapture 2>&1 | tee ../r9-evidence/PATCHED.log
+          grep -q 'r9_patch_applies_new_rate_only_after_checkpoint ... ok' ../r9-evidence/PATCHED.log
+          grep -q 'r9_patch_clamps_when_capacity_decreases ... ok' ../r9-evidence/PATCHED.log
+          cargo test --workspace 2>&1 | tee ../r9-evidence/PATCHED_FULL.log
+          echo PASS > ../r9-evidence/PATCHED.PASS
+          echo PASS > ../r9-evidence/PATCHED_FULL.PASS
+
+      - name: Build decision
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          e=Path('r9-evidence')
+          gates={
+            'exact_commit':True,
+            'vulnerable_exact_test':(e/'VULNERABLE.PASS').exists(),
+            'patched_control':(e/'PATCHED.PASS').exists(),
+            'patched_full_workspace':(e/'PATCHED_FULL.PASS').exists(),
+            'current_scope_confirmed':False,
+            'privileged_actor_policy_clear':False,
+            'production_configuration_material':False,
+            'official_audit_duplicate_clear':False,
+          }
+          technical=all(gates[k] for k in ('exact_commit','vulnerable_exact_test','patched_control','patched_full_workspace'))
+          decision={
+            'finding':'Solana minter rate-limit update retroactively applies new refill rate',
+            'technical_status':'CONFIRMED_EXACT_SOURCE' if technical else 'FAILED',
+            'severity':'HIGH_CANDIDATE' if technical else 'NONE',
+            'critical_supported':False,
+            'submit_ready':all(gates.values()),
+            'decision':'HOLD_DO_NOT_SUBMIT',
+            'production_state_changing_transactions':0,
+            'gates':gates,
+          }
+          (e/'R9_DECISION.json').write_text(json.dumps(decision,indent=2,sort_keys=True))
+          (e/'R9_DECISION.txt').write_text('\n'.join(f'{k}={v}' for k,v in decision.items() if k!='gates')+'\n')
+          PY
+          sha256sum r9-evidence/* > r9-evidence/SHA256SUMS.txt
+          tar -czf PAXOS_R9_EXACT_VALIDATION_V2.tar.gz r9-evidence
+          sha256sum PAXOS_R9_EXACT_VALIDATION_V2.tar.gz > PAXOS_R9_EXACT_VALIDATION_V2.tar.gz.sha256
+
+      - name: Publish decision to branch
+        run: |
+          set -euo pipefail
+          mkdir -p paxos-results/r9-v2
+          cp r9-evidence/R9_DECISION.* paxos-results/r9-v2/
+          cp PAXOS_R9_EXACT_VALIDATION_V2.tar.gz.sha256 paxos-results/r9-v2/
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add paxos-results/r9-v2
+          git commit -m 'Publish Paxos R9 v2 exact validation result'
+          git push origin HEAD:paxos-public-toolchain-bootstrap-20260815
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paxos-r9-exact-validation-v2
+          path: |
+            PAXOS_R9_EXACT_VALIDATION_V2.tar.gz
+            PAXOS_R9_EXACT_VALIDATION_V2.tar.gz.sha256
+            r9-evidence/R9_DECISION.json
+            r9-evidence/R9_DECISION.txt
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
