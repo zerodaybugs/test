@@ -1,0 +1,242 @@
+name: Paxos Solana minter read-only mainnet census
+
+on:
+  push:
+    branches:
+      - paxos-public-toolchain-bootstrap-20260815
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.19.4'
+      - name: Install pinned read-only clients
+        run: npm install --no-save --no-audit --no-fund @solana/web3.js@1.98.4 bs58@6.0.0
+      - name: Clone exact Paxos Solana source and inspect current mainnet state
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone https://github.com/paxosglobal/solana-programs.git source
+          cd source
+          git checkout --detach 90325c53ddb2dc25d924a7f4aaf877eca1ea9f23
+          test "$(git rev-parse HEAD)" = "90325c53ddb2dc25d924a7f4aaf877eca1ea9f23"
+          cd ..
+
+          cat > solana_minter_census.mjs <<'NODE'
+          import { Connection, PublicKey } from '@solana/web3.js';
+          import bs58 from 'bs58';
+          import crypto from 'node:crypto';
+          import fs from 'node:fs';
+
+          const source = fs.readFileSync('source/programs/minter-controller/src/lib.rs', 'utf8');
+          const match = source.match(/declare_id!\(\s*"([1-9A-HJ-NP-Za-km-z]+)"\s*\)/);
+          if (!match) throw new Error('declare_id not found');
+          const programId = new PublicKey(match[1]);
+
+          const endpoints = [
+            'https://api.mainnet-beta.solana.com',
+            'https://solana-rpc.publicnode.com',
+            'https://rpc.ankr.com/solana'
+          ];
+          let connection = null;
+          let rpc = null;
+          for (const url of endpoints) {
+            try {
+              const c = new Connection(url, { commitment: 'confirmed' });
+              const slot = await c.getSlot('confirmed');
+              if (slot > 1) { connection = c; rpc = url; break; }
+            } catch (error) {
+              console.error(`RPC ${url}: ${error.message}`);
+            }
+          }
+          if (!connection) throw new Error('No Solana RPC available');
+
+          const disc = (namespace, name) => crypto.createHash('sha256').update(`${namespace}:${name}`).digest().subarray(0, 8);
+          const minterDisc = disc('account', 'Minter');
+          const whitelistDisc = disc('account', 'WhitelistedAddress');
+          const eventDiscs = Object.fromEntries([
+            'MinterAdded','RateLimitUpdated','TokensMinted','WhitelistedAddressAdded','WhitelistedAddressRemoved','AdminTransferStarted','AdminTransferAccepted'
+          ].map(name => [name, disc('event', name)]));
+
+          function readU64(buf, offset) {
+            return [buf.readBigUInt64LE(offset), offset + 8];
+          }
+          function readPubkey(buf, offset) {
+            return [new PublicKey(buf.subarray(offset, offset + 32)).toBase58(), offset + 32];
+          }
+          function decodeMinter(buf) {
+            let o = 8;
+            let minterAuthority, mintAccount, admin, pendingAdmin, bump, capacity, remainingAmount, refillPerSecond, lastRefillTime;
+            [minterAuthority,o] = readPubkey(buf,o);
+            [mintAccount,o] = readPubkey(buf,o);
+            [admin,o] = readPubkey(buf,o);
+            const tag = buf[o++];
+            if (tag === 1) [pendingAdmin,o] = readPubkey(buf,o);
+            else pendingAdmin = null;
+            bump = buf[o++];
+            [capacity,o] = readU64(buf,o);
+            [remainingAmount,o] = readU64(buf,o);
+            [refillPerSecond,o] = readU64(buf,o);
+            [lastRefillTime,o] = readU64(buf,o);
+            return {
+              minterAuthority, mintAccount, admin, pendingAdmin, bump,
+              rateLimit: {
+                capacity: capacity.toString(),
+                remainingAmount: remainingAmount.toString(),
+                refillPerSecond: refillPerSecond.toString(),
+                lastRefillTime: lastRefillTime.toString()
+              },
+              decodedBytes: o,
+              accountBytes: buf.length
+            };
+          }
+          function decodeWhitelist(buf) {
+            let o = 8;
+            let minterAuthority,mintAccount,toAddress;
+            [minterAuthority,o] = readPubkey(buf,o);
+            [mintAccount,o] = readPubkey(buf,o);
+            [toAddress,o] = readPubkey(buf,o);
+            const bump = buf[o++];
+            return { minterAuthority,mintAccount,toAddress,bump,decodedBytes:o,accountBytes:buf.length };
+          }
+
+          const result = {
+            generatedAt: new Date().toISOString(),
+            repositoryCommit: '90325c53ddb2dc25d924a7f4aaf877eca1ea9f23',
+            rpc,
+            programId: programId.toBase58(),
+            productionStateChangingTransactions: 0,
+            programAccount: null,
+            minters: [],
+            whitelists: [],
+            recentSignatures: [],
+            decodedEvents: [],
+            errors: []
+          };
+
+          const programInfo = await connection.getAccountInfo(programId, 'confirmed');
+          result.programAccount = programInfo ? {
+            executable: programInfo.executable,
+            owner: programInfo.owner.toBase58(),
+            lamports: programInfo.lamports,
+            dataLength: programInfo.data.length
+          } : null;
+
+          try {
+            const accounts = await connection.getProgramAccounts(programId, {
+              commitment: 'confirmed',
+              filters: [{ memcmp: { offset: 0, bytes: bs58.encode(minterDisc) } }]
+            });
+            for (const {pubkey,account} of accounts) {
+              try {
+                result.minters.push({ address: pubkey.toBase58(), lamports: account.lamports, ...decodeMinter(account.data) });
+              } catch (error) {
+                result.minters.push({ address: pubkey.toBase58(), decodeError: error.message, dataLength: account.data.length });
+              }
+            }
+          } catch (error) { result.errors.push(`minter accounts: ${error.message}`); }
+
+          try {
+            const accounts = await connection.getProgramAccounts(programId, {
+              commitment: 'confirmed',
+              filters: [{ memcmp: { offset: 0, bytes: bs58.encode(whitelistDisc) } }]
+            });
+            for (const {pubkey,account} of accounts) {
+              try {
+                result.whitelists.push({ address: pubkey.toBase58(), lamports: account.lamports, ...decodeWhitelist(account.data) });
+              } catch (error) {
+                result.whitelists.push({ address: pubkey.toBase58(), decodeError: error.message, dataLength: account.data.length });
+              }
+            }
+          } catch (error) { result.errors.push(`whitelist accounts: ${error.message}`); }
+
+          try {
+            const signatures = await connection.getSignaturesForAddress(programId, { limit: 1000 }, 'confirmed');
+            result.recentSignatures = signatures.map(s => ({
+              signature: s.signature, slot: s.slot, blockTime: s.blockTime, err: s.err, memo: s.memo
+            }));
+            for (const sig of signatures) {
+              let tx;
+              try { tx = await connection.getTransaction(sig.signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 }); }
+              catch (error) { result.errors.push(`tx ${sig.signature}: ${error.message}`); continue; }
+              for (const line of tx?.meta?.logMessages ?? []) {
+                const prefix = 'Program data: ';
+                if (!line.startsWith(prefix)) continue;
+                let bytes;
+                try { bytes = Buffer.from(line.slice(prefix.length), 'base64'); }
+                catch { continue; }
+                for (const [name,d] of Object.entries(eventDiscs)) {
+                  if (bytes.length < 8 || !bytes.subarray(0,8).equals(d)) continue;
+                  try {
+                    let o = 8;
+                    const event = { name, signature: sig.signature, slot: sig.slot, blockTime: sig.blockTime };
+                    if (name === 'MinterAdded') {
+                      [event.minterAuthority,o]=readPubkey(bytes,o);
+                      [event.mintAccount,o]=readPubkey(bytes,o);
+                      [event.admin,o]=readPubkey(bytes,o);
+                      let v; [v,o]=readU64(bytes,o); event.capacity=v.toString();
+                      [v,o]=readU64(bytes,o); event.refillPerSecond=v.toString();
+                    } else if (name === 'RateLimitUpdated') {
+                      [event.minterAuthority,o]=readPubkey(bytes,o);
+                      [event.mintAccount,o]=readPubkey(bytes,o);
+                      let v; [v,o]=readU64(bytes,o); event.capacity=v.toString();
+                      [v,o]=readU64(bytes,o); event.refillPerSecond=v.toString();
+                    } else if (name === 'TokensMinted') {
+                      [event.minterAuthority,o]=readPubkey(bytes,o);
+                      [event.mintAccount,o]=readPubkey(bytes,o);
+                      let v; [v,o]=readU64(bytes,o); event.amount=v.toString();
+                    } else if (name.startsWith('WhitelistedAddress')) {
+                      [event.minterAuthority,o]=readPubkey(bytes,o);
+                      [event.mintAccount,o]=readPubkey(bytes,o);
+                      [event.toAddress,o]=readPubkey(bytes,o);
+                    }
+                    result.decodedEvents.push(event);
+                  } catch (error) {
+                    result.errors.push(`event ${name} ${sig.signature}: ${error.message}`);
+                  }
+                }
+              }
+            }
+          } catch (error) { result.errors.push(`signatures: ${error.message}`); }
+
+          result.minters.sort((a,b)=>a.address.localeCompare(b.address));
+          result.whitelists.sort((a,b)=>a.address.localeCompare(b.address));
+          result.decodedEvents.sort((a,b)=>(a.slot??0)-(b.slot??0));
+          result.rateLimitUpdateEvents = result.decodedEvents.filter(e=>e.name==='RateLimitUpdated');
+          result.mintEvents = result.decodedEvents.filter(e=>e.name==='TokensMinted');
+
+          fs.writeFileSync('PAXOS_SOLANA_MINTER_MAINNET_CENSUS.json', JSON.stringify(result,null,2));
+          console.log(JSON.stringify({
+            programId: result.programId,
+            programAccount: result.programAccount,
+            minterCount: result.minters.length,
+            whitelistCount: result.whitelists.length,
+            signatureCount: result.recentSignatures.length,
+            decodedEventCount: result.decodedEvents.length,
+            rateLimitUpdateEventCount: result.rateLimitUpdateEvents.length,
+            mintEventCount: result.mintEvents.length,
+            minters: result.minters,
+            errors: result.errors
+          },null,2));
+          NODE
+
+          node solana_minter_census.mjs 2>&1 | tee PAXOS_SOLANA_MINTER_MAINNET_CENSUS.log
+          sha256sum PAXOS_SOLANA_MINTER_MAINNET_CENSUS.json PAXOS_SOLANA_MINTER_MAINNET_CENSUS.log > SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paxos-solana-minter-mainnet-readonly-census
+          path: |
+            PAXOS_SOLANA_MINTER_MAINNET_CENSUS.json
+            PAXOS_SOLANA_MINTER_MAINNET_CENSUS.log
+            SHA256SUMS.txt
+          retention-days: 1
+          if-no-files-found: error
