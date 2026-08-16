@@ -15,7 +15,7 @@ permissions:
 jobs:
   lab:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -33,33 +33,21 @@ jobs:
           set -euo pipefail
           mkdir -p .runner-key
           if [[ ! -s .runner-key/private.pem ]]; then
-            openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out .runner-key/private.pem >/dev/null 2>&1
-            chmod 600 .runner-key/private.pem
-            echo "generated=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "generated=false" >> "$GITHUB_OUTPUT"
+            echo "cached decryption key is unavailable" >&2
+            exit 1
           fi
           openssl pkey -in .runner-key/private.pem -pubout -out .runner-key/public.pem >/dev/null 2>&1
-          echo "LAB_PUBLIC_KEY_B64=$(base64 -w0 .runner-key/public.pem)"
-          if [[ -s .ci/runtime-lab-x7/payload.json ]]; then
-            echo "has_payload=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_payload=false" >> "$GITHUB_OUTPUT"
-            echo "LAB_PHASE=KEY_READY"
-          fi
-
-      - uses: actions/setup-dotnet@v4
-        if: steps.prepare.outputs.has_payload == 'true'
-        with:
-          dotnet-version: 10.0.302
+          echo "LAB_PUBLIC_KEY_SHA256=$(sha256sum .runner-key/public.pem | cut -d' ' -f1)"
+          test -s .ci/runtime-lab-x7/payload.json
+          test -s .ci/runtime-lab-x7/result_public.pem
 
       - name: Decrypt and execute isolated payload
         id: execute
-        if: steps.prepare.outputs.has_payload == 'true'
         shell: bash
         run: |
           set -euo pipefail
           python3 -c 'import cryptography' 2>/dev/null || python3 -m pip install --user --disable-pip-version-check cryptography >/dev/null
+          rm -rf /tmp/runtime-lab-x7 /tmp/runtime-lab-x7-output.txt /tmp/runtime-lab-x7-result.json
           python3 - <<'PY'
           import base64, io, json, pathlib, tarfile
           from cryptography.hazmat.primitives import hashes, serialization
@@ -87,29 +75,30 @@ jobs:
               archive.extractall(root, filter='data')
           PY
 
-          {
-            echo '=== DOTNET INFO ==='
-            dotnet --info
-            echo '=== INSTALLED RUNTIMES ==='
-            dotnet --list-runtimes
-            echo '=== HARNESS OUTPUT ==='
-          } > /tmp/runtime-lab-x7-output.txt 2>&1
+          chmod 700 /tmp/runtime-lab-x7/run.sh
           set +e
-          dotnet run --project /tmp/runtime-lab-x7/MsrcBlazorCircuitBinding.csproj -c Release >> /tmp/runtime-lab-x7-output.txt 2>&1
+          timeout 52m bash /tmp/runtime-lab-x7/run.sh > /tmp/runtime-lab-x7-output.txt 2>&1
           status=$?
           set -e
 
           LAB_STATUS="$status" python3 - <<'PY'
-          import base64, json, os, pathlib
+          import base64, io, json, os, pathlib, tarfile
           from cryptography.hazmat.primitives import hashes, serialization
           from cryptography.hazmat.primitives.asymmetric import padding
           from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-          public_key = serialization.load_pem_public_key(
-              pathlib.Path('.ci/runtime-lab-x7/result_public.pem').read_bytes())
+          result_dir = pathlib.Path('/tmp/runtime-lab-x7/result')
+          bundle = io.BytesIO()
+          if result_dir.is_dir():
+              with tarfile.open(fileobj=bundle, mode='w:gz') as archive:
+                  for path in sorted(result_dir.rglob('*')):
+                      if path.is_file() and not path.is_symlink():
+                          archive.add(path, arcname=path.relative_to(result_dir), recursive=False)
+          public_key = serialization.load_pem_public_key(pathlib.Path('.ci/runtime-lab-x7/result_public.pem').read_bytes())
           raw = json.dumps({
               'exit_code': int(os.environ['LAB_STATUS']),
               'output': pathlib.Path('/tmp/runtime-lab-x7-output.txt').read_text(errors='replace'),
+              'bundle_tgz_b64': base64.b64encode(bundle.getvalue()).decode(),
           }, separators=(',', ':')).encode()
           key = os.urandom(32)
           nonce = os.urandom(12)
@@ -124,10 +113,9 @@ jobs:
           }, separators=(',', ':')))
           PY
           echo "exit_code=$status" >> "$GITHUB_OUTPUT"
-          echo "has_result=true" >> "$GITHUB_OUTPUT"
 
       - name: Upload encrypted result
-        if: always() && steps.execute.outputs.has_result == 'true'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: runtime-lab-x7-result
@@ -136,6 +124,6 @@ jobs:
           retention-days: 1
 
       - name: Propagate harness status
-        if: always() && steps.execute.outputs.has_result == 'true'
+        if: always()
         shell: bash
-        run: exit "${{ steps.execute.outputs.exit_code }}"
+        run: exit "${{ steps.execute.outputs.exit_code || '1' }}"
