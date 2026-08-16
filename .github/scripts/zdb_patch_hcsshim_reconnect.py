@@ -27,22 +27,40 @@ old = """\trequestChan := make(chan *Request)
 \tresponseErrChan := make(chan error)
 \tb.quitChan = make(chan bool)"""
 new = """\trequestChan := make(chan *Request)
-\trequestErrChan := make(chan error)
+\t// Error channels are single-result session channels. They must not be
+\t// closed by ListenAndServe while a connection-bound goroutine may still
+\t// publish its terminal result.
+\trequestErrChan := make(chan error, 1)
 \tresponseChan := make(chan bridgeResponse)
 \tb.responseChan = responseChan
-\tresponseErrChan := make(chan error)
-\tb.quitChan = make(chan bool)
+\tresponseErrChan := make(chan error, 1)
+\tquitChan := make(chan bool)
+\tb.quitChan = quitChan
 \tsessionDone := make(chan struct{})"""
 assert old in text
 text = text.replace(old, new, 1)
 
-old = """\tdefer b.disconnectNotifications()
-\tdefer close(b.quitChan)
+old = """\tdefer bridgeIn.Close()
+\tdefer close(requestErrChan)
+\tdefer close(requestChan)
+\tdefer bridgeOut.Close()
+\tdefer close(responseErrChan)
+\tdefer b.disconnectNotifications()
+\tdefer close(b.quitChan)"""
+new = """\tdefer bridgeIn.Close()
+\tdefer close(requestChan)
+\tdefer bridgeOut.Close()
+\tdefer b.disconnectNotifications()
+\t// Bind shutdown to this connection epoch rather than the mutable field.
+\tdefer close(quitChan)"""
+assert old in text
+text = text.replace(old, new, 1)
+
+old = """\tdefer close(quitChan)
 
 \tif b.Sequential {"""
-new = """\tdefer b.disconnectNotifications()
-\tdefer close(b.quitChan)
-\t// Close this before any old request handler can publish after reconnect.
+new = """\tdefer close(quitChan)
+\t// Close this first on return so late handlers drop their response.
 \tdefer close(sessionDone)
 
 \tif b.Sequential {"""
@@ -95,6 +113,13 @@ new = """\t\tfor req := range requestChan {
 \tgo func() {
 \t\tvar resperr error
 \t\tfor resp := range responseChan {"""
+assert old in text
+text = text.replace(old, new, 1)
+
+old = """\tcase <-b.quitChan:
+\t\t// The request loop needs to exit so that the teardown process begins."""
+new = """\tcase <-quitChan:
+\t\t// The request loop needs to exit so that the teardown process begins."""
 assert old in text
 text = text.replace(old, new, 1)
 
