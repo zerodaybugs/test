@@ -1,0 +1,266 @@
+name: Round 10 targeted Sui DeepBook Seal security gates
+
+on:
+  push:
+    branches:
+      - "sui-runtime-extract-20260815"
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - name: Clone exact public heads
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/r10/repos /tmp/r10/out
+          git clone --depth=1 https://github.com/MystenLabs/sui.git /tmp/r10/repos/sui
+          git clone --depth=1 https://github.com/MystenLabs/deepbookv3.git /tmp/r10/repos/deepbookv3
+          git clone --depth=1 https://github.com/MystenLabs/seal.git /tmp/r10/repos/seal
+          for r in sui deepbookv3 seal; do
+            git -C /tmp/r10/repos/$r rev-parse HEAD > /tmp/r10/out/${r}_HEAD.txt
+          done
+
+      - name: Static invariant and sibling-fix gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/r10/scan.py <<'PY'
+          import json, re
+          from pathlib import Path
+
+          ROOT=Path('/tmp/r10/repos')
+          OUT=Path('/tmp/r10/out')
+
+          def read(p):
+              return p.read_text(errors='ignore')
+
+          def functions(text):
+              # Brace-balanced Rust/Move function extraction, sufficient for evidence localization.
+              pat=re.compile(r'(?m)^\s*((?:public(?:\([^)]*\))?\s+)?(?:entry\s+)?(?:native\s+)?fun|(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn)\s+([A-Za-z_][A-Za-z0-9_]*)[^\{;]*\{')
+              out=[]
+              for m in pat.finditer(text):
+                  start=m.start(); brace=text.find('{',m.start(),m.end()+1)
+                  if brace<0: continue
+                  depth=0; end=None
+                  for i in range(brace,len(text)):
+                      if text[i]=='{': depth+=1
+                      elif text[i]=='}':
+                          depth-=1
+                          if depth==0:
+                              end=i+1; break
+                  if end:
+                      out.append({'name':m.group(2),'start':start,'end':end,'text':text[start:end]})
+              return out
+
+          def line_no(text,pos):
+              return text.count('\n',0,pos)+1
+
+          # 1. Sui accumulator type-bound sibling audit.
+          sui=ROOT/'sui'
+          acc=[]
+          for p in sui.rglob('*'):
+              if not p.is_file() or p.suffix not in ('.rs','.move'): continue
+              t=read(p)
+              if 'emit_accumulator_event' not in t: continue
+              for f in functions(t):
+                  if 'emit_accumulator_event' not in f['text']: continue
+                  calls=[m.start() for m in re.finditer(r'emit_accumulator_event\s*\(',f['text'])]
+                  for c in calls:
+                      prefix=f['text'][:c]
+                      bound='check_accumulator_type_bounds' in prefix
+                      conversion='type_to_type_tag' in prefix
+                      acc.append({
+                          'path':str(p.relative_to(sui)),
+                          'function':f['name'],
+                          'line':line_no(t,f['start']+c),
+                          'bound_before_emit':bound,
+                          'type_conversion_before_bound_or_emit':conversion,
+                          'snippet':f['text'][:12000],
+                      })
+          acc_gate={
+              'sites':acc,
+              'site_count':len(acc),
+              'missing_bound_count':sum(not x['bound_before_emit'] for x in acc),
+              'verdict':'PASS_ALL_EMIT_SITES_BOUNDED' if acc and all(x['bound_before_emit'] for x in acc) else ('CANDIDATE_MISSING_TYPE_BOUND' if acc else 'BLOCKED_NO_SITES_FOUND'),
+          }
+          (OUT/'SUI_ACCUMULATOR_TYPEBOUND_GATE.json').write_text(json.dumps(acc_gate,indent=2)+'\n')
+
+          # 2. Aliased signature one-to-one assignment gate.
+          alias=[]
+          for p in sui.rglob('*.rs'):
+              t=read(p)
+              if 'verify_sender_signed_data_message_signatures' not in t and 'required_signers' not in t: continue
+              if 'alias' not in t.lower(): continue
+              for f in functions(t):
+                  ft=f['text']; low=ft.lower()
+                  if 'required_signers' not in low and 'aliased' not in low: continue
+                  alias.append({
+                      'path':str(p.relative_to(sui)),
+                      'function':f['name'],
+                      'line':line_no(t,f['start']),
+                      'has_used_signature_tracking':bool(re.search(r'\b(used|visited|taken|matched_indices|signature_indices)\b',low)),
+                      'has_explicit_distinctness':bool(re.search(r'(distinct|one.to.one|bijection|matching|injective)',low)),
+                      'greedy_lookup':bool(re.search(r'\.find\s*\(|\.position\s*\(|find_map|first\s*\(',low)),
+                      'feature_flag':('fix_aliased_signer_signatures' in ft),
+                      'snippet':ft[:20000],
+                  })
+          alias_risky=[x for x in alias if x['greedy_lookup'] and not x['has_used_signature_tracking']]
+          alias_gate={
+              'functions':alias,
+              'risky_count':len(alias_risky),
+              'verdict':'CANDIDATE_GREEDY_SIGNATURE_REUSE' if alias_risky else ('PASS_ONE_TO_ONE_OR_NO_GREEDY_PATH' if alias else 'BLOCKED_NO_ALIAS_VERIFIER_FOUND'),
+          }
+          (OUT/'SUI_ALIAS_SIGNATURE_GATE.json').write_text(json.dumps(alias_gate,indent=2)+'\n')
+
+          # 3. Authentication fallback/domain inventory.
+          auth=[]
+          for p in sui.rglob('*.rs'):
+              t=read(p); low=t.lower()
+              if not any(k in low for k in ('zklogin','passkey','multisig')): continue
+              if not any(k in low for k in ('fallback','circuit','issuer','max_epoch','public_identifier')): continue
+              for f in functions(t):
+                  fl=f['text'].lower()
+                  if any(k in fl for k in ('fallback','circuit','issuer','max_epoch','public_identifier')):
+                      auth.append({
+                          'path':str(p.relative_to(sui)),
+                          'function':f['name'],
+                          'line':line_no(t,f['start']),
+                          'domains':{k:(k in fl) for k in ('issuer','max_epoch','circuit','public_identifier','legacy','fallback')},
+                          'snippet':f['text'][:16000],
+                      })
+          (OUT/'SUI_AUTH_DOMAIN_INVENTORY.json').write_text(json.dumps({'functions':auth,'count':len(auth),'verdict':'INVENTORY_ONLY_NEEDS_DIFFERENTIAL_TEST'},indent=2)+'\n')
+
+          # 4. DeepBook financial entrypoints and arithmetic inventory.
+          db=ROOT/'deepbookv3'
+          db_rows=[]
+          for p in db.rglob('*.move'):
+              t=read(p); low=t.lower()
+              if not any(k in low for k in ('liquidat','bad_debt','insurance','margin','rebate','self_match')): continue
+              for f in functions(t):
+                  fl=f['text'].lower()
+                  if not any(k in fl for k in ('liquidat','bad_debt','insurance','margin','rebate','self_match')): continue
+                  arithmetic=[]
+                  for n,l in enumerate(f['text'].splitlines(),1):
+                      if re.search(r'(/|mul_div|ceil|floor|round|as u64|as u128|overflow|underflow|checked_|saturat)',l,re.I):
+                          arithmetic.append({'relative_line':n,'text':l.strip()})
+                  db_rows.append({
+                      'path':str(p.relative_to(db)),
+                      'function':f['name'],
+                      'line':line_no(t,f['start']),
+                      'is_public':bool(re.match(r'\s*public',f['text'])),
+                      'has_sender_or_cap_check':bool(re.search(r'(sender|owner|admin|cap|authorized|assert!|permission)',fl)),
+                      'arithmetic':arithmetic,
+                      'snippet':f['text'][:20000],
+                  })
+          db_gate={
+              'functions':db_rows,
+              'count':len(db_rows),
+              'public_without_visible_auth_count':sum(x['is_public'] and not x['has_sender_or_cap_check'] for x in db_rows),
+              'verdict':'CANDIDATES_REQUIRE_NUMERIC_DIFFERENTIAL' if db_rows else 'BLOCKED_NO_FINANCIAL_SURFACE_FOUND',
+          }
+          (OUT/'DEEPBOOK_FINANCIAL_GATE.json').write_text(json.dumps(db_gate,indent=2)+'\n')
+
+          # 5. Seal cache key/domain inventory.
+          seal=ROOT/'seal'
+          seal_rows=[]
+          for p in seal.rglob('*'):
+              if not p.is_file() or p.suffix not in ('.rs','.ts','.tsx','.move'): continue
+              t=read(p); low=t.lower()
+              if not any(k in low for k in ('cache','lru','hashmap','dashmap','moka')): continue
+              if not any(k in low for k in ('decrypt','key','policy','identity','session')): continue
+              defs=[]
+              for n,l in enumerate(t.splitlines(),1):
+                  if re.search(r'(struct\s+\w*key|type\s+\w*key|cache.*key|hashmap|lru|dashmap|moka)',l,re.I):
+                      defs.append({'line':n,'text':l.strip()})
+              seal_rows.append({
+                  'path':str(p.relative_to(seal)),
+                  'key_defs':defs,
+                  'domain_terms':{k:(k in low) for k in ('policy','identity','epoch','package','object','session','threshold','network','chain','ptb','digest')},
+                  'snippet':t[:24000],
+              })
+          (OUT/'SEAL_CACHE_DOMAIN_GATE.json').write_text(json.dumps({'files':seal_rows,'count':len(seal_rows),'verdict':'INVENTORY_ONLY_NEEDS_CROSS_DOMAIN_REPRO'},indent=2)+'\n')
+
+          summary={
+              'sui_accumulator':acc_gate['verdict'],
+              'sui_alias':alias_gate['verdict'],
+              'deepbook':db_gate['verdict'],
+              'seal':'INVENTORY_ONLY_NEEDS_CROSS_DOMAIN_REPRO',
+              'submission_authorized':False,
+              'verdict':'STATIC_GATES_COMPLETE_NO_SUBMISSION_YET',
+          }
+          (OUT/'SUMMARY.json').write_text(json.dumps(summary,indent=2)+'\n')
+          PY
+          python3 /tmp/r10/scan.py
+
+      - name: Run targeted native and authorization tests
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          cd /tmp/r10/repos/sui
+          timeout 25m cargo test -p sui-types --lib signature_verification -- --nocapture > /tmp/r10/out/SUI_SIGNATURE_TEST.log 2>&1
+          echo $? > /tmp/r10/out/SUI_SIGNATURE_TEST.exit
+          timeout 20m cargo test -p sui-move-natives-latest --lib accumulator -- --nocapture > /tmp/r10/out/SUI_ACCUMULATOR_TEST.log 2>&1
+          echo $? > /tmp/r10/out/SUI_ACCUMULATOR_TEST.exit
+          exit 0
+
+      - name: Run Seal workspace tests
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          cd /tmp/r10/repos/seal
+          if [[ -f Cargo.toml ]]; then
+            timeout 20m cargo test --workspace --locked -- --nocapture > /tmp/r10/out/SEAL_TEST.log 2>&1
+            echo $? > /tmp/r10/out/SEAL_TEST.exit
+          else
+            echo 127 > /tmp/r10/out/SEAL_TEST.exit
+            echo 'No Cargo.toml at repository root' > /tmp/r10/out/SEAL_TEST.log
+          fi
+          exit 0
+
+      - name: Discover DeepBook canonical test commands
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/r10/repos/deepbookv3
+          find .github -type f -maxdepth 4 -print -exec sed -n '1,260p' {} \; > /tmp/r10/out/DEEPBOOK_CI_WORKFLOWS.txt 2>&1 || true
+          find . -maxdepth 4 -name Move.toml -o -name package.json -o -name Cargo.toml | sort > /tmp/r10/out/DEEPBOOK_PROJECTS.txt
+
+      - name: Build final machine gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          out=Path('/tmp/r10/out')
+          summary=json.loads((out/'SUMMARY.json').read_text())
+          tests={}
+          for name in ('SUI_SIGNATURE_TEST','SUI_ACCUMULATOR_TEST','SEAL_TEST'):
+              p=out/f'{name}.exit'
+              tests[name]=int(p.read_text().strip()) if p.exists() else None
+          final={
+              'static':summary,
+              'tests':tests,
+              'proven_critical':False,
+              'proven_high':False,
+              'submission_authorized':False,
+              'verdict':'RESEARCH_ONLY_PENDING_DYNAMIC_EXPLOIT_PROOF',
+          }
+          (out/'FINAL_GATE.json').write_text(json.dumps(final,indent=2)+'\n')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: round10-targeted-security-gates
+          path: /tmp/r10/out/
+          retention-days: 1
+          compression-level: 6
+          if-no-files-found: error
