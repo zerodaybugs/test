@@ -1,0 +1,177 @@
+name: kiln-r26-historical-reward-dilution-poc-v2
+
+on:
+  push:
+    branches: [agent/kiln-r25-compound-reward-dilution-20260816]
+    paths:
+      - kiln_r25/reward_dilution_gate.py
+      - kiln_r25/run_historical_replay.py
+      - .github/workflows/_temporary-kiln-r26-historical-reward-dilution-poc-v2-20260816.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  replay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 115
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/kiln-r25-compound-reward-dilution-20260816
+          fetch-depth: 1
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Install runtime
+        run: python3 -m pip install --disable-pip-version-check 'web3==7.13.0' 'requests==2.32.5'
+      - name: Verify scripts
+        run: |
+          python3 -m py_compile kiln_r25/reward_dilution_gate.py
+          python3 -m py_compile kiln_r25/run_historical_replay.py
+      - name: Ensure forge-std and mirror
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f lib/forge-std/src/Test.sol ]; then
+            rm -rf lib/forge-std
+            forge install foundry-rs/forge-std --no-git
+          fi
+          rm -rf mirror
+          git clone --depth 1 https://github.com/dumebi042/kiln-vault.git mirror
+      - name: Run R25 gate
+        id: r25
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          KILN_MIRROR=mirror python3 kiln_r25/reward_dilution_gate.py 2>&1 | tee r25_replay_gate.log
+      - name: Run R26 historical replay
+        id: r26
+        if: steps.r25.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 kiln_r25/run_historical_replay.py 2>&1 | tee r26_replay.log
+      - name: Build durable public gate
+        if: always()
+        shell: bash
+        env:
+          R25_OUTCOME: ${{ steps.r25.outcome }}
+          R26_OUTCOME: ${{ steps.r26.outcome }}
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,time
+          from pathlib import Path
+          source=None
+          for candidate in [Path('r26_results/PUBLIC_GATE.json'),Path('r26_results/MASTER_GATE.json'),Path('r25_results/PUBLIC_GATE.json'),Path('r25_results/MASTER_GATE.json')]:
+              if candidate.exists():
+                  try: source=json.loads(candidate.read_text()); break
+                  except Exception: pass
+          if source is None:
+              source={
+                'schema':'kiln-r26-fallback-gate-v2',
+                'decision':'INCONCLUSIVE_EXECUTION_FAILURE',
+                'submit_ready':False,
+                'validated_critical':0,
+                'validated_high':0,
+                'candidate_count':0,
+              }
+          public={k:v for k,v in source.items() if k not in {'submit_ready_zip','spec','rows','live_candidates','historical_candidates'}}
+          public.update({
+            'r25_step_outcome':os.environ.get('R25_OUTCOME'),
+            'r26_step_outcome':os.environ.get('R26_OUTCOME'),
+            'persisted_at_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+            'redacted':True,
+            'public_chain_state_changes':0,
+            'transactions_signed':0,
+            'transactions_sent':0,
+          })
+          if os.environ.get('R25_OUTCOME')!='success' or os.environ.get('R26_OUTCOME') not in {'success','skipped'}:
+              public['decision']='INCONCLUSIVE_EXECUTION_FAILURE'
+              public['submit_ready']=False
+              public['validated_critical']=0
+              public['validated_high']=0
+              for name in ('r25_replay_gate.log','r26_replay.log'):
+                  p=Path(name)
+                  if p.exists(): public[name.replace('.','_')+'_tail']=p.read_text(errors='replace')[-4000:]
+          out=Path('r26_public_gate_v2');out.mkdir(exist_ok=True)
+          p=out/'PUBLIC_GATE.json';p.write_text(json.dumps(public,indent=2,sort_keys=True))
+          (out/'SHA256SUMS.txt').write_text(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  PUBLIC_GATE.json\n")
+          PY
+      - name: Validate successful result when present
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,zipfile
+          from pathlib import Path
+          p=Path('r26_results/MASTER_GATE.json')
+          if p.exists():
+              gate=json.loads(p.read_text())
+              safety=gate.get('safety',{})
+              assert safety.get('public_chain_state_changes',0)==0
+              assert safety.get('transactions_signed',0)==0
+              assert safety.get('transactions_sent',0)==0
+          sums=Path('r26_results/SHA256SUMS.txt')
+          if sums.exists():
+              for line in sums.read_text().splitlines():
+                  h,name=line.split('  ',1)
+                  assert hashlib.sha256((Path('r26_results')/name).read_bytes()).hexdigest()==h
+          for zpath in Path('.').glob('KILN_OMNIVAULT_*_SUBMIT_READY_2026-08-16.zip'):
+              with zipfile.ZipFile(zpath) as z: assert z.testzip() is None
+          print('R26_V2_VALIDATION=PASS')
+          PY
+      - name: Persist gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf r26_public_gate
+          cp -R r26_public_gate_v2 r26_public_gate
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add r26_public_gate
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'persist Kiln R26 v2 replay gate'
+          for attempt in 1 2 3; do
+            git pull --rebase origin agent/kiln-r25-compound-reward-dilution-20260816
+            if git push origin HEAD:agent/kiln-r25-compound-reward-dilution-20260816; then exit 0; fi
+            sleep $((attempt * 3))
+          done
+          exit 1
+      - name: Stage submission package
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p submit_ready_delivery
+          find . -maxdepth 1 -type f \( -name 'KILN_OMNIVAULT_*_SUBMIT_READY_2026-08-16.zip' -o -name 'KILN_OMNIVAULT_*_SUBMIT_READY_2026-08-16.zip.sha256' \) -exec cp {} submit_ready_delivery/ \;
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kiln-r26-v2-private-evidence
+          path: |
+            r25_results
+            r26_results
+            r25_replay_gate.log
+            r26_replay.log
+            test/KilnR26PoC.t.sol
+            kiln_r25
+          if-no-files-found: warn
+          retention-days: 3
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kiln-r26-v2-public-gate
+          path: r26_public_gate_v2
+          if-no-files-found: error
+          retention-days: 3
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kiln-r26-v2-submit-ready
+          path: submit_ready_delivery
+          if-no-files-found: warn
+          retention-days: 3
