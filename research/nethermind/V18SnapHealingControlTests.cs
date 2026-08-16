@@ -45,8 +45,8 @@ public class V18SnapHealingControlTests : StateSyncFeedTestsBase
         remote.StateTree.Set(addressB, canonicalB);
         remote.StateTree.Commit();
 
-        byte[] rootNodeA = remote.StateDb[storageA.RootHash.Bytes]!;
-        byte[] rootNodeB = remote.StateDb[storageB.RootHash.Bytes]!;
+        byte[] rootNodeA = remote.TrieStore.LoadRlp(accountPathA, TreePath.Empty, storageA.RootHash)!;
+        byte[] rootNodeB = remote.TrieStore.LoadRlp(accountPathB, TreePath.Empty, storageB.RootHash)!;
         Assert.Multiple(() =>
         {
             Assert.That(rootNodeA, Is.Not.Null.And.Not.Empty);
