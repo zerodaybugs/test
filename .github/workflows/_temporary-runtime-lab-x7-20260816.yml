@@ -6,125 +6,214 @@ on:
       - runtime-lab-20260816-x7
     paths:
       - .github/workflows/_temporary-runtime-lab-x7-20260816.yml
-      - .ci/runtime-lab-x7/payload.json
-      - .ci/runtime-lab-x7/result_public.pem
 
 permissions:
   contents: read
 
 jobs:
-  lab:
+  exact-release-source-gate:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Restore branch-scoped ephemeral private key
-        id: keycache
-        uses: actions/cache@v4
-        with:
-          path: .runner-key/private.pem
-          key: runtime-lab-x7-ed64898f228407684877b7c000ce65e3
-
-      - name: Prepare key channel
-        id: prepare
+      - name: Clone exact release and current main
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p .runner-key
-          if [[ ! -s .runner-key/private.pem ]]; then
-            echo "cached decryption key is unavailable" >&2
-            exit 1
-          fi
-          openssl pkey -in .runner-key/private.pem -pubout -out .runner-key/public.pem >/dev/null 2>&1
-          echo "LAB_PUBLIC_KEY_SHA256=$(sha256sum .runner-key/public.pem | cut -d' ' -f1)"
-          echo "LAB_PUBLIC_KEY_B64=$(base64 -w0 .runner-key/public.pem)"
-          test -s .ci/runtime-lab-x7/payload.json
-          test -s .ci/runtime-lab-x7/result_public.pem
+          rm -rf /tmp/openvmm-release /tmp/openvmm-main /tmp/openvmm-gate
+          mkdir -p /tmp/openvmm-gate
 
-      - name: Decrypt and execute isolated payload
-        id: execute
+          git clone --filter=blob:none --no-checkout https://github.com/microsoft/openvmm.git /tmp/openvmm-release
+          cd /tmp/openvmm-release
+          git fetch --depth=1 origin ee2fc3ffe2a816135374921d34b2fdf2990fd072
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "ee2fc3ffe2a816135374921d34b2fdf2990fd072"
+
+          git clone --filter=blob:none --depth=1 https://github.com/microsoft/openvmm.git /tmp/openvmm-main
+
+          {
+            echo "EXACT_RELEASE_COMMIT=$(git -C /tmp/openvmm-release rev-parse HEAD)"
+            echo "CURRENT_MAIN_COMMIT=$(git -C /tmp/openvmm-main rev-parse HEAD)"
+            echo "RUSTC=$(rustc --version)"
+            echo "CARGO=$(cargo --version)"
+          } | tee /tmp/openvmm-gate/environment.txt
+
+      - name: Extract trust-epoch and reserved-state evidence
         shell: bash
         run: |
           set -euo pipefail
-          python3 -c 'import cryptography' 2>/dev/null || python3 -m pip install --user --disable-pip-version-check cryptography >/dev/null
-          rm -rf /tmp/runtime-lab-x7 /tmp/runtime-lab-x7-output.txt /tmp/runtime-lab-x7-result.json
           python3 - <<'PY'
-          import base64, io, json, pathlib, tarfile
-          from cryptography.hazmat.primitives import hashes, serialization
-          from cryptography.hazmat.primitives.asymmetric import padding
-          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          from pathlib import Path
+          import json, re
 
-          payload = json.loads(pathlib.Path('.ci/runtime-lab-x7/payload.json').read_text())
-          private_key = serialization.load_pem_private_key(pathlib.Path('.runner-key/private.pem').read_bytes(), password=None)
-          key = private_key.decrypt(
-              base64.b64decode(payload['encrypted_key']),
-              padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=b'runtime-lab-x7-key'))
-          plaintext = AESGCM(key).decrypt(
-              base64.b64decode(payload['nonce']),
-              base64.b64decode(payload['ciphertext']),
-              b'runtime-lab-x7-payload')
-          root = pathlib.Path('/tmp/runtime-lab-x7')
-          root.mkdir(parents=True, exist_ok=True)
-          with tarfile.open(fileobj=io.BytesIO(plaintext), mode='r:gz') as archive:
-              for member in archive.getmembers():
-                  candidate = (root / member.name).resolve()
-                  if root.resolve() not in candidate.parents and candidate != root.resolve():
-                      raise RuntimeError('unsafe archive path')
-                  if member.issym() or member.islnk():
-                      raise RuntimeError('links are forbidden')
-              archive.extractall(root, filter='data')
+          out = Path('/tmp/openvmm-gate')
+          roots = {
+              'release': Path('/tmp/openvmm-release'),
+              'main': Path('/tmp/openvmm-main'),
+          }
+          patterns = {
+              'trust_epoch_todo': r"Don't allow trusted messages if an untrusted connection was ever used",
+              'untrusted_message_error': r'UntrustedMessage',
+              'reserved_state': r'ReservedState',
+              'restore_channel': r'restore_channel',
+              'confidential_ring_buffer': r'confidential_ring_buffer',
+              'confidential_channels': r'confidential_channels',
+              'select_gm_for_channel': r'select_gm_for_channel',
+              'open_reserved_channel': r'OPEN_RESERVED_CHANNEL|OpenReservedChannel|handle_open_reserved_channel',
+              'save_restore_reserved_test': r'test_.*save.*restore.*reserved|test_.*reserved.*restore',
+          }
+          files = [
+              'vm/devices/vmbus/vmbus_server/src/channels.rs',
+              'vm/devices/vmbus/vmbus_server/src/channels/saved_state.rs',
+              'vm/devices/vmbus/vmbus_server/src/channels/tests.rs',
+              'vm/devices/vmbus/vmbus_server/src/lib.rs',
+              'vm/devices/vmbus/vmbus_channel/src/bus.rs',
+              'vm/devices/vmbus/vmbus_channel/src/channel.rs',
+              'vm/devices/vmbus/vmbus_channel/src/gpadl_ring.rs',
+          ]
+          summary = {}
+          contexts = []
+          for label, root in roots.items():
+              summary[label] = {}
+              for key, pattern in patterns.items():
+                  rx = re.compile(pattern, re.I)
+                  hits = []
+                  for rel in files:
+                      path = root / rel
+                      if not path.exists():
+                          continue
+                      lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+                      for i, line in enumerate(lines):
+                          if rx.search(line):
+                              hits.append({'file': rel, 'line': i + 1, 'text': line.strip()})
+                              lo, hi = max(0, i - 10), min(len(lines), i + 18)
+                              contexts.append(
+                                  f"===== {label}:{rel}:{i+1} [{key}] =====\n" +
+                                  '\n'.join(f'{j+1:6d}: {lines[j]}' for j in range(lo, hi)) + '\n'
+                              )
+                  summary[label][key] = hits
+          (out / 'source_scan.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+          (out / 'source_contexts.txt').write_text('\n'.join(contexts), encoding='utf-8')
           PY
 
-          chmod 700 /tmp/runtime-lab-x7/run.sh
-          set +e
-          timeout 52m bash /tmp/runtime-lab-x7/run.sh > /tmp/runtime-lab-x7-output.txt 2>&1
-          status=$?
-          set -e
+      - name: Build exact vmbus_server test target
+        id: build
+        shell: bash
+        run: |
+          set -o pipefail
+          cd /tmp/openvmm-release
+          cargo test -p vmbus_server --no-run 2>&1 | tee /tmp/openvmm-gate/build.log
 
-          LAB_STATUS="$status" python3 - <<'PY'
-          import base64, io, json, os, pathlib, tarfile
-          from cryptography.hazmat.primitives import hashes, serialization
-          from cryptography.hazmat.primitives.asymmetric import padding
-          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+      - name: Enumerate and run relevant exact-release tests
+        id: tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cd /tmp/openvmm-release
+          cargo test -p vmbus_server -- --list 2>&1 | tee /tmp/openvmm-gate/test-list.log
 
-          result_dir = pathlib.Path('/tmp/runtime-lab-x7/result')
-          bundle = io.BytesIO()
-          if result_dir.is_dir():
-              with tarfile.open(fileobj=bundle, mode='w:gz') as archive:
-                  for path in sorted(result_dir.rglob('*')):
-                      if path.is_file() and not path.is_symlink():
-                          archive.add(path, arcname=path.relative_to(result_dir), recursive=False)
-          public_key = serialization.load_pem_public_key(pathlib.Path('.ci/runtime-lab-x7/result_public.pem').read_bytes())
-          raw = json.dumps({
-              'exit_code': int(os.environ['LAB_STATUS']),
-              'output': pathlib.Path('/tmp/runtime-lab-x7-output.txt').read_text(errors='replace'),
-              'bundle_tgz_b64': base64.b64encode(bundle.getvalue()).decode(),
-          }, separators=(',', ':')).encode()
-          key = os.urandom(32)
-          nonce = os.urandom(12)
-          ciphertext = AESGCM(key).encrypt(nonce, raw, b'runtime-lab-x7-result')
-          encrypted_key = public_key.encrypt(
-              key,
-              padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=b'runtime-lab-x7-result-key'))
-          pathlib.Path('/tmp/runtime-lab-x7-result.json').write_text(json.dumps({
-              'encrypted_key': base64.b64encode(encrypted_key).decode(),
-              'nonce': base64.b64encode(nonce).decode(),
-              'ciphertext': base64.b64encode(ciphertext).decode(),
-          }, separators=(',', ':')))
+          mapfile -t tests < <(
+            grep -E 'test: ' /tmp/openvmm-gate/test-list.log \
+              | sed -E 's/: test$//' \
+              | grep -Ei '(confidential|reserved|save.*restore|restore.*save|disconnect)' \
+              | sort -u
+          )
+
+          printf '%s\n' "${tests[@]}" > /tmp/openvmm-gate/selected-tests.txt
+          : > /tmp/openvmm-gate/selected-tests.log
+          rc=0
+          for test_name in "${tests[@]}"; do
+            echo "===== RUN $test_name =====" | tee -a /tmp/openvmm-gate/selected-tests.log
+            cargo test -p vmbus_server "$test_name" -- --exact --nocapture 2>&1 \
+              | tee -a /tmp/openvmm-gate/selected-tests.log || rc=1
+          done
+          exit "$rc"
+
+      - name: Produce machine verdict
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, re, subprocess
+
+          out = Path('/tmp/openvmm-gate')
+          scan = json.loads((out / 'source_scan.json').read_text())
+          build_log = (out / 'build.log').read_text(errors='replace') if (out / 'build.log').exists() else ''
+          test_log = (out / 'selected-tests.log').read_text(errors='replace') if (out / 'selected-tests.log').exists() else ''
+          selected = (out / 'selected-tests.txt').read_text(errors='replace').splitlines() if (out / 'selected-tests.txt').exists() else []
+
+          exact = subprocess.check_output(['git', '-C', '/tmp/openvmm-release', 'rev-parse', 'HEAD'], text=True).strip()
+          main = subprocess.check_output(['git', '-C', '/tmp/openvmm-main', 'rev-parse', 'HEAD'], text=True).strip()
+
+          release = scan.get('release', {})
+          current = scan.get('main', {})
+          structural = all(bool(release.get(k)) for k in (
+              'trust_epoch_todo',
+              'reserved_state',
+              'restore_channel',
+              'confidential_ring_buffer',
+              'open_reserved_channel',
+          ))
+          current_persists = all(bool(current.get(k)) for k in (
+              'reserved_state',
+              'restore_channel',
+              'confidential_ring_buffer',
+              'open_reserved_channel',
+          ))
+          build_pass = 'Finished `test`' in build_log or 'Finished `test` profile' in build_log
+          tests_pass = bool(selected) and 'test result: FAILED' not in test_log and test_log.count('test result: ok') >= len(selected)
+
+          verdict = {
+              'candidate_id': 'MS-OHCL-CVMBUS-TRUSTEPOCH-01',
+              'exact_release_commit': exact,
+              'current_main_commit': main,
+              'selected_test_count': len(selected),
+              'selected_tests': selected,
+              'exact_release_build_pass': build_pass,
+              'selected_tests_pass': tests_pass,
+              'release_structural_primitive': structural,
+              'current_main_related_mechanism_present': current_persists,
+              'production_binding_gate': False,
+              'private_memory_read_or_write_gate': False,
+              'deterministic_10_of_10_exploit_gate': False,
+              'scope_gate': False,
+              'duplicate_gate': False,
+              'critical_confirmed': False,
+              'submit_ready': False,
+              'verdict': 'HOLD_NOT_FOR_SUBMISSION',
+              'blocker': 'No production reserved confidential channel and no deterministic private VTL0 memory read/write impact proof.',
+          }
+          (out / 'MACHINE_VERDICT.json').write_text(json.dumps(verdict, indent=2), encoding='utf-8')
+          (out / 'READ_ME_FIRST.txt').write_text(
+              '\n'.join([
+                  'OPENHCL / OPENVMM TRUST-EPOCH EXACT-RELEASE GATE',
+                  '=' * 72,
+                  f'EXACT_RELEASE_COMMIT={exact}',
+                  f'CURRENT_MAIN_COMMIT={main}',
+                  f'EXACT_RELEASE_BUILD_PASS={build_pass}',
+                  f'SELECTED_TEST_COUNT={len(selected)}',
+                  f'SELECTED_TESTS_PASS={tests_pass}',
+                  f'RELEASE_STRUCTURAL_PRIMITIVE={structural}',
+                  f'CURRENT_MAIN_RELATED_MECHANISM_PRESENT={current_persists}',
+                  'PRODUCTION_BINDING_GATE=False',
+                  'PRIVATE_MEMORY_READ_OR_WRITE_GATE=False',
+                  'CRITICAL_CONFIRMED=False',
+                  'SUBMIT_READY=False',
+                  'VERDICT=HOLD_NOT_FOR_SUBMISSION',
+                  '',
+                  'This is a public-source research checkpoint. Do not submit it to MSRC.',
+              ]) + '\n', encoding='utf-8')
           PY
-          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          cd /tmp/openvmm-gate
+          find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0 \
+            | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
 
-      - name: Upload encrypted result
+      - name: Upload public-source checkpoint
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: runtime-lab-x7-result
-          path: /tmp/runtime-lab-x7-result.json
+          name: openvmm-trustepoch-exact-release-gate
+          path: /tmp/openvmm-gate
           if-no-files-found: error
           retention-days: 1
-
-      - name: Propagate harness status
-        if: always()
-        shell: bash
-        run: exit "${{ steps.execute.outputs.exit_code || '1' }}"
