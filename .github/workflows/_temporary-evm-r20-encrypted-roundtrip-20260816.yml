@@ -1,0 +1,154 @@
+name: evm-r20-encrypted-local-fork-roundtrip
+
+on:
+  push:
+    branches: [agent/evm-readonly-encrypted-20260816]
+    paths:
+      - tmp_evm_encrypted/generate_r20_roundtrip.py
+      - tmp_evm_encrypted/r19_public.pem
+      - .github/workflows/_temporary-evm-r20-encrypted-roundtrip-20260816.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  roundtrip:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - chain_name: ethereum
+            chain_id: 1
+          - chain_name: optimism
+            chain_id: 10
+          - chain_name: bnb
+            chain_id: 56
+          - chain_name: polygon
+            chain_id: 137
+          - chain_name: base
+            chain_id: 8453
+          - chain_name: arbitrum
+            chain_id: 42161
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      R20_CHAIN_NAME: ${{ matrix.chain_name }}
+      R20_CHAIN_ID: ${{ matrix.chain_id }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/evm-readonly-encrypted-20260816
+          fetch-depth: 1
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Install pinned generator dependency
+        run: python3 -m pip install --disable-pip-version-check 'web3==7.13.0'
+
+      - name: Select a matching public RPC
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, requests
+          chain = int(os.environ['R20_CHAIN_ID'])
+          urls = {
+              1: ['https://eth.llamarpc.com','https://1rpc.io/eth','https://eth.drpc.org','https://rpc.flashbots.net','https://ethereum-rpc.publicnode.com'],
+              10: ['https://optimism.llamarpc.com','https://optimism-rpc.publicnode.com','https://mainnet.optimism.io'],
+              56: ['https://binance.llamarpc.com','https://bsc-rpc.publicnode.com','https://bsc-dataseed.binance.org'],
+              137: ['https://polygon.llamarpc.com','https://polygon-bor-rpc.publicnode.com','https://polygon-rpc.com'],
+              8453: ['https://base.llamarpc.com','https://base-rpc.publicnode.com','https://mainnet.base.org'],
+              42161: ['https://arbitrum.llamarpc.com','https://arbitrum-one-rpc.publicnode.com','https://arb1.arbitrum.io/rpc'],
+          }[chain]
+          errors=[]
+          for url in urls:
+              try:
+                  r=requests.post(url,json={'jsonrpc':'2.0','id':1,'method':'eth_chainId','params':[]},timeout=20)
+                  r.raise_for_status(); d=r.json()
+                  if int(d['result'],16)==chain:
+                      with open(os.environ['GITHUB_ENV'],'a') as f: f.write(f'R20_RPC_URL={url}\n')
+                      print('RPC_SELECTION=PASS')
+                      break
+              except Exception as e: errors.append(f'{url}: {type(e).__name__}: {e}')
+          else:
+              raise SystemExit('no matching RPC | '+' | '.join(errors))
+          PY
+
+      - name: Generate exact-chain test and input snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tmp_evm_encrypted/generate_r20_roundtrip.py > /tmp/r20_generation.log 2>&1
+          python3 - <<'PY'
+          import requests
+          u='https://raw.githubusercontent.com/zerodaybugs/test/agent/kiln-omnivault-r11-readonly/r13_persisted_results/31910466827/r13_generation/SCOPE.json'
+          r=requests.get(u,timeout=45); r.raise_for_status(); open('/tmp/r20_scope.json','wb').write(r.content)
+          PY
+          sha256sum test/KilnR20RoundTrip.t.sol /tmp/r20_scope.json > /tmp/r20_inputs.sha256
+
+      - name: Execute fixed-block local-fork round trips privately
+        shell: bash
+        run: |
+          set +e
+          forge test --via-ir --match-contract KilnR20RoundTrip -vvv > /tmp/r20_forge.log 2>&1
+          code=$?
+          set -e
+          printf '%s\n' "$code" > /tmp/r20_exit_code.txt
+          forge --version > /tmp/r20_foundry_version.txt
+          echo 'R20_PRIVATE_EXECUTION_RECORDED'
+
+      - name: Encrypt complete chain result
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted_r20
+          tar -czf /tmp/r20_payload.tar.gz \
+            test/KilnR20RoundTrip.t.sol \
+            /tmp/r20_generation.log \
+            /tmp/r20_scope.json \
+            /tmp/r20_inputs.sha256 \
+            /tmp/r20_forge.log \
+            /tmp/r20_exit_code.txt \
+            /tmp/r20_foundry_version.txt
+          openssl rand 32 > /tmp/r20_aes.key
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 250000 \
+            -in /tmp/r20_payload.tar.gz \
+            -out encrypted_r20/payload.aes256 \
+            -pass file:/tmp/r20_aes.key
+          openssl pkeyutl -encrypt -pubin \
+            -inkey tmp_evm_encrypted/r19_public.pem \
+            -in /tmp/r20_aes.key \
+            -out encrypted_r20/key.rsa3072 \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          sha256sum encrypted_r20/payload.aes256 encrypted_r20/key.rsa3072 > encrypted_r20/SHA256SUMS.txt
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          manifest={
+            'schema':'encrypted-r20-local-fork-delivery-v1',
+            'chain_name':os.environ['R20_CHAIN_NAME'],
+            'chain_id':int(os.environ['R20_CHAIN_ID']),
+            'forge_exit_code':int(Path('/tmp/r20_exit_code.txt').read_text().strip()),
+            'source_commit':'${{ github.sha }}',
+            'plaintext_results_publicly_exposed':False,
+            'public_chain_transactions_signed':0,
+            'public_chain_transactions_sent':0,
+            'execution':'fixed-block local fork only',
+            'encryption':'AES-256-CBC/PBKDF2-250000 + RSA-3072-OAEP-SHA256 wrapped key',
+          }
+          Path('encrypted_r20/PUBLIC_MANIFEST.json').write_text(json.dumps(manifest,indent=2,sort_keys=True))
+          PY
+          rm -f /tmp/r20_payload.tar.gz /tmp/r20_aes.key /tmp/r20_forge.log /tmp/r20_exit_code.txt /tmp/r20_scope.json /tmp/r20_inputs.sha256 /tmp/r20_generation.log
+          rm -f test/KilnR20RoundTrip.t.sol
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-r20-${{ matrix.chain_name }}
+          path: encrypted_r20
+          if-no-files-found: error
+          retention-days: 1
