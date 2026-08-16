@@ -1,0 +1,213 @@
+name: kiln-r22-redeem-delta-invariant
+
+on:
+  push:
+    branches: [agent/kiln-r21-connector-source-delta-20260816]
+    paths:
+      - tmp_kiln_r21_delta/generate_r22_redeem_delta.py
+      - tmp_kiln_r21_delta/r21_source_delta_scan.py
+      - tmp_kiln_r21_delta/r19_public.pem
+      - .github/workflows/_temporary-kiln-r22-redeem-delta-20260816.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  redeem-delta:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/kiln-r21-connector-source-delta-20260816
+          fetch-depth: 1
+
+      - name: Install pinned runtime
+        run: |
+          python3 -m pip install --disable-pip-version-check \
+            'requests==2.32.5' 'web3==7.13.0' 'eth-abi==5.2.0'
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Resolve current scope read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tmp_kiln_r21_delta/r21_source_delta_scan.py > r22_scope_public.log
+          cat r21_delta_results/PUBLIC_GATE.json
+
+      - name: Execute redeem-delta invariant on fixed local forks
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p r22_logs
+          run_chain() {
+            chain="$1"; name="$2"; shift 2
+            rpc=""
+            for url in "$@"; do
+              got="$(cast chain-id --rpc-url "$url" 2>/dev/null || true)"
+              if [ "$got" = "$chain" ]; then rpc="$url"; break; fi
+            done
+            if [ -z "$rpc" ]; then
+              printf '{"chain_id":%s,"network":"%s","status":"rpc_unavailable"}\n' "$chain" "$name" \
+                > "r22_logs/${name}.status.json"
+              return 0
+            fi
+            block="$(cast block-number --rpc-url "$rpc")"
+            R22_CHAIN_ID="$chain" python3 tmp_kiln_r21_delta/generate_r22_redeem_delta.py \
+              > "r22_logs/${name}.generation.log"
+            set +e
+            forge test \
+              --match-path test/KilnR22RedeemDeltaInvariant.t.sol \
+              --fork-url "$rpc" --fork-block-number "$block" \
+              --via-ir -vv \
+              > "r22_logs/${name}.forge.log" 2>&1
+            code=$?
+            set -e
+            reported="$(grep -c 'R22_REPORTED_RECEIVED_MISMATCH' "r22_logs/${name}.forge.log" || true)"
+            preview="$(grep -c 'R22_PREVIEW_RECEIVED_MISMATCH' "r22_logs/${name}.forge.log" || true)"
+            freeze="$(grep -c 'R22_REDEEM_REVERT_WITH_ADVERTISED_LIQUIDITY' "r22_logs/${name}.forge.log" || true)"
+            residual="$(grep -c 'R22_RESIDUAL_SHARES_AFTER_FULL_REDEEM' "r22_logs/${name}.forge.log" || true)"
+            python3 - "$chain" "$name" "$block" "$code" "$reported" "$preview" "$freeze" "$residual" <<'PY'
+          import json,sys
+          from pathlib import Path
+          chain,name,block,code,reported,preview,freeze,residual=sys.argv[1:]
+          out={
+            'chain_id':int(chain),'network':name,'fixed_block':int(block),
+            'forge_exit_code':int(code),
+            'reported_received_mismatch_count':int(reported),
+            'preview_received_mismatch_count':int(preview),
+            'advertised_liquidity_revert_count':int(freeze),
+            'residual_share_count':int(residual),
+            'public_chain_mutations':0,'transactions_signed':0,'transactions_sent':0,
+          }
+          Path(f'r22_logs/{name}.status.json').write_text(json.dumps(out,indent=2,sort_keys=True))
+          PY
+          }
+          run_chain 1 ethereum \
+            https://eth.llamarpc.com https://1rpc.io/eth https://rpc.flashbots.net
+          run_chain 10 optimism \
+            https://optimism.llamarpc.com https://optimism-rpc.publicnode.com https://mainnet.optimism.io
+          run_chain 56 bnb \
+            https://binance.llamarpc.com https://bsc-rpc.publicnode.com https://bsc-dataseed.binance.org
+          run_chain 137 polygon \
+            https://polygon.llamarpc.com https://polygon-bor-rpc.publicnode.com https://polygon-rpc.com
+          run_chain 8453 base \
+            https://base.llamarpc.com https://base-rpc.publicnode.com https://mainnet.base.org
+          run_chain 42161 arbitrum \
+            https://arbitrum.llamarpc.com https://arbitrum-one-rpc.publicnode.com https://arb1.arbitrum.io/rpc
+
+      - name: Build strict public gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          statuses=[json.loads(p.read_text()) for p in sorted(Path('r22_logs').glob('*.status.json'))]
+          classes={
+            'reported_received_mismatch_count':sum(int(x.get('reported_received_mismatch_count',0)) for x in statuses),
+            'preview_received_mismatch_count':sum(int(x.get('preview_received_mismatch_count',0)) for x in statuses),
+            'advertised_liquidity_revert_count':sum(int(x.get('advertised_liquidity_revert_count',0)) for x in statuses),
+            'residual_share_count':sum(int(x.get('residual_share_count',0)) for x in statuses),
+          }
+          total=sum(classes.values())
+          infra=[x for x in statuses if x.get('status')=='rpc_unavailable' or int(x.get('forge_exit_code',0))!=0]
+          decision='PROMOTE_R23_CANDIDATE_SPECIFIC_REPRODUCTION' if total else (
+            'INCONCLUSIVE_INFRA_FAILURE' if infra else 'NO_REDEEM_DELTA_INVARIANT_BREAK'
+          )
+          gate={
+            'schema':'kiln-r22-public-gate-v1',
+            'decision':decision,
+            'submit_ready':False,
+            'validated_critical':0,
+            'validated_high':0,
+            'candidate_count':total,
+            'candidate_class_counts':classes,
+            'chain_statuses':statuses,
+            'public_chain_mutations':0,
+            'transactions_signed':0,
+            'transactions_sent':0,
+            'promotion_requirements':[
+              'isolate one exact vault and block',
+              'repeat five times',
+              'prove material victim delta',
+              'patched negative control',
+              'duplicate clearance',
+            ] if total else [],
+          }
+          Path('R22_PUBLIC_GATE.json').write_text(json.dumps(gate,indent=2,sort_keys=True))
+          print(json.dumps(gate,sort_keys=True))
+          PY
+
+      - name: Encrypt evidence and create deterministic checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted_r22 evidence/kiln-r22-redeem-delta
+          tar -czf /tmp/r22_payload.tar.gz \
+            r21_delta_results r22_logs \
+            test/KilnR22RedeemDeltaInvariant.t.sol \
+            tmp_kiln_r21_delta/generate_r22_redeem_delta.py \
+            R22_PUBLIC_GATE.json r22_scope_public.log
+          openssl rand 32 > /tmp/r22_aes.key
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 250000 \
+            -in /tmp/r22_payload.tar.gz \
+            -out encrypted_r22/payload.aes256 \
+            -pass file:/tmp/r22_aes.key
+          openssl pkeyutl -encrypt -pubin \
+            -inkey tmp_kiln_r21_delta/r19_public.pem \
+            -in /tmp/r22_aes.key \
+            -out encrypted_r22/key.rsa3072 \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          cp R22_PUBLIC_GATE.json encrypted_r22/
+          sha256sum encrypted_r22/payload.aes256 encrypted_r22/key.rsa3072 \
+            encrypted_r22/R22_PUBLIC_GATE.json > encrypted_r22/SHA256SUMS.txt
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          gate=json.loads(Path('R22_PUBLIC_GATE.json').read_text())
+          Path('encrypted_r22/PUBLIC_MANIFEST.json').write_text(json.dumps({
+            'schema':'kiln-r22-encrypted-checkpoint-v1',
+            'workflow_run':'${{ github.run_id }}',
+            'source_commit':'${{ github.sha }}',
+            'decision':gate['decision'],
+            'submit_ready':False,
+            'encryption':'AES-256-CBC/PBKDF2-250000 + RSA-3072-OAEP-SHA256',
+            'public_chain_mutations':0,'transactions_signed':0,'transactions_sent':0,
+          },indent=2,sort_keys=True))
+          PY
+          (cd encrypted_r22 && zip -q -9 ../KILN_OMNIVAULT_R22_REDEEM_DELTA_CHECKPOINT_NOT_FOR_SUBMISSION_2026-08-16.zip ./*)
+          cp R22_PUBLIC_GATE.json evidence/kiln-r22-redeem-delta/
+          cp KILN_OMNIVAULT_R22_REDEEM_DELTA_CHECKPOINT_NOT_FOR_SUBMISSION_2026-08-16.zip evidence/kiln-r22-redeem-delta/
+          sha256sum KILN_OMNIVAULT_R22_REDEEM_DELTA_CHECKPOINT_NOT_FOR_SUBMISSION_2026-08-16.zip \
+            > evidence/kiln-r22-redeem-delta/CHECKPOINT_SHA256.txt
+          rm -f /tmp/r22_payload.tar.gz /tmp/r22_aes.key
+
+      - name: Persist public gate and encrypted checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add evidence/kiln-r22-redeem-delta
+          git commit -m "persist Kiln R22 redeem-delta checkpoint ${{ github.run_id }}"
+          for attempt in 1 2 3; do
+            git pull --rebase origin agent/kiln-r21-connector-source-delta-20260816
+            if git push origin HEAD:agent/kiln-r21-connector-source-delta-20260816; then exit 0; fi
+            sleep $((attempt * 2))
+          done
+          exit 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kiln-r22-redeem-delta-checkpoint
+          path: |
+            R22_PUBLIC_GATE.json
+            encrypted_r22
+            KILN_OMNIVAULT_R22_REDEEM_DELTA_CHECKPOINT_NOT_FOR_SUBMISSION_2026-08-16.zip
+          if-no-files-found: error
+          retention-days: 3
