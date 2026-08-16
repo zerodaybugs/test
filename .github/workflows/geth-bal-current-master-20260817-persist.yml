@@ -1,0 +1,98 @@
+name: Persist current Geth EIP-7928 gate
+
+on:
+  push:
+    branches:
+      - tmp/geth-bal-current-master-20260817
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout result branch
+        uses: actions/checkout@v6
+        with:
+          path: control
+          fetch-depth: 1
+
+      - name: Checkout current Geth master
+        uses: actions/checkout@v6
+        with:
+          repository: ethereum/go-ethereum
+          ref: master
+          path: geth
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: geth/go.mod
+          cache: true
+          cache-dependency-path: geth/go.sum
+
+      - name: Run exact current official gates
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          mkdir -p out
+          git -C geth rev-parse HEAD > out/commit.txt
+          git -C geth show -s --format=fuller HEAD > out/commit-full.txt
+          go version > out/go-version.txt
+          cd geth
+          go test ./core -run 'EIP7928|BlockAccess|BAL' -count=10 -timeout=60m -v 2>&1 | tee ../out/focused.log
+          focused=${PIPESTATUS[0]}
+          go test -race ./core -run 'EIP7928|BlockAccess|BAL' -count=1 -timeout=60m -v 2>&1 | tee ../out/race.log
+          race=${PIPESTATUS[0]}
+          cd ..
+          printf '%s\n' "$focused" > out/focused.rc
+          printf '%s\n' "$race" > out/race.rc
+          exit 0
+
+      - name: Build and persist machine decision
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json, re
+          out=Path('out')
+          focused=int((out/'focused.rc').read_text().strip())
+          race=int((out/'race.rc').read_text().strip())
+          logs=(out/'focused.log').read_text(errors='replace')+'\n'+(out/'race.log').read_text(errors='replace')
+          d={
+            'schema':'geth-current-eip7928-official-persist-v1',
+            'commit':(out/'commit.txt').read_text().strip(),
+            'focused_10x_exit_code':focused,
+            'race_1x_exit_code':race,
+            'focused_10x_pass':focused==0,
+            'race_1x_pass':race==0,
+            'panic_signal':bool(re.search(r'panic:',logs,re.I)),
+            'data_race_signal':'DATA RACE' in logs,
+            'technical_decision':'CURRENT_MASTER_OFFICIAL_GATE_CLEAN' if focused==0 and race==0 else 'CURRENT_MASTER_GATE_REVIEW_REQUIRED',
+            'submit_ready':False,
+          }
+          target=Path('control/research/geth-bal-current/results')
+          target.mkdir(parents=True,exist_ok=True)
+          (target/'CURRENT_MACHINE_DECISION.json').write_text(json.dumps(d,indent=2))
+          (target/'CURRENT_COMMIT.txt').write_text(d['commit']+'\n')
+          (target/'FOCUSED_LOG_TAIL.txt').write_text((out/'focused.log').read_text(errors='replace')[-200000:])
+          (target/'RACE_LOG_TAIL.txt').write_text((out/'race.log').read_text(errors='replace')[-200000:])
+          with (target/'SHA256SUMS').open('w') as fh:
+            for p in sorted(x for x in target.iterdir() if x.is_file() and x.name!='SHA256SUMS'):
+              fh.write(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n')
+          print(json.dumps(d,indent=2))
+          PY
+          cd control
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add research/geth-bal-current/results
+          if ! git diff --cached --quiet; then
+            git commit -m 'research: persist current Geth BAL gate [skip ci]'
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
