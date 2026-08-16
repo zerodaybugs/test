@@ -1,0 +1,136 @@
+name: kiln-r21-source-runtime-delta
+
+on:
+  push:
+    branches: [agent/kiln-r21-connector-source-delta-20260816]
+    paths:
+      - tmp_kiln_r21_delta/**
+      - .github/workflows/_temporary-kiln-r21-source-delta-20260816.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  delta:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/kiln-r21-connector-source-delta-20260816
+          fetch-depth: 1
+
+      - name: Install pinned read-only runtime
+        run: |
+          python3 -m pip install --disable-pip-version-check \
+            'requests==2.32.5' 'web3==7.13.0' 'eth-abi==5.2.0'
+
+      - name: Run current-scope source and runtime delta scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tmp_kiln_r21_delta/r21_source_delta_scan.py \
+            | tee r21_public_run.log
+
+      - name: Validate safety, package hashes, and public gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          root = Path('r21_delta_results')
+          ev = json.loads((root/'EVIDENCE.json').read_text())
+          gate = json.loads((root/'MASTER_GATE.json').read_text())
+          public = json.loads((root/'PUBLIC_GATE.json').read_text())
+          assert ev['safety']['read_only'] is True
+          assert ev['safety']['public_chain_mutations'] == 0
+          assert ev['safety']['transactions_signed'] == 0
+          assert ev['safety']['transactions_sent'] == 0
+          assert gate['submit_ready'] is False
+          assert public['submit_ready'] is False
+          for line in (root/'SHA256SUMS.txt').read_text().splitlines():
+              digest, rel = line.split('  ', 1)
+              assert hashlib.sha256((root/rel).read_bytes()).hexdigest() == digest
+          print('R21_SAFETY_AND_INTEGRITY=PASS')
+          print(json.dumps(public, sort_keys=True))
+          PY
+
+      - name: Persist non-sensitive public gate
+        env:
+          RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/kiln-r21-source-delta
+          cp r21_delta_results/PUBLIC_GATE.json \
+            evidence/kiln-r21-source-delta/PUBLIC_GATE.json
+          printf '%s\n' "$RUN_ID" > evidence/kiln-r21-source-delta/RUN_ID.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add evidence/kiln-r21-source-delta
+          git commit -m "persist Kiln R21 public delta gate ${RUN_ID}" || exit 0
+          for attempt in 1 2 3; do
+            git pull --rebase origin agent/kiln-r21-connector-source-delta-20260816
+            if git push origin HEAD:agent/kiln-r21-connector-source-delta-20260816; then exit 0; fi
+            sleep $((attempt * 2))
+          done
+          exit 1
+
+      - name: Encrypt complete detailed evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted_delivery
+          tar -czf /tmp/r21_delta_payload.tar.gz \
+            r21_delta_results/EVIDENCE.json \
+            r21_delta_results/MASTER_GATE.json \
+            r21_delta_results/SCOPE_RESOLVED.json \
+            r21_delta_results/SHA256SUMS.txt \
+            r21_public_run.log \
+            tmp_kiln_r21_delta/r21_source_delta_scan.py
+          openssl rand 32 > /tmp/r21_delta_aes.key
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 250000 \
+            -in /tmp/r21_delta_payload.tar.gz \
+            -out encrypted_delivery/payload.aes256 \
+            -pass file:/tmp/r21_delta_aes.key
+          openssl pkeyutl -encrypt -pubin \
+            -inkey tmp_kiln_r21_delta/r19_public.pem \
+            -in /tmp/r21_delta_aes.key \
+            -out encrypted_delivery/key.rsa3072 \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          cp r21_delta_results/PUBLIC_GATE.json encrypted_delivery/
+          sha256sum encrypted_delivery/payload.aes256 \
+            encrypted_delivery/key.rsa3072 \
+            encrypted_delivery/PUBLIC_GATE.json \
+            > encrypted_delivery/SHA256SUMS.txt
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          gate=json.loads(Path('r21_delta_results/PUBLIC_GATE.json').read_text())
+          manifest={
+            'schema':'kiln-r21-encrypted-delta-delivery-v1',
+            'source_commit':'${{ github.sha }}',
+            'workflow_run':'${{ github.run_id }}',
+            'encryption':'AES-256-CBC/PBKDF2-250000 + RSA-3072-OAEP-SHA256',
+            'plaintext_detailed_results_publicly_exposed':False,
+            'public_chain_mutations':0,
+            'transactions_signed':0,
+            'transactions_sent':0,
+            'public_gate':gate,
+          }
+          Path('encrypted_delivery/PUBLIC_MANIFEST.json').write_text(
+            json.dumps(manifest,indent=2,sort_keys=True)
+          )
+          PY
+          rm -rf r21_delta_results
+          rm -f /tmp/r21_delta_payload.tar.gz /tmp/r21_delta_aes.key
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kiln-r21-source-runtime-delta
+          path: encrypted_delivery
+          if-no-files-found: error
+          retention-days: 3
