@@ -1,0 +1,154 @@
+name: evm-r20c-encrypted-ethereum-shards
+
+on:
+  push:
+    branches: [agent/evm-readonly-encrypted-20260816]
+    paths:
+      - tmp_evm_encrypted/generate_r20_roundtrip.py
+      - tmp_evm_encrypted/r19_public.pem
+      - .github/workflows/_temporary-evm-r20c-ethereum-shards-20260816.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  roundtrip:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: [0, 1, 2, 3]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      R20_CHAIN_NAME: ethereum
+      R20_CHAIN_ID: 1
+      R20_SHARD_INDEX: ${{ matrix.shard }}
+      R20_SHARD_TOTAL: 4
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/evm-readonly-encrypted-20260816
+          fetch-depth: 1
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Install pinned generator dependency
+        run: python3 -m pip install --disable-pip-version-check 'web3==7.13.0'
+
+      - name: Select explicit-state-capable RPC with shard rotation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os,requests
+          shard=int(os.environ['R20_SHARD_INDEX'])
+          scope=requests.get('https://raw.githubusercontent.com/zerodaybugs/test/agent/kiln-omnivault-r11-readonly/r13_persisted_results/31910466827/r13_generation/SCOPE.json',timeout=45).json()
+          vaults=[row['vault'] for row in scope if int(row['chain_id'])==1]
+          vault=vaults[shard]
+          base=['https://rpc.flashbots.net','https://eth.drpc.org','https://eth.llamarpc.com','https://ethereum-rpc.publicnode.com']
+          urls=base[shard:]+base[:shard]
+          errors=[]
+          def post(url,method,params):
+            r=requests.post(url,json={'jsonrpc':'2.0','id':1,'method':method,'params':params},timeout=25,allow_redirects=False)
+            if r.is_redirect or r.is_permanent_redirect: raise RuntimeError(f'redirect {r.status_code}')
+            r.raise_for_status();d=r.json()
+            if 'result' not in d: raise RuntimeError(str(d))
+            return d['result']
+          for url in urls:
+            try:
+              if int(post(url,'eth_chainId',[]),16)!=1: raise RuntimeError('wrong chain')
+              block=post(url,'eth_blockNumber',[])
+              post(url,'eth_getBlockByNumber',[block,False])
+              post(url,'eth_getCode',[vault,block])
+              post(url,'eth_getBalance',['0x1804c8AB1F12E6bbf3894d4083f33e07309d1f38',block])
+              with open(os.environ['GITHUB_ENV'],'a') as f:f.write(f'R20_RPC_URL={url}\n')
+              print('R20C_RPC_GATE=PASS')
+              break
+            except Exception as e:errors.append(f'{url}: {type(e).__name__}: {e}')
+          else:raise SystemExit('no explicit-state RPC | '+' | '.join(errors))
+          PY
+
+      - name: Generate shard and harden snapshot-isolated test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('tmp_evm_encrypted/generate_r20_roundtrip.py')
+          s=p.read_text()
+          needle='''rows = [row for row in scope if int(row["chain_id"]) == CHAIN_ID]\nif not rows:'''
+          replacement='''rows = [row for row in scope if int(row["chain_id"]) == CHAIN_ID]\nshard_index = int(os.environ.get("R20_SHARD_INDEX", "0"))\nshard_total = int(os.environ.get("R20_SHARD_TOTAL", "1"))\nrows = [row for index, row in enumerate(rows) if index % shard_total == shard_index]\nif not rows:'''
+          assert needle in s
+          p.write_text(s.replace(needle,replacement))
+          PY
+          python3 tmp_evm_encrypted/generate_r20_roundtrip.py > /tmp/r20_generation.log 2>&1
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('test/KilnR20RoundTrip.t.sol');s=p.read_text()
+          s=s.replace('_scanVault(rpc, fixedBlock, vaults[i]);','_scanVault(vaults[i]);')
+          s=s.replace('function _scanVault(string memory rpc, uint256 fixedBlock, address vaultAddr) internal {\n        vm.createSelectFork(rpc, fixedBlock);','function _scanVault(address vaultAddr) internal {')
+          s=s.replace('_attempt(rpc, fixedBlock, vaultAddr, asset, small, totalAssetsBefore)','_attempt(vaultAddr, asset, small, totalAssetsBefore)')
+          s=s.replace('_attempt(rpc, fixedBlock, vaultAddr, asset, material, totalAssetsBefore)','_attempt(vaultAddr, asset, material, totalAssetsBefore)')
+          s=s.replace('''function _attempt(\n        string memory rpc,\n        uint256 fixedBlock,\n        address vaultAddr,''','''function _attempt(\n        address vaultAddr,''')
+          s=s.replace('''    ) internal returns (Result memory result) {\n        vm.createSelectFork(rpc, fixedBlock);\n        IR20Vault vault''','''    ) internal returns (Result memory result) {\n        uint256 snapshotId = vm.snapshotState();\n        IR20Vault vault''')
+          s=s.replace('deal(asset, ATTACKER, amount, true);','deal(asset, ATTACKER, amount, false);')
+          s=s.replace('''            result.depositError = bytes4(keccak256("APPROVE_FAILED"));\n            return result;''','''            result.depositError = bytes4(keccak256("APPROVE_FAILED"));\n            require(vm.revertToState(snapshotId), "snapshot restore failed");\n            return result;''')
+          s=s.replace('''            result.afterBalance = token.balanceOf(ATTACKER);\n            return result;''','''            result.afterBalance = token.balanceOf(ATTACKER);\n            require(vm.revertToState(snapshotId), "snapshot restore failed");\n            return result;''')
+          s=s.replace('''        catch { result.totalAssetsAfter = type(uint256).max; }\n    }''','''        catch { result.totalAssetsAfter = type(uint256).max; }\n        require(vm.revertToState(snapshotId), "snapshot restore failed");\n    }''')
+          for needle in ['vm.snapshotState()','vm.revertToState(snapshotId)','deal(asset, ATTACKER, amount, false);']:
+            assert needle in s
+          assert 'vm.createSelectFork(rpc, fixedBlock);' not in s
+          p.write_text(s)
+          PY
+          python3 - <<'PY'
+          import requests
+          u='https://raw.githubusercontent.com/zerodaybugs/test/agent/kiln-omnivault-r11-readonly/r13_persisted_results/31910466827/r13_generation/SCOPE.json'
+          r=requests.get(u,timeout=45);r.raise_for_status();open('/tmp/r20_scope.json','wb').write(r.content)
+          PY
+          sha256sum test/KilnR20RoundTrip.t.sol /tmp/r20_scope.json > /tmp/r20_inputs.sha256
+
+      - name: Execute local fork shard privately
+        shell: bash
+        run: |
+          set +e
+          forge test --via-ir --match-contract KilnR20RoundTrip -vv > /tmp/r20_forge.log 2>&1
+          code=$?
+          set -e
+          printf '%s\n' "$code" > /tmp/r20_exit_code.txt
+          forge --version > /tmp/r20_foundry_version.txt
+          echo 'R20C_PRIVATE_EXECUTION_RECORDED'
+
+      - name: Encrypt shard result
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted_r20c
+          tar -czf /tmp/r20_payload.tar.gz test/KilnR20RoundTrip.t.sol /tmp/r20_generation.log /tmp/r20_scope.json /tmp/r20_inputs.sha256 /tmp/r20_forge.log /tmp/r20_exit_code.txt /tmp/r20_foundry_version.txt
+          openssl rand 32 > /tmp/r20_aes.key
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 250000 -in /tmp/r20_payload.tar.gz -out encrypted_r20c/payload.aes256 -pass file:/tmp/r20_aes.key
+          openssl pkeyutl -encrypt -pubin -inkey tmp_evm_encrypted/r19_public.pem -in /tmp/r20_aes.key -out encrypted_r20c/key.rsa3072 -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          sha256sum encrypted_r20c/payload.aes256 encrypted_r20c/key.rsa3072 > encrypted_r20c/SHA256SUMS.txt
+          python3 - <<'PY'
+          import json,os
+          from pathlib import Path
+          Path('encrypted_r20c/PUBLIC_MANIFEST.json').write_text(json.dumps({
+            'schema':'encrypted-r20c-ethereum-shard-v1','chain_id':1,'shard_index':int(os.environ['R20_SHARD_INDEX']),'shard_total':int(os.environ['R20_SHARD_TOTAL']),
+            'forge_exit_code':int(Path('/tmp/r20_exit_code.txt').read_text().strip()),'source_commit':'${{ github.sha }}',
+            'plaintext_results_publicly_exposed':False,'public_chain_transactions_signed':0,'public_chain_transactions_sent':0,
+            'execution':'single latest local fork with snapshot/revert isolation and unchanged underlying totalSupply',
+            'encryption':'AES-256-CBC/PBKDF2-250000 + RSA-3072-OAEP-SHA256 wrapped key'},indent=2,sort_keys=True))
+          PY
+          rm -f /tmp/r20_payload.tar.gz /tmp/r20_aes.key /tmp/r20_forge.log /tmp/r20_exit_code.txt /tmp/r20_scope.json /tmp/r20_inputs.sha256 /tmp/r20_generation.log
+          rm -f test/KilnR20RoundTrip.t.sol
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-r20c-ethereum-shard-${{ matrix.shard }}
+          path: encrypted_r20c
+          if-no-files-found: error
+          retention-days: 1
