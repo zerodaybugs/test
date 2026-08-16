@@ -1,0 +1,200 @@
+name: kiln-r23-five-repeat-redeem-delta
+
+on:
+  push:
+    branches: [agent/kiln-r21-connector-source-delta-20260816]
+    paths:
+      - tmp_kiln_r21_delta/generate_r22_redeem_delta.py
+      - tmp_kiln_r21_delta/r23_finalize.py
+      - tmp_kiln_r21_delta/r21_source_delta_scan.py
+      - tmp_kiln_r21_delta/r19_public.pem
+      - .github/workflows/_temporary-kiln-r23-5of5-redeem-delta-20260816.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  five-repeat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/kiln-r21-connector-source-delta-20260816
+          fetch-depth: 1
+
+      - name: Install pinned runtime
+        run: |
+          python3 -m pip install --disable-pip-version-check \
+            'requests==2.32.5' 'web3==7.13.0' 'eth-abi==5.2.0'
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Resolve current scope and connector metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tmp_kiln_r21_delta/r21_source_delta_scan.py > r23_scope_public.log
+          cat r21_delta_results/PUBLIC_GATE.json
+
+      - name: Run five deterministic repetitions per chain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p r23_runs
+          run_chain() {
+            chain="$1"; name="$2"; shift 2
+            dir="r23_runs/$name"; mkdir -p "$dir"
+            rpc=""
+            for url in "$@"; do
+              got="$(cast chain-id --rpc-url "$url" 2>/dev/null || true)"
+              if [ "$got" = "$chain" ]; then rpc="$url"; break; fi
+            done
+            if [ -z "$rpc" ]; then
+              printf '{"chain_id":%s,"network":"%s","status":"rpc_unavailable","forge_failure_count":5}\n' "$chain" "$name" > "$dir/RUN_META.json"
+              return 0
+            fi
+            block="$(cast block-number --rpc-url "$rpc")"
+            R22_CHAIN_ID="$chain" python3 tmp_kiln_r21_delta/generate_r22_redeem_delta.py > "$dir/generation.log"
+            cp test/KilnR22RedeemDeltaInvariant.t.sol "$dir/KilnR22RedeemDeltaInvariant.t.sol"
+            failures=0
+            for rep in 1 2 3 4 5; do
+              set +e
+              forge test \
+                --match-path test/KilnR22RedeemDeltaInvariant.t.sol \
+                --fork-url "$rpc" --fork-block-number "$block" \
+                --via-ir -vv \
+                > "$dir/rep${rep}.forge.log" 2>&1
+              code=$?
+              set -e
+              printf '%s\n' "$code" > "$dir/rep${rep}.exit_code.txt"
+              if [ "$code" -ne 0 ]; then failures=$((failures+1)); fi
+            done
+            python3 - "$chain" "$name" "$block" "$failures" <<'PY'
+          import json,sys
+          from pathlib import Path
+          chain,name,block,failures=sys.argv[1:]
+          Path(f'r23_runs/{name}/RUN_META.json').write_text(json.dumps({
+            'chain_id':int(chain),'network':name,'fixed_block':int(block),
+            'forge_failure_count':int(failures),
+            'repetitions':5,
+            'public_chain_mutations':0,'transactions_signed':0,'transactions_sent':0,
+          },indent=2,sort_keys=True))
+          PY
+          }
+          run_chain 1 ethereum \
+            https://eth.llamarpc.com https://1rpc.io/eth https://rpc.flashbots.net
+          run_chain 10 optimism \
+            https://optimism.llamarpc.com https://optimism-rpc.publicnode.com https://mainnet.optimism.io
+          run_chain 56 bnb \
+            https://binance.llamarpc.com https://bsc-rpc.publicnode.com https://bsc-dataseed.binance.org
+          run_chain 137 polygon \
+            https://polygon.llamarpc.com https://polygon-bor-rpc.publicnode.com https://polygon-rpc.com
+          run_chain 8453 base \
+            https://base.llamarpc.com https://base-rpc.publicnode.com https://mainnet.base.org
+          run_chain 42161 arbitrum \
+            https://arbitrum.llamarpc.com https://arbitrum-one-rpc.publicnode.com https://arb1.arbitrum.io/rpc
+
+      - name: Apply strict materiality and duplicate gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tmp_kiln_r21_delta/r23_finalize.py | tee r23_public.log
+          cat r23_output/PUBLIC_GATE.json
+
+      - name: Validate final package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,zipfile
+          from pathlib import Path
+          gate=json.loads(Path('r23_output/PUBLIC_GATE.json').read_text())
+          assert gate['public_chain_mutations']==0
+          assert gate['transactions_signed']==0
+          assert gate['transactions_sent']==0
+          zips=list(Path('r23_output').glob('KILN_OMNIVAULT_R23_*.zip'))
+          assert len(zips)==1
+          with zipfile.ZipFile(zips[0]) as z:
+              assert z.testzip() is None
+              names=z.namelist()
+              assert 'PUBLIC_GATE.json' in names
+              assert 'EVIDENCE.json' in names
+          side=Path(str(zips[0])+'.sha256').read_text().split()[0]
+          assert hashlib.sha256(zips[0].read_bytes()).hexdigest()==side
+          print('R23_PACKAGE_AUDIT=PASS')
+          print(json.dumps(gate,sort_keys=True))
+          PY
+
+      - name: Encrypt exact R23 result
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted_r23 evidence/kiln-r23-five-repeat
+          tar -czf /tmp/r23_complete.tar.gz \
+            r23_output r23_runs r21_delta_results \
+            tmp_kiln_r21_delta/r23_finalize.py \
+            tmp_kiln_r21_delta/generate_r22_redeem_delta.py \
+            r23_scope_public.log r23_public.log
+          openssl rand 32 > /tmp/r23_aes.key
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 250000 \
+            -in /tmp/r23_complete.tar.gz \
+            -out encrypted_r23/payload.aes256 \
+            -pass file:/tmp/r23_aes.key
+          openssl pkeyutl -encrypt -pubin \
+            -inkey tmp_kiln_r21_delta/r19_public.pem \
+            -in /tmp/r23_aes.key \
+            -out encrypted_r23/key.rsa3072 \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          cp r23_output/PUBLIC_GATE.json encrypted_r23/
+          sha256sum encrypted_r23/payload.aes256 encrypted_r23/key.rsa3072 \
+            encrypted_r23/PUBLIC_GATE.json > encrypted_r23/SHA256SUMS.txt
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          gate=json.loads(Path('r23_output/PUBLIC_GATE.json').read_text())
+          Path('encrypted_r23/PUBLIC_MANIFEST.json').write_text(json.dumps({
+            'schema':'kiln-r23-encrypted-delivery-v1',
+            'workflow_run':'${{ github.run_id }}',
+            'source_commit':'${{ github.sha }}',
+            'decision':gate['decision'],
+            'submit_ready':gate['submit_ready'],
+            'validated_critical':gate['validated_critical'],
+            'validated_high':gate['validated_high'],
+            'encryption':'AES-256-CBC/PBKDF2-250000 + RSA-3072-OAEP-SHA256',
+            'public_chain_mutations':0,'transactions_signed':0,'transactions_sent':0,
+          },indent=2,sort_keys=True))
+          PY
+          (cd encrypted_r23 && zip -q -9 ../KILN_OMNIVAULT_R23_ENCRYPTED_DELIVERY_2026-08-16.zip ./*)
+          cp r23_output/PUBLIC_GATE.json evidence/kiln-r23-five-repeat/
+          cp KILN_OMNIVAULT_R23_ENCRYPTED_DELIVERY_2026-08-16.zip evidence/kiln-r23-five-repeat/
+          sha256sum KILN_OMNIVAULT_R23_ENCRYPTED_DELIVERY_2026-08-16.zip > evidence/kiln-r23-five-repeat/DELIVERY_SHA256.txt
+          rm -f /tmp/r23_complete.tar.gz /tmp/r23_aes.key
+
+      - name: Persist public gate and encrypted delivery
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add evidence/kiln-r23-five-repeat
+          git commit -m "persist Kiln R23 five-repeat result ${{ github.run_id }}"
+          for attempt in 1 2 3; do
+            git pull --rebase origin agent/kiln-r21-connector-source-delta-20260816
+            if git push origin HEAD:agent/kiln-r21-connector-source-delta-20260816; then exit 0; fi
+            sleep $((attempt * 2))
+          done
+          exit 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kiln-r23-five-repeat-result
+          path: |
+            r23_output/PUBLIC_GATE.json
+            encrypted_r23
+            KILN_OMNIVAULT_R23_ENCRYPTED_DELIVERY_2026-08-16.zip
+          if-no-files-found: error
+          retention-days: 3
