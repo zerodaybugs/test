@@ -1,0 +1,82 @@
+                context["names"][name_bytes.hex()] = {"bytes32": "0x" + name_bytes.hex(), "name": name_bytes.rstrip(b"\0").decode(errors="replace"), "connector": cs(connector_address["value"]) if connector_address.get("ok") else None, "missing": missing, "paused": paused, "frozen": frozen}
+                if missing or paused:
+                    hist = history(chain, registry_address, name_bytes)
+                    item["history"] = hist
+                    old = []
+                    for event in hist:
+                        address = event.get("connector")
+                        if address and address.lower() != ZERO and address not in old:
+                            old.append(address)
+                    decimals = probe(rpc, asset_address, "decimals()", out_types=["uint8"])
+                    symbol = probe(rpc, asset_address, "symbol()", out_types=["string"])
+                    direct = probe(rpc, asset_address, "balanceOf(address)", ["address"], [vault], ["uint256"])
+                    census = holders(chain, rpc, vault)
+                    claims = []
+                    for connector in old:
+                        claim = probe(rpc, connector, "totalAssets(address)", ["address"], [asset_address], ["uint256"], sender=vault)
+                        human = int(claim["value"]) / 10 ** int(decimals["value"]) if claim.get("ok") and decimals.get("ok") else None
+                        connector_code = rpc.code(connector)
+                        claims.append({"connector": connector, "claim": claim, "human": human, "code_sha256": hashlib.sha256(bytes.fromhex(connector_code.removeprefix("0x"))).hexdigest() if connector_code != "0x" else None})
+                    external = [h for h in census["holders"] if h["address"].lower() != vault.lower()]
+                    claim_human = sum(c["human"] or 0 for c in claims)
+                    item.update({"asset_meta": {"decimals": decimals, "symbol": symbol, "direct_balance": direct}, "holder_census": census, "old_connector_claims": claims, "materiality": {"external_holder_count": len(external), "old_connector_claim_human": claim_human, "direct_asset_human": int(direct["value"]) / 10 ** int(decimals["value"]) if direct.get("ok") and decimals.get("ok") else None}})
+                    item["classification"] = "REAL_ORPHANED_ACTIVE_VAULT" if missing and external and claim_human > 0 else ("ORPHAN_SIGNAL" if missing else "PAUSED_ACTIVE_VAULT")
+                else:
+                    item["classification"] = "BOUND_ACTIVE"
+            except Exception as exc:
+                item["classification"] = "ERROR"
+                item["error"] = f"{type(exc).__name__}: {exc}"
+            evidence["vaults"].append(item)
+
+    for _, context in sorted(registry_ctx.items()):
+        rpc: Rpc = context.pop("rpc")
+        registry = context["registry"]
+        manager_events = role_history(context["chain_id"], registry)
+        current_holders = []
+        for account in sorted({event["account"] for event in manager_events}):
+            has_role = probe(rpc, registry, "hasRole(bytes32,address)", ["bytes32", "address"], [MANAGER_ROLE, account], ["bool"])
+            if has_role.get("ok") and has_role["value"]:
+                code = rpc.code(account)
+                row = {"account": account, "is_contract": code != "0x", "code_sha256": hashlib.sha256(bytes.fromhex(code.removeprefix("0x"))).hexdigest() if code != "0x" else None}
+                if code != "0x":
+                    row["safe"] = safe_info(rpc, account)
+                current_holders.append(row)
+        existing = next((row for row in context["names"].values() if row.get("connector") and not row.get("missing")), None)
+        authz = authz_gate(rpc, registry, bytes.fromhex(existing["bytes32"][2:]) if existing else None, existing["connector"] if existing else None)
+        context.update({"manager_role_history": manager_events, "current_manager_role_holders": current_holders, "unprivileged_authz_gate": authz, "permissionless_bypass": bool(authz["unexpected_successes"])})
+        evidence["registries"].append(context)
+
+    orphans = [row for row in evidence["vaults"] if row.get("classification") == "REAL_ORPHANED_ACTIVE_VAULT"]
+    bypasses = [row for row in evidence["registries"] if row.get("permissionless_bypass")]
+    module_safes = []
+    for registry in evidence["registries"]:
+        for holder in registry.get("current_manager_role_holders", []):
+            safe = holder.get("safe", {})
+            modules = safe.get("modules", {})
+            if safe.get("is_safe") and modules.get("ok"):
+                enabled = [cs(module) for module in modules["value"][0] if cs(module).lower() not in {ZERO, SENTINEL.lower()}]
+                if enabled:
+                    module_safes.append({"chain_id": registry["chain_id"], "registry": registry["registry"], "safe": holder["account"], "modules": enabled, "threshold": safe.get("threshold"), "owners": safe.get("owners"), "guard": safe.get("guard")})
+
+    if bypasses:
+        decision = "ESCALATE_PERMISSIONLESS_REGISTRY_MUTATION"
+    elif module_safes:
+        decision = "HOLD_MANAGER_SAFE_MODULE_REVIEW"
+    elif orphans:
+        decision = "HOLD_REAL_ORPHAN_FREEZE_PRIVILEGED_TRIGGER"
+    else:
+        decision = "KILL_NO_MATERIAL_ORPHAN_OR_AUTHZ_BYPASS"
+    master = {"decision": decision, "submit_ready": False, "validated_critical": 0, "validated_high": 0, "metrics": {"scope_count": len(scope), "chains_completed": len(evidence["chains"]), "errors": len(evidence["errors"]), "material_orphans": len(orphans), "permissionless_bypasses": len(bypasses), "manager_safes_with_modules": len(module_safes)}, "blocking_gates": ["permissionless trigger", "material impact", "fixed-block exploit/control", "duplicate clearance"]}
+    candidates = {"material_orphans": [{"label": row["label"], "chain_id": row["chain_id"], "vault": row["vault"], "connector": row["connector"], "materiality": row.get("materiality")} for row in orphans], "permissionless_bypasses": bypasses, "manager_safes_with_modules": module_safes}
+    for name, value in [("EVIDENCE.json", evidence), ("CANDIDATES.json", candidates), ("MASTER_GATE.json", master)]:
+        (OUT / name).write_text(json.dumps(jnorm(value), indent=2, sort_keys=True))
+    sums = []
+    for path in sorted(OUT.glob("*.json")):
+        sums.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n")
+    (OUT / "SHA256SUMS.txt").write_text("".join(sums))
+    print("CENSUS_COMPLETE")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
