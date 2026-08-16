@@ -1,0 +1,110 @@
+name: Current Geth EIP-7928 sequential-parallel gate
+
+on:
+  push:
+    branches:
+      - tmp/geth-bal-current-master-20260817
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exact-current:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout current Geth master
+        uses: actions/checkout@v6
+        with:
+          repository: ethereum/go-ethereum
+          ref: master
+          path: geth
+          fetch-depth: 1
+
+      - name: Set up repository-declared Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: geth/go.mod
+          cache: true
+          cache-dependency-path: geth/go.sum
+
+      - name: Record provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          git -C geth rev-parse HEAD | tee out/commit.txt
+          git -C geth show -s --format=fuller HEAD > out/commit-full.txt
+          git -C geth status --porcelain=v1 > out/git-status.txt
+          go version | tee out/go-version.txt
+          sha256sum geth/core/eip7928_test.go geth/core/state_processor_parallel.go geth/core/state_processor.go > out/source-sha256.txt
+
+      - name: Run focused official BAL tests repeatedly
+        shell: bash
+        run: |
+          set -o pipefail
+          cd geth
+          start=$(date +%s)
+          go test ./core -run 'EIP7928|BlockAccess|BAL' -count=20 -timeout=60m -v 2>&1 | tee ../out/focused-20x.log
+          rc=${PIPESTATUS[0]}
+          end=$(date +%s)
+          printf 'exit_code=%s\nelapsed_seconds=%s\n' "$rc" "$((end-start))" > ../out/focused-20x.result
+          exit "$rc"
+
+      - name: Run race gate
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          cd geth
+          go test -race ./core -run 'EIP7928|BlockAccess|BAL' -count=3 -timeout=60m -v 2>&1 | tee ../out/race-3x.log
+          rc=${PIPESTATUS[0]}
+          printf 'exit_code=%s\n' "$rc" > ../out/race-3x.result
+          exit 0
+
+      - name: Build machine decision
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json, re
+          out=Path('out')
+          def rc(name):
+              p=out/name
+              if not p.exists(): return None
+              m=re.search(r'exit_code=(\d+)',p.read_text(errors='replace'))
+              return int(m.group(1)) if m else None
+          focused=rc('focused-20x.result')
+          race=rc('race-3x.result')
+          logs='\n'.join(p.read_text(errors='replace') for p in (out/'focused-20x.log',out/'race-3x.log') if p.exists())
+          decision={
+            'schema':'geth-current-eip7928-official-gate-v1',
+            'commit':(out/'commit.txt').read_text().strip() if (out/'commit.txt').exists() else None,
+            'focused_20x_exit_code':focused,
+            'race_3x_exit_code':race,
+            'focused_20x_pass':focused==0,
+            'race_3x_pass':race==0,
+            'panic_signal':bool(re.search(r'panic:',logs,re.I)),
+            'data_race_signal':'DATA RACE' in logs,
+            'technical_decision':'OFFICIAL_CURRENT_MASTER_REGRESSION_CLEAN' if focused==0 and race==0 else 'REVIEW_FAILURE_OR_ENVIRONMENT',
+            'submission_gate':False,
+          }
+          (out/'MACHINE_DECISION.json').write_text(json.dumps(decision,indent=2))
+          with (out/'SHA256SUMS').open('w') as fh:
+              for p in sorted(x for x in out.rglob('*') if x.is_file() and x.name!='SHA256SUMS'):
+                  fh.write(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(out)}\n')
+          print(json.dumps(decision,indent=2))
+          PY
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: geth-current-eip7928-gate
+          path: out
+          if-no-files-found: error
+          retention-days: 1
