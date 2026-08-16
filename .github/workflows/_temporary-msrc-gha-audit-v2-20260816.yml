@@ -1,0 +1,98 @@
+name: temporary-msrc-gha-audit-v2
+
+on:
+  push:
+    branches: [runtime-lab-20260816-x7]
+    paths:
+      - .github/workflows/_temporary-msrc-gha-audit-v2-20260816.yml
+      - .ci/runtime-lab-x7/payload.parts/**
+      - .ci/runtime-lab-x7/result_public.pem
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore isolated payload key
+        uses: actions/cache@v4
+        with:
+          path: .runner-key/private.pem
+          key: runtime-lab-x7-ed64898f228407684877b7c000ce65e3
+
+      - name: Execute encrypted audit and seal result
+        id: execute
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c 'import cryptography' 2>/dev/null || python3 -m pip install --user --disable-pip-version-check cryptography >/dev/null
+          rm -rf /tmp/runtime-lab-x7 /tmp/runtime-lab-x7-output.txt /tmp/runtime-lab-x7-result.json /tmp/runtime-lab-x7-payload.json
+          mkdir -p /tmp/runtime-lab-x7
+          set +e
+          (
+            set -euo pipefail
+            test -s .runner-key/private.pem
+            test -s .ci/runtime-lab-x7/result_public.pem
+            cat .ci/runtime-lab-x7/payload.parts/[0-9][0-9][0-9] > /tmp/runtime-lab-x7-payload.json
+            python3 - <<'PY'
+          import base64, io, json, pathlib, tarfile
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.asymmetric import padding
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          payload = json.loads(pathlib.Path('/tmp/runtime-lab-x7-payload.json').read_text())
+          private_key = serialization.load_pem_private_key(pathlib.Path('.runner-key/private.pem').read_bytes(), password=None)
+          key = private_key.decrypt(base64.b64decode(payload['encrypted_key']), padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=b'runtime-lab-x7-key'))
+          plaintext = AESGCM(key).decrypt(base64.b64decode(payload['nonce']), base64.b64decode(payload['ciphertext']), b'runtime-lab-x7-payload')
+          root = pathlib.Path('/tmp/runtime-lab-x7').resolve()
+          with tarfile.open(fileobj=io.BytesIO(plaintext), mode='r:gz') as archive:
+              for member in archive.getmembers():
+                  target = (root / member.name).resolve()
+                  if target != root and root not in target.parents:
+                      raise RuntimeError('unsafe archive path')
+                  if member.issym() or member.islnk():
+                      raise RuntimeError('archive links forbidden')
+              archive.extractall(root, filter='data')
+          PY
+            chmod 700 /tmp/runtime-lab-x7/run.sh
+            timeout 48m bash /tmp/runtime-lab-x7/run.sh
+          ) > /tmp/runtime-lab-x7-output.txt 2>&1
+          status=$?
+          set -e
+          LAB_STATUS="$status" python3 - <<'PY'
+          import base64, io, json, os, pathlib, tarfile
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.asymmetric import padding
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          result_dir = pathlib.Path('/tmp/runtime-lab-x7/result')
+          bundle = io.BytesIO()
+          if result_dir.is_dir():
+              with tarfile.open(fileobj=bundle, mode='w:gz') as archive:
+                  for path in sorted(result_dir.rglob('*')):
+                      if path.is_file() and not path.is_symlink():
+                          archive.add(path, arcname=path.relative_to(result_dir), recursive=False)
+          raw = json.dumps({'exit_code': int(os.environ['LAB_STATUS']), 'output': pathlib.Path('/tmp/runtime-lab-x7-output.txt').read_text(errors='replace'), 'bundle_tgz_b64': base64.b64encode(bundle.getvalue()).decode()}, separators=(',', ':')).encode()
+          public_key = serialization.load_pem_public_key(pathlib.Path('.ci/runtime-lab-x7/result_public.pem').read_bytes())
+          key, nonce = os.urandom(32), os.urandom(12)
+          encrypted_key = public_key.encrypt(key, padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=b'runtime-lab-x7-result-key'))
+          ciphertext = AESGCM(key).encrypt(nonce, raw, b'runtime-lab-x7-result')
+          pathlib.Path('/tmp/runtime-lab-x7-result.json').write_text(json.dumps({'encrypted_key': base64.b64encode(encrypted_key).decode(), 'nonce': base64.b64encode(nonce).decode(), 'ciphertext': base64.b64encode(ciphertext).decode()}, separators=(',', ':')))
+          PY
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Upload sealed audit result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: msrc-gha-audit-v2-result
+          path: /tmp/runtime-lab-x7-result.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Propagate audit status
+        if: always()
+        shell: bash
+        run: exit "${{ steps.execute.outputs.exit_code || '1' }}"
