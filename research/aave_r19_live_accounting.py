@@ -20,7 +20,7 @@ RAY = 10**27
 
 def request_json(url: str, body: dict[str, Any] | None = None) -> Any:
     encoded = None if body is None else json.dumps(body).encode()
-    headers = {"Accept": "application/json", "User-Agent": "aave-r19-live-accounting/1.0"}
+    headers = {"Accept": "application/json", "User-Agent": "aave-r19-live-accounting/1.1"}
     if body is not None:
         headers["Content-Type"] = "application/json"
     last: Exception | None = None
@@ -49,10 +49,14 @@ def view(function: str, arguments: list[Any], type_arguments: list[str] | None =
     })
 
 
-def as_int(value: Any) -> int:
+def as_scalar(value: Any) -> Any:
     if isinstance(value, list) and len(value) == 1:
-        value = value[0]
-    return int(str(value), 0)
+        return value[0]
+    return value
+
+
+def as_int(value: Any) -> int:
+    return int(str(as_scalar(value)), 0)
 
 
 def ray_mul_down(a: int, b: int) -> int:
@@ -73,9 +77,12 @@ def main() -> None:
         atoken = reserve["a_token_address"]
         vtoken = reserve["variable_debt_token_address"]
         try:
+            token_account = str(as_scalar(view(
+                f"{POOL}::a_token_factory::get_token_account_address", [atoken]
+            )))
             actual_liquidity = as_int(view(
                 "0x1::primary_fungible_store::balance",
-                [atoken, underlying],
+                [token_account, underlying],
                 ["0x1::fungible_asset::Metadata"],
             ))
             scaled_atoken_supply = as_int(view(
@@ -111,6 +118,7 @@ def main() -> None:
                 "symbol": symbol,
                 "underlying": underlying,
                 "atoken": atoken,
+                "atoken_resource_account": token_account,
                 "vtoken": vtoken,
                 "decimals": int(reserve["decimals"]),
                 "actual_liquidity": actual_liquidity,
@@ -143,11 +151,17 @@ def main() -> None:
     material = []
     for row in rows:
         unit = 10 ** row["decimals"]
-        # Research gate only. One basis point of a token or 10 raw units is the
-        # minimum screening threshold; any candidate still requires source/E2E review.
         threshold = max(10, unit // 10_000)
-        if row["absolute_mismatch"] >= threshold:
-            material.append({**row, "screening_threshold": threshold})
+        liquidity_mismatch = max(
+            abs(row["actual_minus_ui_available"]),
+            abs(row["actual_minus_ui_virtual"]),
+        )
+        if row["absolute_mismatch"] >= threshold or liquidity_mismatch >= threshold:
+            material.append({
+                **row,
+                "screening_threshold": threshold,
+                "liquidity_mismatch": liquidity_mismatch,
+            })
     (ROOT / "material_candidates.json").write_text(json.dumps(material, indent=2) + "\n")
 
     summary = {
