@@ -1,0 +1,222 @@
+name: kiln-r21-source-delta-final
+
+on:
+  push:
+    branches: [agent/kiln-r21-connector-source-delta-20260816]
+    paths:
+      - tmp_kiln_r21_delta/**
+      - .github/workflows/_temporary-kiln-r21-source-delta-final-20260816.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  final-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/kiln-r21-connector-source-delta-20260816
+          fetch-depth: 1
+
+      - name: Install pinned Python and Foundry runtime
+        run: |
+          python3 -m pip install --disable-pip-version-check \
+            'requests==2.32.5' 'web3==7.13.0' 'eth-abi==5.2.0'
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Run current-scope source/runtime delta scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tmp_kiln_r21_delta/r21_source_delta_scan.py \
+            > r21_public_scan.log
+          cat r21_delta_results/PUBLIC_GATE.json
+
+      - name: Run fixed-block local-fork roundtrip matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p r21_roundtrip_logs
+          printf '[]\n' > r21_roundtrip_logs/RUNS.json
+          run_chain() {
+            chain="$1"; name="$2"; shift 2
+            rpc=""
+            for url in "$@"; do
+              got="$(cast chain-id --rpc-url "$url" 2>/dev/null || true)"
+              if [ "$got" = "$chain" ]; then rpc="$url"; break; fi
+            done
+            if [ -z "$rpc" ]; then
+              printf '{"chain_id":%s,"network":"%s","status":"rpc_unavailable"}\n' "$chain" "$name" \
+                > "r21_roundtrip_logs/${name}.status.json"
+              return 0
+            fi
+            block="$(cast block-number --rpc-url "$rpc")"
+            R21_CHAIN_ID="$chain" R21_CHAIN_NAME="$name" \
+              python3 tmp_kiln_r21_delta/generate_r21_roundtrip.py \
+              > "r21_roundtrip_logs/${name}.generation.log"
+            set +e
+            forge test \
+              --match-path test/KilnR21CurrentScopeRoundTrip.t.sol \
+              --fork-url "$rpc" \
+              --fork-block-number "$block" \
+              -vv \
+              > "r21_roundtrip_logs/${name}.forge.log" 2>&1
+            code=$?
+            set -e
+            candidates="$(grep -c 'R21_PROFIT_CANDIDATE_VAULT' "r21_roundtrip_logs/${name}.forge.log" || true)"
+            python3 - "$chain" "$name" "$block" "$code" "$candidates" <<'PY'
+          import json,sys
+          from pathlib import Path
+          chain,name,block,code,candidates=sys.argv[1:]
+          out={
+            'chain_id':int(chain),'network':name,'fixed_block':int(block),
+            'forge_exit_code':int(code),'profit_candidate_count':int(candidates),
+            'public_chain_mutations':0,'transactions_signed':0,'transactions_sent':0,
+          }
+          Path(f'r21_roundtrip_logs/{name}.status.json').write_text(json.dumps(out,indent=2,sort_keys=True))
+          PY
+          }
+          run_chain 1 ethereum \
+            https://eth.llamarpc.com https://1rpc.io/eth https://rpc.flashbots.net
+          run_chain 10 optimism \
+            https://optimism.llamarpc.com https://optimism-rpc.publicnode.com https://mainnet.optimism.io
+          run_chain 56 bnb \
+            https://binance.llamarpc.com https://bsc-rpc.publicnode.com https://bsc-dataseed.binance.org
+          run_chain 137 polygon \
+            https://polygon.llamarpc.com https://polygon-bor-rpc.publicnode.com https://polygon-rpc.com
+          run_chain 8453 base \
+            https://base.llamarpc.com https://base-rpc.publicnode.com https://mainnet.base.org
+          run_chain 42161 arbitrum \
+            https://arbitrum.llamarpc.com https://arbitrum-one-rpc.publicnode.com https://arb1.arbitrum.io/rpc
+
+      - name: Build conservative final gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          source=json.loads(Path('r21_delta_results/PUBLIC_GATE.json').read_text())
+          statuses=[]
+          for p in sorted(Path('r21_roundtrip_logs').glob('*.status.json')):
+              statuses.append(json.loads(p.read_text()))
+          profit=sum(int(x.get('profit_candidate_count',0)) for x in statuses)
+          source_promotable=int(source.get('promotable_candidate_count',0))
+          infra=[x for x in statuses if x.get('status')=='rpc_unavailable' or int(x.get('forge_exit_code',0))!=0]
+          decision=(
+            'PROMOTE_EXACT_CANDIDATE_REPRODUCTION'
+            if source_promotable or profit
+            else ('INCONCLUSIVE_INFRA_FAILURE' if infra else 'NO_SUBMIT_READY_FINDING')
+          )
+          gate={
+            'schema':'kiln-r21-final-public-gate-v1',
+            'decision':decision,
+            'submit_ready':False,
+            'validated_critical':0,
+            'validated_high':0,
+            'source_promotable_candidate_count':source_promotable,
+            'local_fork_profit_candidate_count':profit,
+            'roundtrip_chain_statuses':statuses,
+            'source_gate':source,
+            'public_chain_mutations':0,
+            'transactions_signed':0,
+            'transactions_sent':0,
+            'required_before_submission':[
+              'exact candidate-specific fixed-block proof',
+              'material attacker or victim delta',
+              'patched negative control',
+              'duplicate and known-issue clearance',
+            ] if source_promotable or profit else [],
+          }
+          Path('R21_FINAL_PUBLIC_GATE.json').write_text(json.dumps(gate,indent=2,sort_keys=True))
+          print(json.dumps(gate,sort_keys=True))
+          # Validate scanner package hashes and safety.
+          ev=json.loads(Path('r21_delta_results/EVIDENCE.json').read_text())
+          assert ev['safety']['read_only'] is True
+          assert ev['safety']['public_chain_mutations']==0
+          for line in Path('r21_delta_results/SHA256SUMS.txt').read_text().splitlines():
+              h,rel=line.split('  ',1)
+              assert hashlib.sha256((Path('r21_delta_results')/rel).read_bytes()).hexdigest()==h
+          PY
+
+      - name: Encrypt detailed evidence and create deterministic checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted_delivery evidence/kiln-r21-source-delta-final
+          tar -czf /tmp/r21_final_payload.tar.gz \
+            r21_delta_results \
+            r21_roundtrip_logs \
+            test/KilnR21CurrentScopeRoundTrip.t.sol \
+            tmp_kiln_r21_delta/r21_source_delta_scan.py \
+            tmp_kiln_r21_delta/generate_r21_roundtrip.py \
+            R21_FINAL_PUBLIC_GATE.json
+          openssl rand 32 > /tmp/r21_final_aes.key
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 250000 \
+            -in /tmp/r21_final_payload.tar.gz \
+            -out encrypted_delivery/payload.aes256 \
+            -pass file:/tmp/r21_final_aes.key
+          openssl pkeyutl -encrypt -pubin \
+            -inkey tmp_kiln_r21_delta/r19_public.pem \
+            -in /tmp/r21_final_aes.key \
+            -out encrypted_delivery/key.rsa3072 \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          cp R21_FINAL_PUBLIC_GATE.json encrypted_delivery/
+          sha256sum encrypted_delivery/payload.aes256 \
+            encrypted_delivery/key.rsa3072 \
+            encrypted_delivery/R21_FINAL_PUBLIC_GATE.json \
+            > encrypted_delivery/SHA256SUMS.txt
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          gate=json.loads(Path('R21_FINAL_PUBLIC_GATE.json').read_text())
+          manifest={
+            'schema':'kiln-r21-final-encrypted-checkpoint-v1',
+            'workflow_run':'${{ github.run_id }}',
+            'source_commit':'${{ github.sha }}',
+            'decision':gate['decision'],
+            'submit_ready':False,
+            'encryption':'AES-256-CBC/PBKDF2-250000 + RSA-3072-OAEP-SHA256',
+            'public_chain_mutations':0,
+            'transactions_signed':0,
+            'transactions_sent':0,
+          }
+          Path('encrypted_delivery/PUBLIC_MANIFEST.json').write_text(json.dumps(manifest,indent=2,sort_keys=True))
+          PY
+          (cd encrypted_delivery && zip -q -9 ../KILN_OMNIVAULT_R21_ENCRYPTED_CHECKPOINT_NOT_FOR_SUBMISSION_2026-08-16.zip ./*)
+          cp R21_FINAL_PUBLIC_GATE.json evidence/kiln-r21-source-delta-final/
+          cp KILN_OMNIVAULT_R21_ENCRYPTED_CHECKPOINT_NOT_FOR_SUBMISSION_2026-08-16.zip evidence/kiln-r21-source-delta-final/
+          sha256sum KILN_OMNIVAULT_R21_ENCRYPTED_CHECKPOINT_NOT_FOR_SUBMISSION_2026-08-16.zip \
+            > evidence/kiln-r21-source-delta-final/CHECKPOINT_SHA256.txt
+          rm -f /tmp/r21_final_payload.tar.gz /tmp/r21_final_aes.key
+
+      - name: Persist public gate and encrypted checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add evidence/kiln-r21-source-delta-final
+          git commit -m "persist Kiln R21 final encrypted checkpoint ${{ github.run_id }}"
+          for attempt in 1 2 3; do
+            git pull --rebase origin agent/kiln-r21-connector-source-delta-20260816
+            if git push origin HEAD:agent/kiln-r21-connector-source-delta-20260816; then exit 0; fi
+            sleep $((attempt * 2))
+          done
+          exit 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kiln-r21-final-encrypted-checkpoint
+          path: |
+            encrypted_delivery
+            R21_FINAL_PUBLIC_GATE.json
+            KILN_OMNIVAULT_R21_ENCRYPTED_CHECKPOINT_NOT_FOR_SUBMISSION_2026-08-16.zip
+          if-no-files-found: error
+          retention-days: 3
