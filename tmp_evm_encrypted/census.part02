@@ -1,0 +1,89 @@
+
+def probe(rpc: Rpc, target: str, signature: str, in_types: list[str] | None = None, values: list[Any] | None = None, out_types: list[str] | None = None, sender: str | None = None, block: int | str = "latest") -> dict[str, Any]:
+    return rpc.call(target, cdata(signature, in_types, values), out_types, sender, block)
+
+
+def api_get(chain: int, params: dict[str, Any]) -> dict[str, Any]:
+    session = requests.Session()
+    session.headers.update({"User-Agent": "EVM-ReadOnly-Census/1.0"})
+    last = None
+    for attempt in range(7):
+        try:
+            response = session.get(ROUTESCAN.format(chain=chain), params=params, timeout=45)
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:
+            last = exc
+            time.sleep(attempt + 1)
+    raise RuntimeError(f"Routescan chain {chain}: {last}")
+
+
+def logs(chain: int, address: str, topic0: str | None = None, topic1: str | None = None, max_pages: int = 100) -> list[dict[str, Any]]:
+    output = []
+    for page in range(1, max_pages + 1):
+        params: dict[str, Any] = {"module": "logs", "action": "getLogs", "address": cs(address), "fromBlock": 0, "toBlock": "latest", "page": page, "offset": 1000}
+        if topic0:
+            params["topic0"] = topic0
+        if topic1:
+            params["topic1"] = topic1
+        data = api_get(chain, params)
+        result = data.get("result")
+        if isinstance(result, str):
+            if data.get("status") == "0" or "No records" in result:
+                break
+            raise RuntimeError(str(data))
+        if not isinstance(result, list):
+            raise RuntimeError(str(data))
+        output.extend(result)
+        if len(result) < 1000:
+            break
+    return output
+
+
+def taddr(topic: str) -> str:
+    return Web3.to_checksum_address("0x" + topic.removeprefix("0x")[-40:])
+
+
+def history(chain: int, registry: str, name: bytes) -> list[dict[str, Any]]:
+    topic1 = "0x" + name.hex()
+    output = []
+    for event in ["ConnectorAdded", "ConnectorUpdated", "ConnectorRemoved", "Paused", "Unpaused", "Frozen"]:
+        for row in logs(chain, registry, TOPIC[event], topic1):
+            topics = row.get("topics", [])
+            item = {"event": event, "block": int(row["blockNumber"], 16), "tx": row["transactionHash"]}
+            if event in {"ConnectorAdded", "ConnectorUpdated"} and len(topics) > 2:
+                item["connector"] = taddr(topics[2])
+            output.append(item)
+    return sorted(output, key=lambda x: x["block"])
+
+
+def role_history(chain: int, registry: str) -> list[dict[str, Any]]:
+    topic1 = "0x" + MANAGER_ROLE.hex()
+    output = []
+    for event in ["RoleGranted", "RoleRevoked"]:
+        for row in logs(chain, registry, TOPIC[event], topic1):
+            topics = row.get("topics", [])
+            if len(topics) >= 3:
+                output.append({"event": event, "block": int(row["blockNumber"], 16), "tx": row["transactionHash"], "account": taddr(topics[2]), "sender": taddr(topics[3]) if len(topics) > 3 else None})
+    return sorted(output, key=lambda x: x["block"])
+
+
+def holders(chain: int, rpc: Rpc, vault: str) -> dict[str, Any]:
+    transfer_logs = logs(chain, vault, TOPIC["Transfer"])
+    accounts = {cs(vault)}
+    for row in transfer_logs:
+        topics = row.get("topics", [])
+        if len(topics) >= 3:
+            for topic in topics[1:3]:
+                account = taddr(topic)
+                if account.lower() != ZERO:
+                    accounts.add(account)
+    output = []
+    for account in sorted(accounts):
+        balance = probe(rpc, vault, "balanceOf(address)", ["address"], [account], ["uint256"])
+        if balance.get("ok") and int(balance["value"]) > 0:
+            shares = int(balance["value"])
+            output.append({"address": account, "shares": shares, "previewRedeem": probe(rpc, vault, "previewRedeem(uint256)", ["uint256"], [shares], ["uint256"]), "maxRedeem": probe(rpc, vault, "maxRedeem(address)", ["address"], [account], ["uint256"]), "redeem_eth_call": probe(rpc, vault, "redeem(uint256,address,address)", ["uint256", "address", "address"], [shares, account, account], ["uint256"], sender=account)})
+    output.sort(key=lambda x: x["shares"], reverse=True)
+    return {"transfer_log_count": len(transfer_logs), "holders": output}
+
