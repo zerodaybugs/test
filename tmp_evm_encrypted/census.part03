@@ -1,0 +1,90 @@
+def safe_info(rpc: Rpc, account: str) -> dict[str, Any]:
+    threshold = probe(rpc, account, "getThreshold()", out_types=["uint256"])
+    if not threshold.get("ok"):
+        return {"address": account, "is_safe": False, "threshold": threshold}
+    owners = probe(rpc, account, "getOwners()", out_types=["address[]"])
+    modules = probe(rpc, account, "getModulesPaginated(address,uint256)", ["address", "uint256"], [SENTINEL, 50], ["address[]", "address"])
+    guard = probe(rpc, account, "getGuard()", out_types=["address"])
+    return {"address": account, "is_safe": True, "threshold": threshold, "owners": owners, "modules": modules, "guard": guard}
+
+
+def authz_gate(rpc: Rpc, registry: str, existing_name: bytes | None, existing_connector: str | None) -> dict[str, Any]:
+    canary = b"READONLY_CANARY".ljust(32, b"\0")
+    target = existing_connector or registry
+    probes = {
+        "grantRole": probe(rpc, registry, "grantRole(bytes32,address)", ["bytes32", "address"], [MANAGER_ROLE, CALLER], sender=CALLER),
+        "add": probe(rpc, registry, "add(bytes32,address)", ["bytes32", "address"], [canary, target], sender=CALLER),
+    }
+    if existing_name is not None and existing_connector is not None:
+        probes.update({
+            "update": probe(rpc, registry, "update(bytes32,address)", ["bytes32", "address"], [existing_name, existing_connector], sender=CALLER),
+            "remove": probe(rpc, registry, "remove(bytes32)", ["bytes32"], [existing_name], sender=CALLER),
+            "pause": probe(rpc, registry, "pause(bytes32)", ["bytes32"], [existing_name], sender=CALLER),
+            "pauseFor": probe(rpc, registry, "pauseFor(bytes32,uint256)", ["bytes32", "uint256"], [existing_name, 3600], sender=CALLER),
+            "freeze": probe(rpc, registry, "freeze(bytes32)", ["bytes32"], [existing_name], sender=CALLER),
+        })
+    return {"caller": CALLER, "probes": probes, "unexpected_successes": [name for name, result in probes.items() if result.get("ok")]}
+
+
+def main() -> int:
+    response = requests.get(SCOPE_URL, headers={"User-Agent": "EVM-ReadOnly-Census/1.0"}, timeout=45)
+    response.raise_for_status()
+    scope = response.json()
+    if not isinstance(scope, list) or len(scope) < 50:
+        raise RuntimeError(f"scope incomplete: {len(scope) if isinstance(scope, list) else type(scope)}")
+
+    grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row in scope:
+        grouped[int(row["chain_id"])].append(row)
+
+    evidence: dict[str, Any] = {
+        "schema": "evm-readonly-registry-census-v1",
+        "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "scope_source": SCOPE_URL,
+        "scope_count": len(scope),
+        "safety": {"read_only": True, "transactions_signed": 0, "transactions_sent": 0, "private_keys": 0, "rpc_methods": ["eth_chainId", "eth_blockNumber", "eth_getCode", "eth_call"], "log_source": "Routescan"},
+        "chains": {}, "vaults": [], "registries": [], "errors": [],
+    }
+    registry_ctx: dict[tuple[int, str], dict[str, Any]] = {}
+
+    for chain in sorted(grouped):
+        if chain not in CFG:
+            evidence["errors"].append(f"unsupported chain {chain}")
+            continue
+        network, urls = CFG[chain]
+        try:
+            rpc = Rpc(chain, urls)
+            block = rpc.block()
+        except Exception as exc:
+            evidence["errors"].append(f"chain {chain}: {type(exc).__name__}: {exc}")
+            continue
+        evidence["chains"][str(chain)] = {"network": network, "rpc": rpc.url, "block": block, "scope_vaults": len(grouped[chain])}
+
+        for source_row in grouped[chain]:
+            vault = cs(source_row["vault"])
+            item: dict[str, Any] = {**source_row, "vault": vault, "block": block}
+            try:
+                code = rpc.code(vault)
+                item["vault_code_sha256"] = hashlib.sha256(bytes.fromhex(code.removeprefix("0x"))).hexdigest() if code != "0x" else None
+                asset = probe(rpc, vault, "asset()", out_types=["address"])
+                registry = probe(rpc, vault, "connectorRegistry()", out_types=["address"])
+                name = probe(rpc, vault, "connectorName()", out_types=["bytes32"])
+                total_assets = probe(rpc, vault, "totalAssets()", out_types=["uint256"])
+                total_supply = probe(rpc, vault, "totalSupply()", out_types=["uint256"])
+                item.update({"asset": asset, "connectorRegistry": registry, "connectorName": name, "totalAssets": total_assets, "totalSupply": total_supply})
+                if not (asset.get("ok") and registry.get("ok") and name.get("ok")):
+                    item["classification"] = "INCOMPLETE_BINDING"
+                    evidence["vaults"].append(item)
+                    continue
+                asset_address, registry_address, name_bytes = cs(asset["value"]), cs(registry["value"]), name["value"]
+                connector_address = probe(rpc, registry_address, "connectorAddress(bytes32)", ["bytes32"], [name_bytes], ["address"])
+                connector_exists = probe(rpc, registry_address, "connectorExists(bytes32)", ["bytes32"], [name_bytes], ["bool"])
+                connector_info = probe(rpc, registry_address, "connectorInfo(bytes32)", ["bytes32"], [name_bytes], ["address", "uint88", "bool"])
+                get_or_revert = probe(rpc, registry_address, "getOrRevert(bytes32)", ["bytes32"], [name_bytes], ["address"])
+                item["registry_state"] = {"connectorAddress": connector_address, "connectorExists": connector_exists, "connectorInfo": connector_info, "getOrRevert": get_or_revert}
+                missing = (connector_exists.get("ok") and connector_exists["value"] is False) or (connector_address.get("ok") and cs(connector_address["value"]).lower() == ZERO)
+                paused = connector_info.get("ok") and int(connector_info["value"][1]) > int(time.time())
+                frozen = connector_info.get("ok") and bool(connector_info["value"][2])
+                item["gates"] = {"missing": missing, "paused": paused, "frozen": frozen}
+                key = (chain, registry_address.lower())
+                context = registry_ctx.setdefault(key, {"chain_id": chain, "network": network, "registry": registry_address, "rpc": rpc, "names": {}})
