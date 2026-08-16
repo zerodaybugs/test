@@ -1,0 +1,200 @@
+name: Sui Round 10 party object x mixed gas gate
+
+on:
+  push:
+    branches:
+      - "sui-round10-release-1772-20260816"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Fetch exact Sui 1.77.2 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA=51d177ad7d65102fc368b582408f466d97b31548
+          git init /tmp/sui
+          git -C /tmp/sui remote add origin https://github.com/MystenLabs/sui.git
+          git -C /tmp/sui fetch --depth=1 origin "$SHA"
+          git -C /tmp/sui checkout --detach FETCH_HEAD
+          test "$(git -C /tmp/sui rev-parse HEAD)" = "$SHA"
+          mkdir -p /tmp/out
+          printf '%s\n' "$SHA" > /tmp/out/UPSTREAM_COMMIT.txt
+
+      - name: Install build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang cmake libssl-dev libpq-dev pkg-config protobuf-compiler
+
+      - name: Add exact cross-boundary regression test
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST=/tmp/sui/crates/sui-adapter-transactional-tests/tests/address_balances/party_mixed_gas_round10.move
+          cat > "$TEST" <<'MOVE'
+          // Copyright (c) Mysten Labs, Inc.
+          // SPDX-License-Identifier: Apache-2.0
+          // Security gate: consensus-owned Coin<T> inputs crossed with both mixed-gas
+          // orders and the success, Move-abort, and storage-OOG reset paths.
+
+          //# init --addresses test=0x0 --accounts A B
+
+          //# publish --sender A
+          #[allow(deprecated_usage)]
+          module test::asset {
+              use sui::coin::{Self, Coin};
+
+              public struct ASSET has drop {}
+
+              public struct W has key, store {
+                  id: UID,
+              }
+
+              fun init(otw: ASSET, ctx: &mut TxContext) {
+                  let (treasury_cap, metadata) = coin::create_currency(
+                      otw, 0, b"ASSET", b"ASSET", b"", option::none(), ctx,
+                  );
+                  transfer::public_freeze_object(metadata);
+                  transfer::public_transfer(treasury_cap, ctx.sender());
+              }
+
+              public fun send_then_abort(coin: Coin<ASSET>, recipient: address) {
+                  coin::send_funds(coin, recipient);
+                  abort 7
+              }
+
+              public fun make_many_then_send(
+                  coin: Coin<ASSET>,
+                  recipient: address,
+                  n: u64,
+                  ctx: &mut TxContext,
+              ) {
+                  coin::send_funds(coin, recipient);
+                  let mut i = 0;
+                  while (i < n) {
+                      transfer::public_transfer(W { id: object::new(ctx) }, ctx.sender());
+                      i = i + 1;
+                  }
+              }
+          }
+
+          // Seed A's SUI address balance.
+          //# programmable --sender A --inputs 100000000000 @A
+          //> 0: SplitCoins(Gas, [Input(0)]);
+          //> 1: sui::coin::into_balance<sui::sui::SUI>(Result(0));
+          //> 2: sui::balance::send_funds<sui::sui::SUI>(Result(1), Input(1));
+
+          // Create four dedicated SUI gas coins.
+          //# programmable --sender A --inputs 1000000000 1000000000 1000000000 1000000000 @A
+          //> 0: SplitCoins(Gas, [Input(0), Input(1), Input(2), Input(3)]);
+          //> TransferObjects([NestedResult(0, 0), NestedResult(0, 1), NestedResult(0, 2), NestedResult(0, 3)], Input(4));
+
+          // Mint four custom coins and convert them to single-owner party objects.
+          //# programmable --sender A --inputs object(1,1) 2000 @A
+          //> 0: sui::coin::mint<test::asset::ASSET>(Input(0), Input(1));
+          //> 1: sui::coin::mint<test::asset::ASSET>(Input(0), Input(1));
+          //> 2: sui::coin::mint<test::asset::ASSET>(Input(0), Input(1));
+          //> 3: sui::coin::mint<test::asset::ASSET>(Input(0), Input(1));
+          //> 4: sui::party::single_owner(Input(2));
+          //> sui::transfer::public_party_transfer<sui::coin::Coin<test::asset::ASSET>>(Result(0), Result(4));
+          //> sui::transfer::public_party_transfer<sui::coin::Coin<test::asset::ASSET>>(Result(1), Result(4));
+          //> sui::transfer::public_party_transfer<sui::coin::Coin<test::asset::ASSET>>(Result(2), Result(4));
+          //> sui::transfer::public_party_transfer<sui::coin::Coin<test::asset::ASSET>>(Result(3), Result(4));
+
+          //# create-checkpoint
+
+          //# view-funds sui::balance::Balance<sui::sui::SUI> A
+
+          // Success, gas order [Coin, AddressBalance], consuming a party-owned coin.
+          //# programmable --sender A --gas-budget 100000000 --gas-payment object(3,0) --gas-payment withdraw<sui::balance::Balance<sui::sui::SUI>>(500000000) --inputs object(4,0) @B
+          //> sui::coin::send_funds<test::asset::ASSET>(Input(0), Input(1));
+
+          // Success, gas order [AddressBalance, Coin], consuming a party-owned coin.
+          //# programmable --sender A --gas-budget 100000000 --gas-payment withdraw<sui::balance::Balance<sui::sui::SUI>>(500000000) --gas-payment object(3,1) --inputs object(4,1) @B
+          //> sui::coin::send_funds<test::asset::ASSET>(Input(0), Input(1));
+
+          // Move-abort reset, gas order [Coin, AddressBalance]. The party input must
+          // remain valid after writes and accumulator events are rolled back.
+          //# programmable --sender A --gas-budget 100000000 --gas-payment object(3,2) --gas-payment withdraw<sui::balance::Balance<sui::sui::SUI>>(500000000) --inputs object(4,2) @B
+          //> test::asset::send_then_abort(Input(0), Input(1));
+
+          // Storage-OOG reset, gas order [AddressBalance, Coin]. This crosses the
+          // historically dangerous reservation-target gas smash with a consensus input.
+          //# programmable --sender A --gas-budget 5000000 --gas-payment withdraw<sui::balance::Balance<sui::sui::SUI>>(5000000) --gas-payment object(3,3) --inputs object(4,3) @B 100
+          //> test::asset::make_many_then_send(Input(0), Input(1), Input(2));
+
+          //# create-checkpoint
+
+          // Failed transactions must not consume their party-owned inputs.
+          //# view-object 4,2 --hide-contents
+          //# view-object 4,3 --hide-contents
+
+          //# view-funds sui::balance::Balance<sui::sui::SUI> A
+          //# view-funds sui::balance::Balance<test::asset::ASSET> B
+          MOVE
+          cp "$TEST" /tmp/out/party_mixed_gas_round10.move
+          sha256sum "$TEST" > /tmp/out/TEST_SHA256.txt
+
+      - name: Compile and execute targeted test
+        shell: bash
+        run: |
+          set -uo pipefail
+          cd /tmp/sui
+          export CARGO_TERM_COLOR=never
+          export RUST_BACKTRACE=1
+          set +e
+          timeout 75m cargo test -p sui-adapter-transactional-tests --test tests -- party_mixed_gas_round10 --nocapture 2>&1 | tee /tmp/out/TEST.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          printf '%s\n' "$rc" > /tmp/out/TEST_EXIT_CODE.txt
+          find crates/sui-adapter-transactional-tests/tests -name 'party_mixed_gas_round10*.snap' -exec cp {} /tmp/out/ \; 2>/dev/null || true
+
+          python3 - <<'PY'
+          import json, pathlib, re
+          out = pathlib.Path('/tmp/out')
+          log = (out/'TEST.log').read_text(errors='replace')
+          rc = int((out/'TEST_EXIT_CODE.txt').read_text().strip())
+          hard_patterns = {
+              'rust_panic': r"panicked at|thread .* panicked|panic = 'abort'|SIGABRT|signal: 6",
+              'settlement_failure': r'settlement transaction cannot fail|settlement.*failed',
+              'conservation': r'SUI conservation|conservation invariant|CoinBalanceOverflow',
+              'fork_or_equivocation': r'fork detected|effects equivocation|conflicting effects',
+              'fatal_invariant': r'UNKNOWN_INVARIANT_VIOLATION|invariant violation|debug_fatal|fatal!'
+          }
+          hits = {k: sorted(set(re.findall(v, log, re.I))) for k,v in hard_patterns.items()}
+          matched = bool(re.search(r'party_mixed_gas_round10', log))
+          passed = bool(re.search(r'test result: ok', log)) and rc == 0
+          hard = any(hits.values())
+          result = {
+              'upstream_commit': '51d177ad7d65102fc368b582408f466d97b31548',
+              'targeted_test_matched': matched,
+              'test_exit_code': rc,
+              'test_passed': passed,
+              'hard_panic_or_invariant_hit': hard,
+              'pattern_hits': hits,
+              'submission_authorized': False,
+              'verdict': (
+                  'REVIEW_HARD_FAILURE_CANDIDATE' if hard else
+                  'KILL_NO_PANIC_OR_INVARIANT' if passed else
+                  'TEST_INFRA_OR_TEST_DEFINITION_FAILURE'
+              )
+          }
+          (out/'MACHINE_GATE.json').write_text(json.dumps(result, indent=2, sort_keys=True)+'\n')
+          print(json.dumps(result, indent=2, sort_keys=True))
+          PY
+
+      - name: Upload private evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: sui-round10-party-mixed-gas-51d177ad
+          path: /tmp/out/
+          compression-level: 6
+          retention-days: 1
+          if-no-files-found: error
