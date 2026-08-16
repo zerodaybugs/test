@@ -1,0 +1,89 @@
+
+
+def revert_data(error: Any) -> str | None:
+    hits = re.findall(r"0x[0-9a-fA-F]{8,}", json.dumps(error, default=str))
+    return max(hits, key=len) if hits else None
+
+
+class Rpc:
+    def __init__(self, chain: int, urls: list[str]) -> None:
+        self.chain = chain
+        self.urls = urls
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "EVM-ReadOnly-Census/1.0"})
+        self.request_id = 0
+        self.index = 0
+        self.url = self._pick()
+
+    def _post(self, url: str, method: str, params: list[Any]) -> dict[str, Any]:
+        self.request_id += 1
+        response = self.session.post(url, json={"jsonrpc": "2.0", "id": self.request_id, "method": method, "params": params}, timeout=35)
+        response.raise_for_status()
+        return response.json()
+
+    def _pick(self) -> str:
+        errors = []
+        for index, url in enumerate(self.urls):
+            try:
+                result = self._post(url, "eth_chainId", [])
+                if int(result["result"], 16) != self.chain:
+                    raise RuntimeError("wrong chain")
+                if "result" not in self._post(url, "eth_blockNumber", []):
+                    raise RuntimeError("block query failed")
+                self.index = index
+                return url
+            except Exception as exc:
+                errors.append(f"{url}: {type(exc).__name__}: {exc}")
+        raise RuntimeError("no RPC | " + " | ".join(errors))
+
+    def request(self, method: str, params: list[Any], contract_revert_ok: bool = False) -> dict[str, Any]:
+        provider_errors = []
+        for offset in range(len(self.urls)):
+            index = (self.index + offset) % len(self.urls)
+            url = self.urls[index]
+            try:
+                body = self._post(url, method, params)
+            except Exception as exc:
+                provider_errors.append(f"{url}: {type(exc).__name__}: {exc}")
+                continue
+            if "result" in body:
+                self.index, self.url = index, url
+                return {"ok": True, "raw": body["result"], "provider": url}
+            error = body.get("error", {})
+            message = str(error.get("message", "")).lower()
+            data = revert_data(error)
+            is_revert = "revert" in message or (data is not None and len(data) >= 10)
+            if contract_revert_ok and is_revert:
+                selector = data[:10].lower() if data else None
+                return {"ok": False, "kind": "contract_revert", "error": error, "revert_data": data, "decoded_error": ERRORS.get(selector), "provider": url}
+            provider_errors.append(f"{url}: {error}")
+        return {"ok": False, "kind": "provider_failure", "errors": provider_errors}
+
+    def block(self) -> int:
+        result = self.request("eth_blockNumber", [])
+        if not result["ok"]:
+            raise RuntimeError(result)
+        return int(result["raw"], 16)
+
+    def code(self, address: str) -> str:
+        result = self.request("eth_getCode", [cs(address), "latest"])
+        if not result["ok"]:
+            raise RuntimeError(result)
+        return result["raw"]
+
+    def call(self, to: str, data: str, outputs: list[str] | None = None, sender: str | None = None, block: int | str = "latest") -> dict[str, Any]:
+        tx = {"to": cs(to), "data": data}
+        if sender:
+            tx["from"] = cs(sender)
+        tag = hex(block) if isinstance(block, int) else block
+        result = self.request("eth_call", [tx, tag], contract_revert_ok=True)
+        if not result["ok"]:
+            return result
+        if not outputs:
+            return {"ok": True, "value": result["raw"], "provider": result["provider"]}
+        try:
+            decoded = decode(outputs, bytes.fromhex(result["raw"].removeprefix("0x")))
+            value = decoded[0] if len(decoded) == 1 else decoded
+            return {"ok": True, "value": value, "provider": result["provider"]}
+        except Exception as exc:
+            return {"ok": False, "kind": "decode_failure", "raw": result["raw"], "error": f"{type(exc).__name__}: {exc}", "provider": result["provider"]}
