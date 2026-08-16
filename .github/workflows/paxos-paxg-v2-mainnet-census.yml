@@ -1,0 +1,193 @@
+name: Paxos PAXG V2 read-only mainnet census
+
+on:
+  push:
+    branches:
+      - paxos-public-toolchain-bootstrap-20260815
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.19.4'
+      - run: npm install --no-save --no-audit --no-fund ethers@6.15.0
+      - name: Query PAXG V2 state and upgrade sequence
+        shell: bash
+        run: |
+          cat > paxg_v2_census.mjs <<'NODE'
+          import { Contract, Interface, JsonRpcProvider, getAddress, id, zeroPadValue } from "ethers";
+          import { writeFile } from "node:fs/promises";
+
+          const RPCS = [
+            "https://eth.llamarpc.com",
+            "https://1rpc.io/eth",
+            "https://ethereum-rpc.publicnode.com"
+          ];
+          const PAXG = getAddress("0x45804880de22913dafe09f4980848ece6ecbaf78");
+          const IMPL_SLOT = "0x7050c9e0f4ca769c69bd3a8ef740bc37934f8e2c036e5a723fd8ee048ed3f8c3";
+          const ADMIN_SLOT = "0x10d6a54a4754c8869d6886b5f5d7fbfa5b4522237ea5c60d11bc4e7a1ff9390b";
+          const SLOT13 = zeroPadValue("0x0d", 32);
+
+          const abi = [
+            "function name() view returns (string)",
+            "function symbol() view returns (string)",
+            "function decimals() view returns (uint8)",
+            "function totalSupply() view returns (uint256)",
+            "function paused() view returns (bool)",
+            "function owner() view returns (address)",
+            "function defaultAdmin() view returns (address)",
+            "function defaultAdminDelay() view returns (uint48)",
+            "function pendingDefaultAdmin() view returns (address newAdmin,uint48 schedule)",
+            "function supplyControl() view returns (address)",
+            "function feeRate() view returns (uint256)",
+            "function initializedV1() view returns (bool)",
+            "event Upgraded(address implementation)",
+            "event SupplyControlSet(address supplyControlAddress)",
+            "event Initialized(uint64 version)"
+          ];
+          const iface = new Interface(abi);
+
+          let provider, rpc;
+          for (const url of RPCS) {
+            try {
+              const p = new JsonRpcProvider(url, 1, { staticNetwork: true });
+              if ((await p.getBlockNumber()) > 1) { provider = p; rpc = url; break; }
+            } catch (e) { console.error(`RPC ${url}: ${e.message}`); }
+          }
+          if (!provider) throw new Error("No RPC available");
+
+          function storageAddress(word) {
+            if (!word || word === "0x" + "0".repeat(64)) return null;
+            return getAddress("0x" + word.slice(-40));
+          }
+          async function safeCall(contract, name, args = []) {
+            try {
+              const value = await contract[name](...args);
+              if (typeof value === "bigint") return value.toString();
+              if (Array.isArray(value)) return [...value].map(v => typeof v === "bigint" ? v.toString() : v);
+              return value;
+            } catch (e) { return { error: e.shortMessage || e.message }; }
+          }
+
+          const latest = await provider.getBlockNumber();
+          const latestBlock = await provider.getBlock(latest);
+          const token = new Contract(PAXG, abi, provider);
+          const implementationWord = await provider.getStorage(PAXG, IMPL_SLOT);
+          const adminWord = await provider.getStorage(PAXG, ADMIN_SLOT);
+          const slot13 = await provider.getStorage(PAXG, SLOT13);
+          const implementation = storageAddress(implementationWord);
+          const admin = storageAddress(adminWord);
+
+          const result = {
+            generatedAt: new Date().toISOString(),
+            rpc,
+            latestBlock: latest,
+            latestTimestamp: latestBlock.timestamp,
+            productionStateChangingTransactions: 0,
+            proxy: PAXG,
+            implementation,
+            implementationCodeBytes: implementation ? (await provider.getCode(implementation)).length / 2 - 1 : 0,
+            proxyAdmin: admin,
+            slot13Raw: slot13,
+            slot13AddressInterpretation: storageAddress(slot13),
+            reads: {},
+            events: [],
+            errors: []
+          };
+
+          for (const name of ["name","symbol","decimals","totalSupply","paused","owner","defaultAdmin","defaultAdminDelay","pendingDefaultAdmin","supplyControl","feeRate","initializedV1"]) {
+            result.reads[name] = await safeCall(token, name);
+          }
+          const sc = typeof result.reads.supplyControl === "string" ? getAddress(result.reads.supplyControl) : null;
+          result.supplyControlCodeBytes = sc ? (await provider.getCode(sc)).length / 2 - 1 : 0;
+
+          async function scanEvent(name, fromBlock, toBlock) {
+            const topic = iface.getEvent(name).topicHash;
+            const chunk = 20_000;
+            const out = [];
+            for (let from = fromBlock; from <= toBlock; from += chunk) {
+              const to = Math.min(toBlock, from + chunk - 1);
+              let done = false;
+              const errs = [];
+              for (const url of RPCS) {
+                try {
+                  const p = new JsonRpcProvider(url, 1, { staticNetwork: true });
+                  const logs = await p.getLogs({ address: PAXG, fromBlock: from, toBlock: to, topics: [topic] });
+                  for (const log of logs) {
+                    const parsed = iface.parseLog(log);
+                    const block = await p.getBlock(log.blockNumber);
+                    const tx = await p.getTransaction(log.transactionHash);
+                    const entry = {
+                      event: parsed.name,
+                      blockNumber: log.blockNumber,
+                      timestamp: block?.timestamp ?? null,
+                      transactionHash: log.transactionHash,
+                      transactionIndex: tx?.index ?? null,
+                      from: tx?.from ?? null,
+                      args: {}
+                    };
+                    if (parsed.name === "Upgraded") entry.args.implementation = parsed.args.implementation;
+                    if (parsed.name === "SupplyControlSet") entry.args.supplyControlAddress = parsed.args.supplyControlAddress;
+                    if (parsed.name === "Initialized") entry.args.version = parsed.args.version.toString();
+                    out.push(entry);
+                  }
+                  done = true;
+                  break;
+                } catch (e) { errs.push(`${url}: ${e.message}`); }
+              }
+              if (!done) {
+                result.errors.push(`${name} ${from}-${to}: ${errs.join(" | ")}`);
+                break;
+              }
+            }
+            return out;
+          }
+
+          const start = Math.max(0, latest - 2_500_000);
+          for (const name of ["Upgraded", "SupplyControlSet", "Initialized"]) {
+            result.events.push(...await scanEvent(name, start, latest));
+          }
+          result.events.sort((a,b) => a.blockNumber - b.blockNumber || (a.transactionIndex ?? 0) - (b.transactionIndex ?? 0));
+          const v2Upgrade = [...result.events].reverse().find(e => e.event === "Upgraded" && getAddress(e.args.implementation) === implementation);
+          const laterSupplySet = v2Upgrade ? result.events.find(e => e.event === "SupplyControlSet" && (e.blockNumber > v2Upgrade.blockNumber || (e.blockNumber === v2Upgrade.blockNumber && (e.transactionIndex ?? 0) >= (v2Upgrade.transactionIndex ?? 0)))) : null;
+          result.currentUpgradeEvent = v2Upgrade ?? null;
+          result.firstSupplyControlSetAfterUpgrade = laterSupplySet ?? null;
+          result.transitionGap = v2Upgrade && laterSupplySet ? {
+            blocks: laterSupplySet.blockNumber - v2Upgrade.blockNumber,
+            seconds: laterSupplySet.timestamp - v2Upgrade.timestamp,
+            sameTransaction: laterSupplySet.transactionHash === v2Upgrade.transactionHash
+          } : null;
+
+          await writeFile("PAXOS_PAXG_V2_MAINNET_CENSUS.json", JSON.stringify(result, null, 2));
+          console.log(JSON.stringify({
+            proxy: result.proxy,
+            implementation: result.implementation,
+            admin: result.proxyAdmin,
+            slot13Raw: result.slot13Raw,
+            reads: result.reads,
+            supplyControlCodeBytes: result.supplyControlCodeBytes,
+            currentUpgradeEvent: result.currentUpgradeEvent,
+            firstSupplyControlSetAfterUpgrade: result.firstSupplyControlSetAfterUpgrade,
+            transitionGap: result.transitionGap,
+            errors: result.errors
+          }, null, 2));
+          NODE
+          node paxg_v2_census.mjs 2>&1 | tee PAXOS_PAXG_V2_MAINNET_CENSUS.log
+          sha256sum PAXOS_PAXG_V2_MAINNET_CENSUS.json PAXOS_PAXG_V2_MAINNET_CENSUS.log > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paxos-paxg-v2-mainnet-readonly-census
+          path: |
+            PAXOS_PAXG_V2_MAINNET_CENSUS.json
+            PAXOS_PAXG_V2_MAINNET_CENSUS.log
+            SHA256SUMS.txt
+          retention-days: 1
+          if-no-files-found: error
