@@ -1,0 +1,151 @@
+name: Temporary isolated ICP validation icp10
+
+on:
+  push:
+    branches:
+      - tmp-ci-20260816-icp10
+    paths:
+      - ".github/workflows/tmp-ci-icp10.yml"
+      - "secure-ci-icp10/bootstrap.txt"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tmp-ci-20260816-icp10
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - name: Checkout relay repository
+        uses: actions/checkout@v4
+
+      - name: Install repository prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler libprotobuf-dev pkg-config cmake clang lld \
+            libssl-dev libunwind-dev libdw-dev liblzma-dev libzstd-dev \
+            jq unzip zip python3
+          cargo --version
+
+      - name: Generate one-time runner key
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/runner-public"
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 \
+            -out "$RUNNER_TEMP/runner-private.pem" >/dev/null 2>&1
+          openssl pkey -in "$RUNNER_TEMP/runner-private.pem" -pubout \
+            -out "$RUNNER_TEMP/runner-public/runner-public.pem" >/dev/null 2>&1
+          chmod 600 "$RUNNER_TEMP/runner-private.pem"
+          sha256sum "$RUNNER_TEMP/runner-public/runner-public.pem" \
+            > "$RUNNER_TEMP/runner-public/runner-public.pem.sha256"
+
+      - name: Publish runner public key
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-public-key-icp10
+          path: ${{ runner.temp }}/runner-public/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Wait for encrypted payload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/secure-ci-icp10"
+          found=0
+          for _ in $(seq 1 1800); do
+            cp_code=$(curl -sS -o "$RUNNER_TEMP/payload.json" -w '%{http_code}' \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H 'Accept: application/vnd.github+json' \
+              "${api}/payload.enc.b64?ref=${GITHUB_REF_NAME}")
+            key_code=$(curl -sS -o "$RUNNER_TEMP/payload-key.json" -w '%{http_code}' \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H 'Accept: application/vnd.github+json' \
+              "${api}/payload.key.enc.b64?ref=${GITHUB_REF_NAME}")
+            if [[ "$cp_code" == 200 && "$key_code" == 200 ]]; then
+              jq -r '.content' "$RUNNER_TEMP/payload.json" | tr -d '\n' | base64 -d | base64 -d \
+                > "$RUNNER_TEMP/payload.enc"
+              jq -r '.content' "$RUNNER_TEMP/payload-key.json" | tr -d '\n' | base64 -d | base64 -d \
+                > "$RUNNER_TEMP/payload.key.enc"
+              found=1
+              break
+            fi
+            sleep 5
+          done
+          [[ "$found" == 1 ]]
+          test -s "$RUNNER_TEMP/payload.enc"
+          test -s "$RUNNER_TEMP/payload.key.enc"
+
+      - name: Decrypt and execute payload
+        shell: bash
+        env:
+          SECURE_RESULT_DIR: ${{ runner.temp }}/secure-result
+        run: |
+          set -euo pipefail
+          mkdir -p "$SECURE_RESULT_DIR" "$RUNNER_TEMP/secure-payload"
+          openssl pkeyutl -decrypt \
+            -inkey "$RUNNER_TEMP/runner-private.pem" \
+            -in "$RUNNER_TEMP/payload.key.enc" \
+            -out "$RUNNER_TEMP/payload.pass" \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -in "$RUNNER_TEMP/payload.enc" \
+            -out "$RUNNER_TEMP/payload.tar.gz" \
+            -pass file:"$RUNNER_TEMP/payload.pass"
+          tar -xzf "$RUNNER_TEMP/payload.tar.gz" -C "$RUNNER_TEMP/secure-payload" \
+            --no-same-owner --no-same-permissions
+          chmod 700 "$RUNNER_TEMP/secure-payload/run.sh"
+          set +e
+          bash "$RUNNER_TEMP/secure-payload/run.sh" \
+            >"$SECURE_RESULT_DIR/driver.stdout.log" \
+            2>"$SECURE_RESULT_DIR/driver.stderr.log"
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > "$SECURE_RESULT_DIR/driver.exit"
+          printf 'relay_run_id=%s\nrelay_commit=%s\n' "$GITHUB_RUN_ID" "$GITHUB_SHA" \
+            > "$SECURE_RESULT_DIR/relay.env"
+
+      - name: Encrypt result for researcher
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          result_dir="$RUNNER_TEMP/secure-result"
+          mkdir -p "$result_dir" "$RUNNER_TEMP/encrypted-result"
+          [[ -f "$result_dir/driver.exit" ]] || printf 'relay execution did not reach driver completion\n' > "$result_dir/relay_failure.txt"
+          tar -czf "$RUNNER_TEMP/result.tar.gz" -C "$result_dir" .
+          openssl rand -hex 32 > "$RUNNER_TEMP/result.pass"
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+            -in "$RUNNER_TEMP/result.tar.gz" \
+            -out "$RUNNER_TEMP/encrypted-result/result.enc" \
+            -pass file:"$RUNNER_TEMP/result.pass"
+          openssl pkeyutl -encrypt -pubin \
+            -inkey secure-ci-icp10/researcher-public.pem \
+            -in "$RUNNER_TEMP/result.pass" \
+            -out "$RUNNER_TEMP/encrypted-result/result.key.enc" \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          sha256sum "$RUNNER_TEMP/encrypted-result/result.enc" \
+            "$RUNNER_TEMP/encrypted-result/result.key.enc" \
+            > "$RUNNER_TEMP/encrypted-result/SHA256SUMS.txt"
+
+      - name: Upload encrypted result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-result-icp10
+          path: ${{ runner.temp }}/encrypted-result/
+          if-no-files-found: error
+          retention-days: 1
