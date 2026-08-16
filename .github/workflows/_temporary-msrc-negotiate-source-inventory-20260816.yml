@@ -1,0 +1,140 @@
+name: temporary-msrc-negotiate-source-inventory
+
+on:
+  push:
+    branches:
+      - runtime-lab-20260816-x7
+    paths:
+      - .github/workflows/_temporary-msrc-negotiate-source-inventory-20260816.yml
+
+permissions:
+  contents: write
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: runtime-lab-20260816-x7
+          fetch-depth: 1
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Clone exact supported ASP.NET Core source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/aspnetcore /tmp/negotiate-inventory
+          mkdir -p /tmp/negotiate-inventory
+          git clone --filter=blob:none --no-checkout https://github.com/dotnet/aspnetcore.git /tmp/aspnetcore
+          cd /tmp/aspnetcore
+          git fetch --depth=1 origin v10.0.10 || git fetch --depth=1 origin release/10.0
+          git checkout --detach FETCH_HEAD
+          {
+            echo "SOURCE_COMMIT=$(git rev-parse HEAD)"
+            echo "SOURCE_DESCRIBE=$(git describe --tags --always 2>/dev/null || true)"
+            echo "DOTNET=$(dotnet --version)"
+          } > /tmp/negotiate-inventory/environment.txt
+
+      - name: Extract exact Negotiate LDAP implementation and tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/aspnetcore
+          find src/Security/Authentication/Negotiate -type f \
+            \( -name '*.cs' -o -name '*.csproj' -o -name '*.props' \) \
+            -print | sort > /tmp/negotiate-inventory/file-list.txt
+
+          while IFS= read -r file; do
+            case "$file" in
+              *Ldap*|*NegotiateOptions*|*PostConfigure*|*Claims*|*Test*|*.csproj)
+                mkdir -p "/tmp/negotiate-inventory/$(dirname "$file")"
+                cp "$file" "/tmp/negotiate-inventory/$file"
+                ;;
+            esac
+          done < /tmp/negotiate-inventory/file-list.txt
+
+          grep -RInE \
+            'class LdapAdapter|groupType|tokenGroups|memberOf|1\.2\.840\.113556\.1\.4\.1941|IgnoreNestedGroups|ClaimTypes\.Role|new Claim|SearchRequest|SearchResponse' \
+            src/Security/Authentication/Negotiate \
+            > /tmp/negotiate-inventory/security-map.txt || true
+
+      - name: Create package API reflection inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/reflection
+          cd /tmp/reflection
+          dotnet new console --framework net10.0 --force >/dev/null
+          dotnet add package Microsoft.AspNetCore.Authentication.Negotiate --version 10.0.10 >/dev/null
+          cat > Program.cs <<'CS'
+          using System.Reflection;
+          using Microsoft.AspNetCore.Authentication.Negotiate;
+
+          static object Describe(Type t) => new {
+              type = t.FullName,
+              constructors = t.GetConstructors(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                  .Select(c => c.ToString()).ToArray(),
+              properties = t.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
+                  .Select(p => new { p.Name, PropertyType = p.PropertyType.FullName, Getter = p.GetMethod?.IsPublic, Setter = p.SetMethod?.IsPublic }).ToArray(),
+              methods = t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
+                  .Where(m => m.DeclaringType == t)
+                  .Select(m => m.ToString()).OrderBy(x => x).ToArray()
+          };
+
+          var asm = typeof(NegotiateOptions).Assembly;
+          var types = asm.GetTypes()
+              .Where(t => (t.FullName ?? "").Contains("Negotiate", StringComparison.OrdinalIgnoreCase)
+                       || (t.FullName ?? "").Contains("Ldap", StringComparison.OrdinalIgnoreCase))
+              .OrderBy(t => t.FullName)
+              .Select(Describe).ToArray();
+          Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(new {
+              assembly = asm.FullName,
+              location = asm.Location,
+              types
+          }, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+          CS
+          dotnet run -c Release > /tmp/negotiate-inventory/package-api.json
+
+      - name: Targeted source build
+        shell: bash
+        run: |
+          set -o pipefail
+          cd /tmp/aspnetcore
+          project="$(find src/Security/Authentication/Negotiate -name 'Microsoft.AspNetCore.Authentication.Negotiate.csproj' -print -quit)"
+          echo "PROJECT=$project" > /tmp/negotiate-inventory/build-status.txt
+          if [ -n "$project" ]; then
+            dotnet build "$project" -c Release --nologo 2>&1 \
+              | tee /tmp/negotiate-inventory/build.log
+            echo "BUILD_EXIT=0" >> /tmp/negotiate-inventory/build-status.txt
+          else
+            echo "BUILD_EXIT=127" >> /tmp/negotiate-inventory/build-status.txt
+            exit 1
+          fi
+
+      - name: Commit bounded public-source inventory
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          dest=.ci/negotiate-gate/source-inventory
+          rm -rf "$dest"
+          mkdir -p "$dest"
+          cp -a /tmp/negotiate-inventory/. "$dest/"
+          find "$dest" -type f -size +1500k -delete
+          (
+            cd "$dest"
+            find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+          )
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add "$dest"
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "research: capture exact Negotiate LDAP source inventory"
+          git push origin HEAD:runtime-lab-20260816-x7
