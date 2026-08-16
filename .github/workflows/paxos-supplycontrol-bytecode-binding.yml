@@ -1,0 +1,138 @@
+name: Paxos SupplyControl read-only bytecode binding
+
+on:
+  push:
+    branches:
+      - paxos-public-toolchain-bootstrap-20260815
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bind:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      URL_ETH_MAINNET: http://127.0.0.1:8545
+      URL_ETH_SEPOLIA: http://127.0.0.1:8545
+      URL_INK_MAINNET: http://127.0.0.1:8545
+      URL_INK_SEPOLIA: http://127.0.0.1:8545
+      URL_ARB_MAINNET: http://127.0.0.1:8545
+      URL_ARB_SEPOLIA: http://127.0.0.1:8545
+      URL_XLAYER_TESTNET: http://127.0.0.1:8545
+      URL_XLAYER_MAINNET: http://127.0.0.1:8545
+      GAS_REPORTING: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.19.4'
+      - name: Clone and compile exact public source
+        run: |
+          git clone https://github.com/paxosglobal/paxos-token-contracts.git paxos-token-contracts
+          cd paxos-token-contracts
+          git checkout --detach 674ac1046a0a40bfd2b6b892192998af9ac3b171
+          git submodule update --init --recursive
+          npm ci --no-audit --no-fund
+          npm run compile
+      - name: Bind deployed SupplyControl bytecode to exact artifact
+        working-directory: paxos-token-contracts
+        shell: bash
+        run: |
+          cat > ../bind_supplycontrol.mjs <<'NODE'
+          import { JsonRpcProvider, Contract, getAddress } from "ethers";
+          import fs from "node:fs";
+
+          const endpoints = [
+            "https://ethereum-rpc.publicnode.com",
+            "https://rpc.flashbots.net",
+            "https://eth.drpc.org"
+          ];
+          const tokens = {
+            USDG: "0xe343167631d89b6ffc58b88d6b7fb0228795491d",
+            PYUSD: "0x6c3ea9036406852006290770bedfcaba0e23a0e8",
+            USDP: "0x8e870d67f660d95d5be530380d0ec0bd388289e1",
+            PAXG: "0x45804880de22913dafe09f4980848ece6ecbaf78"
+          };
+          let provider, rpc;
+          for (const url of endpoints) {
+            try {
+              const p = new JsonRpcProvider(url, 1, { staticNetwork: true });
+              if ((await p.getBlockNumber()) > 1) { provider = p; rpc = url; break; }
+            } catch (e) { console.error(`${url}: ${e.message}`); }
+          }
+          if (!provider) throw new Error("No RPC available");
+
+          const candidates = [
+            "artifacts/contracts/SupplyControl.sol/SupplyControl.json"
+          ];
+          const artifactPath = candidates.find(fs.existsSync);
+          if (!artifactPath) throw new Error("SupplyControl artifact missing");
+          const artifact = JSON.parse(fs.readFileSync(artifactPath, "utf8"));
+
+          function strip0x(x) { return x.startsWith("0x") ? x.slice(2) : x; }
+          function stripMetadata(hex) {
+            let h = strip0x(hex);
+            if (h.length < 4) return h;
+            const len = parseInt(h.slice(-4), 16) * 2;
+            if (Number.isFinite(len) && len + 4 <= h.length) return h.slice(0, h.length - len - 4);
+            return h;
+          }
+          function zeroRanges(hex, refs) {
+            const bytes = Buffer.from(strip0x(hex), "hex");
+            for (const entries of Object.values(refs || {})) {
+              for (const ranges of Object.values(entries || {})) {
+                for (const r of ranges || []) bytes.fill(0, r.start, r.start + r.length);
+              }
+            }
+            return bytes.toString("hex");
+          }
+          const compiledRaw = artifact.deployedBytecode;
+          const compiledNormalized = stripMetadata(zeroRanges(compiledRaw, artifact.immutableReferences));
+          const tokenAbi = ["function supplyControl() view returns (address)"];
+          const result = {
+            generatedAt: new Date().toISOString(),
+            rpc,
+            sourceCommit: "674ac1046a0a40bfd2b6b892192998af9ac3b171",
+            artifactPath,
+            compiledBytes: strip0x(compiledRaw).length / 2,
+            compiledNormalizedBytes: compiledNormalized.length / 2,
+            productionStateChangingTransactions: 0,
+            tokens: {}
+          };
+          for (const [symbol, raw] of Object.entries(tokens)) {
+            const token = getAddress(raw);
+            const c = new Contract(token, tokenAbi, provider);
+            try {
+              const supplyControl = getAddress(await c.supplyControl());
+              const chainCode = await provider.getCode(supplyControl);
+              const chainNormalized = stripMetadata(zeroRanges(chainCode, artifact.immutableReferences));
+              result.tokens[symbol] = {
+                token,
+                supplyControl,
+                chainBytes: strip0x(chainCode).length / 2,
+                chainNormalizedBytes: chainNormalized.length / 2,
+                exactNormalizedMatch: chainNormalized === compiledNormalized,
+                prefixMatch: chainNormalized.startsWith(compiledNormalized) || compiledNormalized.startsWith(chainNormalized)
+              };
+            } catch (e) {
+              result.tokens[symbol] = { token, error: e.message };
+            }
+          }
+          fs.writeFileSync("../PAXOS_SUPPLYCONTROL_BYTECODE_BINDING.json", JSON.stringify(result, null, 2));
+          console.log(JSON.stringify(result, null, 2));
+          if (!Object.values(result.tokens).some(x => x.exactNormalizedMatch)) process.exitCode = 2;
+          NODE
+          node ../bind_supplycontrol.mjs 2>&1 | tee ../PAXOS_SUPPLYCONTROL_BYTECODE_BINDING.log
+          sha256sum ../PAXOS_SUPPLYCONTROL_BYTECODE_BINDING.json ../PAXOS_SUPPLYCONTROL_BYTECODE_BINDING.log > ../SHA256SUMS_SUPPLYCONTROL_BINDING.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: paxos-supplycontrol-bytecode-binding
+          path: |
+            PAXOS_SUPPLYCONTROL_BYTECODE_BINDING.json
+            PAXOS_SUPPLYCONTROL_BYTECODE_BINDING.log
+            SHA256SUMS_SUPPLYCONTROL_BINDING.txt
+          retention-days: 1
+          if-no-files-found: error
