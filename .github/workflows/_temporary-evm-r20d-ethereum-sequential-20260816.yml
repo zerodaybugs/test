@@ -1,0 +1,130 @@
+name: evm-r20d-encrypted-ethereum-sequential-shards
+
+on:
+  push:
+    branches: [agent/evm-readonly-encrypted-20260816]
+    paths:
+      - tmp_evm_encrypted/generate_r20_roundtrip.py
+      - tmp_evm_encrypted/r19_public.pem
+      - .github/workflows/_temporary-evm-r20d-ethereum-sequential-20260816.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  roundtrip:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      R20_CHAIN_NAME: ethereum
+      R20_CHAIN_ID: 1
+      R20_SHARD_TOTAL: 4
+      R20_RPC_URL: https://rpc.flashbots.net
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/evm-readonly-encrypted-20260816
+          fetch-depth: 1
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Install pinned generator dependency
+        run: python3 -m pip install --disable-pip-version-check 'web3==7.13.0'
+
+      - name: Verify explicit-state RPC
+        run: |
+          python3 - <<'PY'
+          import requests
+          u='https://rpc.flashbots.net'
+          def call(method,params):
+              r=requests.post(u,json={'jsonrpc':'2.0','id':1,'method':method,'params':params},timeout=25,allow_redirects=False)
+              r.raise_for_status();d=r.json();assert 'result' in d,d;return d['result']
+          assert int(call('eth_chainId',[]),16)==1
+          b=call('eth_blockNumber',[])
+          call('eth_getBlockByNumber',[b,False])
+          call('eth_getCode',['0x8AF79Dd066d86fE6F3169c62e515D15174dc1A45',b])
+          call('eth_getBalance',['0x1804c8AB1F12E6bbf3894d4083f33e07309d1f38',b])
+          print('R20D_RPC_GATE=PASS')
+          PY
+
+      - name: Prepare shard-aware generator and patcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp tmp_evm_encrypted/generate_r20_roundtrip.py /tmp/generator.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/generator.py');s=p.read_text()
+          needle='''rows = [row for row in scope if int(row["chain_id"]) == CHAIN_ID]\nif not rows:'''
+          repl='''rows = [row for row in scope if int(row["chain_id"]) == CHAIN_ID]\nshard_index = int(os.environ.get("R20_SHARD_INDEX", "0"))\nshard_total = int(os.environ.get("R20_SHARD_TOTAL", "1"))\nrows = [row for index, row in enumerate(rows) if index % shard_total == shard_index]\nif not rows:'''
+          assert needle in s
+          p.write_text(s.replace(needle,repl))
+          PY
+          cat > /tmp/patch_test.py <<'PY'
+          from pathlib import Path
+          p=Path('test/KilnR20RoundTrip.t.sol');s=p.read_text()
+          s=s.replace('_scanVault(rpc, fixedBlock, vaults[i]);','_scanVault(vaults[i]);')
+          s=s.replace('function _scanVault(string memory rpc, uint256 fixedBlock, address vaultAddr) internal {\n        vm.createSelectFork(rpc, fixedBlock);','function _scanVault(address vaultAddr) internal {')
+          s=s.replace('_attempt(rpc, fixedBlock, vaultAddr, asset, small, totalAssetsBefore)','_attempt(vaultAddr, asset, small, totalAssetsBefore)')
+          s=s.replace('_attempt(rpc, fixedBlock, vaultAddr, asset, material, totalAssetsBefore)','_attempt(vaultAddr, asset, material, totalAssetsBefore)')
+          s=s.replace('''function _attempt(\n        string memory rpc,\n        uint256 fixedBlock,\n        address vaultAddr,''','''function _attempt(\n        address vaultAddr,''')
+          s=s.replace('''    ) internal returns (Result memory result) {\n        vm.createSelectFork(rpc, fixedBlock);\n        IR20Vault vault''','''    ) internal returns (Result memory result) {\n        uint256 snapshotId = vm.snapshotState();\n        IR20Vault vault''')
+          s=s.replace('deal(asset, ATTACKER, amount, true);','deal(asset, ATTACKER, amount, false);')
+          s=s.replace('''            result.depositError = bytes4(keccak256("APPROVE_FAILED"));\n            return result;''','''            result.depositError = bytes4(keccak256("APPROVE_FAILED"));\n            require(vm.revertToState(snapshotId), "snapshot restore failed");\n            return result;''')
+          s=s.replace('''            result.afterBalance = token.balanceOf(ATTACKER);\n            return result;''','''            result.afterBalance = token.balanceOf(ATTACKER);\n            require(vm.revertToState(snapshotId), "snapshot restore failed");\n            return result;''')
+          s=s.replace('''        catch { result.totalAssetsAfter = type(uint256).max; }\n    }''','''        catch { result.totalAssetsAfter = type(uint256).max; }\n        require(vm.revertToState(snapshotId), "snapshot restore failed");\n    }''')
+          for n in ['vm.snapshotState()','vm.revertToState(snapshotId)','deal(asset, ATTACKER, amount, false);']:assert n in s,n
+          assert 'vm.createSelectFork(rpc, fixedBlock);' not in s
+          p.write_text(s)
+          PY
+          python3 -m py_compile /tmp/generator.py /tmp/patch_test.py
+
+      - name: Execute and encrypt four shards
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted_r20d
+          for shard in 0 1 2 3; do
+            export R20_SHARD_INDEX="$shard"
+            rm -f test/KilnR20RoundTrip.t.sol
+            python3 /tmp/generator.py > "/tmp/r20_generation_${shard}.log" 2>&1
+            python3 /tmp/patch_test.py
+            sha256sum test/KilnR20RoundTrip.t.sol > "/tmp/r20_input_${shard}.sha256"
+            set +e
+            forge test --via-ir --match-contract KilnR20RoundTrip -vv > "/tmp/r20_forge_${shard}.log" 2>&1
+            code=$?
+            set -e
+            printf '%s\n' "$code" > "/tmp/r20_exit_${shard}.txt"
+            dest="encrypted_r20d/shard-${shard}"
+            mkdir -p "$dest"
+            tar -czf "/tmp/r20_payload_${shard}.tar.gz" test/KilnR20RoundTrip.t.sol "/tmp/r20_generation_${shard}.log" "/tmp/r20_input_${shard}.sha256" "/tmp/r20_forge_${shard}.log" "/tmp/r20_exit_${shard}.txt"
+            openssl rand 32 > "/tmp/r20_aes_${shard}.key"
+            openssl enc -aes-256-cbc -salt -pbkdf2 -iter 250000 -in "/tmp/r20_payload_${shard}.tar.gz" -out "$dest/payload.aes256" -pass file:"/tmp/r20_aes_${shard}.key"
+            openssl pkeyutl -encrypt -pubin -inkey tmp_evm_encrypted/r19_public.pem -in "/tmp/r20_aes_${shard}.key" -out "$dest/key.rsa3072" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+            sha256sum "$dest/payload.aes256" "$dest/key.rsa3072" > "$dest/SHA256SUMS.txt"
+            python3 - "$shard" "$code" "$dest" <<'PY'
+          import json,sys
+          from pathlib import Path
+          shard,code,dest=int(sys.argv[1]),int(sys.argv[2]),Path(sys.argv[3])
+          dest.joinpath('PUBLIC_MANIFEST.json').write_text(json.dumps({
+            'schema':'encrypted-r20d-ethereum-shard-v1','chain_id':1,'shard_index':shard,'shard_total':4,'forge_exit_code':code,
+            'source_commit':'${{ github.sha }}','rpc':'Flashbots','plaintext_results_publicly_exposed':False,
+            'public_chain_transactions_signed':0,'public_chain_transactions_sent':0,
+            'execution':'single latest local fork with snapshot/revert isolation; unchanged underlying totalSupply',
+            'encryption':'AES-256-CBC/PBKDF2-250000 + RSA-3072-OAEP-SHA256 wrapped key'},indent=2,sort_keys=True))
+          PY
+            rm -f "/tmp/r20_payload_${shard}.tar.gz" "/tmp/r20_aes_${shard}.key" test/KilnR20RoundTrip.t.sol
+            sleep 20
+          done
+          forge --version > encrypted_r20d/FOUNDRY_VERSION.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-r20d-ethereum-sequential-shards
+          path: encrypted_r20d
+          if-no-files-found: error
+          retention-days: 1
