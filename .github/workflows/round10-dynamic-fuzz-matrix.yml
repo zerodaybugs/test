@@ -1,0 +1,162 @@
+name: Round 10 dynamic security fuzz matrix
+
+on:
+  push:
+    branches:
+      - "sui-runtime-extract-20260815"
+
+permissions:
+  contents: read
+
+jobs:
+  dynamic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - name: Clone exact heads
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/r10dyn/repos /tmp/r10dyn/out
+          git clone --depth=1 https://github.com/MystenLabs/sui.git /tmp/r10dyn/repos/sui
+          git clone --depth=1 https://github.com/MystenLabs/deepbookv3.git /tmp/r10dyn/repos/deepbookv3
+          git clone --depth=1 https://github.com/MystenLabs/seal.git /tmp/r10dyn/repos/seal
+          for r in sui deepbookv3 seal; do
+            git -C /tmp/r10dyn/repos/$r rev-parse HEAD > /tmp/r10dyn/out/${r}_HEAD.txt
+          done
+
+      - name: Sui authorization and accumulator tests
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          cd /tmp/r10dyn/repos/sui
+          timeout 25m cargo test -p sui-types --lib signature -- --nocapture > /tmp/r10dyn/out/SUI_SIGNATURE.log 2>&1
+          echo $? > /tmp/r10dyn/out/SUI_SIGNATURE.exit
+          timeout 25m cargo test -p sui-adapter-transactional-tests address_balance -- --nocapture > /tmp/r10dyn/out/SUI_ADDRESS_BALANCE.log 2>&1
+          echo $? > /tmp/r10dyn/out/SUI_ADDRESS_BALANCE.exit
+          timeout 20m cargo test -p transaction-fuzzer fuzz_addr_balance -- --nocapture > /tmp/r10dyn/out/SUI_ADDR_BAL_FUZZ.log 2>&1
+          echo $? > /tmp/r10dyn/out/SUI_ADDR_BAL_FUZZ.exit
+          exit 0
+
+      - name: Install Sui CLI for DeepBook Move tests
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          curl -fsSL https://raw.githubusercontent.com/MystenLabs/suiup/main/install.sh | sh > /tmp/r10dyn/out/SUIUP_INSTALL.log 2>&1
+          export PATH="$HOME/.local/bin:$HOME/.sui/bin:$PATH"
+          if command -v suiup >/dev/null 2>&1; then
+            timeout 8m suiup install sui@testnet >> /tmp/r10dyn/out/SUIUP_INSTALL.log 2>&1
+          fi
+          command -v sui > /tmp/r10dyn/out/SUI_CLI_PATH.txt 2>&1
+          sui --version > /tmp/r10dyn/out/SUI_CLI_VERSION.txt 2>&1
+          echo $? > /tmp/r10dyn/out/SUIUP_INSTALL.exit
+          exit 0
+
+      - name: DeepBook Move and SDK tests
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          export PATH="$HOME/.local/bin:$HOME/.sui/bin:$PATH"
+          cd /tmp/r10dyn/repos/deepbookv3
+          : > /tmp/r10dyn/out/DEEPBOOK_MOVE_TEST.log
+          overall=0
+          if command -v sui >/dev/null 2>&1; then
+            while IFS= read -r manifest; do
+              dir=$(dirname "$manifest")
+              echo "=== $dir ===" >> /tmp/r10dyn/out/DEEPBOOK_MOVE_TEST.log
+              timeout 12m sui move test --path "$dir" --gas-limit 1000000000 >> /tmp/r10dyn/out/DEEPBOOK_MOVE_TEST.log 2>&1
+              rc=$?
+              echo "exit=$rc" >> /tmp/r10dyn/out/DEEPBOOK_MOVE_TEST.log
+              if [[ $rc -ne 0 ]]; then overall=$rc; fi
+            done < <(find . -name Move.toml -not -path '*/build/*' -not -path '*/node_modules/*' | sort)
+          else
+            echo 'sui CLI unavailable' >> /tmp/r10dyn/out/DEEPBOOK_MOVE_TEST.log
+            overall=127
+          fi
+          echo $overall > /tmp/r10dyn/out/DEEPBOOK_MOVE_TEST.exit
+
+          if [[ -f pnpm-lock.yaml ]] && command -v corepack >/dev/null 2>&1; then
+            timeout 10m corepack pnpm install --frozen-lockfile > /tmp/r10dyn/out/DEEPBOOK_PNPM_INSTALL.log 2>&1
+            timeout 12m corepack pnpm test > /tmp/r10dyn/out/DEEPBOOK_SDK_TEST.log 2>&1
+            echo $? > /tmp/r10dyn/out/DEEPBOOK_SDK_TEST.exit
+          else
+            echo 127 > /tmp/r10dyn/out/DEEPBOOK_SDK_TEST.exit
+            echo 'No root pnpm project' > /tmp/r10dyn/out/DEEPBOOK_SDK_TEST.log
+          fi
+          exit 0
+
+      - name: Seal tests and cache-domain negative-control inventory
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          cd /tmp/r10dyn/repos/seal
+          if [[ -f Cargo.toml ]]; then
+            timeout 25m cargo test --workspace --locked -- --nocapture > /tmp/r10dyn/out/SEAL_WORKSPACE_TEST.log 2>&1
+            echo $? > /tmp/r10dyn/out/SEAL_WORKSPACE_TEST.exit
+          else
+            echo 127 > /tmp/r10dyn/out/SEAL_WORKSPACE_TEST.exit
+            echo 'No root Cargo.toml' > /tmp/r10dyn/out/SEAL_WORKSPACE_TEST.log
+          fi
+          python3 - <<'PY'
+          import json,re
+          from pathlib import Path
+          root=Path('/tmp/r10dyn/repos/seal')
+          rows=[]
+          for p in root.rglob('*'):
+              if not p.is_file() or p.suffix not in ('.rs','.ts','.tsx','.move'): continue
+              t=p.read_text(errors='ignore'); low=t.lower()
+              if not any(x in low for x in ('cache','lru','hashmap','dashmap','moka')): continue
+              if not any(x in low for x in ('decrypt','key','policy','identity','session')): continue
+              rows.append({
+                  'path':str(p.relative_to(root)),
+                  'domain_terms':{x:(x in low) for x in ('policy','identity','epoch','package','object','session','threshold','network','chain','ptb','digest')},
+                  'tests_in_same_file':len(re.findall(r'#\[(?:tokio::)?test\]|\btest\s*\(',t)),
+              })
+          Path('/tmp/r10dyn/out/SEAL_CACHE_NEGATIVE_CONTROL_INVENTORY.json').write_text(json.dumps(rows,indent=2)+'\n')
+          PY
+          exit 0
+
+      - name: Classify failures without treating test failure as exploit proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,re
+          from pathlib import Path
+          out=Path('/tmp/r10dyn/out')
+          names=['SUI_SIGNATURE','SUI_ADDRESS_BALANCE','SUI_ADDR_BAL_FUZZ','SUIUP_INSTALL','DEEPBOOK_MOVE_TEST','DEEPBOOK_SDK_TEST','SEAL_WORKSPACE_TEST']
+          rows={}
+          security_crash=re.compile(r'(panicked at|SIGSEGV|segmentation fault|stack overflow|arithmetic overflow|invariant violation|consensus.*fail|unauthorized|assertion.*failed)',re.I)
+          for n in names:
+              ep=out/f'{n}.exit'; lp=out/f'{n}.log'
+              rc=int(ep.read_text().strip()) if ep.exists() else None
+              text=lp.read_text(errors='ignore') if lp.exists() else ''
+              hits=[]
+              for i,l in enumerate(text.splitlines(),1):
+                  if security_crash.search(l): hits.append({'line':i,'text':l[:500]})
+              rows[n]={'exit':rc,'security_signal_hits':hits[:100],'log_bytes':len(text)}
+          proven=False
+          final={
+              'tests':rows,
+              'deterministic_security_reproduction':proven,
+              'negative_control_passed':False,
+              'unauthorized_impact_proven':False,
+              'production_binding_proven':False,
+              'submission_authorized':False,
+              'verdict':'TEST_FAILURES_REQUIRE_MANUAL_ROOT_CAUSE_NO_EXPLOIT_INFERENCE' if any(v['security_signal_hits'] for v in rows.values()) else 'NO_DYNAMIC_SECURITY_REPRO',
+          }
+          (out/'DYNAMIC_FINAL_GATE.json').write_text(json.dumps(final,indent=2)+'\n')
+          PY
+
+      - name: Upload dynamic evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: round10-dynamic-fuzz-matrix
+          path: /tmp/r10dyn/out/
+          retention-days: 1
+          compression-level: 6
+          if-no-files-found: error
