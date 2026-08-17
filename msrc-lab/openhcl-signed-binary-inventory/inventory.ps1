@@ -10,6 +10,13 @@ function Write-JsonFile([string]$Path, $Object) {
     $Object | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $Path -Encoding UTF8
 }
 
+function Get-NullableProperty($Object, [string]$Name) {
+    if ($null -eq $Object) { return $null }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
 $os = [ordered]@{}
 $os['utc'] = [DateTime]::UtcNow.ToString('o')
 $os['computerInfo'] = Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsBuildNumber, OsArchitecture, OsHardwareAbstractionLayer
@@ -67,11 +74,13 @@ foreach ($root in $roots) {
 }
 
 $candidates = $candidateMap.Values | Sort-Object FullName
+$candidatePaths = $candidates | ForEach-Object FullName
+$candidatePaths | Set-Content -LiteralPath (Join-Path $evidence 'CANDIDATE_PATHS.txt') -Encoding UTF8
 $inventory = [System.Collections.Generic.List[object]]::new()
-$termPattern = '(?i)(KEY_RELEASE_REQUEST|key[_ -]?release|wrapped[_ -]?key|key_hsm|x5c|RS256|skip_hw_unsealing|VMGS|IGVM|OpenHCL|Underhill|attestation|secure boot|BIOS_NVRAM|guest secret|vTPM)'
+$scanErrors = [System.Collections.Generic.List[object]]::new()
 
 $python = @'
-import json, os, re, sys, hashlib
+import json, re, sys, hashlib
 from pathlib import Path
 
 path = Path(sys.argv[1])
@@ -120,53 +129,66 @@ try { $dumpbin = (Get-Command dumpbin.exe -ErrorAction Stop).Source } catch {}
 $llvmReadobj = $null
 try { $llvmReadobj = (Get-Command llvm-readobj.exe -ErrorAction Stop).Source } catch {}
 
+$index = 0
 foreach ($file in $candidates) {
-    $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
-    $hash = Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256
-    $version = $file.VersionInfo
-    $entry = [ordered]@{
-        path = $file.FullName
-        name = $file.Name
-        size = $file.Length
-        sha256 = $hash.Hash.ToLowerInvariant()
-        version = [ordered]@{
-            FileVersion = $version.FileVersion
-            ProductVersion = $version.ProductVersion
-            CompanyName = $version.CompanyName
-            ProductName = $version.ProductName
-            OriginalFilename = $version.OriginalFilename
-            InternalName = $version.InternalName
-            FileDescription = $version.FileDescription
+    $index++
+    Write-Host ("SCAN {0}/{1}: {2}" -f $index, $candidates.Count, $file.FullName)
+    try {
+        $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
+        $hash = Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256
+        $version = $file.VersionInfo
+        $signer = Get-NullableProperty $signature 'SignerCertificate'
+        $timeStamper = Get-NullableProperty $signature 'TimeStamperCertificate'
+        $entry = [ordered]@{
+            path = $file.FullName
+            name = $file.Name
+            size = $file.Length
+            sha256 = $hash.Hash.ToLowerInvariant()
+            version = [ordered]@{
+                FileVersion = Get-NullableProperty $version 'FileVersion'
+                ProductVersion = Get-NullableProperty $version 'ProductVersion'
+                CompanyName = Get-NullableProperty $version 'CompanyName'
+                ProductName = Get-NullableProperty $version 'ProductName'
+                OriginalFilename = Get-NullableProperty $version 'OriginalFilename'
+                InternalName = Get-NullableProperty $version 'InternalName'
+                FileDescription = Get-NullableProperty $version 'FileDescription'
+            }
+            signature = [ordered]@{
+                Status = [string](Get-NullableProperty $signature 'Status')
+                StatusMessage = Get-NullableProperty $signature 'StatusMessage'
+                SignerSubject = Get-NullableProperty $signer 'Subject'
+                SignerThumbprint = Get-NullableProperty $signer 'Thumbprint'
+                Issuer = Get-NullableProperty $signer 'Issuer'
+                NotBefore = Get-NullableProperty $signer 'NotBefore'
+                NotAfter = Get-NullableProperty $signer 'NotAfter'
+                TimeStamperSubject = Get-NullableProperty $timeStamper 'Subject'
+            }
+            source_root = ($roots | Where-Object { $file.FullName.StartsWith($_, [System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1)
         }
-        signature = [ordered]@{
-            Status = [string]$signature.Status
-            StatusMessage = $signature.StatusMessage
-            SignerSubject = $signature.SignerCertificate.Subject
-            SignerThumbprint = $signature.SignerCertificate.Thumbprint
-            Issuer = $signature.SignerCertificate.Issuer
-            NotBefore = $signature.SignerCertificate.NotBefore
-            NotAfter = $signature.SignerCertificate.NotAfter
-            TimeStamperSubject = $signature.TimeStamperCertificate.Subject
+
+        $stringResult = & python $extractor $file.FullName (Join-Path $evidence 'strings') 2>&1
+        $entry['string_extractor'] = ($stringResult | Out-String).Trim()
+
+        $safe = ($file.FullName -replace '[^A-Za-z0-9_.-]+', '_')
+        if ($safe.Length -gt 170) { $safe = $safe.Substring($safe.Length - 170) }
+        if ($dumpbin) {
+            try { & $dumpbin /headers /imports $file.FullName *> (Join-Path $evidence "pe\$safe.dumpbin.txt") } catch {}
+        } elseif ($llvmReadobj) {
+            try { & $llvmReadobj --file-headers --sections --coff-imports $file.FullName *> (Join-Path $evidence "pe\$safe.llvm-readobj.txt") } catch {}
         }
-        source_root = ($roots | Where-Object { $file.FullName.StartsWith($_, [System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1)
+
+        $inventory.Add([pscustomobject]$entry)
+    } catch {
+        $scanErrors.Add([pscustomobject]@{
+            path = $file.FullName
+            error = ($_ | Out-String).Trim()
+        })
     }
-
-    $stringResult = & python $extractor $file.FullName (Join-Path $evidence 'strings') 2>&1
-    $entry['string_extractor'] = ($stringResult | Out-String).Trim()
-
-    $safe = ($file.FullName -replace '[^A-Za-z0-9_.-]+', '_')
-    if ($safe.Length -gt 170) { $safe = $safe.Substring($safe.Length - 170) }
-    if ($dumpbin) {
-        try { & $dumpbin /headers /imports $file.FullName *> (Join-Path $evidence "pe\$safe.dumpbin.txt") } catch {}
-    } elseif ($llvmReadobj) {
-        try { & $llvmReadobj --file-headers --sections --coff-imports $file.FullName *> (Join-Path $evidence "pe\$safe.llvm-readobj.txt") } catch {}
-    }
-
-    $inventory.Add([pscustomobject]$entry)
 }
 
 Write-JsonFile (Join-Path $evidence 'SIGNED_BINARY_INVENTORY.json') $inventory
 $inventory | Export-Csv -LiteralPath (Join-Path $evidence 'SIGNED_BINARY_INVENTORY.csv') -NoTypeInformation -Encoding UTF8
+Write-JsonFile (Join-Path $evidence 'SCAN_ERRORS.json') $scanErrors
 
 $strong = $inventory | Where-Object {
     $_.name -match '(?i)(vmfirmwarecvm|openhcl|underhill|igvm|vmgs)' -or
@@ -174,17 +196,25 @@ $strong = $inventory | Where-Object {
 }
 Write-JsonFile (Join-Path $evidence 'STRONG_CANDIDATES.json') $strong
 
+$exactCvm = @($inventory | Where-Object name -IEQ 'vmfirmwarecvm.dll')
+$exactOpenHcl = @($inventory | Where-Object name -Match '(?i)openhcl')
+$signedStrong = @($strong | Where-Object {
+    $_.signature.Status -eq 'Valid' -and $_.signature.SignerSubject -match '(?i)Microsoft'
+})
 $summary = [ordered]@{
-    schema = 'openhcl_signed_product_binary_inventory/v1'
+    schema = 'openhcl_signed_product_binary_inventory/v2'
     generated_utc = [DateTime]::UtcNow.ToString('o')
     roots = $roots
-    total_candidates = $inventory.Count
+    enumerated_candidates = $candidates.Count
+    successfully_scanned_candidates = $inventory.Count
+    scan_errors = $scanErrors.Count
     strong_candidates = @($strong).Count
-    exact_vmfirmwarecvm_found = [bool]($inventory | Where-Object name -IEQ 'vmfirmwarecvm.dll')
-    exact_openhcl_named_file_found = [bool]($inventory | Where-Object name -Match '(?i)openhcl')
-    signed_microsoft_strong_candidates = @($strong | Where-Object {
-        $_.signature.Status -eq 'Valid' -and $_.signature.SignerSubject -match '(?i)Microsoft'
-    }).Count
+    exact_vmfirmwarecvm_found = [bool]($exactCvm.Count -gt 0)
+    exact_vmfirmwarecvm_count = $exactCvm.Count
+    exact_openhcl_named_file_found = [bool]($exactOpenHcl.Count -gt 0)
+    exact_openhcl_named_file_count = $exactOpenHcl.Count
+    signed_microsoft_strong_candidates = $signedStrong.Count
+    exact_vmfirmwarecvm_rows = $exactCvm
     product_binding_closed = $false
     submission_ready = $false
     note = 'Metadata and static strings only. A signed binary match is evidence for product binding, not proof of runtime exploitability or deployed Azure parity.'
@@ -196,4 +226,7 @@ Get-ChildItem -LiteralPath $evidence -File -Recurse | Sort-Object FullName | For
     "{0}  {1}" -f $h.Hash.ToLowerInvariant(), $_.FullName.Substring($evidence.Length + 1).Replace('\','/')
 } | Set-Content -LiteralPath (Join-Path $evidence 'SHA256SUMS.txt') -Encoding ASCII
 
-$summary | ConvertTo-Json -Depth 8
+$summary | ConvertTo-Json -Depth 12
+if ($scanErrors.Count -gt 0) {
+    Write-Warning ("Completed with {0} per-file scan errors; see SCAN_ERRORS.json" -f $scanErrors.Count)
+}
