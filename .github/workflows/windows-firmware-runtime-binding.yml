@@ -1,0 +1,194 @@
+name: Windows VM firmware runtime binding
+
+on:
+  push:
+    branches:
+      - openvmm-runtime-binding-20260817
+    paths:
+      - .github/workflows/windows-firmware-runtime-binding.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - name: Collect signed VM firmware files and provenance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $out = Join-Path $env:RUNNER_TEMP 'openhcl-runtime-binding'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $out 'files') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $out 'strings') | Out-Null
+
+          $computer = Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsBuildNumber, OsArchitecture, WindowsBuildLabEx, OsHardwareAbstractionLayer
+          $computer | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 (Join-Path $out 'WINDOWS_BUILD.json')
+          [ordered]@{
+            runner_os = '${{ matrix.os }}'
+            image_os = $env:ImageOS
+            image_version = $env:ImageVersion
+            runner_arch = $env:RUNNER_ARCH
+            collected_utc = (Get-Date).ToUniversalTime().ToString('o')
+          } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 (Join-Path $out 'RUNNER_IMAGE.json')
+
+          $roots = @(
+            (Join-Path $env:windir 'System32'),
+            (Join-Path $env:windir 'System32\drivers'),
+            (Join-Path $env:windir 'WinSxS')
+          ) | Where-Object { Test-Path -LiteralPath $_ }
+          $patterns = @(
+            'vmfirmware*.dll',
+            '*vmfirmware*cvm*.dll',
+            '*igvm*.dll',
+            '*openhcl*.dll',
+            '*openvmm*.dll'
+          )
+          $candidateMap = @{}
+          foreach ($root in $roots) {
+            foreach ($pattern in $patterns) {
+              Get-ChildItem -LiteralPath $root -Filter $pattern -File -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                $candidateMap[$_.FullName.ToLowerInvariant()] = $_.FullName
+              }
+            }
+          }
+          $candidates = @($candidateMap.Values | Sort-Object)
+
+          $records = @()
+          $index = 0
+          foreach ($path in $candidates) {
+            $item = Get-Item -LiteralPath $path
+            $sig = Get-AuthenticodeSignature -LiteralPath $path
+            $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $path
+            $copyName = ('{0:D3}_{1}' -f $index, $item.Name)
+            $copyPath = Join-Path (Join-Path $out 'files') $copyName
+            Copy-Item -LiteralPath $path -Destination $copyPath -Force
+            $certChain = @()
+            if ($sig.SignerCertificate) {
+              $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+              $null = $chain.Build($sig.SignerCertificate)
+              foreach ($element in $chain.ChainElements) {
+                $certChain += [ordered]@{
+                  subject = $element.Certificate.Subject
+                  issuer = $element.Certificate.Issuer
+                  thumbprint = $element.Certificate.Thumbprint
+                  not_before = $element.Certificate.NotBefore.ToUniversalTime().ToString('o')
+                  not_after = $element.Certificate.NotAfter.ToUniversalTime().ToString('o')
+                  status = @($element.ChainElementStatus | ForEach-Object { [string]$_.Status })
+                }
+              }
+            }
+            $records += [ordered]@{
+              source_path = $path
+              copied_file = $copyName
+              length = $item.Length
+              file_version = $item.VersionInfo.FileVersion
+              product_version = $item.VersionInfo.ProductVersion
+              company_name = $item.VersionInfo.CompanyName
+              product_name = $item.VersionInfo.ProductName
+              original_filename = $item.VersionInfo.OriginalFilename
+              sha256 = $hash.Hash.ToLowerInvariant()
+              signature_status = [string]$sig.Status
+              signature_status_message = $sig.StatusMessage
+              signer_subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { $null }
+              signer_issuer = if ($sig.SignerCertificate) { $sig.SignerCertificate.Issuer } else { $null }
+              signer_thumbprint = if ($sig.SignerCertificate) { $sig.SignerCertificate.Thumbprint } else { $null }
+              certificate_chain = $certChain
+            }
+            $index++
+          }
+          $records | ConvertTo-Json -Depth 10 | Set-Content -Encoding utf8 (Join-Path $out 'FIRMWARE_BINDING.json')
+
+          @'
+          import json, pathlib, re, sys
+          root = pathlib.Path(sys.argv[1])
+          markers = [
+              b'igvm', b'key_release', b'key release', b'akv', b'jwt', b'x5c',
+              b'ciphertext', b'vmgs', b'guest_secret', b'hardware sealing',
+              b'rsa_aes', b'attestation', b'wrapped key', b'certificate chain',
+              b'failed to verify akv jwt signature', b'failed to parse akv jwt',
+              b'igvm agent attestation response signals',
+              b'failed to get wrapped key from akv jwt body'
+          ]
+          summary = []
+          for path in sorted((root / 'files').glob('*')):
+              data = path.read_bytes()
+              values = []
+              values.extend(m.group(0) for m in re.finditer(rb'[\x20-\x7e]{4,}', data))
+              values.extend(m.group(0).replace(b'\x00', b'') for m in re.finditer(rb'(?:[\x20-\x7e]\x00){4,}', data))
+              hits = []
+              seen = set()
+              for raw in values:
+                  low = raw.lower()
+                  if any(marker in low for marker in markers):
+                      text = raw.decode('utf-8', 'replace')[:1000]
+                      if text not in seen:
+                          seen.add(text)
+                          hits.append(text)
+              out = root / 'strings' / (path.name + '.json')
+              out.write_text(json.dumps({'file': path.name, 'hits': hits}, indent=2), encoding='utf-8')
+              summary.append({'file': path.name, 'hit_count': len(hits), 'hits': hits[:50]})
+          (root / 'STRING_MARKER_SUMMARY.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+          '@ | Set-Content -Encoding utf8 (Join-Path $out 'extract_markers.py')
+          python (Join-Path $out 'extract_markers.py') $out
+
+          $servicingHits = @()
+          $servicingRoots = @(
+            (Join-Path $env:windir 'servicing\Packages'),
+            (Join-Path $env:windir 'WinSxS\Manifests')
+          ) | Where-Object { Test-Path -LiteralPath $_ }
+          foreach ($root in $servicingRoots) {
+            Get-ChildItem -LiteralPath $root -File -ErrorAction SilentlyContinue | Where-Object {
+              $_.Name -match 'hyper-v|virtualmachine|vmfirmware|igvm|openhcl'
+            } | Select-Object -First 500 | ForEach-Object {
+              $servicingHits += [ordered]@{
+                path = $_.FullName
+                length = $_.Length
+                sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+              }
+            }
+          }
+          $servicingHits | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 (Join-Path $out 'SERVICING_REFERENCES.json')
+
+          try {
+            Get-WindowsOptionalFeature -Online | Where-Object {
+              $_.FeatureName -match 'Hyper-V|VirtualMachinePlatform|Containers|IsolatedUserMode|GuardedHost'
+            } | Select-Object FeatureName, State | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 (Join-Path $out 'WINDOWS_FEATURES.json')
+          } catch {
+            [ordered]@{ error = $_.Exception.Message } | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $out 'WINDOWS_FEATURES.json')
+          }
+
+          Get-ChildItem -LiteralPath $out -File -Recurse | Where-Object { $_.Name -ne 'COLLECTED_SHA256.json' } | ForEach-Object {
+            [ordered]@{
+              relative_path = $_.FullName.Substring($out.Length + 1).Replace('\\','/')
+              size = $_.Length
+              sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+            }
+          } | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 (Join-Path $out 'COLLECTED_SHA256.json')
+
+          [ordered]@{
+            result = 'PASS'
+            runner_os = '${{ matrix.os }}'
+            firmware_file_count = $records.Count
+            signed_valid_count = @($records | Where-Object { $_.signature_status -eq 'Valid' }).Count
+            exact_vmfirmwarecvm_count = @($records | Where-Object { $_.original_filename -ieq 'vmfirmwarecvm.dll' -or $_.source_path -match '(?i)vmfirmwarecvm\.dll$' }).Count
+            marker_file_count = @((Get-Content -Raw (Join-Path $out 'STRING_MARKER_SUMMARY.json') | ConvertFrom-Json) | Where-Object { $_.hit_count -gt 0 }).Count
+          } | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 (Join-Path $out 'RESULT.json')
+
+          Get-Content -Raw (Join-Path $out 'RESULT.json')
+
+      - name: Upload runtime binding evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: openhcl-runtime-binding-${{ matrix.os }}
+          path: ${{ runner.temp }}\openhcl-runtime-binding
+          if-no-files-found: error
+          retention-days: 7
