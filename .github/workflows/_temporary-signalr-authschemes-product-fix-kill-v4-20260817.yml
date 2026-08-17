@@ -1,0 +1,269 @@
+name: Temporary SignalR AuthenticationSchemes Product Fix Kill V4
+
+on:
+  push:
+    branches:
+      - agent/dotnet10-toolchain-20260815
+    paths:
+      - .github/workflows/_temporary-signalr-authschemes-product-fix-kill-v4-20260817.yml
+      - msrc-lab/signalr-authschemes-v2/apply_product_fix.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-signalr-authschemes-product-fix-kill-v4-20260817
+  cancel-in-progress: false
+
+jobs:
+  actual-product-harness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+
+    steps:
+      - name: Check out validation patch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          path: lab
+
+      - name: Check out exact ASP.NET Core source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: dotnet/aspnetcore
+          ref: v10.0.11
+          persist-credentials: false
+          fetch-depth: 1
+          path: aspnetcore
+
+      - name: Install SDK
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: 10.0.303
+          cache: false
+
+      - name: Record exact environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence validation
+          git -C aspnetcore rev-parse HEAD | tee evidence/ASPNETCORE_COMMIT.txt
+          test "$(cat evidence/ASPNETCORE_COMMIT.txt)" = "a5383385245bdacc20ec19f30e46090a8154d8da"
+          test "$(git -C aspnetcore describe --tags --exact-match)" = "v10.0.11"
+          dotnet --info > evidence/DOTNET_INFO.txt
+
+      - name: Generate required repository build inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd aspnetcore
+          generator="$(find . -type f -name 'GenerateFiles.csproj' -print -quit)"
+          test -n "$generator"
+          echo "GENERATOR=$generator" | tee ../evidence/GENERATEFILES.env
+          dotnet build "$generator" -c Release /p:AllowMissingPrunePackageData=true --nologo \
+            > ../evidence/GENERATEFILES.log 2>&1
+          cat ../evidence/GENERATEFILES.log
+          test -f artifacts/bin/GenerateFiles/Directory.Build.props
+
+      - name: Create public-constructor product harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > validation/Validation.csproj <<'EOF'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net10.0</TargetFramework>
+              <ImplicitUsings>enable</ImplicitUsings>
+              <Nullable>enable</Nullable>
+              <Optimize>true</Optimize>
+              <Deterministic>true</Deterministic>
+            </PropertyGroup>
+            <ItemGroup>
+              <FrameworkReference Include="Microsoft.AspNetCore.App" />
+              <ProjectReference Include="../aspnetcore/src/SignalR/server/SignalR/src/Microsoft.AspNetCore.SignalR.csproj" />
+            </ItemGroup>
+          </Project>
+          EOF
+
+          cat > validation/Program.cs <<'EOF'
+          using Microsoft.AspNetCore.Authorization;
+          using Microsoft.AspNetCore.SignalR;
+          using Microsoft.Extensions.DependencyInjection;
+
+          static string Resolve<T>() where T : Hub
+          {
+              var services = new ServiceCollection();
+              services.AddLogging();
+              services.AddSignalR();
+              using var provider = services.BuildServiceProvider();
+              try
+              {
+                  _ = provider.GetRequiredService<HubConnectionHandler<T>>();
+                  return "ALLOWED";
+              }
+              catch (Exception ex)
+              {
+                  for (Exception? current = ex; current is not null; current = current.InnerException)
+                  {
+                      if (current is NotSupportedException && current.Message.Contains("AuthenticationSchemes", StringComparison.Ordinal))
+                      {
+                          return "REJECTED_NOT_SUPPORTED";
+                      }
+                  }
+                  Console.WriteLine(ex);
+                  return "UNEXPECTED_EXCEPTION";
+              }
+          }
+
+          string affected = Resolve<AffectedMethodHub>();
+          string missing = Resolve<MissingSchemeMethodHub>();
+          string classLevel = Resolve<ClassSchemeHub>();
+          string plain = Resolve<PlainMethodHub>();
+
+          Console.WriteLine($"AFFECTED_METHOD={affected}");
+          Console.WriteLine($"MISSING_METHOD={missing}");
+          Console.WriteLine($"CLASS_LEVEL={classLevel}");
+          Console.WriteLine($"PLAIN_METHOD={plain}");
+
+          string mode = Environment.GetEnvironmentVariable("EXPECTED_MODE") ?? "";
+          bool pass = mode switch
+          {
+              "unmodified" => affected == "ALLOWED" && missing == "ALLOWED" && classLevel == "ALLOWED" && plain == "ALLOWED",
+              "patched" => affected == "REJECTED_NOT_SUPPORTED" && missing == "REJECTED_NOT_SUPPORTED" && classLevel == "ALLOWED" && plain == "ALLOWED",
+              _ => false,
+          };
+          Console.WriteLine($"MODE={mode}");
+          Console.WriteLine($"PASS={pass}");
+          return pass ? 0 : 90;
+
+          public sealed class AffectedMethodHub : Hub
+          {
+              [Authorize(AuthenticationSchemes = "MfaCookie")]
+              public Task InstallAdminApiKey(string value) => Task.CompletedTask;
+          }
+
+          public sealed class MissingSchemeMethodHub : Hub
+          {
+              [Authorize(AuthenticationSchemes = "Nonexistent")]
+              public Task InstallAdminApiKey(string value) => Task.CompletedTask;
+          }
+
+          [Authorize(AuthenticationSchemes = "MfaCookie")]
+          public sealed class ClassSchemeHub : Hub
+          {
+              public Task Ping() => Task.CompletedTask;
+          }
+
+          public sealed class PlainMethodHub : Hub
+          {
+              [Authorize(Roles = "Admin")]
+              public Task Ping() => Task.CompletedTask;
+          }
+          EOF
+          cp validation/Program.cs evidence/PRODUCT_HARNESS_PROGRAM.cs
+          cp validation/Validation.csproj evidence/PRODUCT_HARNESS.csproj
+
+      - name: Build and run exact unmodified product
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet restore validation/Validation.csproj /p:AllowMissingPrunePackageData=true --nologo \
+            > evidence/UNMODIFIED_RESTORE.log 2>&1
+          dotnet build validation/Validation.csproj -c Release --no-restore \
+            /p:AllowMissingPrunePackageData=true --nologo > evidence/UNMODIFIED_BUILD.log 2>&1
+          EXPECTED_MODE=unmodified dotnet run --project validation/Validation.csproj -c Release --no-build \
+            > evidence/UNMODIFIED_RUN.log 2>&1
+          cat evidence/UNMODIFIED_RUN.log
+          grep -q '^AFFECTED_METHOD=ALLOWED$' evidence/UNMODIFIED_RUN.log
+          grep -q '^MISSING_METHOD=ALLOWED$' evidence/UNMODIFIED_RUN.log
+          grep -q '^CLASS_LEVEL=ALLOWED$' evidence/UNMODIFIED_RUN.log
+          grep -q '^PLAIN_METHOD=ALLOWED$' evidence/UNMODIFIED_RUN.log
+          grep -q '^PASS=True$' evidence/UNMODIFIED_RUN.log
+          assembly="$(find aspnetcore/artifacts/bin/Microsoft.AspNetCore.SignalR.Core -type f -name 'Microsoft.AspNetCore.SignalR.Core.dll' -print | sort | tail -1)"
+          test -n "$assembly"
+          printf 'UNMODIFIED_ASSEMBLY=%s\n' "$assembly" > evidence/UNMODIFIED_ASSEMBLY.env
+          sha256sum "$assembly" >> evidence/UNMODIFIED_ASSEMBLY.env
+
+      - name: Apply actual product patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp lab/msrc-lab/signalr-authschemes-v2/apply_product_fix.py aspnetcore/
+          cd aspnetcore
+          python3 apply_product_fix.py
+          git diff -- src/SignalR/server/Core/src/Internal/DefaultHubDispatcher.cs > ../evidence/PRODUCT_FIX.patch
+          test -s ../evidence/PRODUCT_FIX.patch
+          grep -q 'AuthenticationSchemes' ../evidence/PRODUCT_FIX.patch
+          grep -q 'cannot re-run named authentication handlers' ../evidence/PRODUCT_FIX.patch
+
+      - name: Rebuild and run patched actual product
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf validation/bin validation/obj
+          dotnet restore validation/Validation.csproj /p:AllowMissingPrunePackageData=true --nologo \
+            > evidence/PATCHED_RESTORE.log 2>&1
+          dotnet build validation/Validation.csproj -c Release --no-restore \
+            /p:AllowMissingPrunePackageData=true --nologo > evidence/PATCHED_BUILD.log 2>&1
+          EXPECTED_MODE=patched dotnet run --project validation/Validation.csproj -c Release --no-build \
+            > evidence/PATCHED_RUN.log 2>&1
+          cat evidence/PATCHED_RUN.log
+          grep -q '^AFFECTED_METHOD=REJECTED_NOT_SUPPORTED$' evidence/PATCHED_RUN.log
+          grep -q '^MISSING_METHOD=REJECTED_NOT_SUPPORTED$' evidence/PATCHED_RUN.log
+          grep -q '^CLASS_LEVEL=ALLOWED$' evidence/PATCHED_RUN.log
+          grep -q '^PLAIN_METHOD=ALLOWED$' evidence/PATCHED_RUN.log
+          grep -q '^PASS=True$' evidence/PATCHED_RUN.log
+          assembly="$(find aspnetcore/artifacts/bin/Microsoft.AspNetCore.SignalR.Core -type f -name 'Microsoft.AspNetCore.SignalR.Core.dll' -print | sort | tail -1)"
+          test -n "$assembly"
+          printf 'PATCHED_ASSEMBLY=%s\n' "$assembly" > evidence/PATCHED_ASSEMBLY.env
+          sha256sum "$assembly" >> evidence/PATCHED_ASSEMBLY.env
+
+      - name: Build strict actual-product fix gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          u = Path('evidence/UNMODIFIED_RUN.log').read_text()
+          p = Path('evidence/PATCHED_RUN.log').read_text()
+          checks = {
+              'exact_v10_0_11_commit': Path('evidence/ASPNETCORE_COMMIT.txt').read_text().strip() == 'a5383385245bdacc20ec19f30e46090a8154d8da',
+              'unmodified_registered_scheme_allowed': 'AFFECTED_METHOD=ALLOWED' in u,
+              'unmodified_missing_scheme_allowed': 'MISSING_METHOD=ALLOWED' in u,
+              'patched_registered_scheme_rejected': 'AFFECTED_METHOD=REJECTED_NOT_SUPPORTED' in p,
+              'patched_missing_scheme_rejected': 'MISSING_METHOD=REJECTED_NOT_SUPPORTED' in p,
+              'patched_class_scheme_supported': 'CLASS_LEVEL=ALLOWED' in p,
+              'patched_plain_method_supported': 'PLAIN_METHOD=ALLOWED' in p,
+              'actual_source_patch_present': Path('evidence/PRODUCT_FIX.patch').stat().st_size > 0,
+              'unmodified_assembly_recorded': Path('evidence/UNMODIFIED_ASSEMBLY.env').exists(),
+              'patched_assembly_recorded': Path('evidence/PATCHED_ASSEMBLY.env').exists(),
+          }
+          passed = all(checks.values())
+          gate = {
+              'schema': 'signalr_method_authschemes_product_fix_gate/v4',
+              'checks': checks,
+              'fixKillPass': passed,
+              'verdict': 'ACTUAL_PRODUCT_FAIL_FAST_FIX_KILLS_BYPASS' if passed else 'FIX_GATE_FAILED',
+              'submissionReady': False,
+          }
+          Path('evidence/FIX_GATE.json').write_text(json.dumps(gate, indent=2))
+          Path('evidence/FINAL_VERDICT.env').write_text(
+              f"FIX_KILL_PASS={int(passed)}\nVERDICT={gate['verdict']}\nSUBMISSION_READY=0\n")
+          if not passed:
+              raise SystemExit(90)
+          PY
+          find evidence -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS
+
+      - name: Upload independent product fix evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signalr-authschemes-product-fix-kill-v4-20260817
+          path: evidence
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 9
+          include-hidden-files: true
