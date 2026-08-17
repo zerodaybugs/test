@@ -1,0 +1,148 @@
+name: Temporary SignalR AuthenticationSchemes Product Fix Kill
+
+on:
+  push:
+    branches:
+      - agent/dotnet10-toolchain-20260815
+    paths:
+      - .github/workflows/_temporary-signalr-authschemes-product-fix-kill-20260817.yml
+      - msrc-lab/signalr-authschemes-v2/HubMethodAuthenticationSchemesTests.cs
+      - msrc-lab/signalr-authschemes-v2/apply_product_fix.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-signalr-authschemes-product-fix-kill-20260817
+  cancel-in-progress: false
+
+jobs:
+  product-fix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out validation files
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          path: lab
+
+      - name: Check out exact ASP.NET Core 10.0.11 source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: dotnet/aspnetcore
+          ref: v10.0.11
+          persist-credentials: false
+          fetch-depth: 1
+          path: aspnetcore
+
+      - name: Install exact current SDK
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: 10.0.303
+          cache: false
+
+      - name: Stage exact product regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git -C aspnetcore rev-parse HEAD > evidence/ASPNETCORE_COMMIT.txt
+          test "$(git -C aspnetcore describe --tags --exact-match)" = "v10.0.11"
+          dotnet --info > evidence/DOTNET_INFO.txt
+          cp lab/msrc-lab/signalr-authschemes-v2/HubMethodAuthenticationSchemesTests.cs \
+            aspnetcore/src/SignalR/server/SignalR/test/Microsoft.AspNetCore.SignalR.Tests/
+          cp lab/msrc-lab/signalr-authschemes-v2/HubMethodAuthenticationSchemesTests.cs evidence/
+
+      - name: Baseline test must detect silent acceptance
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd aspnetcore
+          project='src/SignalR/server/SignalR/test/Microsoft.AspNetCore.SignalR.Tests/Microsoft.AspNetCore.SignalR.Tests.csproj'
+          set +e
+          dotnet test "$project" -c Release --filter 'FullyQualifiedName~HubMethodAuthenticationSchemesTests' \
+            --logger 'console;verbosity=normal' --nologo > ../evidence/BASELINE_TEST.log 2>&1
+          rc=$?
+          set -e
+          echo "BASELINE_RC=$rc" > ../evidence/BASELINE_STATUS.env
+          cat ../evidence/BASELINE_TEST.log
+          test "$rc" -ne 0
+          grep -q 'MethodLevelAuthenticationSchemesFailFast' ../evidence/BASELINE_TEST.log
+          grep -q 'MissingMethodLevelAuthenticationSchemeAlsoFailsFast' ../evidence/BASELINE_TEST.log
+
+      - name: Apply actual product fail-fast fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp lab/msrc-lab/signalr-authschemes-v2/apply_product_fix.py aspnetcore/
+          cd aspnetcore
+          python3 apply_product_fix.py
+          git diff -- src/SignalR/server/Core/src/Internal/DefaultHubDispatcher.cs > ../evidence/PRODUCT_FIX.patch
+          test -s ../evidence/PRODUCT_FIX.patch
+          grep -q 'AuthenticationSchemes' ../evidence/PRODUCT_FIX.patch
+          grep -q 'cannot re-run named authentication handlers' ../evidence/PRODUCT_FIX.patch
+
+      - name: Patched product tests must pass
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd aspnetcore
+          project='src/SignalR/server/SignalR/test/Microsoft.AspNetCore.SignalR.Tests/Microsoft.AspNetCore.SignalR.Tests.csproj'
+          dotnet test "$project" -c Release --filter 'FullyQualifiedName~HubMethodAuthenticationSchemesTests' \
+            --logger 'console;verbosity=normal' --nologo > ../evidence/PATCHED_TEST.log 2>&1
+          cat ../evidence/PATCHED_TEST.log
+          grep -q 'MethodLevelAuthenticationSchemesFailFast' ../evidence/PATCHED_TEST.log
+          grep -q 'MissingMethodLevelAuthenticationSchemeAlsoFailsFast' ../evidence/PATCHED_TEST.log
+          grep -q 'ClassLevelAuthenticationSchemesRemainSupported' ../evidence/PATCHED_TEST.log
+          grep -q 'PlainMethodAuthorizationRemainsSupported' ../evidence/PATCHED_TEST.log
+          grep -Eq 'Failed:[[:space:]]+0' ../evidence/PATCHED_TEST.log
+
+      - name: Build product fix machine gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          baseline=Path('evidence/BASELINE_STATUS.env').read_text()
+          patched=Path('evidence/PATCHED_TEST.log').read_text(errors='replace')
+          checks={
+              'exact_v10_0_11_source':Path('evidence/ASPNETCORE_COMMIT.txt').exists(),
+              'baseline_detects_silent_acceptance':'BASELINE_RC=0' not in baseline,
+              'patched_zero_failures':'Failed:     0' in patched or 'Failed: 0' in patched,
+              'method_scheme_fails_fast':'MethodLevelAuthenticationSchemesFailFast' in patched,
+              'missing_scheme_fails_fast':'MissingMethodLevelAuthenticationSchemeAlsoFailsFast' in patched,
+              'class_level_control_passes':'ClassLevelAuthenticationSchemesRemainSupported' in patched,
+              'plain_authorize_control_passes':'PlainMethodAuthorizationRemainsSupported' in patched,
+              'actual_product_patch_present':Path('evidence/PRODUCT_FIX.patch').stat().st_size > 0,
+          }
+          passed=all(checks.values())
+          gate={
+              'schema':'signalr_method_authschemes_product_fix_gate/v1',
+              'checks':checks,
+              'fixKillPass':passed,
+              'verdict':'ACTUAL_PRODUCT_FAIL_FAST_FIX_KILLS_BYPASS' if passed else 'FIX_GATE_FAILED',
+              'submissionReady':False,
+          }
+          Path('evidence/FIX_GATE.json').write_text(json.dumps(gate,indent=2))
+          Path('evidence/FINAL_VERDICT.env').write_text(
+              f"FIX_KILL_PASS={int(passed)}\nVERDICT={gate['verdict']}\nSUBMISSION_READY=0\n")
+          print(Path('evidence/FINAL_VERDICT.env').read_text())
+          if not passed:
+              raise SystemExit(90)
+          PY
+          find evidence -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS
+
+      - name: Upload actual product fix evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signalr-authschemes-product-fix-kill-20260817
+          path: evidence
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 9
+          include-hidden-files: true
