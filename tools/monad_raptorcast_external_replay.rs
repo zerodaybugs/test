@@ -83,7 +83,7 @@
                 let mut manifest = File::create(base.join("manifest.tsv")).expect("manifest");
                 writeln!(
                     manifest,
-                    "packet_id\tpath\tstride\tround\tproposer_index\tpacket_index\tpayload_len"
+                    "packet_id\tpath\tstride\tround\tproposer_index\trecipient_index\tpacket_index\tpayload_len"
                 )
                 .unwrap();
 
@@ -110,13 +110,17 @@
                             .expect("deterministic packet corpus builds");
 
                         for (packet_index, packet) in packets.iter().enumerate() {
+                            let recipient_index = node_ids
+                                .iter()
+                                .position(|node_id| node_id == packet.recipient.node_id())
+                                .expect("packet recipient belongs to validator set");
                             let name = format!(
                                 "r{round_value}_p{proposer_index}_c{packet_index}.bin"
                             );
                             fs::write(base.join(&name), &packet.payload).expect("write packet");
                             writeln!(
                                 manifest,
-                                "{packet_id}\t{name}\t{}\t{round_value}\t{proposer_index}\t{packet_index}\t{}",
+                                "{packet_id}\t{name}\t{}\t{round_value}\t{proposer_index}\t{recipient_index}\t{packet_index}\t{}",
                                 packet.stride,
                                 packet.payload.len(),
                             )
