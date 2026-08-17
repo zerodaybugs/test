@@ -19,7 +19,7 @@ concurrency:
 jobs:
   product-fix:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Check out validation files
@@ -55,8 +55,24 @@ jobs:
           cp lab/msrc-lab/signalr-authschemes-v2/HubMethodAuthenticationSchemesTests.cs \
             aspnetcore/src/SignalR/server/SignalR/test/Microsoft.AspNetCore.SignalR.Tests/
           cp lab/msrc-lab/signalr-authschemes-v2/HubMethodAuthenticationSchemesTests.cs evidence/
+          cp lab/msrc-lab/signalr-authschemes-v2/apply_product_fix.py evidence/
 
-      - name: Baseline test must detect silent acceptance
+      - name: Generate required ASP.NET Core build inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd aspnetcore
+          generator="$(find . -type f -name 'GenerateFiles.csproj' -print -quit)"
+          test -n "$generator"
+          printf 'GENERATOR_PROJECT=%s\n' "$generator" | tee ../evidence/GENERATEFILES_STATUS.env
+          dotnet build "$generator" -c Release /p:AllowMissingPrunePackageData=true --nologo \
+            > ../evidence/GENERATEFILES.log 2>&1
+          cat ../evidence/GENERATEFILES.log
+          test -f artifacts/bin/GenerateFiles/Directory.Build.props
+          sha256sum artifacts/bin/GenerateFiles/Directory.Build.props \
+            >> ../evidence/GENERATEFILES_STATUS.env
+
+      - name: Baseline test must detect silent method-scheme acceptance
         shell: bash
         run: |
           set -euo pipefail
@@ -73,6 +89,8 @@ jobs:
           test "$rc" -ne 0
           grep -q 'MethodLevelAuthenticationSchemesFailFast' ../evidence/BASELINE_TEST.log
           grep -q 'MissingMethodLevelAuthenticationSchemeAlsoFailsFast' ../evidence/BASELINE_TEST.log
+          grep -q 'ClassLevelAuthenticationSchemesRemainSupported' ../evidence/BASELINE_TEST.log
+          grep -q 'PlainMethodAuthorizationRemainsSupported' ../evidence/BASELINE_TEST.log
 
       - name: Apply actual product fail-fast fix
         shell: bash
@@ -86,7 +104,7 @@ jobs:
           grep -q 'AuthenticationSchemes' ../evidence/PRODUCT_FIX.patch
           grep -q 'cannot re-run named authentication handlers' ../evidence/PRODUCT_FIX.patch
 
-      - name: Patched product tests must pass
+      - name: Patched product regression tests must pass
         shell: bash
         run: |
           set -euo pipefail
@@ -102,6 +120,21 @@ jobs:
           grep -q 'PlainMethodAuthorizationRemainsSupported' ../evidence/PATCHED_TEST.log
           grep -Eq 'Failed:[[:space:]]+0' ../evidence/PATCHED_TEST.log
 
+      - name: Run complete patched SignalR server test project
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd aspnetcore
+          project='src/SignalR/server/SignalR/test/Microsoft.AspNetCore.SignalR.Tests/Microsoft.AspNetCore.SignalR.Tests.csproj'
+          dotnet test "$project" -c Release --no-restore /p:AllowMissingPrunePackageData=true \
+            --logger 'console;verbosity=minimal' --nologo > ../evidence/PATCHED_FULL_SIGNALR_TEST.log 2>&1
+          cat ../evidence/PATCHED_FULL_SIGNALR_TEST.log
+          grep -Eq 'Failed:[[:space:]]+0' ../evidence/PATCHED_FULL_SIGNALR_TEST.log
+          assembly="$(find artifacts/bin/Microsoft.AspNetCore.SignalR.Core -type f -name 'Microsoft.AspNetCore.SignalR.Core.dll' -print | sort | tail -1)"
+          test -n "$assembly"
+          printf 'PATCHED_ASSEMBLY=%s\n' "$assembly" > ../evidence/PATCHED_ASSEMBLY.env
+          sha256sum "$assembly" >> ../evidence/PATCHED_ASSEMBLY.env
+
       - name: Build product fix machine gate
         shell: bash
         run: |
@@ -111,19 +144,23 @@ jobs:
           import json
           baseline=Path('evidence/BASELINE_STATUS.env').read_text()
           patched=Path('evidence/PATCHED_TEST.log').read_text(errors='replace')
+          full=Path('evidence/PATCHED_FULL_SIGNALR_TEST.log').read_text(errors='replace')
           checks={
-              'exact_v10_0_11_source':Path('evidence/ASPNETCORE_COMMIT.txt').exists(),
+              'exact_v10_0_11_source':Path('evidence/ASPNETCORE_COMMIT.txt').read_text().strip() == 'a5383385245bdacc20ec19f30e46090a8154d8da',
+              'generated_build_inputs':Path('evidence/GENERATEFILES_STATUS.env').exists(),
               'baseline_detects_silent_acceptance':'BASELINE_RC=0' not in baseline,
-              'patched_zero_failures':'Failed:     0' in patched or 'Failed: 0' in patched,
+              'patched_targeted_zero_failures':('Failed:     0' in patched or 'Failed: 0' in patched),
+              'patched_full_zero_failures':('Failed:     0' in full or 'Failed: 0' in full),
               'method_scheme_fails_fast':'MethodLevelAuthenticationSchemesFailFast' in patched,
               'missing_scheme_fails_fast':'MissingMethodLevelAuthenticationSchemeAlsoFailsFast' in patched,
               'class_level_control_passes':'ClassLevelAuthenticationSchemesRemainSupported' in patched,
               'plain_authorize_control_passes':'PlainMethodAuthorizationRemainsSupported' in patched,
               'actual_product_patch_present':Path('evidence/PRODUCT_FIX.patch').stat().st_size > 0,
+              'patched_product_assembly_built':Path('evidence/PATCHED_ASSEMBLY.env').exists(),
           }
           passed=all(checks.values())
           gate={
-              'schema':'signalr_method_authschemes_product_fix_gate/v1',
+              'schema':'signalr_method_authschemes_product_fix_gate/v2',
               'checks':checks,
               'fixKillPass':passed,
               'verdict':'ACTUAL_PRODUCT_FAIL_FAST_FIX_KILLS_BYPASS' if passed else 'FIX_GATE_FAILED',
