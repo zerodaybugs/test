@@ -1,0 +1,162 @@
+name: kiln-r31-aggregate-public-gates
+
+on:
+  push:
+    branches: [agent/kiln-r31-runtime-census-20260817]
+    paths:
+      - .github/workflows/_temporary-kiln-r31-aggregate-20260817.yml
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  aggregate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/kiln-r31-runtime-census-20260817
+          fetch-depth: 1
+
+      - name: Download exactly ten corrected public-gate artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: '32066655309'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/r31_public
+          mkdir -p /tmp/r31_public
+          gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100" > /tmp/artifacts.json
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          data=json.load(open('/tmp/artifacts.json'))
+          rows=[]
+          for a in data.get('artifacts',[]):
+              name=a.get('name','')
+              if name.startswith('kiln-r31-') and name.endswith('-public-gate'):
+                  rows.append((name,int(a['id'])))
+          if len(rows)!=10:
+              raise SystemExit(f'expected 10 public gates, found {len(rows)}: {rows}')
+          out=Path('/tmp/r31_public')
+          for name,aid in sorted(rows):
+              z=out/f'{name}.zip'
+              subprocess.run(['gh','api',f'/repos/{os.environ["GITHUB_REPOSITORY"]}/actions/artifacts/{aid}/zip'],check=True,stdout=z.open('wb'))
+          print('PUBLIC_GATE_ARTIFACT_COUNT=10')
+          PY
+
+      - name: Verify CRC, manifests, coverage and aggregate signals
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json,zipfile,time
+
+          root=Path('/tmp/r31_public')
+          records=[]
+          for archive in sorted(root.glob('*.zip')):
+              with zipfile.ZipFile(archive) as z:
+                  bad=z.testzip()
+                  if bad is not None: raise RuntimeError(f'{archive.name}: CRC failure {bad}')
+                  names=z.namelist()
+                  gates=[n for n in names if n.endswith('PUBLIC_GATE.json')]
+                  sums=[n for n in names if n.endswith('SHA256SUMS.txt')]
+                  if len(gates)!=1 or len(sums)!=1:
+                      raise RuntimeError(f'{archive.name}: gate={gates}, sums={sums}')
+                  gate_raw=z.read(gates[0]); gate=json.loads(gate_raw)
+                  manifest=z.read(sums[0]).decode(errors='replace')
+                  expected=None
+                  for line in manifest.splitlines():
+                      if line.strip().endswith('PUBLIC_GATE.json'):
+                          expected=line.split()[0]; break
+                  actual=hashlib.sha256(gate_raw).hexdigest()
+                  if expected!=actual:
+                      raise RuntimeError(f'{archive.name}: hash mismatch {expected} != {actual}')
+                  if gate.get('submit_ready') is not False:
+                      raise RuntimeError(f'{archive.name}: unexpected submit_ready')
+                  if int(gate.get('validated_critical',0) or 0)!=0 or int(gate.get('validated_high',0) or 0)!=0:
+                      raise RuntimeError(f'{archive.name}: unexpected validated severity')
+                  records.append({
+                      'artifact':archive.stem,
+                      'network':gate.get('network'),
+                      'shard_index':gate.get('shard_index'),
+                      'shard_count':gate.get('shard_count'),
+                      'selected_count':int(gate.get('selected_count',0) or 0),
+                      'inspected_count':int(gate.get('inspected_count',0) or 0),
+                      'error_count':int(gate.get('error_count',0) or 0),
+                      'signal_row_count':int(gate.get('signal_row_count',0) or 0),
+                      'unique_connector_count':int(gate.get('unique_connector_count',0) or 0),
+                      'runner_exit_code':int(gate.get('runner_exit_code',0) or 0),
+                      'decision':gate.get('decision'),
+                      'gate_sha256':actual,
+                  })
+
+          selected=sum(r['selected_count'] for r in records)
+          inspected=sum(r['inspected_count'] for r in records)
+          errors=sum(r['error_count'] for r in records)
+          signals=sum(r['signal_row_count'] for r in records)
+          exits=[r for r in records if r['runner_exit_code']!=0]
+          positive=[r for r in records if r['signal_row_count']>0]
+          complete=(len(records)==10 and selected==101 and inspected==101 and errors==0 and not exits)
+          if not complete:
+              decision='INCONCLUSIVE_INCOMPLETE_OR_ERRORFUL_RUNTIME_CENSUS'
+          elif positive:
+              decision='PROMOTE_POSITIVE_SHARDS_TO_PRIVATE_FIXED_BLOCK_REVIEW'
+          else:
+              decision='KILL_NO_RUNTIME_ACCOUNTING_OR_BINDING_SIGNAL'
+          aggregate={
+              'schema':'kiln-r31-aggregate-public-gate-v1',
+              'generated_at_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+              'source_run_id':32066655309,
+              'decision':decision,
+              'submit_ready':False,
+              'validated_critical':0,
+              'validated_high':0,
+              'artifact_count':len(records),
+              'expected_artifact_count':10,
+              'selected_total':selected,
+              'inspected_total':inspected,
+              'error_total':errors,
+              'signal_total':signals,
+              'positive_shard_count':len(positive),
+              'positive_shards':positive,
+              'all_hashes_and_crc_pass':True,
+              'coverage_complete':complete,
+              'rows':records,
+              'public_chain_state_changes':0,
+              'transactions_signed':0,
+              'transactions_sent':0,
+          }
+          out=Path('r31_aggregate'); out.mkdir(exist_ok=True)
+          p=out/'PUBLIC_GATE.json'; p.write_text(json.dumps(aggregate,indent=2,sort_keys=True))
+          (out/'SHA256SUMS.txt').write_text(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  PUBLIC_GATE.json\n')
+          print(json.dumps({k:aggregate[k] for k in ('decision','artifact_count','selected_total','inspected_total','error_total','signal_total','positive_shard_count','coverage_complete')},sort_keys=True))
+          PY
+
+      - name: Persist aggregate gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add r31_aggregate
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'persist Kiln R31 aggregate public gate'
+          for attempt in 1 2 3; do
+            git pull --rebase origin agent/kiln-r31-runtime-census-20260817
+            if git push origin HEAD:agent/kiln-r31-runtime-census-20260817; then exit 0; fi
+            sleep $((attempt * 3))
+          done
+          exit 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kiln-r31-aggregate-public-gate
+          path: r31_aggregate
+          if-no-files-found: error
+          retention-days: 3
