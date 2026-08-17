@@ -1,0 +1,235 @@
+name: WSL VirtioFS admin-selection probe
+
+on:
+  push:
+    branches:
+      - research/wsl-virtiofs-admin-probe-20260818
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout WSL at pinned current source
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/WSL
+          ref: 1ef0817a0465b9ad7458f155bec0a2c877462e6d
+          path: WSL
+          fetch-depth: 1
+
+      - name: Checkout OpenVMM at pinned current source
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/openvmm
+          ref: 3959cc4332d780d3d48524d182e993f9dcab8238
+          path: openvmm
+          fetch-depth: 1
+
+      - name: Verify source chain and run deterministic differential
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/source
+          git -C WSL rev-parse HEAD | tee evidence/WSL_HEAD.txt
+          git -C openvmm rev-parse HEAD | tee evidence/OPENVMM_HEAD.txt
+          git -C WSL status --short | tee evidence/WSL_STATUS.txt
+          git -C openvmm status --short | tee evidence/OPENVMM_STATUS.txt
+
+          cp WSL/src/linux/init/drvfs.cpp evidence/source/
+          cp WSL/src/linux/init/util.h evidence/source/
+          cp WSL/src/windows/service/exe/WslCoreVm.cpp evidence/source/
+          cp WSL/src/windows/service/exe/WslCoreVm.h evidence/source/
+          cp WSL/test/windows/DrvFsTests.cpp evidence/source/
+          cp WSL/src/shared/inc/lxinitshared.h evidence/source/
+
+          python3 - <<'PY'
+          from __future__ import annotations
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path('WSL')
+          paths = {
+              'drvfs': root / 'src/linux/init/drvfs.cpp',
+              'util_h': root / 'src/linux/init/util.h',
+              'vm_cpp': root / 'src/windows/service/exe/WslCoreVm.cpp',
+              'vm_h': root / 'src/windows/service/exe/WslCoreVm.h',
+              'tests': root / 'test/windows/DrvFsTests.cpp',
+              'shared': root / 'src/shared/inc/lxinitshared.h',
+          }
+          src = {k: p.read_text(encoding='utf-8', errors='replace') for k, p in paths.items()}
+
+          checks = {
+              'guest_env_symbol': '#define WSL_DRVFS_ELEVATED_ENV "WSL_DRVFS_ELEVATED"' in src['util_h'],
+              'guest_env_one_selects_admin': 'strcmp(envFlag, "1") == 0' in src['drvfs'] and 'return true;' in src['drvfs'],
+              'guest_sets_admin_message': 'AddShare->Admin = Admin.value();' in src['drvfs'],
+              'guest_sends_virtiofs_request': 'LxInitMessageAddVirtioFsDevice' in src['drvfs'] and 'LX_INIT_UTILITY_VM_VIRTIOFS_PORT' in src['drvfs'],
+              'host_consumes_message_admin': 'AddVirtioFsShare(addShare->Admin' in src['vm_cpp'],
+              'host_selects_admin_token_from_message': 'UserToken = Admin ? m_adminDrvfsToken.get() : m_drvfsToken.get();' in src['vm_cpp'],
+              'host_stores_admin_and_regular_tokens': 'm_adminDrvfsToken' in src['vm_h'] and 'm_drvfsToken' in src['vm_h'],
+              'admin_token_duplicated': 'DuplicateTokenEx(UserToken' in src['vm_cpp'] and '&m_adminDrvfsToken' in src['vm_cpp'],
+              'regular_token_duplicated': 'DuplicateTokenEx(UserToken' in src['vm_cpp'] and '&m_drvfsToken' in src['vm_cpp'],
+              'admin_and_regular_virtiofs_devices': 'm_adminVirtioFsDevice' in src['vm_h'] and 'm_virtioFsDevice' in src['vm_h'],
+              'test_requires_elevated_write_success': 'Elevated token should be able to create files at /mnt/c' in src['tests'],
+              'test_requires_non_elevated_write_failure': 'Non-elevated token should NOT be able to create files at /mnt/c' in src['tests'],
+              'virtiofs_test_class_present': 'WSL2_DRVFS_TEST_CLASS(VirtioFs)' in src['tests'],
+              'default_options_omit_sandbox': 'LX_INIT_DEFAULT_PLAN9_MOUNT_OPTIONS' in src['shared'] and 'symlinkroot=/mnt/' in src['shared'],
+          }
+
+          def lines_containing(text: str, needles: list[str]) -> list[dict[str, object]]:
+              rows = []
+              split = text.splitlines()
+              for needle in needles:
+                  for index, line in enumerate(split, 1):
+                      if needle in line:
+                          rows.append({'needle': needle, 'line': index, 'text': line.strip()})
+                          break
+              return rows
+
+          evidence = {
+              'checks': checks,
+              'all_source_checks_pass': all(checks.values()),
+              'locations': {
+                  'guest': lines_containing(src['drvfs'], [
+                      'strcmp(envFlag, "1") == 0',
+                      'AddShare->Admin = Admin.value();',
+                      'LxInitMessageAddVirtioFsDevice',
+                  ]),
+                  'host': lines_containing(src['vm_cpp'], [
+                      'AddVirtioFsShare(addShare->Admin',
+                      'UserToken = Admin ? m_adminDrvfsToken.get() : m_drvfsToken.get();',
+                      '&m_adminDrvfsToken',
+                      '&m_drvfsToken',
+                  ]),
+                  'tests': lines_containing(src['tests'], [
+                      'Elevated token should be able to create files at /mnt/c',
+                      'Non-elevated token should NOT be able to create files at /mnt/c',
+                      'WSL2_DRVFS_TEST_CLASS(VirtioFs)',
+                  ]),
+              },
+              'sha256': {
+                  str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+                  for p in paths.values()
+              },
+          }
+          Path('evidence/SOURCE_CHAIN.json').write_text(json.dumps(evidence, indent=2), encoding='utf-8')
+          if not evidence['all_source_checks_pass']:
+              raise SystemExit('pinned source no longer matches the expected chain')
+
+          def guest_select(env_value: str | None, authenticated_session_elevated: bool) -> bool:
+              if env_value == '0':
+                  return False
+              if env_value == '1':
+                  return True
+              return authenticated_session_elevated
+
+          def vulnerable_host(request_admin: bool, admin_token_present: bool, regular_token_present: bool) -> str:
+              if request_admin:
+                  return 'ADMIN_TOKEN' if admin_token_present else 'ERROR_NO_ADMIN_TOKEN'
+              return 'REGULAR_TOKEN' if regular_token_present else 'ERROR_NO_REGULAR_TOKEN'
+
+          def fixed_host(authenticated_session_elevated: bool, admin_token_present: bool, regular_token_present: bool) -> str:
+              if authenticated_session_elevated:
+                  return 'ADMIN_TOKEN' if admin_token_present else 'ERROR_NO_ADMIN_TOKEN'
+              return 'REGULAR_TOKEN' if regular_token_present else 'ERROR_NO_REGULAR_TOKEN'
+
+          cases = []
+          for env in [None, '0', '1', 'invalid']:
+              for session_elevated in [False, True]:
+                  for admin_present in [False, True]:
+                      request = guest_select(env, session_elevated)
+                      vulnerable = vulnerable_host(request, admin_present, True)
+                      fixed = fixed_host(session_elevated, admin_present, True)
+                      cases.append({
+                          'env': env,
+                          'session_elevated': session_elevated,
+                          'admin_token_present': admin_present,
+                          'request_admin': request,
+                          'vulnerable_result': vulnerable,
+                          'fixed_result': fixed,
+                      })
+
+          exploit = [c for c in cases if c['env'] == '1' and not c['session_elevated'] and c['admin_token_present']]
+          negative_no_admin = [c for c in cases if c['env'] == '1' and not c['session_elevated'] and not c['admin_token_present']]
+          legitimate_admin = [c for c in cases if c['session_elevated'] and c['admin_token_present']]
+          model = {
+              'case_count': len(cases),
+              'exploit_case_count': len(exploit),
+              'exploit_vulnerable_selects_admin': all(c['vulnerable_result'] == 'ADMIN_TOKEN' for c in exploit),
+              'exploit_fixed_selects_regular': all(c['fixed_result'] == 'REGULAR_TOKEN' for c in exploit),
+              'negative_no_admin_fails_closed': all(c['vulnerable_result'] == 'ERROR_NO_ADMIN_TOKEN' for c in negative_no_admin),
+              'legitimate_admin_preserved_by_fix': all(c['fixed_result'] == 'ADMIN_TOKEN' for c in legitimate_admin),
+              'cases': cases,
+          }
+          Path('evidence/DECISION_DIFFERENTIAL.json').write_text(json.dumps(model, indent=2), encoding='utf-8')
+          assert model['exploit_vulnerable_selects_admin']
+          assert model['exploit_fixed_selects_regular']
+          assert model['negative_no_admin_fails_closed']
+          assert model['legitimate_admin_preserved_by_fix']
+
+          # Repeat deterministically to detect hidden state assumptions in the model.
+          repetitions = 1000
+          for _ in range(repetitions):
+              assert vulnerable_host(guest_select('1', False), True, True) == 'ADMIN_TOKEN'
+              assert fixed_host(False, True, True) == 'REGULAR_TOKEN'
+          Path('evidence/STRESS_RESULT.txt').write_text(
+              f'iterations={repetitions}\nvulnerable=ADMIN_TOKEN\nfixed=REGULAR_TOKEN\nstatus=PASS\n',
+              encoding='utf-8',
+          )
+          PY
+
+          sha256sum evidence/source/* evidence/*.txt evidence/*.json > evidence/SHA256SUMS.txt
+          test ! -s evidence/WSL_STATUS.txt
+          test ! -s evidence/OPENVMM_STATUS.txt
+
+      - name: Upload source-chain evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsl-virtiofs-admin-source-chain
+          path: evidence
+          retention-days: 2
+          if-no-files-found: error
+
+  windows-runtime-capability:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - name: Probe WSL runtime availability without modifying the runner
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path evidence | Out-Null
+          $output = New-Object System.Collections.Generic.List[string]
+          $output.Add("timestamp_utc=$([DateTime]::UtcNow.ToString('o'))")
+          $output.Add("os=$((Get-CimInstance Win32_OperatingSystem).Caption)")
+          $output.Add("build=$((Get-CimInstance Win32_OperatingSystem).BuildNumber)")
+          $output.Add("is_admin=$([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)")
+          $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
+          $output.Add("wsl_exe_present=$([bool]$wsl)")
+          if ($wsl) {
+            foreach ($args in @(@('--version'), @('--status'), @('-l','-v'))) {
+              $output.Add("--- wsl $($args -join ' ') ---")
+              try {
+                $text = & wsl.exe @args 2>&1 | Out-String
+                $output.Add($text.TrimEnd())
+                $output.Add("exit_code=$LASTEXITCODE")
+              } catch {
+                $output.Add("exception=$($_.Exception.Message)")
+              }
+            }
+          }
+          $output | Set-Content -Encoding UTF8 evidence/windows_runner_probe.txt
+          Get-FileHash evidence/windows_runner_probe.txt -Algorithm SHA256 | Format-List | Out-String | Set-Content -Encoding UTF8 evidence/windows_runner_probe.sha256.txt
+          Get-Content evidence/windows_runner_probe.txt
+
+      - name: Upload Windows capability result
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsl-windows-runner-capability
+          path: evidence
+          retention-days: 2
+          if-no-files-found: error
