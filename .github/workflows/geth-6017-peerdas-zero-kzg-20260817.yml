@@ -1,0 +1,206 @@
+name: Geth 6017 zero-KZG caller-contract gate
+
+on:
+  push:
+    branches:
+      - tmp/geth-6017-peerdas-zero-kzg-20260817
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exact-current:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: Checkout exact current Geth
+        uses: actions/checkout@v6
+        with:
+          repository: ethereum/go-ethereum
+          ref: 6017c756e2b07fc39a8b51af39c80dd6a4d8d185
+          fetch-depth: 1
+
+      - name: Set up module-declared Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Record provenance and all call sites
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          test "$(git rev-parse HEAD)" = "6017c756e2b07fc39a8b51af39c80dd6a4d8d185"
+          git rev-parse HEAD > out/commit.txt
+          git status --porcelain=v1 > out/git-status.txt
+          go version > out/go-version.txt
+          git grep -n -E 'RecoverBlobsUnchecked|blobsFromDataCells|RecoverCells|RecoverBlobs\(' -- '*.go' > out/recovery-callers.txt || true
+          git grep -n -E 'VerifyCell|Verify.*Proof|CellProof|BlobSidecar|CellSidecar' -- 'eth/**' 'core/**' 'crypto/**' > out/verification-callers.txt || true
+          git grep -n -E 'RecoverBlobsUnchecked|RecoverCells' -- ':!crypto/kzg4844/*_test.go' > out/production-fastpath-callers.txt || true
+          sha256sum crypto/kzg4844/kzg4844.go crypto/kzg4844/kzg4844_test.go > out/source-sha256.txt
+
+      - name: Add adversarial package tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > crypto/kzg4844/zz_v18_zero_kzg_contract_test.go <<'EOF'
+          package kzg4844
+
+          import (
+              "slices"
+              "testing"
+          )
+
+          func v18DataIndices() []uint64 {
+              indices := make([]uint64, DataPerBlob)
+              for i := range indices {
+                  indices[i] = uint64(i)
+              }
+              return indices
+          }
+
+          // Documents the security boundary of RecoverBlobsUnchecked: the fast
+          // path accepts non-canonical field bytes and therefore MUST only be
+          // reached after proof/authenticity verification at the production caller.
+          func TestV18UncheckedAcceptsNonCanonicalDataBytes(t *testing.T) {
+              indices := v18DataIndices()
+              cells := make([]Cell, DataPerBlob)
+              for i := range cells {
+                  cells[i][0] = 0xff
+                  cells[i][1] = byte(i)
+              }
+              fast, err := RecoverBlobsUnchecked(cells, indices)
+              if err != nil {
+                  t.Fatalf("unchecked fast path rejected bytes: %v", err)
+              }
+              if len(fast) != 1 || fast[0][0] != 0xff {
+                  t.Fatalf("unexpected unchecked reconstruction")
+              }
+              if _, err := RecoverBlobs(cells, indices); err == nil {
+                  t.Fatal("checked RecoverBlobs unexpectedly accepted non-canonical field bytes")
+              }
+          }
+
+          // The fast path must remain byte-identical to the original KZG recovery
+          // for every accepted index layout. Exercise far more randomized tails
+          // than the upstream unit test and both multi-blob and single-blob shapes.
+          func TestV18FastPathDifferentialRandomTails(t *testing.T) {
+              indices := v18DataIndices()
+              for blobCount := 1; blobCount <= 4; blobCount++ {
+                  d := newBlobs(t, blobCount)
+                  for iter := 0; iter < 128; iter++ {
+                      tail := make([]uint64, 0, CellsPerBlob-DataPerBlob)
+                      for i := DataPerBlob; i < CellsPerBlob; i++ {
+                          if ((i*17 + iter*31 + blobCount) % 7) < 3 {
+                              tail = append(tail, uint64(i))
+                          }
+                      }
+                      layout := append(slices.Clone(indices), tail...)
+                      cells := make([]Cell, 0, blobCount*len(layout))
+                      for b := 0; b < blobCount; b++ {
+                          for _, idx := range layout {
+                              cells = append(cells, d.cells[b*CellsPerBlob+int(idx)])
+                          }
+                      }
+                      fast, ok := blobsFromDataCells(cells, layout)
+                      if !ok {
+                          t.Fatalf("blobCount=%d iter=%d: accepted layout declined", blobCount, iter)
+                      }
+                      slow, err := RecoverBlobs(cells, layout)
+                      if err != nil {
+                          t.Fatalf("blobCount=%d iter=%d: slow recovery failed: %v", blobCount, iter, err)
+                      }
+                      if !slices.Equal(fast, slow) {
+                          t.Fatalf("blobCount=%d iter=%d: fast/slow mismatch", blobCount, iter)
+                      }
+                  }
+              }
+          }
+
+          // Every malformed index shape below must fail closed rather than use
+          // concatenation. These cases cover duplicate, descending, out-of-range,
+          // partial-data-head and cell-count misalignment.
+          func TestV18FastPathMalformedLayoutsFailClosed(t *testing.T) {
+              base := v18DataIndices()
+              cases := [][]uint64{
+                  append(slices.Clone(base), DataPerBlob-1),
+                  append(slices.Clone(base), DataPerBlob+1, DataPerBlob),
+                  append(slices.Clone(base), CellsPerBlob),
+                  append(slices.Clone(base[:DataPerBlob-1]), DataPerBlob),
+              }
+              for i, layout := range cases {
+                  cells := make([]Cell, len(layout))
+                  if _, ok := blobsFromDataCells(cells, layout); ok {
+                      t.Fatalf("case %d unexpectedly accepted", i)
+                  }
+              }
+              if _, ok := blobsFromDataCells(make([]Cell, len(base)+1), base); ok {
+                  t.Fatal("misaligned cell count unexpectedly accepted")
+              }
+          }
+          EOF
+          gofmt -w crypto/kzg4844/zz_v18_zero_kzg_contract_test.go
+          cp crypto/kzg4844/zz_v18_zero_kzg_contract_test.go out/
+
+      - name: Run exact package gates
+        shell: bash
+        run: |
+          set -o pipefail
+          go test ./crypto/kzg4844 -run 'Test(CKZG|GoKZG|V18)' -count=1 -v 2>&1 | tee out/kzg-focused.log
+          go test ./crypto/kzg4844 -count=1 2>&1 | tee out/kzg-full.log
+          go test ./eth/fetcher ./core/txpool/blobpool -count=1 2>&1 | tee out/caller-packages.log
+
+      - name: Run deterministic repetition and race gate
+        shell: bash
+        run: |
+          set -o pipefail
+          for run in 1 2 3 4 5; do
+            go test ./crypto/kzg4844 -run '^TestV18' -count=1 2>&1 | tee "out/v18-repeat-${run}.log"
+          done
+          go test -race ./crypto/kzg4844 -run '^TestV18' -count=1 2>&1 | tee out/v18-race.log
+
+      - name: Archive exact source and build machine decision
+        if: always()
+        shell: bash
+        run: |
+          set -uxo pipefail
+          tar --exclude=.git --zstd -cf out/go-ethereum-6017c756-source.tar.zst .
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json, re
+          out = Path('out')
+          callers = (out/'production-fastpath-callers.txt').read_text(errors='replace') if (out/'production-fastpath-callers.txt').exists() else ''
+          logs = sorted(out.glob('v18-repeat-*.log'))
+          repeats = [p for p in logs if 'PASS' in p.read_text(errors='replace') or 'ok  ' in p.read_text(errors='replace')]
+          focused = (out/'kzg-focused.log').read_text(errors='replace') if (out/'kzg-focused.log').exists() else ''
+          full = (out/'kzg-full.log').read_text(errors='replace') if (out/'kzg-full.log').exists() else ''
+          callerlog = (out/'caller-packages.log').read_text(errors='replace') if (out/'caller-packages.log').exists() else ''
+          race = (out/'v18-race.log').read_text(errors='replace') if (out/'v18-race.log').exists() else ''
+          decision = {
+              'schema': 'geth-zero-kzg-caller-contract-v18',
+              'commit': (out/'commit.txt').read_text().strip(),
+              'package_tests_pass': all('FAIL' not in x for x in (focused, full, callerlog)) and bool(focused and full and callerlog),
+              'repeat_pass_count': len(repeats),
+              'race_pass': bool(race) and 'FAIL' not in race,
+              'production_fastpath_callers': callers.splitlines(),
+              'unchecked_noncanonical_boundary_proven': 'TestV18UncheckedAcceptsNonCanonicalDataBytes' in focused,
+              'submission_gate': False,
+              'required_next_gate': 'prove every production caller verifies authenticity and grouping before RecoverBlobsUnchecked/RecoverCells; otherwise reproduce with a network-derived cell set',
+          }
+          (out/'MACHINE_DECISION.json').write_text(json.dumps(decision, indent=2))
+          with (out/'SHA256SUMS').open('w') as f:
+              for p in sorted(x for x in out.rglob('*') if x.is_file() and x.name != 'SHA256SUMS'):
+                  f.write(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(out)}\n")
+          print(json.dumps(decision, indent=2))
+          PY
+
+      - name: Upload exact evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: geth-6017-zero-kzg-v18
+          path: out
+          if-no-files-found: error
+          retention-days: 1
