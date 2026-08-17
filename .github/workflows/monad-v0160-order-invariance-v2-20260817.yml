@@ -1,0 +1,173 @@
+name: Monad v0.16.0 state commit order invariance v2
+
+on:
+  push:
+    branches:
+      - agent/monad-v0160-deep-hunt-20260817
+    paths:
+      - .github/workflows/monad-v0160-order-invariance-v2-20260817.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monad-v0160-order-invariance-v2-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  exact-order-oracle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container:
+      image: ubuntu:26.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install exact build dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            apt-utils ca-certificates cmake curl g++-15 gcc-15 git make ninja-build \
+            pkg-config python3 ripgrep time zstd \
+            libarchive-dev libbenchmark-dev libbrotli-dev libcap-dev libcgroup-dev \
+            libcli11-dev libcrypto++-dev libgmock-dev libgmp-dev libgtest-dev \
+            libtbb-dev liburing-dev libzstd-dev \
+            libboost1.83-dev libboost-context1.83-dev libboost-filesystem1.83-dev \
+            libboost-json1.83-dev libboost-stacktrace1.83-dev libboost-test1.83-dev
+          test -x /usr/bin/time
+          gcc-15 --version | head -1
+          g++-15 --version | head -1
+
+      - name: Clone exact in-scope execution source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          EXEC_COMMIT='e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0'
+          git clone --filter=blob:none https://github.com/category-labs/monad.git monad-execution
+          git -C monad-execution checkout --detach "$EXEC_COMMIT"
+          git -C monad-execution submodule sync --recursive
+          git -C monad-execution submodule update --init --recursive --depth 1
+          test "$(git -C monad-execution rev-parse HEAD)" = "$EXEC_COMMIT"
+          mkdir -p evidence
+          {
+            echo "execution_commit=$(git -C monad-execution rev-parse HEAD)"
+            echo "runner=$(uname -a)"
+            echo "gcc=$(gcc-15 --version | head -1)"
+            echo "gxx=$(g++-15 --version | head -1)"
+            git -C monad-execution submodule status --recursive
+          } > evidence/PROVENANCE.txt
+
+      - name: Recover unchanged oracle source from frozen v1 workflow
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          src=Path('.github/workflows/monad-v0160-order-invariance-20260817.yml').read_text()
+          begin="cat > monad-execution/category/execution/monad/test_order_invariance_research.cpp <<'CPP'\n"
+          start=src.index(begin)+len(begin)
+          end=src.index('\n          CPP\n',start)
+          lines=src[start:end].splitlines()
+          code='\n'.join(line[10:] if line.startswith('          ') else line for line in lines)+'\n'
+          out=Path('monad-execution/category/execution/monad/test_order_invariance_research.cpp')
+          out.write_text(code)
+          PY
+          sha256sum monad-execution/category/execution/monad/test_order_invariance_research.cpp \
+            > evidence/TEST_SOURCE.sha256
+
+      - name: Configure and build only the oracle
+        shell: bash
+        env:
+          CC: gcc-15
+          CXX: g++-15
+          GIT_COMMIT_HASH: e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+        run: |
+          set -Eeuo pipefail
+          cd monad-execution
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=category/core/toolchains/gcc-avx2.cmake \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            2>&1 | tee ../evidence/configure.log
+          /usr/bin/time -v cmake --build build --target test_order_invariance_research --parallel 2 \
+            2>&1 | tee ../evidence/build.log
+          sha256sum build/category/execution/test_order_invariance_research \
+            > ../evidence/BINARY.sha256
+
+      - name: Run matched oracle three times
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          BIN="$PWD/monad-execution/build/category/execution/test_order_invariance_research"
+          : > evidence/RUNS.tsv
+          for r in 1 2 3; do
+            before="$(cat /sys/fs/cgroup/memory.events 2>/dev/null || true)"
+            set +e
+            /usr/bin/time -v "$BIN" \
+              --gtest_filter='MonadOrderInvariance.*' \
+              --gtest_color=no \
+              > "evidence/run-${r}.stdout.log" \
+              2> "evidence/run-${r}.stderr.log"
+            rc=$?
+            set -e
+            after="$(cat /sys/fs/cgroup/memory.events 2>/dev/null || true)"
+            printf '%s\t%s\n' "$r" "$rc" >> evidence/RUNS.tsv
+            printf '%s\n' "$before" > "evidence/run-${r}.memory.before"
+            printf '%s\n' "$after" > "evidence/run-${r}.memory.after"
+            test "$rc" -eq 0
+            grep -q '\[  PASSED  \] 2 tests' "evidence/run-${r}.stdout.log"
+          done
+
+      - name: Package machine evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json
+          e=Path('evidence')
+          runs=[]
+          for line in (e/'RUNS.tsv').read_text().splitlines():
+              r,rc=line.split('\t'); runs.append({'run':int(r),'returncode':int(rc)})
+          result={
+              'decision':'KILL_ORDER_DEPENDENCE_CANDIDATE',
+              'exact_execution_commit':'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0',
+              'slot_encoded_permutations':24,
+              'page_encoded_permutations':24,
+              'blocks_per_case':2,
+              'accounts':48,
+              'slots_per_account':20,
+              'runs':runs,
+              'state_root_mismatches':0,
+              'logical_state_mismatches':0,
+              'severity_proven':'NONE_NEW',
+              'submit_ready_zip':False,
+          }
+          (e/'RESULT.json').write_text(json.dumps(result,indent=2)+'\n')
+          (e/'REPORT.md').write_text('''# Monad v0.16.0 state-commit insertion-order oracle\n\nDecision: **KILL — no state-root or logical-state divergence**.\n\nThe exact slot-encoded and page-encoded commit paths produced identical roots for 24 insertion permutations across two consecutive blocks, 48 accounts, and 20 storage keys per account. The complete oracle ran three times. This is negative research evidence and must not be submitted.\n''')
+          manifest=[]
+          for p in sorted(e.rglob('*')):
+              if p.is_file(): manifest.append(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(e)}')
+          (e/'SHA256SUMS').write_text('\n'.join(manifest)+'\n')
+          PY
+          tar --sort=name --mtime='UTC 2026-08-17' --owner=0 --group=0 --numeric-owner \
+            -I 'zstd -T0 -10' -cf monad-v0160-order-invariance-evidence.tar.zst evidence
+          sha256sum monad-v0160-order-invariance-evidence.tar.zst \
+            > monad-v0160-order-invariance-evidence.tar.zst.sha256
+
+      - name: Upload exact oracle evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0160-order-invariance-v2-${{ github.run_id }}
+          path: |
+            monad-v0160-order-invariance-evidence.tar.zst
+            monad-v0160-order-invariance-evidence.tar.zst.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
