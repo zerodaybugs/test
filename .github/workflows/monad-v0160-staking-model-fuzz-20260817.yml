@@ -1,0 +1,266 @@
+name: Monad v0.16.0 staking model and boundary fuzz
+
+on:
+  push:
+    branches:
+      - agent/monad-v0160-deep-hunt-20260817
+    paths:
+      - .github/workflows/monad-v0160-staking-model-fuzz-20260817.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monad-v0160-staking-model-fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  exact-staking-oracle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container:
+      image: ubuntu:26.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install exact build dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates cmake curl g++-15 gcc-15 git make ninja-build pkg-config \
+            python3 time zstd \
+            libarchive-dev libbenchmark-dev libbrotli-dev libcap-dev libcgroup-dev \
+            libcli11-dev libcrypto++-dev libgmock-dev libgmp-dev libgtest-dev \
+            libtbb-dev liburing-dev libzstd-dev \
+            libboost1.83-dev libboost-context1.83-dev libboost-filesystem1.83-dev \
+            libboost-json1.83-dev libboost-stacktrace1.83-dev libboost-test1.83-dev
+          test -x /usr/bin/time
+
+      - name: Clone exact in-scope execution source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          EXEC_COMMIT='e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0'
+          git clone --filter=blob:none https://github.com/category-labs/monad.git monad-execution
+          git -C monad-execution checkout --detach "$EXEC_COMMIT"
+          git -C monad-execution submodule sync --recursive
+          git -C monad-execution submodule update --init --recursive --depth 1
+          test "$(git -C monad-execution rev-parse HEAD)" = "$EXEC_COMMIT"
+          mkdir -p evidence
+          {
+            echo "execution_commit=$(git -C monad-execution rev-parse HEAD)"
+            echo "runner=$(uname -a)"
+            echo "gcc=$(gcc-15 --version | head -1)"
+            echo "gxx=$(g++-15 --version | head -1)"
+          } > evidence/PROVENANCE.txt
+
+      - name: Add targeted epoch-boundary state-machine oracle
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > monad-execution/category/execution/monad/staking/test_staking_boundary_research.cpp <<'CPP'
+          #include <category/execution/monad/staking/fuzzer/staking_contract_machine.hpp>
+          #include <category/vm/evm/monad/revision.h>
+          #include <category/vm/evm/traits.hpp>
+          #include <gtest/gtest.h>
+          #include <array>
+          #include <cstdint>
+
+          using namespace monad;
+          using namespace monad::staking::test;
+
+          namespace {
+          template <Traits traits>
+          void run_seed(uint64_t seed)
+          {
+              using Machine = StakingContractMachine<traits>;
+              using T = typename Machine::Transition;
+              typename Machine::Config cfg;
+              cfg.close_to_max_active_validators_prob = 0.01;
+              cfg.many_active_validators_prob = 0.10;
+              cfg.enable_pubkey_assertions = false;
+              cfg.enable_trace = false;
+              Machine m{seed, cfg};
+
+              constexpr std::array<T, 22> sequence = {
+                  T::precompile_add_validator,
+                  T::precompile_add_validator,
+                  T::precompile_delegate,
+                  T::precompile_external_reward,
+                  T::syscall_snapshot,
+                  T::precompile_undelegate,
+                  T::precompile_compound,
+                  T::syscall_reward,
+                  T::distribute_priority_fees,
+                  T::syscall_on_epoch_change,
+                  T::precompile_claim_rewards,
+                  T::precompile_withdraw,
+                  T::precompile_change_commission,
+                  T::precompile_delegate,
+                  T::syscall_snapshot,
+                  T::precompile_undelegate,
+                  T::syscall_on_epoch_change,
+                  T::precompile_withdraw,
+                  T::precompile_compound,
+                  T::precompile_claim_rewards,
+                  T::precompile_get_delegator,
+                  T::syscall_reward,
+              };
+
+              for (size_t cycle = 0; cycle < 160; ++cycle) {
+                  for (auto const transition : sequence) {
+                      (void)m.transition(transition);
+                  }
+                  if ((cycle % 17) == 0) {
+                      m.skip_epochs(2);
+                  }
+              }
+              m.assert_all_invariants();
+          }
+
+          template <Traits traits>
+          void run_matrix()
+          {
+              constexpr std::array<uint64_t, 32> seeds = {
+                  0,1,2,3,7,11,31,63,64,127,128,255,256,511,512,1023,
+                  1024,1337,0xdeadbeefULL,0xcafebabeULL,
+                  0x123456789abcdef0ULL,0xffffffffffffffffULL,
+                  0xa5a5a5a5a5a5a5a5ULL,0x55aa55aa55aa55aaULL,
+                  0x3141592653589793ULL,0x2718281828459045ULL,
+                  0x0102030405060708ULL,0x8877665544332211ULL,
+                  0x8000000000000000ULL,0x7fffffffffffffffULL,
+                  0x1111111111111111ULL,0xeeeeeeeeeeeeeeeeULL};
+              for (auto const seed : seeds) run_seed<traits>(seed);
+          }
+          }
+
+          TEST(StakingBoundaryResearch, MonadNine)
+          {
+              run_matrix<MonadTraits<MONAD_NINE>>();
+          }
+
+          TEST(StakingBoundaryResearch, MonadTen)
+          {
+              run_matrix<MonadTraits<MONAD_TEN>>();
+          }
+          CPP
+          sha256sum monad-execution/category/execution/monad/staking/test_staking_boundary_research.cpp \
+            > evidence/BOUNDARY_TEST_SOURCE.sha256
+
+      - name: Configure and build exact targets
+        shell: bash
+        env:
+          CC: gcc-15
+          CXX: g++-15
+          GIT_COMMIT_HASH: e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+        run: |
+          set -Eeuo pipefail
+          cd monad-execution
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=category/core/toolchains/gcc-avx2.cmake \
+            -DBUILD_TESTING=ON \
+            2>&1 | tee ../evidence/configure.log
+          /usr/bin/time -v cmake --build build \
+            --target monad_staking_contract_fuzzer test_staking_boundary_research \
+            --parallel 2 2>&1 | tee ../evidence/build.log
+          sha256sum \
+            build/category/execution/monad_staking_contract_fuzzer \
+            build/category/execution/test_staking_boundary_research \
+            > ../evidence/BINARIES.sha256
+
+      - name: Run targeted boundary oracle three times
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          BIN="$PWD/monad-execution/build/category/execution/test_staking_boundary_research"
+          : > evidence/BOUNDARY_RUNS.tsv
+          for r in 1 2 3; do
+            set +e
+            /usr/bin/time -v "$BIN" --gtest_filter='StakingBoundaryResearch.*' --gtest_color=no \
+              > "evidence/boundary-${r}.stdout.log" \
+              2> "evidence/boundary-${r}.stderr.log"
+            rc=$?
+            set -e
+            printf '%s\t%s\n' "$r" "$rc" >> evidence/BOUNDARY_RUNS.tsv
+            test "$rc" -eq 0
+            grep -q '\[  PASSED  \] 2 tests' "evidence/boundary-${r}.stdout.log"
+          done
+
+      - name: Run model fuzzer matrix
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          BIN="$PWD/monad-execution/build/category/execution/monad_staking_contract_fuzzer"
+          : > evidence/FUZZ_RUNS.tsv
+          for rev in MONAD_NINE MONAD_TEN; do
+            for seed in 0 1 3735928559 18446744073709551615; do
+              tag="${rev}-${seed}"
+              set +e
+              /usr/bin/time -v "$BIN" \
+                --monad-rev "$rev" --seed "$seed" --runs 64 --depth 500 \
+                > "evidence/fuzz-${tag}.stdout.log" \
+                2> "evidence/fuzz-${tag}.stderr.log"
+              rc=$?
+              set -e
+              printf '%s\t%s\t%s\n' "$rev" "$seed" "$rc" >> evidence/FUZZ_RUNS.tsv
+              test "$rc" -eq 0
+              grep -q 'Running 64 simulations' "evidence/fuzz-${tag}.stdout.log"
+            done
+          done
+
+      - name: Package machine evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json
+          e=Path('evidence')
+          boundary=[]
+          for line in (e/'BOUNDARY_RUNS.tsv').read_text().splitlines():
+              r,rc=line.split('\t'); boundary.append({'run':int(r),'returncode':int(rc)})
+          fuzz=[]
+          for line in (e/'FUZZ_RUNS.tsv').read_text().splitlines():
+              rev,seed,rc=line.split('\t'); fuzz.append({'revision':rev,'seed':seed,'returncode':int(rc)})
+          result={
+              'decision':'KILL_STAKING_STATE_MACHINE_CANDIDATE',
+              'exact_execution_commit':'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0',
+              'targeted_boundary_runs':boundary,
+              'targeted_seeds_per_revision':32,
+              'targeted_cycles_per_seed':160,
+              'targeted_transitions_per_cycle':22,
+              'fuzzer_runs':fuzz,
+              'fuzzer_simulations_per_invocation':64,
+              'fuzzer_depth':500,
+              'model_or_invariant_failures':0,
+              'severity_proven':'NONE_NEW',
+              'submit_ready_zip':False,
+          }
+          (e/'RESULT.json').write_text(json.dumps(result,indent=2)+'\n')
+          (e/'REPORT.md').write_text('''# Monad v0.16.0 staking model/boundary oracle\n\nDecision: **KILL — no model, solvency, reward-accumulator, validator-set, linked-list, withdrawal, or boundary invariant failure**.\n\nThe exact model-based staking fuzzer and a forced epoch-boundary transition matrix completed without mismatch. This is negative research evidence and must not be submitted.\n''')
+          manifest=[]
+          for p in sorted(e.rglob('*')):
+              if p.is_file(): manifest.append(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(e)}')
+          (e/'SHA256SUMS').write_text('\n'.join(manifest)+'\n')
+          PY
+          tar --sort=name --mtime='UTC 2026-08-17' --owner=0 --group=0 --numeric-owner \
+            -I 'zstd -T0 -10' -cf monad-v0160-staking-model-evidence.tar.zst evidence
+          sha256sum monad-v0160-staking-model-evidence.tar.zst \
+            > monad-v0160-staking-model-evidence.tar.zst.sha256
+
+      - name: Upload exact staking evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0160-staking-model-evidence-${{ github.run_id }}
+          path: |
+            monad-v0160-staking-model-evidence.tar.zst
+            monad-v0160-staking-model-evidence.tar.zst.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
