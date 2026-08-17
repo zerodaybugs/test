@@ -1,0 +1,139 @@
+name: Temporary .NET Global Cryptographic Compare Scan
+
+on:
+  push:
+    branches:
+      - agent/dotnet10-toolchain-20260815
+    paths:
+      - .github/workflows/_temporary-dotnet-global-crypto-compare-scan-20260817.yml
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout runtime current
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: dotnet/runtime
+          ref: 6f4026d538b80b1f6f27bb190a05a16e983506af
+          fetch-depth: 1
+          persist-credentials: false
+          path: runtime-current
+
+      - name: Checkout runtime supported
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: dotnet/runtime
+          ref: v10.0.10
+          fetch-depth: 1
+          persist-credentials: false
+          path: runtime-supported
+
+      - name: Checkout aspnetcore current
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: dotnet/aspnetcore
+          ref: 1b3defefc0818bbf845a7dfc0aec6559c001d60f
+          fetch-depth: 1
+          persist-credentials: false
+          path: aspnetcore-current
+
+      - name: Checkout aspnetcore supported
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: dotnet/aspnetcore
+          ref: v10.0.10
+          fetch-depth: 1
+          persist-credentials: false
+          path: aspnetcore-supported
+
+      - name: Perform context-aware compare and verifier scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/export"
+          mkdir -p "$OUT"
+          python3 - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import re
+
+          roots = [
+              ('runtime-current', Path('runtime-current')),
+              ('runtime-supported', Path('runtime-supported')),
+              ('aspnetcore-current', Path('aspnetcore-current')),
+              ('aspnetcore-supported', Path('aspnetcore-supported')),
+          ]
+          extensions = {'.cs','.fs','.vb','.c','.cc','.cpp','.cxx','.h','.hpp','.m','.mm','.rs','.java','.js','.ts'}
+          compare_rx = re.compile(r'(?:SequenceEqual|FixedTimeEquals|CryptographicEquals|CRYPTO_memcmp|memcmp|timingsafe_bcmp|MessageDigest\.isEqual)')
+          verifier_rx = re.compile(r'(?i)(?:verify|validat|check).{0,45}(?:signature|mac|hmac|tag|digest|hash|mic)|(?:signature|mac|hmac|tag|digest|hash|mic).{0,45}(?:verify|validat|check)')
+          attacker_length_rx = re.compile(r'(?i)(?:signature|sig|mac|hmac|tag|digest|hash|mic|proof|token)[A-Za-z0-9_\.]*\s*\.\s*(?:Length|Count|len|size)|(?:len|size)\s*\([^\)]*(?:signature|sig|mac|hmac|tag|digest|hash|mic)')
+          prefix_rx = re.compile(r'(?i)(?:Slice|AsSpan|Take|\[\s*\.\.|subarray|substring|resize|truncate|prefix)')
+          min_rx = re.compile(r'(?i)(?:Math\.Min|min\s*\()')
+          equality_rx = re.compile(r'(?:==|!=|<=|>=|<|>)\s*[^\n]*(?:Length|Count|len|size)|(?:Length|Count|len|size)[^\n]*(?:==|!=|<=|>=|<|>)')
+          rows=[]
+          for label, root in roots:
+              for p in root.rglob('*'):
+                  if not p.is_file() or p.suffix.lower() not in extensions:
+                      continue
+                  if any(part in {'.git','bin','obj','artifacts','node_modules','packages'} for part in p.parts):
+                      continue
+                  try:
+                      text=p.read_text(errors='replace')
+                  except OSError:
+                      continue
+                  lines=text.splitlines()
+                  for i,line in enumerate(lines):
+                      window='\n'.join(lines[max(0,i-8):min(len(lines),i+9)])
+                      flags=[]
+                      if compare_rx.search(line): flags.append('compare')
+                      if verifier_rx.search(window): flags.append('verifier_context')
+                      if attacker_length_rx.search(window): flags.append('attacker_length')
+                      if prefix_rx.search(window): flags.append('prefix_or_slice')
+                      if min_rx.search(window): flags.append('min_length')
+                      if equality_rx.search(window): flags.append('length_condition')
+                      if 'compare' not in flags and not (verifier_rx.search(line) and attacker_length_rx.search(window)):
+                          continue
+                      score=(100*('compare' in flags and 'attacker_length' in flags and 'prefix_or_slice' in flags)
+                             +45*('verifier_context' in flags)
+                             +30*('attacker_length' in flags)
+                             +25*('prefix_or_slice' in flags)
+                             +35*('min_length' in flags)
+                             +15*('length_condition' in flags)
+                             +10*('compare' in flags))
+                      rows.append({
+                          'tree':label,
+                          'path':p.relative_to(root).as_posix(),
+                          'line':i+1,
+                          'score':score,
+                          'flags':','.join(flags),
+                          'line_text':line.strip()[:800],
+                          'context':'\n'.join(f'{j+1}: {lines[j]}' for j in range(max(0,i-5),min(len(lines),i+6))),
+                      })
+          rows.sort(key=lambda r:(-r['score'],r['tree'],r['path'],r['line']))
+          with Path('export/GLOBAL_CRYPTO_SCAN.csv').open('w',newline='',encoding='utf-8') as f:
+              w=csv.DictWriter(f,fieldnames=['tree','path','line','score','flags','line_text','context']); w.writeheader(); w.writerows(rows)
+          Path('export/GLOBAL_CRYPTO_SCAN.json').write_text(json.dumps(rows,indent=2),encoding='utf-8')
+          with Path('export/TOP_GLOBAL_CANDIDATES.md').open('w',encoding='utf-8') as f:
+              f.write('# Global cryptographic comparison candidates\n\nHeuristic index only.\n\n')
+              for n,r in enumerate(rows[:400],1):
+                  f.write(f"## {n}. {r['tree']} — `{r['path']}:{r['line']}` — score {r['score']}\n\n")
+                  f.write(f"Flags: `{r['flags']}`\n\n```text\n{r['context']}\n```\n\n")
+          Path('export/COMMITS.json').write_text(json.dumps({label: __import__('subprocess').check_output(['git','-C',str(root),'rev-parse','HEAD'],text=True).strip() for label,root in roots},indent=2),encoding='utf-8')
+          PY
+          (cd "$OUT" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+          du -sh "$OUT"
+
+      - name: Upload global scan
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dotnet-global-crypto-compare-scan-20260817
+          path: export
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 9
