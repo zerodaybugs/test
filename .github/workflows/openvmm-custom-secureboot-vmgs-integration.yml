@@ -1,0 +1,440 @@
+name: Exact OpenVMM custom Secure Boot VMGS integration
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/openvmm-custom-secureboot-vmgs-integration.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: '1'
+    steps:
+      - name: Capture runner baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            date -u +%FT%TZ
+            uname -a
+            id
+            nproc
+            grep MemTotal /proc/meminfo
+            ls -l /dev/kvm
+            grep -m1 -Eo '(^| )(vmx|svm)( |$)' /proc/cpuinfo || true
+          } | tee runner-baseline.txt
+          sudo chmod 666 /dev/kvm
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential clang lld llvm pkg-config libssl-dev libudev-dev \
+            libcap-dev libfdt-dev uuid-dev nasm jq curl unzip openssl sbsigntool
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Checkout exact Microsoft source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/microsoft/openvmm.git openvmm
+          cd openvmm
+          git checkout --detach 21dc2e64d599a0a8d7fe283f05bd75ea2e72ba46
+          test "$(git rev-parse HEAD)" = 21dc2e64d599a0a8d7fe283f05bd75ea2e72ba46
+          git rev-parse HEAD | tee ../source-commit.txt
+
+      - name: Restore exact OpenVMM external packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd openvmm
+          cargo xflowey restore-packages 2>&1 | tee ../restore-packages.log
+          test -x .packages/Google.Protobuf.Tools/tools/protoc
+          .packages/Google.Protobuf.Tools/tools/protoc --version | tee ../protoc-version.txt
+
+      - name: Download pinned Microsoft UEFI firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://github.com/microsoft/mu_msvm/releases/download/v26.0.19/RELEASE-X64-VS2022-artifacts.tar.gz'
+          curl --fail --location --retry 5 --retry-all-errors -o mu_msvm-x64.tar.gz "$url"
+          mkdir mu_msvm-x64
+          tar -xzf mu_msvm-x64.tar.gz -C mu_msvm-x64
+          test -f mu_msvm-x64/FV/MSVM.fd
+          sha256sum mu_msvm-x64/FV/MSVM.fd | tee MSVM.fd.sha256
+
+      - name: Generate ephemeral Secure Boot signing identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl req -new -x509 -newkey rsa:2048 -sha256 -nodes \
+            -subj '/CN=OpenVMM Custom Secure Boot Integration/' \
+            -days 2 -keyout lab-sb.key -out lab-sb.crt
+          openssl x509 -in lab-sb.crt -outform DER -out lab-sb.der
+          openssl x509 -in lab-sb.crt -noout -subject -issuer -serial -fingerprint -sha256 \
+            | tee secure-boot-cert-metadata.txt
+          sha256sum lab-sb.der | tee secure-boot-cert-der.sha256
+
+      - name: Add test-only integration hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd openvmm
+
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('flowey/flowey_lib_hvlite/src/build_guest_test_uefi.rs')
+          text = path.read_text(encoding='utf-8')
+          old = '''                    let (efi, pdb) = match rt.read(output) {
+                        crate::run_cargo_build::CargoBuildOutput::UefiBin { efi, pdb } => {
+                            (efi, pdb)
+                        }
+                        _ => unreachable!(),
+                    };
+
+                    // package it up into an img using the xtask
+          '''
+          new = '''                    let (mut efi, pdb) = match rt.read(output) {
+                        crate::run_cargo_build::CargoBuildOutput::UefiBin { efi, pdb } => {
+                            (efi, pdb)
+                        }
+                        _ => unreachable!(),
+                    };
+
+                    if let (Some(key), Some(cert)) = (
+                        std::env::var_os("CUSTOM_SB_KEY"),
+                        std::env::var_os("CUSTOM_SB_CERT"),
+                    ) {
+                        let key = PathBuf::from(key);
+                        let cert = PathBuf::from(cert);
+                        let signed_efi = rt.sh.current_dir().join("guest_test_uefi.signed.efi");
+                        flowey::shell_cmd!(
+                            rt,
+                            "sbsign --key {key} --cert {cert} --output {signed_efi} {efi}"
+                        )
+                        .run()?;
+                        efi = signed_efi;
+                    }
+
+                    // package it up into an img using the xtask
+          '''
+          if old not in text:
+              raise SystemExit('build_guest_test_uefi anchor not found')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+
+          cat >> vm/devices/firmware/firmware_uefi/src/service/nvram/mod.rs <<'RS'
+
+          #[cfg(test)]
+          mod custom_secure_boot_nvram_export {
+              use super::*;
+              use hcl_compat_uefi_nvram_storage::HclCompatNvram;
+              use hcl_compat_uefi_nvram_storage::storage_backend::{StorageBackend, StorageBackendError};
+              use pal_async::async_test;
+              use std::borrow::Cow;
+              use std::sync::{Arc, Mutex};
+              use uefi_nvram_specvars::signature_list::{ParseSignatureLists, SignatureData, SignatureList};
+              use uefi_nvram_storage::{EFI_TIME, NvramStorage};
+
+              #[derive(Clone, Default)]
+              struct SharedPackedNvramBackend(Arc<Mutex<Option<Vec<u8>>>>);
+
+              #[async_trait::async_trait]
+              impl StorageBackend for SharedPackedNvramBackend {
+                  async fn persist(&mut self, data: Vec<u8>) -> Result<(), StorageBackendError> {
+                      *self.0.lock().unwrap() = Some(data);
+                      Ok(())
+                  }
+
+                  async fn restore(&mut self) -> Result<Option<Vec<u8>>, StorageBackendError> {
+                      Ok(self.0.lock().unwrap().clone())
+                  }
+              }
+
+              fn ucs2_nul(s: &str) -> Vec<u8> {
+                  s.encode_utf16()
+                      .chain(std::iter::once(0))
+                      .flat_map(u16::to_le_bytes)
+                      .collect()
+              }
+
+              fn make_file_boot_option(description: &str, file_path: &str) -> Vec<u8> {
+                  let description = ucs2_nul(description);
+                  let file_path = ucs2_nul(file_path);
+                  let mut device_path = Vec::new();
+                  let file_node_len = u16::try_from(4usize + file_path.len()).unwrap();
+                  device_path.extend([
+                      uefi_specs::uefi::boot::EfiDeviceType::MEDIA.0,
+                      uefi_specs::uefi::boot::EfiMediaDeviceSubType::FILE.0,
+                  ]);
+                  device_path.extend(file_node_len.to_le_bytes());
+                  device_path.extend(file_path);
+                  device_path.extend([
+                      uefi_specs::uefi::boot::EfiDeviceType::END.0,
+                      uefi_specs::uefi::boot::EfiEndDeviceSubType::ENTIRE.0,
+                      4,
+                      0,
+                  ]);
+                  let mut out = Vec::new();
+                  out.extend(1u32.to_le_bytes());
+                  out.extend(u16::try_from(device_path.len()).unwrap().to_le_bytes());
+                  out.extend(description);
+                  out.extend(device_path);
+                  out
+              }
+
+              async fn raw_get(
+                  nvram: &mut NvramServices,
+                  vendor: guid::Guid,
+                  name: &[u8],
+              ) -> Option<Vec<u8>> {
+                  let mut attr = 0u32;
+                  let mut size = 128 * 1024u32;
+                  let NvramResult(data, status, err) = nvram
+                      .services
+                      .uefi_get_variable(Some(name), vendor, &mut attr, &mut size, false)
+                      .await;
+                  if status == EfiStatus::NOT_FOUND {
+                      assert!(err.is_none());
+                      return None;
+                  }
+                  if let Some(err) = err {
+                      panic!("unexpected NVRAM error: {err}");
+                  }
+                  assert_eq!(status, EfiStatus::SUCCESS);
+                  data
+              }
+
+              #[async_test]
+              async fn export_custom_secure_boot_nvram() {
+                  use uefi_specs::uefi::nvram::vars::{DB, PK, SECURE_BOOT, SETUP_MODE};
+
+                  let cert_der = std::fs::read(
+                      std::env::var_os("CUSTOM_SB_CERT_DER")
+                          .expect("CUSTOM_SB_CERT_DER must be set"),
+                  )
+                  .unwrap();
+                  let output = std::path::PathBuf::from(
+                      std::env::var_os("CUSTOM_NVRAM_OUT")
+                          .expect("CUSTOM_NVRAM_OUT must be set"),
+                  );
+                  let owner = guid::Guid::new_random();
+                  let mut pk_blob = Vec::new();
+                  SignatureList::X509(SignatureData::new_x509(
+                      owner,
+                      Cow::Owned(cert_der.clone()),
+                  ))
+                  .extend_as_spec_signature_list(&mut pk_blob);
+                  let mut db_blob = Vec::new();
+                  SignatureList::X509(SignatureData::new_x509(
+                      owner,
+                      Cow::Owned(cert_der.clone()),
+                  ))
+                  .extend_as_spec_signature_list(&mut db_blob);
+
+                  let backend = SharedPackedNvramBackend::default();
+                  let mut storage = HclCompatNvram::new(backend.clone(), None);
+                  let auth_attr: u32 = EfiVariableAttributes::DEFAULT_ATTRIBUTES_TIME_BASED_AUTH.into();
+                  let normal_attr: u32 = EfiVariableAttributes::DEFAULT_ATTRIBUTES.into();
+                  let timestamp = EFI_TIME::default();
+
+                  let (pk_vendor, pk_name) = PK();
+                  storage.set_variable(pk_name, pk_vendor, auth_attr, pk_blob.clone(), timestamp).await.unwrap();
+                  let (db_vendor, db_name) = DB();
+                  storage.set_variable(db_name, db_vendor, auth_attr, db_blob.clone(), timestamp).await.unwrap();
+                  let (setup_vendor, setup_name) = SETUP_MODE();
+                  storage.set_variable(setup_name, setup_vendor, normal_attr, vec![0], timestamp).await.unwrap();
+
+                  let efi_global = uefi_specs::uefi::nvram::vars::EFI_GLOBAL_VARIABLE;
+                  let boot_order_name = ucs2::Ucs2LeVec::from("BootOrder".to_string());
+                  let boot_option_name = ucs2::Ucs2LeVec::from("Boot0000".to_string());
+                  storage.set_variable(
+                      &boot_order_name,
+                      efi_global,
+                      normal_attr,
+                      0u16.to_le_bytes().to_vec(),
+                      timestamp,
+                  ).await.unwrap();
+                  storage.set_variable(
+                      &boot_option_name,
+                      efi_global,
+                      normal_attr,
+                      make_file_boot_option("Custom Secure Boot Probe", r"\EFI\BOOT\BOOTX64.EFI"),
+                      timestamp,
+                  ).await.unwrap();
+                  drop(storage);
+
+                  let boot_storage = HclCompatNvram::new(backend.clone(), None);
+                  let mut nvram = NvramServices::new(
+                      Box::new(boot_storage),
+                      firmware_uefi_custom_vars::CustomVars::default(),
+                      true,
+                      None,
+                      false,
+                  ).await.unwrap();
+
+                  let observed_pk = raw_get(&mut nvram, pk_vendor, pk_name.as_bytes()).await.unwrap();
+                  let observed_db = raw_get(&mut nvram, db_vendor, db_name.as_bytes()).await.unwrap();
+                  assert_eq!(observed_pk, pk_blob);
+                  assert_eq!(observed_db, db_blob);
+                  assert!(ParseSignatureLists::new(&observed_pk).collect_signature_set().is_ok());
+                  assert!(ParseSignatureLists::new(&observed_db).collect_signature_set().is_ok());
+                  assert_eq!(raw_get(&mut nvram, setup_vendor, setup_name.as_bytes()).await.unwrap(), vec![0]);
+                  let (sb_vendor, sb_name) = SECURE_BOOT();
+                  assert_eq!(raw_get(&mut nvram, sb_vendor, sb_name.as_bytes()).await.unwrap(), vec![1]);
+                  drop(nvram);
+
+                  let packed = backend.0.lock().unwrap().clone().unwrap();
+                  assert!(!packed.is_empty());
+                  std::fs::write(&output, &packed).unwrap();
+                  eprintln!("CUSTOM_SECURE_BOOT_NVRAM_EXPORT_PASS bytes={}", packed.len());
+              }
+          }
+          RS
+
+          cat >> vmm_tests/vmm_tests/tests/tests/multiarch/vmgs.rs <<'RS'
+
+          #[vmm_test_with(
+              noagent,
+              configs(openvmm_openhcl_uefi_x64(guest_test_uefi_x64))
+          )]
+          async fn custom_secure_boot_vmgs_guest<T: PetriVmmBackend>(
+              config: PetriVmBuilder<T>,
+          ) -> anyhow::Result<()> {
+              let vmgs_path = std::path::PathBuf::from(
+                  std::env::var_os("CUSTOM_VMGS_PATH")
+                      .ok_or_else(|| anyhow::anyhow!("CUSTOM_VMGS_PATH is required"))?,
+              );
+              let expect_execution = std::env::var("CUSTOM_EXPECT_EXECUTION")
+                  .map(|v| v == "1")
+                  .unwrap_or(true);
+              let vm = config
+                  .with_windows_secure_boot_template()
+                  .with_default_boot_always_attempt(true)
+                  .with_guest_state_lifetime(PetriGuestStateLifetime::Disk)
+                  .with_persistent_vmgs(&vmgs_path)
+                  .with_guest_state_encryption(GuestStateEncryptionPolicy::GspById(true))
+                  .run_without_agent()
+                  .await?;
+              let halt_reason = vm.wait_for_teardown().await?;
+              if expect_execution {
+                  if halt_reason.reason != petri::PetriHaltReason::TripleFault {
+                      anyhow::bail!("custom signed guest did not execute: {halt_reason:?}");
+                  }
+                  tracing::info!("CUSTOM_SECURE_BOOT_SIGNED_GUEST_EXECUTION_PASS");
+              } else if halt_reason.reason == petri::PetriHaltReason::TripleFault {
+                  anyhow::bail!("wrongly signed guest unexpectedly executed");
+              }
+              Ok(())
+          }
+          RS
+
+          cargo xtask fmt --fix
+          git diff --check
+          git diff --stat | tee ../test-only-diff-stat.txt
+
+      - name: Export and validate packed NVRAM
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd openvmm
+          CUSTOM_SB_CERT_DER="$GITHUB_WORKSPACE/lab-sb.der" \
+          CUSTOM_NVRAM_OUT="$GITHUB_WORKSPACE/custom-secure-boot-nvram.bin" \
+            cargo test -p firmware_uefi export_custom_secure_boot_nvram -- --nocapture \
+            2>&1 | tee "$GITHUB_WORKSPACE/nvram-export-test.log"
+          test -s "$GITHUB_WORKSPACE/custom-secure-boot-nvram.bin"
+          sha256sum "$GITHUB_WORKSPACE/custom-secure-boot-nvram.bin" \
+            | tee "$GITHUB_WORKSPACE/custom-secure-boot-nvram.sha256"
+
+      - name: Create encrypted VMGS with custom NVRAM
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd openvmm
+          cargo build --features encryption -p vmgstool 2>&1 | tee "$GITHUB_WORKSPACE/vmgstool-build.log"
+          python - <<'PY'
+          from pathlib import Path
+          Path('../gsp-by-id.bin').write_bytes(bytes([
+              0x30,0x04,0xE2,0x1E,0x2E,0x5E,0x26,0xDA,0x18,0xFA,0x7F,0x03,0x08,0x29,0xB8,0x91,
+              0x61,0xAD,0x54,0xB4,0xAC,0x4D,0x9A,0xEF,0x72,0xB3,0x28,0x41,0xF2,0xB7,0x05,0x1A,
+          ]))
+          PY
+          target/debug/vmgstool create \
+            --filepath "$GITHUB_WORKSPACE/custom-secure-boot.vmgs" \
+            --keypath "$GITHUB_WORKSPACE/gsp-by-id.bin" \
+            --encryptionalgorithm AES_GCM
+          target/debug/vmgstool write \
+            --filepath "$GITHUB_WORKSPACE/custom-secure-boot.vmgs" \
+            --datapath "$GITHUB_WORKSPACE/custom-secure-boot-nvram.bin" \
+            --fileid BIOS_NVRAM \
+            --keypath "$GITHUB_WORKSPACE/gsp-by-id.bin"
+          target/debug/vmgstool uefi-nvram dump \
+            --filepath "$GITHUB_WORKSPACE/custom-secure-boot.vmgs" \
+            --keypath "$GITHUB_WORKSPACE/gsp-by-id.bin" \
+            --truncate \
+            --outpath "$GITHUB_WORKSPACE/nvram-dump.txt"
+          target/debug/vmgstool dump-headers \
+            --filepath "$GITHUB_WORKSPACE/custom-secure-boot.vmgs" \
+            > "$GITHUB_WORKSPACE/vmgs-headers.txt"
+          sha256sum "$GITHUB_WORKSPACE/custom-secure-boot.vmgs" \
+            | tee "$GITHUB_WORKSPACE/custom-secure-boot.vmgs.sha256"
+
+      - name: Run exact OpenHCL custom Secure Boot integration
+        shell: bash
+        run: |
+          set -uo pipefail
+          cd openvmm
+          export CUSTOM_SB_KEY="$GITHUB_WORKSPACE/lab-sb.key"
+          export CUSTOM_SB_CERT="$GITHUB_WORKSPACE/lab-sb.crt"
+          export CUSTOM_VMGS_PATH="$GITHUB_WORKSPACE/custom-secure-boot.vmgs"
+          export CUSTOM_EXPECT_EXECUTION=1
+          set +e
+          cargo xflowey vmm-tests-run \
+            --target linux-x64 \
+            --filter 'test(custom_secure_boot_vmgs_guest)' \
+            --install-missing-deps \
+            --skip-vhd-prompt \
+            --custom-uefi-firmware "$GITHUB_WORKSPACE/mu_msvm-x64/FV/MSVM.fd" \
+            2>&1 | tee "$GITHUB_WORKSPACE/custom-secure-boot-integration.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "return_code=$rc" | tee "$GITHUB_WORKSPACE/custom-secure-boot-integration-status.txt"
+          exit "$rc"
+
+      - name: Upload auditable evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-openvmm-custom-secureboot-vmgs-integration
+          path: |
+            runner-baseline.txt
+            source-commit.txt
+            MSVM.fd.sha256
+            protoc-version.txt
+            restore-packages.log
+            secure-boot-cert-metadata.txt
+            secure-boot-cert-der.sha256
+            test-only-diff-stat.txt
+            nvram-export-test.log
+            custom-secure-boot-nvram.sha256
+            vmgstool-build.log
+            nvram-dump.txt
+            vmgs-headers.txt
+            custom-secure-boot.vmgs.sha256
+            custom-secure-boot-integration.log
+            custom-secure-boot-integration-status.txt
+          retention-days: 7
