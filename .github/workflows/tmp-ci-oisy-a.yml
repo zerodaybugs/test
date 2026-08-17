@@ -1,0 +1,94 @@
+name: Temporary isolated OISY validation
+
+on:
+  push:
+    branches:
+      - tmp-ci-20260817-oisy-assign
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install prerequisites
+        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends jq openssl git
+
+      - name: Generate one-time runner key
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/runner-public"
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out "$RUNNER_TEMP/runner-private.pem" >/dev/null 2>&1
+          openssl pkey -in "$RUNNER_TEMP/runner-private.pem" -pubout -out "$RUNNER_TEMP/runner-public/runner-public.pem" >/dev/null 2>&1
+          sha256sum "$RUNNER_TEMP/runner-public/runner-public.pem" > "$RUNNER_TEMP/runner-public/runner-public.pem.sha256"
+
+      - name: Publish runner public key
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-public-key-oisy-a
+          path: ${{ runner.temp }}/runner-public/
+          retention-days: 1
+
+      - name: Wait for encrypted payload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/secure-ci-oisy-a"
+          for _ in $(seq 1 600); do
+            a=$(curl -sS -o "$RUNNER_TEMP/a.json" -w '%{http_code}' -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' "${api}/payload.enc.b64?ref=${GITHUB_REF_NAME}")
+            b=$(curl -sS -o "$RUNNER_TEMP/b.json" -w '%{http_code}' -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' "${api}/payload.key.enc.b64?ref=${GITHUB_REF_NAME}")
+            if [[ "$a" == 200 && "$b" == 200 ]]; then
+              jq -r '.content' "$RUNNER_TEMP/a.json" | tr -d '\r\n' | base64 -d > "$RUNNER_TEMP/payload.enc.txt"
+              jq -r '.content' "$RUNNER_TEMP/b.json" | tr -d '\r\n' | base64 -d > "$RUNNER_TEMP/payload.key.enc.txt"
+              tr -d '\r\n ' < "$RUNNER_TEMP/payload.enc.txt" | base64 -d > "$RUNNER_TEMP/payload.enc"
+              tr -d '\r\n ' < "$RUNNER_TEMP/payload.key.enc.txt" | base64 -d > "$RUNNER_TEMP/payload.key.enc"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo 'Encrypted payload was not published.' >&2
+          exit 1
+
+      - name: Decrypt and execute payload
+        id: execute
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/payload" "$RUNNER_TEMP/secure-result"
+          openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/runner-private.pem" -in "$RUNNER_TEMP/payload.key.enc" -out "$RUNNER_TEMP/payload.pass" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/payload.enc" -out "$RUNNER_TEMP/payload.tar.gz" -pass file:"$RUNNER_TEMP/payload.pass"
+          tar -xzf "$RUNNER_TEMP/payload.tar.gz" -C "$RUNNER_TEMP/payload"
+          chmod +x "$RUNNER_TEMP/payload/run.sh"
+          set +e
+          timeout 1800 "$RUNNER_TEMP/payload/run.sh" "$RUNNER_TEMP/secure-result" > "$RUNNER_TEMP/secure-result/runner.log" 2>&1
+          code=$?
+          set -e
+          printf '%s\n' "$code" > "$RUNNER_TEMP/secure-result/exit.code"
+          exit "$code"
+
+      - name: Encrypt result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/encrypted-result" "$RUNNER_TEMP/secure-result"
+          tar -czf "$RUNNER_TEMP/result.tar.gz" -C "$RUNNER_TEMP/secure-result" .
+          openssl rand -hex 32 > "$RUNNER_TEMP/result.pass"
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/result.tar.gz" -out "$RUNNER_TEMP/encrypted-result/result.enc" -pass file:"$RUNNER_TEMP/result.pass"
+          openssl pkeyutl -encrypt -pubin -inkey secure-ci-oisy-a/researcher-public.pem -in "$RUNNER_TEMP/result.pass" -out "$RUNNER_TEMP/encrypted-result/result.key.enc" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          sha256sum "$RUNNER_TEMP/encrypted-result/result.enc" "$RUNNER_TEMP/encrypted-result/result.key.enc" > "$RUNNER_TEMP/encrypted-result/SHA256SUMS.txt"
+
+      - name: Upload encrypted result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-result-oisy-a
+          path: ${{ runner.temp }}/encrypted-result/
+          retention-days: 1
