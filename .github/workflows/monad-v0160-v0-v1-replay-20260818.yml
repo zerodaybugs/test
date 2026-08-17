@@ -1,0 +1,161 @@
+name: Monad v0.16.0 generic V0/V1 packet replay binary
+
+on:
+  push:
+    branches:
+      - agent/monad-v0160-packet-replay-20260817
+    paths:
+      - .github/workflows/monad-v0160-v0-v1-replay-20260818.yml
+      - tools/monad_raptorcast_external_replay.rs
+      - tools/monad_raptorcast_external_v0_emit.rs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monad-v0160-v0-v1-replay-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-replay-binary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies and pinned Rust
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang libclang-dev cmake ninja-build pkg-config libssl-dev \
+            protobuf-compiler zstd liburing-dev libnuma-dev
+          rustup toolchain install 1.91.1 --profile minimal
+          rustup default 1.91.1
+
+      - name: Clone immutable Monad v0.16.0
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          BFT_COMMIT='c616743d1358186605e1c1b74a3d6c4fdd9dd48c'
+          EXEC_COMMIT='e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0'
+          git config --global advice.detachedHead false
+          git clone --filter=blob:none --no-recurse-submodules \
+            https://github.com/category-labs/monad-bft.git monad-bft
+          git -C monad-bft checkout --detach "$BFT_COMMIT"
+          git -C monad-bft submodule sync --recursive
+          git -C monad-bft submodule update --init --recursive --depth 1
+          test "$(git -C monad-bft rev-parse HEAD)" = "$BFT_COMMIT"
+          test "$(git -C monad-bft/monad-execution rev-parse HEAD)" = "$EXEC_COMMIT"
+          {
+            echo "bft_commit=$(git -C monad-bft rev-parse HEAD)"
+            echo "execution_commit=$(git -C monad-bft/monad-execution rev-parse HEAD)"
+          } > SOURCE_PROVENANCE.txt
+
+      - name: Inject generic external replay tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          target = Path('monad-bft/monad-raptorcast/src/udp.rs')
+          text = target.read_text()
+          pos = text.rfind('\n}')
+          if pos < 0:
+              raise SystemExit('final module brace not found')
+          additions = [
+              Path('tools/monad_raptorcast_external_replay.rs').read_text(),
+              Path('tools/monad_raptorcast_external_v0_emit.rs').read_text(),
+          ]
+          target.write_text(text[:pos] + '\n\n' + '\n\n'.join(additions) + text[pos:])
+          PY
+          sha256sum \
+            tools/monad_raptorcast_external_replay.rs \
+            tools/monad_raptorcast_external_v0_emit.rs \
+            monad-bft/monad-raptorcast/src/udp.rs \
+            > HARNESS_INPUTS.sha256
+
+      - name: Build exact replay executable
+        shell: bash
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+        run: |
+          set -Eeuo pipefail
+          cd monad-bft
+          cargo test --locked -p monad-raptorcast external_packet --no-run
+
+      - name: Locate binary and run V0/V1 authentic controls
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifact "$RUNNER_TEMP/v1" "$RUNNER_TEMP/v0"
+          BIN=''
+          V1_TEST=''
+          V0_TEST=''
+          while IFS= read -r candidate; do
+            if [[ -x "$candidate" ]] && file "$candidate" | grep -q 'ELF'; then
+              listed="$($candidate --list 2>/dev/null || true)"
+              if grep -q 'external_packet_replay_scenario' <<<"$listed" && \
+                 grep -q 'external_packet_v0_emit_scenario' <<<"$listed"; then
+                BIN="$candidate"
+                V1_TEST="$(grep 'external_packet_replay_scenario' <<<"$listed" | head -1 | sed 's/: test$//')"
+                V0_TEST="$(grep 'external_packet_v0_emit_scenario' <<<"$listed" | head -1 | sed 's/: test$//')"
+                break
+              fi
+            fi
+          done < <(find monad-bft/target/debug/deps -maxdepth 1 -type f -name 'monad_raptorcast-*' | sort)
+          test -n "$BIN"
+          test -n "$V1_TEST"
+          test -n "$V0_TEST"
+
+          cp "$BIN" artifact/monad-raptorcast-v0-v1-replay-v0160
+          printf '%s\n' "$V1_TEST" > artifact/V1_TEST_NAME.txt
+          printf '%s\n' "$V0_TEST" > artifact/V0_TEST_NAME.txt
+          file "$BIN" > artifact/BINARY.file.txt
+          ldd "$BIN" > artifact/BINARY.ldd.txt
+          sha256sum artifact/monad-raptorcast-v0-v1-replay-v0160 > artifact/BINARY.sha256
+
+          MONAD_REPLAY_MODE=emit MONAD_REPLAY_DIR="$RUNNER_TEMP/v1" \
+            MONAD_REPLAY_ROUNDS=42 MONAD_REPLAY_APP_SIZE=131072 \
+            "$BIN" --exact "$V1_TEST" --nocapture 2>&1 | tee artifact/V1_EMIT.log
+
+          MONAD_REPLAY_MODE=emit-v0 MONAD_REPLAY_DIR="$RUNNER_TEMP/v0" \
+            MONAD_REPLAY_ROUNDS=43 MONAD_REPLAY_APP_SIZE=131072 \
+            "$BIN" --exact "$V0_TEST" --nocapture 2>&1 | tee artifact/V0_EMIT.log
+
+          {
+            printf 'round\t1\t42\n'
+            awk -F '\t' '$4 == 42 && $5 == 1 {print "feed\t1\t" $6 "\t" $2 "\t" $3}' \
+              "$RUNNER_TEMP/v1/manifest.tsv"
+            printf 'snapshot\tv1-authentic\n'
+            printf 'round\t1\t43\n'
+            awk -F '\t' '$4 == 43 && $5 == 1 {print "feed\t1\t" $6 "\t" $2 "\t" $3}' \
+              "$RUNNER_TEMP/v0/manifest.tsv"
+            printf 'snapshot\tv0-authentic-after-v1\n'
+          } > "$RUNNER_TEMP/v1/scenario.tsv"
+          cp "$RUNNER_TEMP/v0"/*.bin "$RUNNER_TEMP/v1/"
+
+          MONAD_REPLAY_MODE=replay MONAD_REPLAY_DIR="$RUNNER_TEMP/v1" \
+            MONAD_REPLAY_STAGE=accept-both-publish-v0 \
+            "$BIN" --exact "$V1_TEST" --nocapture 2>&1 | tee artifact/REPLAY_CONTROL.log
+
+          cp "$RUNNER_TEMP/v1/manifest.tsv" artifact/V1_MANIFEST.tsv
+          cp "$RUNNER_TEMP/v0/manifest.tsv" artifact/V0_MANIFEST.tsv
+          cp "$RUNNER_TEMP/v1/scenario.tsv" artifact/CONTROL_SCENARIO.tsv
+          cp "$RUNNER_TEMP/v1/replay_output.tsv" artifact/CONTROL_OUTPUT.tsv
+          awk -F '\t' '$2 == "feed" {decoded += $4} END {exit decoded == 2 ? 0 : 1}' \
+            artifact/CONTROL_OUTPUT.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0160-v0-v1-replay-${{ github.run_id }}
+          path: |
+            artifact
+            SOURCE_PROVENANCE.txt
+            HARNESS_INPUTS.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
