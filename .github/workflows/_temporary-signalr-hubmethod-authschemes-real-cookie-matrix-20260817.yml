@@ -1,0 +1,506 @@
+name: Temporary SignalR Hub Method AuthenticationSchemes Real Cookie Matrix
+
+on:
+  push:
+    branches:
+      - agent/dotnet10-toolchain-20260815
+    paths:
+      - .github/workflows/_temporary-signalr-hubmethod-authschemes-real-cookie-matrix-20260817.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-signalr-authschemes-real-cookie-20260817
+  cancel-in-progress: false
+
+jobs:
+  current-release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install exact current .NET SDK and runtime
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: 10.0.303
+          cache: false
+
+      - name: Verify current supported runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence harness
+          dotnet --info | tee evidence/DOTNET_INFO.txt
+          dotnet --list-runtimes | tee evidence/DOTNET_RUNTIMES.txt
+          test "$(dotnet --version)" = "10.0.303"
+          grep -E '^Microsoft\.NETCore\.App 10\.0\.11 ' evidence/DOTNET_RUNTIMES.txt
+          grep -E '^Microsoft\.AspNetCore\.App 10\.0\.11 ' evidence/DOTNET_RUNTIMES.txt
+
+      - name: Build exact real-cookie SignalR harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > harness/harness.csproj <<'EOF'
+          <Project Sdk="Microsoft.NET.Sdk.Web">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net10.0</TargetFramework>
+              <ImplicitUsings>enable</ImplicitUsings>
+              <Nullable>enable</Nullable>
+              <Optimize>true</Optimize>
+              <Deterministic>true</Deterministic>
+              <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+            </PropertyGroup>
+            <ItemGroup>
+              <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.11" />
+            </ItemGroup>
+          </Project>
+          EOF
+
+          cat > harness/Program.cs <<'EOF'
+          using System.Collections.Concurrent;
+          using System.Net;
+          using System.Net.Http.Json;
+          using System.Net.Security;
+          using System.Security.Claims;
+          using System.Security.Cryptography;
+          using System.Security.Cryptography.X509Certificates;
+          using System.Text.Json;
+          using Microsoft.AspNetCore.Authentication;
+          using Microsoft.AspNetCore.Authentication.Cookies;
+          using Microsoft.AspNetCore.Authorization;
+          using Microsoft.AspNetCore.Hosting.Server;
+          using Microsoft.AspNetCore.Hosting.Server.Features;
+          using Microsoft.AspNetCore.Http.Connections;
+          using Microsoft.AspNetCore.SignalR;
+          using Microsoft.AspNetCore.SignalR.Client;
+          using Microsoft.Extensions.DependencyInjection;
+
+          namespace SignalRMethodSchemeMatrix;
+
+          internal static class Program
+          {
+              internal const string DynamicScheme = "DynamicCookie";
+              internal const string BaseScheme = "BaseCookie";
+              internal const string MfaScheme = "MfaCookie";
+              internal const string BaseCookieName = "__Secure-signalr-base";
+              internal const string MfaCookieName = "__Secure-signalr-mfa";
+
+              public static async Task<int> Main()
+              {
+                  using X509Certificate2 serverCertificate = CreateServerCertificate();
+                  var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+                  {
+                      EnvironmentName = Environments.Production,
+                      ApplicationName = typeof(Program).Assembly.FullName,
+                  });
+
+                  builder.Logging.ClearProviders();
+                  builder.WebHost.ConfigureKestrel(options =>
+                      options.Listen(IPAddress.Loopback, 0, listen => listen.UseHttps(serverCertificate)));
+                  builder.Services.AddSingleton<CapabilityStore>();
+                  builder.Services.AddAuthentication(options =>
+                  {
+                      options.DefaultAuthenticateScheme = DynamicScheme;
+                      options.DefaultChallengeScheme = DynamicScheme;
+                      options.DefaultForbidScheme = DynamicScheme;
+                  })
+                  .AddPolicyScheme(DynamicScheme, DynamicScheme, options =>
+                  {
+                      options.ForwardDefaultSelector = context =>
+                          context.Request.Cookies.ContainsKey(MfaCookieName) ? MfaScheme : BaseScheme;
+                  })
+                  .AddCookie(BaseScheme, options => ConfigureCookie(options, BaseCookieName))
+                  .AddCookie(MfaScheme, options => ConfigureCookie(options, MfaCookieName));
+                  builder.Services.AddAuthorization();
+                  builder.Services.AddSignalR(options => options.EnableDetailedErrors = true);
+
+                  await using WebApplication app = builder.Build();
+                  app.UseAuthentication();
+                  app.UseAuthorization();
+
+                  app.MapPost("/login/base/{user}", async (HttpContext context, string user) =>
+                  {
+                      await context.SignInAsync(BaseScheme, Principal(BaseScheme, user, "base"));
+                      return Results.Json(new { scheme = BaseScheme, user });
+                  }).AllowAnonymous();
+
+                  app.MapPost("/login/mfa/{user}", async (HttpContext context, string user) =>
+                  {
+                      await context.SignInAsync(MfaScheme, Principal(MfaScheme, user, "mfa"));
+                      return Results.Json(new { scheme = MfaScheme, user });
+                  }).AllowAnonymous();
+
+                  app.MapPost("/http/mfa-install/{key}", (string key, CapabilityStore store, HttpContext context) =>
+                  {
+                      store.Install(key, $"http:{context.User.Identity?.AuthenticationType}:{context.User.Identity?.Name}");
+                      return Results.NoContent();
+                  }).RequireAuthorization(new AuthorizeAttribute { AuthenticationSchemes = MfaScheme });
+
+                  app.MapPost("/http/missing-install/{key}", (string key, CapabilityStore store) =>
+                  {
+                      store.Install(key, "http:missing");
+                      return Results.NoContent();
+                  }).RequireAuthorization(new AuthorizeAttribute { AuthenticationSchemes = "Nonexistent" });
+
+                  app.MapGet("/proof/{key}", (string key, CapabilityStore store) =>
+                      store.TryGet(key, out string? source)
+                          ? Results.Json(new { installed = true, source })
+                          : Results.StatusCode(StatusCodes.Status403Forbidden)).AllowAnonymous();
+
+                  app.MapHub<MethodRestrictedHub>("/method-hub");
+                  app.MapHub<MfaClassRestrictedHub>("/class-hub");
+
+                  await app.StartAsync();
+                  string address = app.Services.GetRequiredService<IServer>()
+                      .Features.Get<IServerAddressesFeature>()!.Addresses.Single();
+                  var baseUri = new Uri(address);
+
+                  var rows = new List<RunRow>();
+                  foreach (HttpTransportType transport in new[] { HttpTransportType.WebSockets, HttpTransportType.LongPolling })
+                  {
+                      for (int iteration = 1; iteration <= 20; iteration++)
+                      {
+                          rows.Add(await RunAttackIteration(baseUri, transport, iteration));
+                      }
+                  }
+
+                  var controls = new List<ControlRow>();
+                  foreach (HttpTransportType transport in new[] { HttpTransportType.WebSockets, HttpTransportType.LongPolling })
+                  {
+                      for (int iteration = 1; iteration <= 5; iteration++)
+                      {
+                          controls.AddRange(await RunControls(baseUri, transport, iteration));
+                      }
+                  }
+
+                  await app.StopAsync();
+
+                  bool attackPass = rows.Count == 40 && rows.All(r =>
+                      r.BeforeProofStatus == 403 &&
+                      r.BaseCookiePresent && !r.MfaCookiePresent &&
+                      r.ConnectionAuthenticationType == BaseScheme &&
+                      r.MethodInvocationSucceeded &&
+                      r.AfterProofStatus == 200 &&
+                      r.InstalledByAuthenticationType == BaseScheme);
+
+                  bool controlsPass = controls.All(c => c.Passed);
+                  var summary = new
+                  {
+                      schema = "signalr_hubmethod_authschemes_real_cookie_matrix/v1",
+                      framework = System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription,
+                      aspnetcoreAssembly = typeof(Hub).Assembly.FullName,
+                      signalrCoreLocation = typeof(Hub).Assembly.Location,
+                      address,
+                      attackRows = rows,
+                      controlRows = controls,
+                      attackPass,
+                      controlsPass,
+                      verdict = attackPass && controlsPass
+                          ? "CURRENT_RELEASE_REAL_COOKIE_METHOD_SCHEME_FAIL_OPEN"
+                          : "NO_QUALIFYING_SIGNAL_OR_CONTROL_FAILURE",
+                      submissionReady = false,
+                  };
+
+                  Directory.CreateDirectory("evidence");
+                  await File.WriteAllTextAsync("evidence/RESULT.json", JsonSerializer.Serialize(summary, new JsonSerializerOptions { WriteIndented = true }));
+                  await File.WriteAllTextAsync("evidence/VERDICT.env",
+                      $"ATTACK_PASS={(attackPass ? 1 : 0)}\nCONTROLS_PASS={(controlsPass ? 1 : 0)}\n" +
+                      $"VERDICT={summary.verdict}\nSUBMISSION_READY=0\n");
+                  Console.WriteLine(JsonSerializer.Serialize(summary, new JsonSerializerOptions { WriteIndented = true }));
+                  return attackPass && controlsPass ? 0 : 90;
+              }
+
+              private static async Task<RunRow> RunAttackIteration(Uri baseUri, HttpTransportType transport, int iteration)
+              {
+                  string key = $"attack-{transport}-{iteration}-{Guid.NewGuid():N}";
+                  using var proof = CreateClient(new CookieContainer());
+                  int before = (int)(await proof.GetAsync(new Uri(baseUri, $"/proof/{key}"))).StatusCode;
+
+                  var cookies = new CookieContainer();
+                  using var login = CreateClient(cookies);
+                  (await login.PostAsync(new Uri(baseUri, $"/login/base/base-user-{iteration}"), null)).EnsureSuccessStatusCode();
+                  var present = CookieNames(cookies, baseUri);
+
+                  string? authType = null;
+                  string? name = null;
+                  string? installedBy = null;
+                  bool invoked = false;
+                  await using (HubConnection connection = BuildConnection(baseUri, "/method-hub", cookies, transport))
+                  {
+                      await connection.StartAsync();
+                      var identity = await connection.InvokeAsync<IdentitySnapshot>("IdentitySnapshot");
+                      authType = identity.AuthenticationType;
+                      name = identity.Name;
+                      var install = await connection.InvokeAsync<InstallSnapshot>("InstallAdminApiKey", key);
+                      installedBy = install.AuthenticationType;
+                      invoked = install.Installed;
+                  }
+
+                  int after = (int)(await proof.GetAsync(new Uri(baseUri, $"/proof/{key}"))).StatusCode;
+                  return new RunRow(transport.ToString(), iteration, before,
+                      present.Contains(BaseCookieName), present.Contains(MfaCookieName),
+                      authType, name, invoked, after, installedBy);
+              }
+
+              private static async Task<List<ControlRow>> RunControls(Uri baseUri, HttpTransportType transport, int iteration)
+              {
+                  var output = new List<ControlRow>();
+
+                  // Same method-level attribute on a normal HTTP endpoint must deny a base-only user.
+                  string httpKey = $"http-base-{transport}-{iteration}-{Guid.NewGuid():N}";
+                  var baseCookies = new CookieContainer();
+                  using (var client = CreateClient(baseCookies))
+                  {
+                      (await client.PostAsync(new Uri(baseUri, $"/login/base/base-control-{iteration}"), null)).EnsureSuccessStatusCode();
+                      HttpResponseMessage response = await client.PostAsync(new Uri(baseUri, $"/http/mfa-install/{httpKey}"), null);
+                      int proof = (int)(await CreateClient(new CookieContainer()).GetAsync(new Uri(baseUri, $"/proof/{httpKey}"))).StatusCode;
+                      output.Add(new ControlRow(transport.ToString(), iteration, "http_mfa_attribute_base_only_denied",
+                          (int)response.StatusCode is 401 or 403 && proof == 403,
+                          $"status={(int)response.StatusCode};proof={proof}"));
+                  }
+
+                  // Same attribute at hub class level must deny the base-only connection.
+                  bool classDenied = false;
+                  await using (HubConnection classConnection = BuildConnection(baseUri, "/class-hub", baseCookies, transport))
+                  {
+                      try { await classConnection.StartAsync(); }
+                      catch { classDenied = true; }
+                  }
+                  output.Add(new ControlRow(transport.ToString(), iteration, "hub_class_mfa_attribute_base_only_denied", classDenied, classDenied.ToString()));
+
+                  // Plain Authorize continues to allow the base-authenticated connection.
+                  await using (HubConnection baseConnection = BuildConnection(baseUri, "/method-hub", baseCookies, transport))
+                  {
+                      await baseConnection.StartAsync();
+                      string plain = await baseConnection.InvokeAsync<string>("PlainAuthorized");
+                      output.Add(new ControlRow(transport.ToString(), iteration, "plain_authorize_base_allowed", plain == BaseScheme, plain));
+
+                      string missingKey = $"missing-{transport}-{iteration}-{Guid.NewGuid():N}";
+                      InstallSnapshot missing = await baseConnection.InvokeAsync<InstallSnapshot>("InstallWithMissingScheme", missingKey);
+                      using var freshProof = CreateClient(new CookieContainer());
+                      int missingProof = (int)(await freshProof.GetAsync(new Uri(baseUri, $"/proof/{missingKey}"))).StatusCode;
+                      output.Add(new ControlRow(transport.ToString(), iteration, "missing_scheme_method_fails_open",
+                          missing.Installed && missing.AuthenticationType == BaseScheme && missingProof == 200,
+                          $"installed={missing.Installed};auth={missing.AuthenticationType};proof={missingProof}"));
+                  }
+
+                  // Anonymous method invocation must fail and leave no side effect.
+                  string anonKey = $"anon-{transport}-{iteration}-{Guid.NewGuid():N}";
+                  bool anonDenied = false;
+                  await using (HubConnection anonymous = BuildConnection(baseUri, "/method-hub", new CookieContainer(), transport))
+                  {
+                      await anonymous.StartAsync();
+                      try { await anonymous.InvokeAsync<InstallSnapshot>("InstallAdminApiKey", anonKey); }
+                      catch { anonDenied = true; }
+                  }
+                  using (var freshProof = CreateClient(new CookieContainer()))
+                  {
+                      int status = (int)(await freshProof.GetAsync(new Uri(baseUri, $"/proof/{anonKey}"))).StatusCode;
+                      output.Add(new ControlRow(transport.ToString(), iteration, "anonymous_denied_no_effect", anonDenied && status == 403, $"denied={anonDenied};proof={status}"));
+                  }
+
+                  // A legitimate MFA principal is allowed, and the class-level scheme works.
+                  string mfaKey = $"mfa-{transport}-{iteration}-{Guid.NewGuid():N}";
+                  var mfaCookies = new CookieContainer();
+                  using (var client = CreateClient(mfaCookies))
+                  {
+                      (await client.PostAsync(new Uri(baseUri, $"/login/mfa/mfa-user-{iteration}"), null)).EnsureSuccessStatusCode();
+                  }
+                  await using (HubConnection mfaConnection = BuildConnection(baseUri, "/method-hub", mfaCookies, transport))
+                  {
+                      await mfaConnection.StartAsync();
+                      InstallSnapshot mfa = await mfaConnection.InvokeAsync<InstallSnapshot>("InstallAdminApiKey", mfaKey);
+                      output.Add(new ControlRow(transport.ToString(), iteration, "legitimate_mfa_method_allowed",
+                          mfa.Installed && mfa.AuthenticationType == MfaScheme, $"installed={mfa.Installed};auth={mfa.AuthenticationType}"));
+                  }
+                  await using (HubConnection mfaClass = BuildConnection(baseUri, "/class-hub", mfaCookies, transport))
+                  {
+                      await mfaClass.StartAsync();
+                      string pong = await mfaClass.InvokeAsync<string>("Ping");
+                      output.Add(new ControlRow(transport.ToString(), iteration, "legitimate_mfa_class_allowed", pong == MfaScheme, pong));
+                  }
+
+                  // A malformed MFA ticket must not fall back to the base principal.
+                  string malformedKey = $"malformed-{transport}-{iteration}-{Guid.NewGuid():N}";
+                  var malformedCookies = new CookieContainer();
+                  using (var client = CreateClient(malformedCookies))
+                  {
+                      (await client.PostAsync(new Uri(baseUri, $"/login/base/base-malformed-{iteration}"), null)).EnsureSuccessStatusCode();
+                  }
+                  malformedCookies.Add(baseUri, new Cookie(MfaCookieName, "malformed-ticket", "/") { Secure = true });
+                  bool malformedDenied = false;
+                  await using (HubConnection malformed = BuildConnection(baseUri, "/method-hub", malformedCookies, transport))
+                  {
+                      await malformed.StartAsync();
+                      try { await malformed.InvokeAsync<InstallSnapshot>("InstallAdminApiKey", malformedKey); }
+                      catch { malformedDenied = true; }
+                  }
+                  using (var freshProof = CreateClient(new CookieContainer()))
+                  {
+                      int status = (int)(await freshProof.GetAsync(new Uri(baseUri, $"/proof/{malformedKey}"))).StatusCode;
+                      output.Add(new ControlRow(transport.ToString(), iteration, "malformed_mfa_no_base_fallback", malformedDenied && status == 403, $"denied={malformedDenied};proof={status}"));
+                  }
+
+                  return output;
+              }
+
+              private static ClaimsPrincipal Principal(string scheme, string user, string level) =>
+                  new(new ClaimsIdentity(new[]
+                  {
+                      new Claim(ClaimTypes.NameIdentifier, user),
+                      new Claim(ClaimTypes.Name, user),
+                      new Claim("auth_level", level),
+                  }, scheme));
+
+              private static void ConfigureCookie(CookieAuthenticationOptions options, string name)
+              {
+                  options.Cookie.Name = name;
+                  options.Cookie.HttpOnly = true;
+                  options.Cookie.SecurePolicy = CookieSecurePolicy.Always;
+                  options.Cookie.SameSite = SameSiteMode.Strict;
+                  options.SlidingExpiration = false;
+                  options.ExpireTimeSpan = TimeSpan.FromMinutes(20);
+                  options.Events.OnRedirectToLogin = context => { context.Response.StatusCode = 401; return Task.CompletedTask; };
+                  options.Events.OnRedirectToAccessDenied = context => { context.Response.StatusCode = 403; return Task.CompletedTask; };
+              }
+
+              private static HttpClient CreateClient(CookieContainer cookies)
+              {
+                  var handler = new HttpClientHandler
+                  {
+                      CookieContainer = cookies,
+                      ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+                      AllowAutoRedirect = false,
+                  };
+                  return new HttpClient(handler, disposeHandler: true);
+              }
+
+              private static HubConnection BuildConnection(Uri baseUri, string path, CookieContainer cookies, HttpTransportType transport)
+              {
+                  return new HubConnectionBuilder()
+                      .WithUrl(new Uri(baseUri, path), options =>
+                      {
+                          options.Cookies = cookies;
+                          options.Transports = transport;
+                          options.HttpMessageHandlerFactory = _ => new HttpClientHandler
+                          {
+                              CookieContainer = cookies,
+                              ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+                          };
+                          options.WebSocketConfiguration = socketOptions =>
+                              socketOptions.RemoteCertificateValidationCallback = (_, _, _, _) => true;
+                      })
+                      .Build();
+              }
+
+              private static HashSet<string> CookieNames(CookieContainer container, Uri uri) =>
+                  container.GetCookies(uri).Cast<Cookie>().Select(c => c.Name).ToHashSet(StringComparer.Ordinal);
+
+              private static X509Certificate2 CreateServerCertificate()
+              {
+                  using RSA rsa = RSA.Create(2048);
+                  var request = new CertificateRequest("CN=localhost", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+                  var san = new SubjectAlternativeNameBuilder();
+                  san.AddDnsName("localhost");
+                  san.AddIpAddress(IPAddress.Loopback);
+                  request.CertificateExtensions.Add(san.Build());
+                  request.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, false));
+                  request.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature, false));
+                  request.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(request.PublicKey, false));
+                  using X509Certificate2 generated = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddDays(2));
+                  return new X509Certificate2(generated.Export(X509ContentType.Pfx));
+              }
+          }
+
+          public sealed class CapabilityStore
+          {
+              private readonly ConcurrentDictionary<string, string> _keys = new(StringComparer.Ordinal);
+              public void Install(string key, string source) => _keys[key] = source;
+              public bool TryGet(string key, out string? source) => _keys.TryGetValue(key, out source);
+          }
+
+          public sealed class MethodRestrictedHub(CapabilityStore store) : Hub
+          {
+              public IdentitySnapshot IdentitySnapshot()
+              {
+                  HttpContext context = Context.GetHttpContext()!;
+                  return new IdentitySnapshot(
+                      Context.User?.Identity?.AuthenticationType,
+                      Context.User?.Identity?.Name,
+                      context.Request.Cookies.ContainsKey(Program.BaseCookieName),
+                      context.Request.Cookies.ContainsKey(Program.MfaCookieName));
+              }
+
+              public string Open() => "open";
+
+              [Authorize]
+              public string PlainAuthorized() => Context.User?.Identity?.AuthenticationType ?? "none";
+
+              [Authorize(AuthenticationSchemes = Program.MfaScheme)]
+              public InstallSnapshot InstallAdminApiKey(string key)
+              {
+                  string? auth = Context.User?.Identity?.AuthenticationType;
+                  string? name = Context.User?.Identity?.Name;
+                  store.Install(key, $"hub:{auth}:{name}");
+                  return new InstallSnapshot(true, auth, name);
+              }
+
+              [Authorize(AuthenticationSchemes = "Nonexistent")]
+              public InstallSnapshot InstallWithMissingScheme(string key)
+              {
+                  string? auth = Context.User?.Identity?.AuthenticationType;
+                  string? name = Context.User?.Identity?.Name;
+                  store.Install(key, $"hub-missing:{auth}:{name}");
+                  return new InstallSnapshot(true, auth, name);
+              }
+          }
+
+          [Authorize(AuthenticationSchemes = Program.MfaScheme)]
+          public sealed class MfaClassRestrictedHub : Hub
+          {
+              public string Ping() => Context.User?.Identity?.AuthenticationType ?? "none";
+          }
+
+          public sealed record IdentitySnapshot(string? AuthenticationType, string? Name, bool BaseCookiePresent, bool MfaCookiePresent);
+          public sealed record InstallSnapshot(bool Installed, string? AuthenticationType, string? Name);
+          public sealed record RunRow(string Transport, int Iteration, int BeforeProofStatus, bool BaseCookiePresent, bool MfaCookiePresent,
+              string? ConnectionAuthenticationType, string? ConnectionName, bool MethodInvocationSucceeded, int AfterProofStatus,
+              string? InstalledByAuthenticationType);
+          public sealed record ControlRow(string Transport, int Iteration, string Name, bool Passed, string Detail);
+          EOF
+
+          dotnet restore harness/harness.csproj --nologo
+          dotnet build harness/harness.csproj -c Release --no-restore --nologo
+          cp harness/Program.cs harness/harness.csproj evidence/
+          dotnet list harness/harness.csproj package --include-transitive > evidence/PACKAGES.txt
+
+      - name: Run strict current-release matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          timeout --signal=KILL 18m dotnet run --project harness/harness.csproj -c Release --no-build > evidence/RUN.log 2>&1
+          rc=$?
+          set -e
+          echo "RUN_RC=$rc" | tee evidence/RUN_STATUS.env
+          cat evidence/RUN.log
+          test "$rc" -eq 0
+          grep -q '^ATTACK_PASS=1$' evidence/VERDICT.env
+          grep -q '^CONTROLS_PASS=1$' evidence/VERDICT.env
+          grep -q '^VERDICT=CURRENT_RELEASE_REAL_COOKIE_METHOD_SCHEME_FAIL_OPEN$' evidence/VERDICT.env
+          (
+            cd evidence
+            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          )
+
+      - name: Upload strict raw evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signalr-hubmethod-authschemes-real-cookie-current-20260817
+          path: evidence
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 9
+          include-hidden-files: true
