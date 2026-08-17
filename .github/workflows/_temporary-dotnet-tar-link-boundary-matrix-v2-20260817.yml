@@ -1,0 +1,285 @@
+name: Temporary .NET Tar Link Boundary Matrix V2
+
+on:
+  push:
+    branches:
+      - agent/dotnet10-toolchain-20260815
+    paths:
+      - .github/workflows/_temporary-dotnet-tar-link-boundary-matrix-v2-20260817.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-dotnet-tar-link-boundary-matrix-v2-20260817
+  cancel-in-progress: false
+
+jobs:
+  matrix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install exact baseline and current runtimes
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: |
+            10.0.302
+            10.0.303
+          cache: false
+
+      - name: Verify exact runtime matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          dotnet --info > evidence/DOTNET_INFO.txt
+          dotnet --list-runtimes > evidence/DOTNET_RUNTIMES.txt
+          grep -F 'Microsoft.NETCore.App 10.0.10 ' evidence/DOTNET_RUNTIMES.txt
+          grep -F 'Microsoft.NETCore.App 10.0.11 ' evidence/DOTNET_RUNTIMES.txt
+
+      - name: Build process-isolated local Tar harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p harness
+          cat > harness/harness.csproj <<'EOF'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework>
+              <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable>
+              <Optimize>true</Optimize><Deterministic>true</Deterministic>
+              <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+            </PropertyGroup>
+          </Project>
+          EOF
+          cat > harness/Program.cs <<'EOF'
+          using System.Formats.Tar;
+          using System.Runtime.InteropServices;
+          using System.Text;
+          using System.Text.Json;
+
+          if (args.Length != 1) return 64;
+          string scenario = args[0];
+          string root = Path.Combine(Path.GetTempPath(), "dotnet-tar-boundary-v2", Guid.NewGuid().ToString("N"));
+          string dest = Path.Combine(root, "d");
+          string outside = Path.Combine(root, "outside");
+          string archive = Path.Combine(root, "attack.tar");
+          Directory.CreateDirectory(root);
+          Directory.CreateDirectory(outside);
+          string? setupException = null;
+          string? extractionException = null;
+          bool extractionCompleted = false;
+
+          try
+          {
+              if (scenario == "destination_root_symlink_control")
+              {
+                  string physical = Path.Combine(root, "physical-destination-name-much-longer-than-d");
+                  Directory.CreateDirectory(physical);
+                  Directory.CreateSymbolicLink(dest, physical);
+              }
+              else
+              {
+                  Directory.CreateDirectory(dest);
+              }
+
+              using FileStream stream = File.Create(archive);
+              using var writer = new TarWriter(stream, TarEntryFormat.Pax, leaveOpen: false);
+              Build(writer, scenario, outside);
+          }
+          catch (Exception ex)
+          {
+              setupException = ex.GetType().FullName + ": " + ex.Message;
+          }
+
+          if (setupException is null)
+          {
+              try
+              {
+                  TarFile.ExtractToDirectory(archive, dest, overwriteFiles: true);
+                  extractionCompleted = true;
+              }
+              catch (Exception ex)
+              {
+                  extractionException = ex.GetType().FullName + ": " + ex.Message;
+              }
+          }
+
+          bool outsideWritten = File.Exists(Path.Combine(outside, "pwn.txt")) || File.Exists(Path.Combine(outside, "target.txt"));
+          Console.WriteLine(JsonSerializer.Serialize(new
+          {
+              framework = RuntimeInformation.FrameworkDescription,
+              os = RuntimeInformation.OSDescription,
+              scenario,
+              root,
+              setupException,
+              extractionException,
+              extractionCompleted,
+              outsideWritten,
+              outsidePwn = File.Exists(Path.Combine(outside, "pwn.txt")),
+              outsideTarget = File.Exists(Path.Combine(outside, "target.txt")),
+          }));
+          return 0;
+
+          static void Build(TarWriter writer, string scenario, string outside)
+          {
+              switch (scenario)
+              {
+                  case "destination_root_symlink_control": WriteFile(writer, "file.txt", "control"); break;
+                  case "direct_parent_traversal": WriteFile(writer, "../outside/pwn.txt", "pwn"); break;
+                  case "direct_absolute_path": WriteFile(writer, Path.Combine(outside, "pwn.txt"), "pwn"); break;
+                  case "symlink_absolute_then_file": WriteLink(writer, "link", outside); WriteFile(writer, "link/pwn.txt", "pwn"); break;
+                  case "symlink_parent_then_file": WriteLink(writer, "link", "../outside"); WriteFile(writer, "link/pwn.txt", "pwn"); break;
+                  case "symlink_dotdot_then_file": WriteLink(writer, "link", "inside/../../outside"); WriteFile(writer, "link/pwn.txt", "pwn"); break;
+                  case "symlink_inside_dangling_then_file": WriteLink(writer, "link", "inside/target"); WriteFile(writer, "link/pwn.txt", "pwn"); break;
+                  case "symlink_chain_parent_then_file": WriteLink(writer, "a", "b"); WriteLink(writer, "b", "../outside"); WriteFile(writer, "a/pwn.txt", "pwn"); break;
+                  case "symlink_dot_chain_then_file":
+                      WriteDirectory(writer, "a/"); WriteLink(writer, "a/b", "."); WriteLink(writer, "a/b/c", ".");
+                      WriteLink(writer, "a/b/c/d", "../../outside"); WriteFile(writer, "a/d/pwn.txt", "pwn"); break;
+                  case "symlink_loop_then_file": WriteLink(writer, "a", "b"); WriteLink(writer, "b", "a"); WriteFile(writer, "a/pwn.txt", "pwn"); break;
+                  case "hardlink_absolute": WriteHardLink(writer, "hard", Path.Combine(outside, "target.txt")); break;
+                  case "hardlink_parent": WriteHardLink(writer, "hard", "../outside/target.txt"); break;
+                  case "hardlink_to_archive_symlink": WriteLink(writer, "alias", "../outside"); WriteHardLink(writer, "hard", "alias/target.txt"); break;
+                  case "directory_symlink_parent_file": WriteDirectory(writer, "dir/"); WriteLink(writer, "dir/link", "../../outside"); WriteFile(writer, "dir/link/pwn.txt", "pwn"); break;
+                  case "target_then_inside_symlink_file": WriteDirectory(writer, "inside/"); WriteLink(writer, "link", "inside"); WriteFile(writer, "link/pwn.txt", "inside-only"); break;
+                  case "deep_chain_parent_then_file":
+                      WriteDirectory(writer, "d/"); WriteLink(writer, "d/a", "b"); WriteLink(writer, "d/b", "c");
+                      WriteLink(writer, "d/c", "../../outside"); WriteFile(writer, "d/a/pwn.txt", "pwn"); break;
+                  case "double_separator_parent_file": WriteLink(writer, "link", "..//outside"); WriteFile(writer, "link/pwn.txt", "pwn"); break;
+                  case "dot_prefixed_parent_file": WriteLink(writer, "link", "./../outside"); WriteFile(writer, "link/pwn.txt", "pwn"); break;
+                  default: throw new ArgumentOutOfRangeException(nameof(scenario));
+              }
+          }
+
+          static void WriteDirectory(TarWriter writer, string name) => writer.WriteEntry(new PaxTarEntry(TarEntryType.Directory, name));
+          static void WriteLink(TarWriter writer, string name, string target) => writer.WriteEntry(new PaxTarEntry(TarEntryType.SymbolicLink, name) { LinkName = target });
+          static void WriteHardLink(TarWriter writer, string name, string target) => writer.WriteEntry(new PaxTarEntry(TarEntryType.HardLink, name) { LinkName = target });
+          static void WriteFile(TarWriter writer, string name, string content)
+          {
+              var entry = new PaxTarEntry(TarEntryType.RegularFile, name) { DataStream = new MemoryStream(Encoding.UTF8.GetBytes(content), writable: false) };
+              writer.WriteEntry(entry);
+          }
+          EOF
+          dotnet publish harness/harness.csproj -c Release -o harness/out --nologo
+          cp harness/Program.cs harness/harness.csproj evidence/
+
+      - name: Run per-case repeated differential
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/runs
+          cat > evidence/SCENARIOS.txt <<'EOF'
+          destination_root_symlink_control
+          direct_parent_traversal
+          direct_absolute_path
+          symlink_absolute_then_file
+          symlink_parent_then_file
+          symlink_dotdot_then_file
+          symlink_inside_dangling_then_file
+          symlink_chain_parent_then_file
+          symlink_dot_chain_then_file
+          symlink_loop_then_file
+          hardlink_absolute
+          hardlink_parent
+          hardlink_to_archive_symlink
+          directory_symlink_parent_file
+          target_then_inside_symlink_file
+          deep_chain_parent_then_file
+          double_separator_parent_file
+          dot_prefixed_parent_file
+          EOF
+          printf 'runtime\tscenario\trepeat\texit_code\tsignal\tcompleted\tlog\n' > evidence/MATRIX.tsv
+          for runtime in 10.0.10 10.0.11; do
+            for scenario in $(cat evidence/SCENARIOS.txt); do
+              for repeat in 1 2 3; do
+                log="evidence/runs/${runtime}__${scenario}__${repeat}.log"
+                set +e
+                timeout --signal=KILL 8s dotnet exec --fx-version "$runtime" harness/out/harness.dll "$scenario" > "$log" 2>&1
+                rc=$?
+                set -e
+                signal=0
+                if [[ "$rc" -ge 128 ]]; then signal="$((rc-128))"; fi
+                completed=0
+                grep -q '"scenario"' "$log" && completed=1 || true
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$runtime" "$scenario" "$repeat" "$rc" "$signal" "$completed" "$log" >> evidence/MATRIX.tsv
+              done
+            done
+          done
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          rows=list(csv.DictReader(Path('evidence/MATRIX.tsv').open(),delimiter='\t'))
+          for row in rows:
+              for key in ('repeat','exit_code','signal','completed'):
+                  row[key]=int(row[key])
+              if row['completed']:
+                  try: row['result']=json.loads(Path(row['log']).read_text())
+                  except Exception as exc: row['result']={'parse_error':str(exc)}
+              else: row['result']=None
+
+          baseline_control=[r for r in rows if r['runtime']=='10.0.10' and r['scenario']=='destination_root_symlink_control']
+          current_control=[r for r in rows if r['runtime']=='10.0.11' and r['scenario']=='destination_root_symlink_control']
+          control_detected=bool(baseline_control) and all(
+              r['result'] and (r['result'].get('extractionException') or '').startswith('System.ArgumentOutOfRangeException')
+              for r in baseline_control)
+          control_fixed=bool(current_control) and all(
+              r['result'] and not (r['result'].get('extractionException') or '').startswith('System.ArgumentOutOfRangeException')
+              for r in current_control)
+          current_attacks=[r for r in rows if r['runtime']=='10.0.11' and r['scenario']!='destination_root_symlink_control']
+          current_escapes=[r for r in current_attacks if r['result'] and r['result'].get('outsideWritten')]
+          current_process_failures=[r for r in current_attacks if r['exit_code']!=0 or not r['completed']]
+
+          deterministic=True
+          for scenario in sorted({r['scenario'] for r in rows if r['runtime']=='10.0.11'}):
+              subset=[r for r in rows if r['runtime']=='10.0.11' and r['scenario']==scenario]
+              fingerprints=[]
+              for r in subset:
+                  result=r['result'] or {}
+                  fingerprints.append((r['exit_code'],r['signal'],r['completed'],result.get('setupException'),result.get('extractionException'),result.get('extractionCompleted'),result.get('outsideWritten')))
+              deterministic &= len(set(fingerprints))==1
+
+          if not control_detected:
+              verdict='HARNESS_NOT_SENSITIVE_KILL'
+          elif current_escapes:
+              verdict='CURRENT_RELEASE_RAW_TAR_ESCAPE_CANDIDATE'
+          elif current_process_failures:
+              verdict='CURRENT_RELEASE_TAR_PROCESS_FAILURE_REQUIRES_IMPACT_GATE'
+          elif control_fixed and deterministic:
+              verdict='PUBLIC_REGRESSION_DETECTED_CURRENT_RELEASE_NO_ESCAPE'
+          else:
+              verdict='INCONCLUSIVE_MATRIX'
+
+          gate={
+              'schema':'dotnet_tar_link_boundary_matrix/v2',
+              'control_detected_10_0_10':control_detected,
+              'control_fixed_10_0_11':control_fixed,
+              'current_deterministic':deterministic,
+              'current_escapes':current_escapes,
+              'current_process_failures':current_process_failures,
+              'verdict':verdict,
+              'submission_ready':False,
+              'rows':rows,
+          }
+          Path('evidence/GATE.json').write_text(json.dumps(gate,indent=2))
+          Path('evidence/VERDICT.env').write_text(
+              f'VERDICT={verdict}\nSUBMISSION_READY=0\nCONTROL_DETECTED={int(control_detected)}\n'
+              f'CONTROL_FIXED={int(control_fixed)}\nDETERMINISTIC={int(deterministic)}\n'
+              f'CURRENT_ESCAPE_COUNT={len(current_escapes)}\nCURRENT_PROCESS_FAILURE_COUNT={len(current_process_failures)}\n')
+          print(Path('evidence/VERDICT.env').read_text())
+          if not control_detected:
+              raise SystemExit(90)
+          PY
+          (cd evidence && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+
+      - name: Upload process-isolated Tar evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dotnet-tar-link-boundary-matrix-v2-20260817
+          path: evidence
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 9
+          include-hidden-files: true
