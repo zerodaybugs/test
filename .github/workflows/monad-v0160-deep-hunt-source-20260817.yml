@@ -1,0 +1,161 @@
+name: Monad v0.16.0 exact deep-hunt source bundle
+
+on:
+  push:
+    branches:
+      - agent/monad-v0160-deep-hunt-20260817
+    paths:
+      - .github/workflows/monad-v0160-deep-hunt-source-20260817.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monad-v0160-deep-hunt-source-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone and pin exact in-scope sources
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          BFT_COMMIT='c616743d1358186605e1c1b74a3d6c4fdd9dd48c'
+          EXEC_COMMIT='e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0'
+
+          git clone --filter=blob:none --no-recurse-submodules \
+            https://github.com/category-labs/monad-bft.git monad-bft
+          git -C monad-bft checkout --detach "$BFT_COMMIT"
+
+          git clone --filter=blob:none \
+            https://github.com/category-labs/monad.git monad-execution
+          git -C monad-execution checkout --detach "$EXEC_COMMIT"
+
+          test "$(git -C monad-bft rev-parse HEAD)" = "$BFT_COMMIT"
+          test "$(git -C monad-execution rev-parse HEAD)" = "$EXEC_COMMIT"
+
+          # Populate only public BFT submodules needed for complete source context.
+          git -C monad-bft submodule sync --recursive
+          git -C monad-bft submodule update --init --recursive --depth 1 || true
+
+          mkdir -p evidence
+          {
+            echo "bft_commit=$(git -C monad-bft rev-parse HEAD)"
+            echo "execution_commit=$(git -C monad-execution rev-parse HEAD)"
+            echo "runner=$(uname -a)"
+            echo "git=$(git --version)"
+            echo "python=$(python3 --version)"
+            git -C monad-bft submodule status --recursive || true
+          } > evidence/PROVENANCE.txt
+
+      - name: Generate focused security inventories
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, re
+
+          roots = {
+              'bft': Path('monad-bft'),
+              'execution': Path('monad-execution'),
+          }
+          out = Path('evidence')
+
+          inventories = {
+              'hashers_and_maps': re.compile(r'unordered_(?:dense::)?map|unordered_map|HashMap|BTreeMap|std::hash<|wyhash|komihash|BytesHashCompare'),
+              'staking_arithmetic': re.compile(r'claimRewards|withdraw|undelegate|compound|commission|externalReward|reward|checked_(?:add|sub|mul|div)|uint256|total_stake', re.I),
+              'network_failstop': re.compile(r'panic!|todo!|unreachable!|expect\(|unwrap\(|MONAD_ASSERT|assert!'),
+              'parallel_state': re.compile(r'parallel|speculat|conflict|read.?set|write.?set|StateDelta|state.?root|receipt', re.I),
+              'epoch_valset': re.compile(r'epoch|validator.?set|ValSet|AddEpochValidatorSet|get_role|try_propose', re.I),
+          }
+
+          results = {name: [] for name in inventories}
+          exts = {'.rs','.cpp','.cc','.cxx','.hpp','.h'}
+          for repo, root in roots.items():
+              for p in root.rglob('*'):
+                  if not p.is_file() or p.suffix.lower() not in exts:
+                      continue
+                  if any(part in {'.git','target','build','vendor','third_party'} for part in p.parts):
+                      continue
+                  try:
+                      if p.stat().st_size > 5_000_000:
+                          continue
+                      lines = p.read_text(errors='replace').splitlines()
+                  except OSError:
+                      continue
+                  for name, pat in inventories.items():
+                      for idx, line in enumerate(lines, 1):
+                          if pat.search(line):
+                              results[name].append({
+                                  'repo': repo,
+                                  'path': str(p.relative_to(root)),
+                                  'line': idx,
+                                  'text': line.strip()[:1000],
+                              })
+
+          for name, rows in results.items():
+              (out / f'{name}.json').write_text(json.dumps(rows, indent=2) + '\n')
+              with (out / f'{name}.tsv').open('w') as f:
+                  for r in rows:
+                      f.write(f"{r['repo']}\t{r['path']}\t{r['line']}\t{r['text']}\n")
+
+          # Enumerate exact map declarations and iteration sites in execution code.
+          map_rows = []
+          root = roots['execution']
+          map_decl = re.compile(r'(unordered_(?:dense::)?map|unordered_map)\s*<([^;>{}]*(?:<[^;{}>]*>[^;{}]*)*)>')
+          loop_pat = re.compile(r'for\s*\([^:]+:\s*([^\)]+)\)')
+          for p in root.rglob('*'):
+              if not p.is_file() or p.suffix.lower() not in exts:
+                  continue
+              if any(part in {'.git','build','vendor','third_party'} for part in p.parts):
+                  continue
+              try:
+                  text = p.read_text(errors='replace')
+              except OSError:
+                  continue
+              for m in map_decl.finditer(text):
+                  line = text.count('\n', 0, m.start()) + 1
+                  map_rows.append({'kind':'declaration','path':str(p.relative_to(root)),'line':line,'text':m.group(0)[:1500]})
+              for m in loop_pat.finditer(text):
+                  snippet = m.group(0)
+                  if any(word in snippet.lower() for word in ('state','delta','account','storage','receipt','write','read','conflict')):
+                      line = text.count('\n', 0, m.start()) + 1
+                      map_rows.append({'kind':'iteration','path':str(p.relative_to(root)),'line':line,'text':snippet[:1500]})
+          (out/'map_declarations_and_iterations.json').write_text(json.dumps(map_rows, indent=2)+'\n')
+          PY
+
+      - name: Create deterministic source archive
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          BUNDLE='monad-v0160-deep-hunt-source-20260817.tar.zst'
+          tar \
+            --sort=name \
+            --mtime='UTC 2026-08-17' \
+            --owner=0 --group=0 --numeric-owner \
+            --exclude='.git' \
+            -I 'zstd -T0 -10' \
+            -cf "$BUNDLE" \
+            monad-bft monad-execution evidence
+          sha256sum "$BUNDLE" > "$BUNDLE.sha256"
+          sha256sum evidence/* | sort > evidence/SHA256SUMS
+          du -h "$BUNDLE"
+
+      - name: Upload exact source and inventories
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0160-deep-hunt-source-20260817-${{ github.run_id }}
+          path: |
+            monad-v0160-deep-hunt-source-20260817.tar.zst
+            monad-v0160-deep-hunt-source-20260817.tar.zst.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
