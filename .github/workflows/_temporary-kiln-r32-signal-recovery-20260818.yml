@@ -1,0 +1,174 @@
+name: kiln-r32-signal-recovery
+
+on:
+  push:
+    branches: [agent/kiln-r32-signal-recovery-20260818]
+    paths:
+      - kiln_r31/runtime_census.py
+      - kiln_r31/delivery_public.pem
+      - .github/workflows/_temporary-kiln-r32-signal-recovery-20260818.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {network: ethereum, shard_index: 0, shard_count: 4}
+          - {network: ethereum, shard_index: 1, shard_count: 4}
+          - {network: ethereum, shard_index: 2, shard_count: 4}
+          - {network: ethereum, shard_index: 3, shard_count: 4}
+          - {network: arbitrum, shard_index: 0, shard_count: 2}
+          - {network: arbitrum, shard_index: 1, shard_count: 2}
+          - {network: base, shard_index: 0, shard_count: 1}
+          - {network: bnb, shard_index: 0, shard_count: 1}
+          - {network: polygon, shard_index: 0, shard_count: 1}
+          - {network: optimism, shard_index: 0, shard_count: 1}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/kiln-r32-signal-recovery-20260818
+          fetch-depth: 1
+
+      - name: Install pinned runtime
+        run: python3 -m pip install --disable-pip-version-check 'web3==7.13.0'
+
+      - name: Verify inputs
+        run: |
+          python3 -m py_compile kiln_r31/runtime_census.py
+          test -s r30_scope/SCOPE.json
+          test -s kiln_r31/delivery_public.pem
+
+      - name: Run exact read-only census
+        env:
+          TARGET_NETWORK: ${{ matrix.network }}
+          SHARD_INDEX: ${{ matrix.shard_index }}
+          SHARD_COUNT: ${{ matrix.shard_count }}
+        shell: bash
+        run: |
+          set +e
+          python3 kiln_r31/runtime_census.py > /tmp/private_run.log 2>&1
+          code=$?
+          set -e
+          printf '%s\n' "$code" > /tmp/private_exit_code.txt
+          echo "R32_PRIVATE_EXIT_RECORDED_${{ matrix.network }}_${{ matrix.shard_index }}"
+
+      - name: Fail-closed gate and fresh hashes
+        env:
+          TARGET_NETWORK: ${{ matrix.network }}
+          SHARD_INDEX: ${{ matrix.shard_index }}
+          SHARD_COUNT: ${{ matrix.shard_count }}
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os
+          from pathlib import Path
+          root=Path('r31_results'); root.mkdir(exist_ok=True)
+          gate=root/'PUBLIC_GATE.json'
+          code=int(Path('/tmp/private_exit_code.txt').read_text().strip())
+          if gate.exists():
+              data=json.loads(gate.read_text())
+          else:
+              data={
+                'schema':'kiln-r32-public-gate-fallback-v1',
+                'decision':'INCONCLUSIVE_EXECUTION_FAILURE',
+                'submit_ready':False,
+                'validated_critical':0,
+                'validated_high':0,
+                'network':os.environ['TARGET_NETWORK'],
+                'shard_index':int(os.environ['SHARD_INDEX']),
+                'shard_count':int(os.environ['SHARD_COUNT']),
+                'selected_count':0,'inspected_count':0,'error_count':1,
+                'signal_row_count':0,'unique_connector_count':0,
+                'public_chain_state_changes':0,'transactions_signed':0,'transactions_sent':0,
+              }
+          data['runner_exit_code']=code
+          if code!=0:
+              data.update({
+                'decision':'INCONCLUSIVE_EXECUTION_FAILURE',
+                'submit_ready':False,
+                'validated_critical':0,
+                'validated_high':0,
+              })
+          gate.write_text(json.dumps(data,indent=2,sort_keys=True))
+          files=sorted(p for p in root.iterdir() if p.is_file() and p.name!='SHA256SUMS.txt')
+          (root/'SHA256SUMS.txt').write_text(''.join(
+              f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in files
+          ))
+          PY
+
+      - name: Validate evidence and safety
+        run: |
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          root=Path('r31_results')
+          gate=json.loads((root/'PUBLIC_GATE.json').read_text())
+          assert gate['submit_ready'] is False
+          assert gate['validated_critical']==0
+          assert gate['validated_high']==0
+          for line in (root/'SHA256SUMS.txt').read_text().splitlines():
+              digest,name=line.split('  ',1)
+              assert hashlib.sha256((root/name).read_bytes()).hexdigest()==digest
+          evidence=root/'EVIDENCE.json'
+          if evidence.exists():
+              e=json.loads(evidence.read_text())
+              safety=e.get('safety',{})
+              assert safety.get('public_chain_state_changes',0)==0
+              assert safety.get('transactions_signed',0)==0
+              assert safety.get('transactions_sent',0)==0
+          print('R32_SELF_CHECK=PASS')
+          PY
+
+      - name: Encrypt complete evidence
+        env:
+          TARGET_NETWORK: ${{ matrix.network }}
+          SHARD_INDEX: ${{ matrix.shard_index }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted_delivery public_delivery
+          cp r31_results/PUBLIC_GATE.json public_delivery/
+          cp r31_results/SHA256SUMS.txt public_delivery/
+          tar -czf /tmp/private_payload.tar.gz r31_results /tmp/private_run.log /tmp/private_exit_code.txt kiln_r31/runtime_census.py r30_scope/SCOPE.json
+          openssl rand 32 > /tmp/aes.key
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 250000 -in /tmp/private_payload.tar.gz -out encrypted_delivery/payload.aes256 -pass file:/tmp/aes.key
+          openssl pkeyutl -encrypt -pubin -inkey kiln_r31/delivery_public.pem -in /tmp/aes.key -out encrypted_delivery/key.rsa3072 -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          sha256sum encrypted_delivery/payload.aes256 encrypted_delivery/key.rsa3072 > encrypted_delivery/SHA256SUMS.txt
+          python3 - <<'PY'
+          import json,os
+          from pathlib import Path
+          Path('encrypted_delivery/PUBLIC_MANIFEST.json').write_text(json.dumps({
+            'schema':'kiln-r32-encrypted-delivery-v1',
+            'network':os.environ['TARGET_NETWORK'],
+            'shard_index':int(os.environ['SHARD_INDEX']),
+            'runner_exit_code':int(Path('/tmp/private_exit_code.txt').read_text().strip()),
+            'source_commit':'${{ github.sha }}',
+            'plaintext_results_publicly_exposed':False,
+            'public_chain_state_changes':0,
+            'transactions_signed':0,
+            'transactions_sent':0,
+            'private_keys_loaded':0
+          },indent=2,sort_keys=True))
+          PY
+          rm -rf r31_results
+          rm -f /tmp/private_payload.tar.gz /tmp/private_run.log /tmp/private_exit_code.txt /tmp/aes.key
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kiln-r32-${{ matrix.network }}-${{ matrix.shard_index }}-encrypted
+          path: encrypted_delivery
+          if-no-files-found: error
+          retention-days: 3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kiln-r32-${{ matrix.network }}-${{ matrix.shard_index }}-public-gate
+          path: public_delivery
+          if-no-files-found: error
+          retention-days: 3
