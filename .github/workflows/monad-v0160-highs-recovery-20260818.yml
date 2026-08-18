@@ -1,0 +1,256 @@
+name: Monad v0.16.0 V1 high-S one-round recovery gate
+
+on:
+  push:
+    branches:
+      - agent/monad-v0160-deep-hunt-20260817
+    paths:
+      - .github/workflows/monad-v0160-highs-recovery-20260818.yml
+      - scripts/monad_v0160_highs_recovery_inject.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monad-v0160-highs-recovery-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  exact-recovery-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    env:
+      BFT_COMMIT: c616743d1358186605e1c1b74a3d6c4fdd9dd48c
+      EXEC_COMMIT: e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_HTTP_MULTIPLEXING: "false"
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Check out research harness
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rustup toolchain install 1.91.1 --profile minimal --component rustfmt
+          rustup default 1.91.1
+          rustc --version --verbose
+          cargo --version --verbose
+
+      - name: Clone exact in-scope Monad source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config --global advice.detachedHead false
+          git clone --filter=blob:none --no-recurse-submodules \
+            https://github.com/category-labs/monad-bft.git monad-bft
+          git -C monad-bft checkout --detach "$BFT_COMMIT"
+          git -C monad-bft submodule sync --recursive
+          git -C monad-bft submodule update --init --recursive --depth 1
+          test "$(git -C monad-bft rev-parse HEAD)" = "$BFT_COMMIT"
+          test "$(git -C monad-bft/monad-execution rev-parse HEAD)" = "$EXEC_COMMIT"
+
+      - name: Inject exact V1 low-S/high-S recovery test
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p evidence
+          sha256sum monad-bft/monad-raptorcast/src/udp.rs \
+            > evidence/udp.rs.pristine.sha256
+          python3 scripts/monad_v0160_highs_recovery_inject.py
+          cargo fmt --manifest-path monad-bft/Cargo.toml --all
+          git -C monad-bft diff -- monad-raptorcast/src/udp.rs \
+            > evidence/MONAD_V0160_RAPTORCAST_V1_HIGHS_ONE_ROUND_RECOVERY_TEST.patch
+          sha256sum monad-bft/monad-raptorcast/src/udp.rs \
+            > evidence/udp.rs.injected.sha256
+          test -s evidence/MONAD_V0160_RAPTORCAST_V1_HIGHS_ONE_ROUND_RECOVERY_TEST.patch
+
+      - name: Fetch exact locked dependencies with retries
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for attempt in 1 2 3 4 5; do
+            if cargo fetch --manifest-path monad-bft/Cargo.toml --locked; then
+              exit 0
+            fi
+            sleep $((attempt * 5))
+          done
+          exit 1
+
+      - name: Run the exact recovery gate three times
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p evidence
+          : > evidence/status.tsv
+          for repetition in 1 2 3; do
+            set +e
+            cargo test \
+              --manifest-path monad-bft/Cargo.toml \
+              --locked \
+              -p monad-raptorcast \
+              malicious_v1_high_s_alias_is_one_round_only_under_accept_both_publish_v0 \
+              -- \
+              --exact \
+              --nocapture \
+              --test-threads=1 \
+              2>&1 | tee "evidence/run-${repetition}.log"
+            status=${PIPESTATUS[0]}
+            set -e
+            printf '%s\t%s\n' "$repetition" "$status" >> evidence/status.tsv
+          done
+
+      - name: Produce fail-closed machine decision
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          from pathlib import Path
+          import hashlib
+          import json
+          import re
+
+          evidence = Path("evidence")
+          statuses = {}
+          for line in (evidence / "status.tsv").read_text().splitlines():
+              repetition, status = line.split("\t")
+              statuses[int(repetition)] = int(status)
+
+          marker_names = [
+              "DEFAULT_STAGE_V1_CONTROL_ROUND42",
+              "POISONED_HONEST_ONE_ROUND42",
+              "POISONED_HONEST_TWO_ROUND42",
+              "RECOVERED_HONEST_ONE_ROUND43",
+              "RECOVERED_HONEST_TWO_ROUND43",
+              "RECOVERED_HONEST_THREE_ROUND43",
+              "TEST_COMPLETE",
+          ]
+          runs = []
+          for repetition in (1, 2, 3):
+              text = (evidence / f"run-{repetition}.log").read_text(errors="replace")
+              markers = {}
+              for name in marker_names:
+                  matches = re.findall(rf"MARKER_{name}=([0-9]+)", text)
+                  markers[name] = int(matches[-1]) if matches else None
+              runs.append({
+                  "repetition": repetition,
+                  "exit_code": statuses.get(repetition),
+                  "markers": markers,
+              })
+
+          expected = {
+              "DEFAULT_STAGE_V1_CONTROL_ROUND42": 1,
+              "POISONED_HONEST_ONE_ROUND42": 0,
+              "POISONED_HONEST_TWO_ROUND42": 0,
+              "RECOVERED_HONEST_ONE_ROUND43": 1,
+              "RECOVERED_HONEST_TWO_ROUND43": 1,
+              "RECOVERED_HONEST_THREE_ROUND43": 1,
+              "TEST_COMPLETE": 1,
+          }
+          all_expected = all(
+              run["exit_code"] == 0
+              and all(run["markers"].get(key) == value for key, value in expected.items())
+              for run in runs
+          )
+          default_rejects_v1 = all(
+              run["markers"].get("DEFAULT_STAGE_V1_CONTROL_ROUND42") == 0
+              for run in runs
+          )
+          poisoning_not_reproduced = all(
+              run["markers"].get("POISONED_HONEST_ONE_ROUND42") == 1
+              or run["markers"].get("POISONED_HONEST_TWO_ROUND42") == 1
+              for run in runs
+          )
+          sustained = all(
+              run["markers"].get("DEFAULT_STAGE_V1_CONTROL_ROUND42") == 1
+              and run["markers"].get("POISONED_HONEST_ONE_ROUND42") == 0
+              and run["markers"].get("POISONED_HONEST_TWO_ROUND42") == 0
+              and (
+                  run["markers"].get("RECOVERED_HONEST_ONE_ROUND43") == 0
+                  or run["markers"].get("RECOVERED_HONEST_TWO_ROUND43") == 0
+              )
+              for run in runs
+          )
+
+          if all_expected:
+              decision = "ONE_ROUND_POISONING_RECOVERS_NEXT_HONEST_ROUND"
+              high_gate = False
+          elif default_rejects_v1:
+              decision = "DEFAULT_ACCEPT_BOTH_PUBLISH_V0_REJECTS_V1"
+              high_gate = False
+          elif poisoning_not_reproduced:
+              decision = "HIGH_S_POISONING_NOT_REPRODUCED"
+              high_gate = False
+          elif sustained:
+              decision = "SUSTAINED_POISONING_CANDIDATE_REQUIRES_CONSENSUS_NETWORK_AB"
+              high_gate = True
+          else:
+              decision = "INCOMPLETE_OR_COMPILE_RUNTIME_FAILURE"
+              high_gate = False
+
+          result = {
+              "bft_commit": "c616743d1358186605e1c1b74a3d6c4fdd9dd48c",
+              "execution_commit": "e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0",
+              "decision": decision,
+              "runs": runs,
+              "root_cause_proven": all(
+                  run["markers"].get("DEFAULT_STAGE_V1_CONTROL_ROUND42") == 1
+                  and run["markers"].get("POISONED_HONEST_ONE_ROUND42") == 0
+                  and run["markers"].get("POISONED_HONEST_TWO_ROUND42") == 0
+                  for run in runs
+              ),
+              "accept_both_publish_v0_accepts_malicious_v1": all(
+                  run["markers"].get("DEFAULT_STAGE_V1_CONTROL_ROUND42") == 1
+                  for run in runs
+              ),
+              "next_honest_round_recovers": all_expected,
+              "sustained_high_candidate": high_gate,
+              "critical_proven": False,
+              "submit_ready": False,
+          }
+          (evidence / "RESULT.json").write_text(json.dumps(result, indent=2) + "\n")
+          (evidence / "REPORT.md").write_text(f"""# Monad v0.16.0 V1 high-S recovery gate
+
+## Decision
+
+**{decision}**
+
+The test uses an equal-stake four-validator set: one Byzantine V1 proposer and three honest
+receivers. Two honest receivers see the high-S signature alias first; the third receives the
+authentic low-S stream. All receivers run the exact `AcceptBothPublishV0` stage.
+
+The next round uses an honest proposer and a distinct V1 message. High severity requires the
+two poisoned receivers to remain unable to reconstruct in that next honest round. Recovery
+therefore kills the sustained-network-halt hypothesis and limits the demonstrated effect to
+one Byzantine-leader round.
+
+- Root cause reproduced: **{result['root_cause_proven']}**
+- Default-stage V1 acceptance: **{result['accept_both_publish_v0_accepts_malicious_v1']}**
+- Next honest round recovers: **{result['next_honest_round_recovers']}**
+- Sustained High candidate: **{result['sustained_high_candidate']}**
+- Critical proven: **false**
+- Submit-ready: **false**
+""")
+
+          manifest = []
+          for path in sorted(evidence.rglob("*")):
+              if path.is_file() and path.name != "SHA256SUMS":
+                  manifest.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(evidence)}")
+          (evidence / "SHA256SUMS").write_text("\n".join(manifest) + "\n")
+          print(json.dumps(result, indent=2))
+          PY
+
+      - name: Upload exact evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0160-highs-one-round-recovery-${{ github.run_id }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 7
