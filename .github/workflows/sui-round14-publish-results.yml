@@ -1,0 +1,146 @@
+name: Sui Round 14 publish scan results
+
+on:
+  push:
+    branches:
+      - "sui-round14-*"
+
+permissions:
+  contents: write
+
+jobs:
+  scan-and-publish:
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout private research branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 1
+
+      - name: Fetch exact public Sui revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          fetch_rev() {
+            local dir="$1" rev="$2"
+            git init -q "$dir"
+            git -C "$dir" remote add origin https://github.com/MystenLabs/sui.git
+            git -C "$dir" fetch -q --depth=1 origin "$rev"
+            git -C "$dir" checkout -q --detach FETCH_HEAD
+            test "$(git -C "$dir" rev-parse HEAD)" = "$rev"
+          }
+          fetch_rev /tmp/sui-mainnet 51d177ad7d65102fc368b582408f466d97b31548
+          fetch_rev /tmp/sui-main 39acc82017718b11f8c8240f537a489cece91c1d
+          rm -rf round14-results
+          mkdir -p round14-results
+
+      - name: Run targeted security scans
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/scan.py <<'PY'
+          import csv, json, re, subprocess
+          from pathlib import Path
+
+          roots = {"mainnet": Path('/tmp/sui-mainnet'), "main": Path('/tmp/sui-main')}
+          out = Path('round14-results')
+
+          def files(root, suffix):
+              for p in root.rglob('*' + suffix):
+                  s = str(p)
+                  if not any(x in s for x in ('/target/', '/node_modules/', '/snapshots/')):
+                      yield p
+
+          def ln(text, pos): return text.count('\n', 0, pos) + 1
+          fun_re = re.compile(r'(?ms)^\s*(?P<vis>public(?:\([^)]*\))?|entry|public\s+entry)\s+fun\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>{;]*>)?\s*\((?P<params>.*?)\)\s*(?::\s*(?P<ret>[^\{;]+))?\s*\{')
+          struct_re = re.compile(r'(?m)^\s*public\s+struct\s+([A-Za-z_][A-Za-z0-9_]*)[^\{]*has\s+([^\{]+)\{')
+
+          returns, mutators, no_cap, auth_panics, verifier_deltas = [], [], [], [], []
+
+          for rev, root in roots.items():
+              move_base = root / 'crates/sui-framework/packages'
+              if move_base.exists():
+                  for p in files(move_base, '.move'):
+                      try: text = p.read_text(encoding='utf-8')
+                      except Exception: continue
+                      key_structs = {m.group(1) for m in struct_re.finditer(text) if 'key' in m.group(2)}
+                      for m in fun_re.finditer(text):
+                          params = ' '.join(m.group('params').split())
+                          ret = ' '.join((m.group('ret') or '').split())
+                          name = m.group('name')
+                          start, depth, i = m.end(), 1, m.end()
+                          while i < len(text) and depth:
+                              depth += (text[i] == '{') - (text[i] == '}')
+                              i += 1
+                          body = text[start:i-1]
+                          rel = str(p.relative_to(root))
+                          row = {'revision': rev, 'file': rel, 'line': ln(text,m.start()), 'function': name, 'params': params, 'return': ret}
+                          if re.search(r'&\s*mut\s+(?:UID|ID|[A-Za-z0-9_:<>]*Cap\b|Balance\s*<)', ret):
+                              returns.append(row)
+                          ops = sorted(set(re.findall(r'\b(?:withdraw(?:_funds_from_object)?|send_funds|burn|mint|destroy|public_transfer|transfer::transfer|uid_mut|claim|redeem|freeze_object|share_object)\b', body)))
+                          mut_key = any(re.search(rf'&\s*mut\s+{re.escape(s)}\b', params) for s in key_structs)
+                          cap = bool(re.search(r'\b[A-Za-z0-9_:<>]*(?:Cap|Witness|Admin|Owner|Authority|Treasury)[A-Za-z0-9_:<>]*\b', params))
+                          if mut_key and ops:
+                              r = dict(row); r.update({'ops': ','.join(ops), 'cap_like_param': cap}); mutators.append(r)
+                              if not cap: no_cap.append(r)
+
+              rust_paths = [root/'crates/sui-types/src', root/'crates/sui-core/src', root/'sui-execution/latest']
+              for base in rust_paths:
+                  if not base.exists(): continue
+                  for p in files(base, '.rs'):
+                      rel = str(p.relative_to(root))
+                      if not any(x in rel for x in ('signature', 'transaction', 'verifier', 'adapter', 'authority_server', 'execution')):
+                          continue
+                      try: text = p.read_text(encoding='utf-8')
+                      except Exception: continue
+                      for m in re.finditer(r'\b(?:unwrap|expect|panic!|assert!|unreachable!)\s*\(', text):
+                          auth_panics.append({'revision':rev,'file':rel,'line':ln(text,m.start()),'token':m.group(0).split('(')[0],'context':' '.join(text[max(0,m.start()-160):m.start()+240].split())})
+
+          def sigs(root):
+              result = {}
+              base = root/'crates/sui-framework/packages'
+              if not base.exists(): return result
+              for p in files(base, '.move'):
+                  try: text = p.read_text(encoding='utf-8')
+                  except Exception: continue
+                  for m in fun_re.finditer(text):
+                      result[f"{p.relative_to(root)}:{m.group('name')}"] = ' '.join(m.group(0).split())
+              return result
+          a,b=sigs(roots['mainnet']),sigs(roots['main'])
+          for k in sorted(set(a)|set(b)):
+              if a.get(k)!=b.get(k): verifier_deltas.append({'symbol':k,'mainnet':a.get(k,''),'main':b.get(k,'')})
+
+          def write(name, rows):
+              p=out/name
+              if not rows: p.write_text('',encoding='utf-8'); return
+              with p.open('w',newline='',encoding='utf-8') as f:
+                  w=csv.DictWriter(f,fieldnames=list(rows[0])); w.writeheader(); w.writerows(rows)
+          write('PUBLIC_SENSITIVE_RETURNS.csv',returns)
+          write('PUBLIC_KEY_MUTATORS.csv',mutators)
+          write('NO_CAP_SENSITIVE_MUTATORS.csv',no_cap)
+          write('AUTH_EXEC_PANIC_SURFACES.csv',auth_panics)
+          write('FRAMEWORK_PUBLIC_API_DELTA.csv',verifier_deltas)
+
+          # Exact textual source-delta inventory without assuming ancestry.
+          subprocess.run(['git','-C','/tmp/sui-main','remote','add','active','/tmp/sui-mainnet'],check=False)
+          subprocess.run(['git','-C','/tmp/sui-main','fetch','-q','active','51d177ad7d65102fc368b582408f466d97b31548'],check=False)
+          with (out/'SECURITY_DIFF_FILES.txt').open('w') as f:
+              subprocess.run(['git','-C','/tmp/sui-main','diff','--name-status','51d177ad7d65102fc368b582408f466d97b31548','39acc82017718b11f8c8240f537a489cece91c1d','--','crates/sui-framework','sui-execution','crates/sui-core','crates/sui-types','consensus','bridge','crates/sui-protocol-config'],stdout=f,check=False)
+          summary={'mainnet_commit':'51d177ad7d65102fc368b582408f466d97b31548','main_commit':'39acc82017718b11f8c8240f537a489cece91c1d','public_sensitive_returns':len(returns),'public_key_mutators':len(mutators),'no_cap_sensitive_mutators':len(no_cap),'auth_exec_panic_surfaces':len(auth_panics),'framework_public_api_delta':len(verifier_deltas)}
+          (out/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+          PY
+          python3 /tmp/scan.py
+          find round14-results -type f -print0 | sort -z | xargs -0 sha256sum > round14-results/SHA256SUMS
+
+      - name: Publish results to branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add round14-results
+          git commit -m "ci: publish Sui Round 14 scan results [skip ci]" || exit 0
+          git push origin "HEAD:${GITHUB_REF_NAME}"
