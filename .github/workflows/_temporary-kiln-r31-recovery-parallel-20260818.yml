@@ -1,0 +1,211 @@
+name: kiln-r31-recovery-parallel
+
+on:
+  push:
+    branches: [agent/kiln-r31-runtime-census-20260817]
+    paths:
+      - .github/workflows/_temporary-kiln-r31-recovery-parallel-20260818.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  recover:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {network: ethereum, shard_index: 0, shard_count: 4}
+          - {network: ethereum, shard_index: 1, shard_count: 4}
+          - {network: ethereum, shard_index: 2, shard_count: 4}
+          - {network: ethereum, shard_index: 3, shard_count: 4}
+          - {network: arbitrum, shard_index: 0, shard_count: 2}
+          - {network: arbitrum, shard_index: 1, shard_count: 2}
+          - {network: base, shard_index: 0, shard_count: 1}
+          - {network: bnb, shard_index: 0, shard_count: 1}
+          - {network: polygon, shard_index: 0, shard_count: 1}
+          - {network: optimism, shard_index: 0, shard_count: 1}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/kiln-r31-runtime-census-20260817
+          fetch-depth: 1
+      - name: Install pinned runtime
+        run: python3 -m pip install --disable-pip-version-check 'web3==7.13.0'
+      - name: Verify source
+        run: python3 -m py_compile kiln_r31/runtime_census.py
+      - name: Run read-only shard
+        env:
+          TARGET_NETWORK: ${{ matrix.network }}
+          SHARD_INDEX: ${{ matrix.shard_index }}
+          SHARD_COUNT: ${{ matrix.shard_count }}
+        shell: bash
+        run: |
+          set +e
+          python3 kiln_r31/runtime_census.py > /tmp/private_run.log 2>&1
+          code=$?
+          set -e
+          printf '%s\n' "$code" > /tmp/private_exit_code.txt
+          echo "R31_PARALLEL_PRIVATE_EXIT_RECORDED=${code}"
+      - name: Fail-closed gate and refresh hashes
+        env:
+          TARGET_NETWORK: ${{ matrix.network }}
+          SHARD_INDEX: ${{ matrix.shard_index }}
+          SHARD_COUNT: ${{ matrix.shard_count }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os
+          from pathlib import Path
+          root=Path('r31_results'); root.mkdir(exist_ok=True)
+          gate=root/'PUBLIC_GATE.json'
+          code=int(Path('/tmp/private_exit_code.txt').read_text().strip())
+          if gate.exists():
+              data=json.loads(gate.read_text())
+          else:
+              data={
+                'schema':'kiln-r31-parallel-recovery-fallback-v1',
+                'decision':'INCONCLUSIVE_EXECUTION_FAILURE',
+                'submit_ready':False,'validated_critical':0,'validated_high':0,
+                'network':os.environ['TARGET_NETWORK'],
+                'shard_index':int(os.environ['SHARD_INDEX']),
+                'shard_count':int(os.environ['SHARD_COUNT']),
+                'selected_count':0,'inspected_count':0,'error_count':1,
+                'signal_row_count':0,'unique_connector_count':0,
+                'public_chain_state_changes':0,'transactions_signed':0,'transactions_sent':0,
+              }
+          data['runner_exit_code']=code
+          if code!=0:
+              data.update({'decision':'INCONCLUSIVE_EXECUTION_FAILURE','submit_ready':False,'validated_critical':0,'validated_high':0})
+          gate.write_text(json.dumps(data,indent=2,sort_keys=True))
+          files=sorted(p for p in root.iterdir() if p.is_file() and p.name!='SHA256SUMS.txt')
+          (root/'SHA256SUMS.txt').write_text(''.join(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n" for p in files))
+          for line in (root/'SHA256SUMS.txt').read_text().splitlines():
+              digest,name=line.split('  ',1)
+              assert hashlib.sha256((root/name).read_bytes()).hexdigest()==digest
+          assert json.loads(gate.read_text()).get('submit_ready') is False
+          PY
+      - name: Encrypt complete shard evidence
+        env:
+          TARGET_NETWORK: ${{ matrix.network }}
+          SHARD_INDEX: ${{ matrix.shard_index }}
+          SHARD_COUNT: ${{ matrix.shard_count }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="${TARGET_NETWORK}_${SHARD_INDEX}"
+          out="delivery/${key}"
+          mkdir -p "$out/encrypted"
+          cp r31_results/PUBLIC_GATE.json "$out/PUBLIC_GATE.json"
+          cp r31_results/SHA256SUMS.txt "$out/PRIVATE_SHA256SUMS.txt"
+          tar -czf /tmp/private_payload.tar.gz r31_results /tmp/private_run.log /tmp/private_exit_code.txt kiln_r31/runtime_census.py
+          openssl rand 32 > /tmp/aes.key
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 250000 \
+            -in /tmp/private_payload.tar.gz -out "$out/encrypted/payload.aes256" -pass file:/tmp/aes.key
+          openssl pkeyutl -encrypt -pubin -inkey kiln_r31/delivery_public.pem \
+            -in /tmp/aes.key -out "$out/encrypted/key.rsa3072" \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          sha256sum "$out/encrypted/payload.aes256" "$out/encrypted/key.rsa3072" > "$out/encrypted/SHA256SUMS.txt"
+          python3 - <<'PY'
+          import json,os
+          from pathlib import Path
+          out=Path('delivery')/f"{os.environ['TARGET_NETWORK']}_{os.environ['SHARD_INDEX']}"
+          (out/'MANIFEST.json').write_text(json.dumps({
+            'schema':'kiln-r31-parallel-recovery-encrypted-v1',
+            'network':os.environ['TARGET_NETWORK'],
+            'shard_index':int(os.environ['SHARD_INDEX']),
+            'shard_count':int(os.environ['SHARD_COUNT']),
+            'runner_exit_code':int(Path('/tmp/private_exit_code.txt').read_text().strip()),
+            'plaintext_evidence_committed':False,
+            'public_chain_state_changes':0,
+            'transactions_signed':0,
+            'transactions_sent':0,
+            'private_keys_loaded':0,
+          },indent=2,sort_keys=True))
+          PY
+          rm -rf r31_results
+          rm -f /tmp/private_payload.tar.gz /tmp/private_run.log /tmp/private_exit_code.txt /tmp/aes.key
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kiln-r31-recovery-${{ matrix.network }}-${{ matrix.shard_index }}
+          path: delivery
+          if-no-files-found: error
+          retention-days: 3
+
+  aggregate:
+    needs: recover
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/kiln-r31-runtime-census-20260817
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kiln-r31-recovery-*
+          path: downloaded
+          merge-multiple: true
+      - name: Verify and aggregate recoverable evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf r31_recovery_parallel_results
+          mkdir -p r31_recovery_parallel_results
+          cp -R downloaded/* r31_recovery_parallel_results/
+          python3 - <<'PY'
+          import hashlib,json,time
+          from pathlib import Path
+          root=Path('r31_recovery_parallel_results')
+          gates=[]; manifests=[]
+          for p in sorted(root.rglob('PUBLIC_GATE.json')):
+              gates.append(json.loads(p.read_text()))
+          for p in sorted(root.rglob('MANIFEST.json')):
+              manifests.append(json.loads(p.read_text()))
+          expected={(n,i) for n,i in [('ethereum',0),('ethereum',1),('ethereum',2),('ethereum',3),('arbitrum',0),('arbitrum',1),('base',0),('bnb',0),('polygon',0),('optimism',0)]}
+          actual={(x.get('network'),int(x.get('shard_index',-1))) for x in gates}
+          checks={
+            'ten_public_gates':len(gates)==10,
+            'ten_manifests':len(manifests)==10,
+            'all_expected_shards':actual==expected,
+            'all_submit_ready_false':all(x.get('submit_ready') is False for x in gates),
+            'all_severity_zero':all(int(x.get('validated_critical',0) or 0)==0 and int(x.get('validated_high',0) or 0)==0 for x in gates),
+            'all_safety_zero':all(int(x.get('public_chain_state_changes',0) or 0)==0 and int(x.get('transactions_signed',0) or 0)==0 and int(x.get('transactions_sent',0) or 0)==0 for x in gates),
+          }
+          aggregate={
+            'schema':'kiln-r31-parallel-recovery-aggregate-v1',
+            'generated_at_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+            'checks':checks,
+            'shard_count':len(gates),
+            'selected_total':sum(int(x.get('selected_count',0) or 0) for x in gates),
+            'inspected_total':sum(int(x.get('inspected_count',0) or 0) for x in gates),
+            'error_total':sum(int(x.get('error_count',0) or 0) for x in gates),
+            'signal_total':sum(int(x.get('signal_row_count',0) or 0) for x in gates),
+            'positive_shards':[{'network':x.get('network'),'shard_index':x.get('shard_index'),'signals':x.get('signal_row_count'),'errors':x.get('error_count'),'decision':x.get('decision')} for x in gates if int(x.get('signal_row_count',0) or 0)>0],
+            'submit_ready':False,'validated_critical':0,'validated_high':0,
+            'rows':sorted(gates,key=lambda x:(str(x.get('network')),int(x.get('shard_index',0) or 0))),
+          }
+          (root/'AGGREGATE_PUBLIC.json').write_text(json.dumps(aggregate,indent=2,sort_keys=True))
+          files=sorted(p for p in root.rglob('*') if p.is_file() and p.name!='PACKAGE_SHA256SUMS.txt')
+          (root/'PACKAGE_SHA256SUMS.txt').write_text(''.join(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(root).as_posix()}\n" for p in files))
+          assert all(checks.values()),checks
+          PY
+      - name: Commit encrypted recovery package
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add r31_recovery_parallel_results
+          git commit -m 'persist parallel recoverable Kiln R31 evidence'
+          for attempt in 1 2 3; do
+            git pull --rebase origin agent/kiln-r31-runtime-census-20260817
+            if git push origin HEAD:agent/kiln-r31-runtime-census-20260817; then exit 0; fi
+            sleep $((attempt * 3))
+          done
+          exit 1
