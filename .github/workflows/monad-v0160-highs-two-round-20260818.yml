@@ -1,0 +1,319 @@
+name: Monad v0.16.0 RaptorCast high-S two-round gate
+
+on:
+  push:
+    branches:
+      - agent/monad-v0160-deep-hunt-20260817
+    paths:
+      - .github/workflows/monad-v0160-highs-two-round-20260818.yml
+      - research/monad-v0160-highs/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monad-v0160-highs-two-round-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  exact-two-round-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out research gates
+        uses: actions/checkout@v4
+
+      - name: Install pinned toolchain and native dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libssl-dev libsecp256k1-dev libzstd-dev protobuf-compiler
+          rustup toolchain install 1.91.1 --profile minimal
+          rustup default 1.91.1
+          rustc --version --verbose
+          cargo --version --verbose
+
+      - name: Clone immutable in-scope Monad v0.16.0 source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          BFT_COMMIT='c616743d1358186605e1c1b74a3d6c4fdd9dd48c'
+          EXEC_COMMIT='e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0'
+
+          git config --global advice.detachedHead false
+          git clone --filter=blob:none --no-recurse-submodules \
+            https://github.com/category-labs/monad-bft.git monad-bft
+          git -C monad-bft checkout --detach "$BFT_COMMIT"
+          git -C monad-bft submodule sync --recursive
+          git -C monad-bft submodule update --init --recursive --depth 1
+
+          test "$(git -C monad-bft rev-parse HEAD)" = "$BFT_COMMIT"
+          test "$(git -C monad-bft/monad-execution rev-parse HEAD)" = "$EXEC_COMMIT"
+
+          mkdir -p evidence/logs
+          {
+            echo "bft_commit=$(git -C monad-bft rev-parse HEAD)"
+            echo "execution_commit=$(git -C monad-bft/monad-execution rev-parse HEAD)"
+            echo "rustc=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            git -C monad-bft submodule status --recursive
+          } > evidence/SOURCE_PROVENANCE.txt
+          sha256sum \
+            monad-bft/Cargo.lock \
+            research/monad-v0160-highs/commitment-poisoning.patch \
+            research/monad-v0160-highs/full-pipeline.patch \
+            research/monad-v0160-highs/next-round-recovery.patch \
+            > evidence/INPUTS.sha256
+
+      - name: Apply exact research regressions fail-closed
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd monad-bft
+
+          for patch_file in \
+            "$GITHUB_WORKSPACE/research/monad-v0160-highs/commitment-poisoning.patch" \
+            "$GITHUB_WORKSPACE/research/monad-v0160-highs/full-pipeline.patch" \
+            "$GITHUB_WORKSPACE/research/monad-v0160-highs/next-round-recovery.patch"
+          do
+            patch --dry-run --batch -p0 < "$patch_file"
+            patch --batch -p0 < "$patch_file"
+          done
+
+          git diff --check
+          git diff -- \
+            monad-raptorcast/src/round_info.rs \
+            monad-raptorcast/src/udp.rs \
+            > "$GITHUB_WORKSPACE/evidence/APPLIED_TESTS.patch"
+          sha256sum \
+            monad-raptorcast/src/round_info.rs \
+            monad-raptorcast/src/udp.rs \
+            > "$GITHUB_WORKSPACE/evidence/PATCHED_SOURCES.sha256"
+
+      - name: Run exact root-cause and two-round recovery matrix
+        shell: bash
+        env:
+          RUST_BACKTRACE: "1"
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          CARGO_HTTP_MULTIPLEXING: "false"
+        run: |
+          set -Eeuo pipefail
+          cd monad-bft
+
+          run_exact_test() {
+            local test_name="$1"
+            local label="$2"
+            local repetition="$3"
+            local log="$GITHUB_WORKSPACE/evidence/logs/${label}-r${repetition}.log"
+            local rc_file="$GITHUB_WORKSPACE/evidence/logs/${label}-r${repetition}.exitcode"
+
+            set +e
+            /usr/bin/time -v cargo test --locked -p monad-raptorcast --lib "$test_name" -- \
+              --exact --nocapture --test-threads=1 >"$log" 2>&1
+            local rc=$?
+            set -e
+            printf '%s\n' "$rc" > "$rc_file"
+
+            test "$rc" -eq 0
+            grep -Eq 'running[[:space:]]+1[[:space:]]+test' "$log"
+            grep -Fq "test ${test_name} ... ok" "$log"
+          }
+
+          COMMITMENT='round_info::tests::recoverable_high_s_alias_poisoning_rejects_authentic_commitment'
+          PIPELINE='udp::tests_deterministic::malleated_first_chunk_blocks_authentic_v1_message_reconstruction'
+          RECOVERY='udp::tests_deterministic::high_s_alias_poisoning_is_round_scoped_and_next_honest_round_recovers'
+
+          for i in 1 2 3; do
+            run_exact_test "$COMMITMENT" commitment "$i"
+            run_exact_test "$PIPELINE" pipeline "$i"
+          done
+
+          for i in 1 2 3 4 5; do
+            run_exact_test "$RECOVERY" recovery "$i"
+          done
+
+          set +e
+          /usr/bin/time -v cargo test --locked -p monad-raptorcast --lib -- \
+            --test-threads=1 > "$GITHUB_WORKSPACE/evidence/logs/full-suite.log" 2>&1
+          full_rc=$?
+          set -e
+          printf '%s\n' "$full_rc" > "$GITHUB_WORKSPACE/evidence/logs/full-suite.exitcode"
+          test "$full_rc" -eq 0
+          grep -Eq 'test result: ok\.' "$GITHUB_WORKSPACE/evidence/logs/full-suite.log"
+
+      - name: Verify evidence and classify impact
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          from pathlib import Path
+          import hashlib
+          import json
+          import re
+
+          root = Path("evidence")
+          logs = root / "logs"
+
+          def verify(label: str, count: int, test_name: str) -> dict:
+              entries = []
+              for i in range(1, count + 1):
+                  log_path = logs / f"{label}-r{i}.log"
+                  rc_path = logs / f"{label}-r{i}.exitcode"
+                  text = log_path.read_text(errors="replace")
+                  rc = int(rc_path.read_text().strip())
+                  executed = bool(re.search(r"running\s+1\s+test", text))
+                  passed = f"test {test_name} ... ok" in text
+                  entries.append({
+                      "repetition": i,
+                      "returncode": rc,
+                      "executed_one_test": executed,
+                      "passed": passed,
+                      "sha256": hashlib.sha256(log_path.read_bytes()).hexdigest(),
+                  })
+              return {
+                  "label": label,
+                  "expected_repetitions": count,
+                  "clean_passes": sum(
+                      1 for e in entries
+                      if e["returncode"] == 0 and e["executed_one_test"] and e["passed"]
+                  ),
+                  "entries": entries,
+              }
+
+          commitment_name = (
+              "round_info::tests::"
+              "recoverable_high_s_alias_poisoning_rejects_authentic_commitment"
+          )
+          pipeline_name = (
+              "udp::tests_deterministic::"
+              "malleated_first_chunk_blocks_authentic_v1_message_reconstruction"
+          )
+          recovery_name = (
+              "udp::tests_deterministic::"
+              "high_s_alias_poisoning_is_round_scoped_and_next_honest_round_recovers"
+          )
+
+          commitment = verify("commitment", 3, commitment_name)
+          pipeline = verify("pipeline", 3, pipeline_name)
+          recovery = verify("recovery", 5, recovery_name)
+
+          full_log = logs / "full-suite.log"
+          full_text = full_log.read_text(errors="replace")
+          full_rc = int((logs / "full-suite.exitcode").read_text().strip())
+          full_suite_pass = full_rc == 0 and "test result: ok." in full_text
+
+          root_cause_pass = (
+              commitment["clean_passes"] == 3
+              and pipeline["clean_passes"] == 3
+          )
+          next_round_recovery_pass = recovery["clean_passes"] == 5
+
+          if root_cause_pass and next_round_recovery_pass and full_suite_pass:
+              decision = "HIGH_KILL_ROUND_SCOPED_NEXT_HONEST_ROUND_RECOVERS"
+              severity_proven = "MEDIUM_OR_DEFENSE_IN_DEPTH_MAX"
+          elif root_cause_pass and not next_round_recovery_pass:
+              decision = "SUSTAINED_LIVENESS_CANDIDATE_REQUIRES_NETWORK_AND_PATCHED_CONTROL"
+              severity_proven = "NONE_YET"
+          else:
+              decision = "INCOMPLETE_OR_NEGATIVE_ROOT_CAUSE_GATE"
+              severity_proven = "NONE"
+
+          result = {
+              "decision": decision,
+              "severity_proven": severity_proven,
+              "submit_ready": False,
+              "exact_source": {
+                  "bft_commit": "c616743d1358186605e1c1b74a3d6c4fdd9dd48c",
+                  "execution_commit": "e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0",
+              },
+              "root_cause_pass": root_cause_pass,
+              "next_round_recovery_pass": next_round_recovery_pass,
+              "full_suite_pass": full_suite_pass,
+              "commitment": commitment,
+              "pipeline": pipeline,
+              "recovery": recovery,
+              "high_gate": {
+                  "sustained_finality_halt": False,
+                  "network_wide_halt": False,
+                  "patched_network_control": False,
+              },
+          }
+          (root / "RESULT.json").write_text(json.dumps(result, indent=2) + "\n")
+
+          report = f"""# Monad v0.16.0 RaptorCast high-S two-round gate
+
+          ## Decision
+
+          **{decision}**
+
+          ## Exact results
+
+          - Commitment alias root cause: {commitment['clean_passes']}/3 clean passes
+          - Same-round full UDP reconstruction failure: {pipeline['clean_passes']}/3 clean passes
+          - Next honest round recovery: {recovery['clean_passes']}/5 clean passes
+          - Full monad-raptorcast library suite: {full_suite_pass}
+
+          ## Security interpretation
+
+          The high-S alias can win the raw-signature commitment race and suppress authentic
+          reconstruction in the Byzantine proposer's V1 round. The decisive test then advances
+          the same two honest receiver states to the next round and sends a fresh V1 proposal
+          from an honest proposer.
+
+          If the recovery gate passes, the poison is round-scoped. It does not persist through
+          the next honest leader, so a sustained network halt is not proven and High is killed.
+          The remaining issue is signature-canonicalization / one-round liveness hardening.
+
+          If the recovery gate fails, this artifact is still not submit-ready: a four-node
+          consensus finality halt and matched canonical-low-S patch are mandatory.
+
+          ## Submission state
+
+          - New High: not proven
+          - New Critical: not proven
+          - Submit-ready ZIP: no
+          - Previous epoch-boundary High: separate and unchanged
+          """
+          (root / "REPORT.md").write_text(report)
+          PY
+
+          cat evidence/RESULT.json
+          sha256sum evidence/RESULT.json evidence/REPORT.md > evidence/RESULTS.sha256
+
+      - name: Package immutable machine evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          BUNDLE='monad-v0160-highs-two-round-evidence-20260818.tar.zst'
+          tar \
+            --sort=name \
+            --mtime='UTC 2026-08-18' \
+            --owner=0 --group=0 --numeric-owner \
+            --zstd -cf "$BUNDLE" \
+            evidence
+          sha256sum "$BUNDLE" > "$BUNDLE.sha256"
+          tar --zstd -tf "$BUNDLE" > evidence/TAR_MEMBERS.txt
+          test -s evidence/RESULT.json
+          test -s evidence/REPORT.md
+          test -s "$BUNDLE.sha256"
+
+      - name: Upload exact two-round evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0160-highs-two-round-evidence-${{ github.run_id }}
+          path: |
+            monad-v0160-highs-two-round-evidence-20260818.tar.zst
+            monad-v0160-highs-two-round-evidence-20260818.tar.zst.sha256
+            evidence/RESULT.json
+            evidence/REPORT.md
+            evidence/RESULTS.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
