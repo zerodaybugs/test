@@ -1,0 +1,139 @@
+name: kiln-r33-control-plane-exact-v4-persist
+
+on:
+  push:
+    branches: [agent/kiln-r33-control-plane-exact-v2-20260818]
+    paths:
+      - .github/workflows/_temporary-kiln-r33-control-plane-exact-v4-persist-20260818.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        network: [ethereum, arbitrum, base, bnb, polygon, optimism]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 210
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/kiln-r33-control-plane-exact-v2-20260818
+          fetch-depth: 1
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Install and verify
+        run: |
+          python3 -m pip install --disable-pip-version-check 'web3==7.13.0' 'requests==2.32.5'
+          python3 -m py_compile kiln_r33/control_plane_exact_v2.py kiln_r33/control_plane_exact_v3.py
+
+      - name: Execute exact gate
+        id: execute
+        continue-on-error: true
+        env:
+          TARGET_NETWORK: ${{ matrix.network }}
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 kiln_r33/control_plane_exact_v3.py 2>&1 | tee private_run.log
+          printf '%s\n' "${PIPESTATUS[0]}" > private_exit_code.txt
+          exit "$(cat private_exit_code.txt)"
+
+      - name: Fail-closed public gate and hashes
+        if: always()
+        env:
+          TARGET_NETWORK: ${{ matrix.network }}
+          STEP_OUTCOME: ${{ steps.execute.outcome }}
+          RUN_ID: ${{ github.run_id }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,time
+          from pathlib import Path
+          network=os.environ['TARGET_NETWORK']; root=Path('r33_exact_results'); root.mkdir(exist_ok=True)
+          try: code=int(Path('private_exit_code.txt').read_text().strip())
+          except Exception: code=999
+          try: gate=json.loads((root/'PUBLIC_GATE.json').read_text())
+          except Exception: gate={}
+          if not gate:
+              gate={
+                'schema':'kiln-r33-v4-fallback-gate', 'decision':'INCONCLUSIVE_EXECUTION_FAILURE',
+                'submit_ready':False, 'validated_critical':0, 'validated_high':0,
+                'network':network, 'scope_count':0, 'component_count':0,
+                'candidate_count':0, 'verified_5of5_count':0, 'verified_candidates':[],
+                'rpc_agreement':False, 'local_fork_error_count':1,
+                'public_chain_state_changes':0, 'transactions_signed':0,
+                'transactions_sent':0, 'local_fork_transactions':0,
+              }
+          gate.update({
+            'runner_exit_code':code, 'step_outcome':os.environ.get('STEP_OUTCOME'),
+            'run_id':int(os.environ['RUN_ID']), 'source_sha':os.environ['SOURCE_SHA'],
+            'persisted_at_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+          })
+          if code!=0 or os.environ.get('STEP_OUTCOME')!='success':
+              gate.update({'decision':'INCONCLUSIVE_EXECUTION_FAILURE','submit_ready':False,'validated_critical':0,'validated_high':0})
+          (root/'PUBLIC_GATE.json').write_text(json.dumps(gate,indent=2,sort_keys=True))
+          files=sorted(p for p in root.iterdir() if p.is_file() and p.name!='SHA256SUMS.txt')
+          (root/'SHA256SUMS.txt').write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in files))
+          PY
+
+      - name: Validate safety and integrity
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          root=Path('r33_exact_results'); gate=json.loads((root/'PUBLIC_GATE.json').read_text())
+          assert gate['submit_ready'] is False
+          assert gate['validated_critical']==0 and gate['validated_high']==0
+          assert gate['public_chain_state_changes']==0 and gate['transactions_signed']==0 and gate['transactions_sent']==0
+          for line in (root/'SHA256SUMS.txt').read_text().splitlines():
+              digest,name=line.split('  ',1); assert hashlib.sha256((root/name).read_bytes()).hexdigest()==digest
+          p=root/'EVIDENCE.json'
+          if p.exists():
+              e=json.loads(p.read_text()); s=e['safety']
+              assert s['public_chain_state_changes']==0 and s['transactions_signed']==0 and s['transactions_sent_to_public_chain']==0
+          print('R33_V4_SELF_CHECK=PASS')
+          PY
+
+      - name: Persist network gate
+        if: always()
+        env:
+          TARGET_NETWORK: ${{ matrix.network }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          dest="r33_public_gates/${TARGET_NETWORK}"
+          rm -rf "$dest"; mkdir -p "$dest"
+          cp r33_exact_results/PUBLIC_GATE.json "$dest/"
+          cp r33_exact_results/SHA256SUMS.txt "$dest/"
+          printf '%s\n' '${{ github.run_id }}' > "$dest/RUN_ID.txt"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$dest"
+          git commit -m "persist Kiln R33 ${TARGET_NETWORK} control-plane gate" || exit 0
+          for attempt in 1 2 3 4 5 6 7 8; do
+            git pull --rebase origin agent/kiln-r33-control-plane-exact-v2-20260818
+            if git push origin HEAD:agent/kiln-r33-control-plane-exact-v2-20260818; then exit 0; fi
+            sleep $((attempt * 3))
+          done
+          exit 1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kiln-r33-v4-${{ matrix.network }}-private-evidence
+          path: |
+            r33_exact_results
+            private_run.log
+            private_exit_code.txt
+            kiln_r33/control_plane_exact_v2.py
+            kiln_r33/control_plane_exact_v3.py
+          if-no-files-found: error
+          retention-days: 3
