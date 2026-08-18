@@ -1,0 +1,206 @@
+name: kiln-r32-targeted-recovery-persist
+
+on:
+  push:
+    branches: [agent/kiln-r32-signal-recovery-20260818]
+    paths:
+      - .github/workflows/_temporary-kiln-r32-targeted-recovery-persist-20260818.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  recover-and-persist:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/kiln-r32-signal-recovery-20260818
+          fetch-depth: 1
+
+      - name: Install pinned runtime
+        run: python3 -m pip install --disable-pip-version-check 'web3==7.13.0'
+
+      - name: Verify inputs
+        run: |
+          python3 -m py_compile kiln_r31/runtime_census.py
+          test -s r30_scope/SCOPE.json
+          test -s kiln_r31/delivery_public.pem
+
+      - name: Recover positive and error shards
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf r32_recovered
+          mkdir -p r32_recovered
+
+          specs=(
+            'ethereum 0 4'
+            'ethereum 1 4'
+            'ethereum 2 4'
+            'ethereum 3 4'
+            'bnb 0 1'
+            'base 0 1'
+          )
+
+          for spec in "${specs[@]}"; do
+            read -r network shard_index shard_count <<< "$spec"
+            key="${network}_${shard_index}"
+            out="r32_recovered/${key}"
+            mkdir -p "$out/encrypted"
+            rm -rf r31_results
+
+            set +e
+            TARGET_NETWORK="$network" SHARD_INDEX="$shard_index" SHARD_COUNT="$shard_count" \
+              python3 kiln_r31/runtime_census.py > "$out/private_run.log" 2>&1
+            code=$?
+            set -e
+            printf '%s\n' "$code" > "$out/private_exit_code.txt"
+
+            python3 - "$network" "$shard_index" "$shard_count" "$code" <<'PY'
+          import hashlib,json,sys
+          from pathlib import Path
+          network,shard_index,shard_count,code=sys.argv[1],int(sys.argv[2]),int(sys.argv[3]),int(sys.argv[4])
+          root=Path('r31_results'); root.mkdir(exist_ok=True)
+          gate_path=root/'PUBLIC_GATE.json'
+          if gate_path.exists():
+              gate=json.loads(gate_path.read_text())
+          else:
+              gate={
+                'schema':'kiln-r32-public-gate-fallback-v1',
+                'decision':'INCONCLUSIVE_EXECUTION_FAILURE',
+                'submit_ready':False,
+                'validated_critical':0,
+                'validated_high':0,
+                'network':network,
+                'shard_index':shard_index,
+                'shard_count':shard_count,
+                'selected_count':0,
+                'inspected_count':0,
+                'error_count':1,
+                'signal_row_count':0,
+                'unique_connector_count':0,
+                'public_chain_state_changes':0,
+                'transactions_signed':0,
+                'transactions_sent':0,
+              }
+          gate['runner_exit_code']=code
+          if code != 0:
+              gate.update({
+                'decision':'INCONCLUSIVE_EXECUTION_FAILURE',
+                'submit_ready':False,
+                'validated_critical':0,
+                'validated_high':0,
+              })
+          gate_path.write_text(json.dumps(gate,indent=2,sort_keys=True))
+          files=sorted(p for p in root.iterdir() if p.is_file() and p.name!='SHA256SUMS.txt')
+          (root/'SHA256SUMS.txt').write_text(''.join(
+              f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in files
+          ))
+          PY
+
+            python3 - "$out" <<'PY'
+          import hashlib,json,sys
+          from pathlib import Path
+          out=Path(sys.argv[1]); root=Path('r31_results')
+          gate=json.loads((root/'PUBLIC_GATE.json').read_text())
+          assert gate['submit_ready'] is False
+          assert gate['validated_critical']==0 and gate['validated_high']==0
+          for line in (root/'SHA256SUMS.txt').read_text().splitlines():
+              digest,name=line.split('  ',1)
+              assert hashlib.sha256((root/name).read_bytes()).hexdigest()==digest
+          evidence=root/'EVIDENCE.json'
+          if evidence.exists():
+              e=json.loads(evidence.read_text())
+              safety=e.get('safety',{})
+              assert safety.get('public_chain_state_changes',0)==0
+              assert safety.get('transactions_signed',0)==0
+              assert safety.get('transactions_sent',0)==0
+          (out/'PUBLIC_GATE.json').write_bytes((root/'PUBLIC_GATE.json').read_bytes())
+          (out/'PUBLIC_SHA256SUMS.txt').write_bytes((root/'SHA256SUMS.txt').read_bytes())
+          PY
+
+            tar -czf "/tmp/${key}.tar.gz" r31_results "$out/private_run.log" "$out/private_exit_code.txt" kiln_r31/runtime_census.py r30_scope/SCOPE.json
+            openssl rand 32 > "/tmp/${key}.aes.key"
+            openssl enc -aes-256-cbc -salt -pbkdf2 -iter 250000 \
+              -in "/tmp/${key}.tar.gz" -out "$out/encrypted/payload.aes256" \
+              -pass "file:/tmp/${key}.aes.key"
+            openssl pkeyutl -encrypt -pubin -inkey kiln_r31/delivery_public.pem \
+              -in "/tmp/${key}.aes.key" -out "$out/encrypted/key.rsa3072" \
+              -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+            sha256sum "$out/encrypted/payload.aes256" "$out/encrypted/key.rsa3072" \
+              > "$out/encrypted/SHA256SUMS.txt"
+
+            python3 - "$out" "$network" "$shard_index" "$shard_count" "$code" <<'PY'
+          import hashlib,json,sys
+          from pathlib import Path
+          out=Path(sys.argv[1]); network=sys.argv[2]; shard_index=int(sys.argv[3]); shard_count=int(sys.argv[4]); code=int(sys.argv[5])
+          gate=json.loads((out/'PUBLIC_GATE.json').read_text())
+          manifest={
+            'schema':'kiln-r32-persisted-encrypted-delivery-v1',
+            'network':network,
+            'shard_index':shard_index,
+            'shard_count':shard_count,
+            'runner_exit_code':code,
+            'gate_decision':gate.get('decision'),
+            'selected_count':gate.get('selected_count'),
+            'inspected_count':gate.get('inspected_count'),
+            'error_count':gate.get('error_count'),
+            'signal_row_count':gate.get('signal_row_count'),
+            'plaintext_private_evidence_persisted':False,
+            'public_chain_state_changes':0,
+            'transactions_signed':0,
+            'transactions_sent':0,
+            'private_keys_loaded':0,
+          }
+          (out/'PUBLIC_MANIFEST.json').write_text(json.dumps(manifest,indent=2,sort_keys=True))
+          PY
+
+            rm -rf r31_results
+            rm -f "/tmp/${key}.tar.gz" "/tmp/${key}.aes.key"
+          done
+
+          find r32_recovered -type f -print | sort
+
+      - name: Validate persisted encrypted bundles
+        run: |
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          root=Path('r32_recovered')
+          dirs=sorted(p for p in root.iterdir() if p.is_dir())
+          assert len(dirs)==6, len(dirs)
+          for d in dirs:
+              gate=json.loads((d/'PUBLIC_GATE.json').read_text())
+              manifest=json.loads((d/'PUBLIC_MANIFEST.json').read_text())
+              assert gate['submit_ready'] is False
+              assert gate['validated_critical']==0 and gate['validated_high']==0
+              assert manifest['public_chain_state_changes']==0
+              assert manifest['transactions_signed']==0
+              assert manifest['transactions_sent']==0
+              sums=(d/'encrypted'/'SHA256SUMS.txt').read_text().splitlines()
+              for line in sums:
+                  digest,path=line.split(maxsplit=1)
+                  candidate=d/'encrypted'/Path(path).name
+                  assert hashlib.sha256(candidate.read_bytes()).hexdigest()==digest
+          print('R32_PERSISTED_BUNDLES=PASS')
+          PY
+
+      - name: Persist encrypted recovery material
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add r32_recovered
+          git commit -m 'persist encrypted Kiln R32 signal evidence' || exit 0
+          for attempt in 1 2 3 4 5; do
+            git pull --rebase origin agent/kiln-r32-signal-recovery-20260818
+            if git push origin HEAD:agent/kiln-r32-signal-recovery-20260818; then
+              exit 0
+            fi
+            sleep $((attempt * 4))
+          done
+          exit 1
