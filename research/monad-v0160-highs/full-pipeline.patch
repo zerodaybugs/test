@@ -1,0 +1,137 @@
+--- /mnt/data/udp.rs.before_highs	2026-08-09 16:24:13.150871078 +0000
++++ monad-raptorcast/src/udp.rs	2026-08-09 16:24:42.863018975 +0000
+@@ -2184,4 +2184,134 @@
+             assert_eq!(pp.payload, vp.payload);
+         }
+     }
++
++    fn sub_be_32_high_s(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
++        let mut out = [0u8; 32];
++        let mut borrow = 0u16;
++        for i in (0..32).rev() {
++            let ai = a[i] as u16;
++            let bi = b[i] as u16 + borrow;
++            if ai >= bi {
++                out[i] = (ai - bi) as u8;
++                borrow = 0;
++            } else {
++                out[i] = (ai + 256 - bi) as u8;
++                borrow = 1;
++            }
++        }
++        assert_eq!(borrow, 0);
++        out
++    }
++
++    fn malleate_recoverable_signature(payload: &Bytes) -> Bytes {
++        use bytes::BytesMut;
++        let mut out = BytesMut::from(payload.as_ref());
++        assert!(out.len() >= crate::SIGNATURE_SIZE);
++        let mut low_s = [0u8; 32];
++        low_s.copy_from_slice(&out[32..64]);
++        let high_s = sub_be_32_high_s(&[0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xfe,0xba,0xae,0xdc,0xe6,0xaf,0x48,0xa0,0x3b,0xbf,0xd2,0x5e,0x8c,0xd0,0x36,0x41,0x41], &low_s);
++        out[32..64].copy_from_slice(&high_s);
++        out[64] ^= 1;
++        out.freeze()
++    }
++
++    #[test]
++    fn malleated_first_chunk_blocks_authentic_v1_message_reconstruction() {
++        use std::{collections::BTreeMap, net::{IpAddr, Ipv4Addr, SocketAddr}};
++        use monad_crypto::{
++            certificate_signature::{CertificateKeyPair, PubKey as _},
++            hasher::{Hasher, HasherType},
++        };
++        use monad_secp::{KeyPair, SecpSignature};
++        use monad_types::{Epoch, NodeId, Round, Stake};
++        use monad_validator::validator_set::ValidatorSet;
++        use crate::{
++            auth::AuthRecvMsg,
++            packet::MessageBuilder,
++            util::{BuildTarget, FullNodeGroupMap, PrimaryBroadcastGroup, Redundancy, StubProposerSchedule},
++            v1_rollout::DeterministicProtocolRolloutStage,
++        };
++
++        fn key(seed: u8) -> KeyPair {
++            let mut h = HasherType::new();
++            h.update([seed]);
++            let mut bytes = h.hash().0;
++            KeyPair::from_bytes(&mut bytes).unwrap()
++        }
++
++        let proposer_key = key(1);
++        let attacker_key = key(2);
++        let receiver_key = key(3);
++        let other_key = key(4);
++        let proposer = NodeId::new(proposer_key.pubkey());
++        let attacker = NodeId::new(attacker_key.pubkey());
++        let receiver = NodeId::new(receiver_key.pubkey());
++        let other = NodeId::new(other_key.pubkey());
++        let epoch = Epoch(1);
++        let round = Round(42);
++
++        let validators = ValidatorSet::new_unchecked([
++            (proposer, Stake::ONE),
++            (attacker, Stake::ONE),
++            (receiver, Stake::ONE),
++            (other, Stake::ONE),
++        ].into());
++        let validator_map: BTreeMap<_, _> = [(epoch, validators.clone())].into();
++        let group = PrimaryBroadcastGroup::of_epoch(epoch, &proposer, &validator_map).unwrap();
++
++        // Multiple source symbols are required, so one poisoned chunk cannot decode the message.
++        let app_message = vec![0xA5u8; 128 * 1024];
++        let packets = MessageBuilder::<SecpSignature>::new(&proposer_key)
++            .unix_ts_ms(1_700_000_000_000u64)
++            .redundancy(Redundancy::from_u8(2))
++            .build_vec(&app_message, &BuildTarget::deterministic_raptorcast(group, round))
++            .expect("deterministic message builds");
++        assert!(packets.len() > 2);
++
++        let feed = |state: &mut UdpState<SecpSignature>, payload: Bytes, stride: usize| {
++            state.handle_message(
++                &validator_map,
++                &FullNodeGroupMap::default(),
++                &StubProposerSchedule::VALID,
++                |_, _, _| {},
++                AuthRecvMsg {
++                    src_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000),
++                    payload,
++                    stride: u16::try_from(stride).unwrap(),
++                    sender: Some(attacker),
++                },
++            )
++        };
++
++        let mut control = UdpState::<SecpSignature>::new(receiver, u64::MAX, 10_000);
++        control.set_v1_rollout(DeterministicProtocolRolloutStage::AcceptBothPublishV1);
++        control.update_current_round(round);
++        let control_decoded: usize = packets
++            .iter()
++            .map(|p| feed(&mut control, p.payload.clone(), p.stride).len())
++            .sum();
++        assert_eq!(control_decoded, 1, "authentic chunks reconstruct normally");
++
++        let mut poisoned = UdpState::<SecpSignature>::new(receiver, u64::MAX, 10_000);
++        poisoned.set_v1_rollout(DeterministicProtocolRolloutStage::AcceptBothPublishV1);
++        poisoned.update_current_round(round);
++
++        let poison_payload = malleate_recoverable_signature(&packets[0].payload);
++        assert_ne!(poison_payload, packets[0].payload);
++        assert_eq!(
++            feed(&mut poisoned, poison_payload, packets[0].stride).len(),
++            0,
++            "one symbol must not be enough to decode"
++        );
++
++        let decoded_after_poison: usize = packets
++            .iter()
++            .map(|p| feed(&mut poisoned, p.payload.clone(), p.stride).len())
++            .sum();
++        assert_eq!(
++            decoded_after_poison, 0,
++            "the authentic signature is rejected as a conflicting commitment after the alias wins the race"
++        );
++    }
++
++ }
