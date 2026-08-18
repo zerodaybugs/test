@@ -1,0 +1,171 @@
+--- monad-raptorcast/src/udp.rs
++++ monad-raptorcast/src/udp.rs
+@@ -2314,4 +2314,168 @@
+         );
+     }
+ 
++
++    #[test]
++    fn high_s_alias_poisoning_is_round_scoped_and_next_honest_round_recovers() {
++        use std::{
++            collections::BTreeMap,
++            net::{IpAddr, Ipv4Addr, SocketAddr},
++        };
++
++        use monad_crypto::{
++            certificate_signature::{CertificateKeyPair, PubKey as _},
++            hasher::{Hasher, HasherType},
++        };
++        use monad_secp::{KeyPair, SecpSignature};
++        use monad_types::{Epoch, NodeId, Round, Stake};
++        use monad_validator::validator_set::ValidatorSet;
++
++        use crate::{
++            auth::AuthRecvMsg,
++            packet::MessageBuilder,
++            util::{
++                BuildTarget, FullNodeGroupMap, PrimaryBroadcastGroup, Redundancy,
++                StubProposerSchedule,
++            },
++            v1_rollout::DeterministicProtocolRolloutStage,
++        };
++
++        fn key(seed: u8) -> KeyPair {
++            let mut h = HasherType::new();
++            h.update([seed]);
++            let mut bytes = h.hash().0;
++            KeyPair::from_bytes(&mut bytes).expect("valid key")
++        }
++
++        let byzantine_key = key(11);
++        let recovery_proposer_key = key(12);
++        let receiver_a_key = key(13);
++        let receiver_b_key = key(14);
++
++        let byzantine = NodeId::new(byzantine_key.pubkey());
++        let recovery_proposer = NodeId::new(recovery_proposer_key.pubkey());
++        let receiver_a = NodeId::new(receiver_a_key.pubkey());
++        let receiver_b = NodeId::new(receiver_b_key.pubkey());
++
++        let epoch = Epoch(1);
++        let poisoned_round = Round(42);
++        let recovery_round = Round(43);
++
++        let validators = ValidatorSet::new_unchecked(
++            [
++                (byzantine, Stake::ONE),
++                (recovery_proposer, Stake::ONE),
++                (receiver_a, Stake::ONE),
++                (receiver_b, Stake::ONE),
++            ]
++            .into(),
++        );
++        let validator_map: BTreeMap<_, _> = [(epoch, validators.clone())].into();
++
++        let poisoned_group =
++            PrimaryBroadcastGroup::of_epoch(epoch, &byzantine, &validator_map).unwrap();
++        let recovery_group =
++            PrimaryBroadcastGroup::of_epoch(epoch, &recovery_proposer, &validator_map).unwrap();
++
++        let poisoned_message = vec![0xA5u8; 128 * 1024];
++        let poisoned_packets = MessageBuilder::<SecpSignature>::new(&byzantine_key)
++            .unix_ts_ms(1_700_000_000_000u64)
++            .redundancy(Redundancy::from_u8(2))
++            .build_vec(
++                &poisoned_message,
++                &BuildTarget::deterministic_raptorcast(poisoned_group, poisoned_round),
++            )
++            .expect("poisoned-round message builds");
++        assert!(poisoned_packets.len() > 2);
++
++        let recovery_message = vec![0x5Au8; 128 * 1024];
++        let recovery_packets = MessageBuilder::<SecpSignature>::new(&recovery_proposer_key)
++            .unix_ts_ms(1_700_000_000_001u64)
++            .redundancy(Redundancy::from_u8(2))
++            .build_vec(
++                &recovery_message,
++                &BuildTarget::deterministic_raptorcast(recovery_group, recovery_round),
++            )
++            .expect("recovery-round message builds");
++        assert!(recovery_packets.len() > 2);
++
++        let feed = |
++            state: &mut UdpState<SecpSignature>,
++            payload: Bytes,
++            stride: usize,
++            sender: NodeId<PubKeyType>,
++        | {
++            state.handle_message(
++                &validator_map,
++                &FullNodeGroupMap::default(),
++                &StubProposerSchedule::VALID,
++                |_, _, _| {},
++                AuthRecvMsg {
++                    src_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000),
++                    payload,
++                    stride: u16::try_from(stride).unwrap(),
++                    sender: Some(sender),
++                },
++            )
++        };
++
++        for receiver in [receiver_a, receiver_b] {
++            let mut state = UdpState::<SecpSignature>::new(receiver, u64::MAX, 10_000);
++            state.set_v1_rollout(DeterministicProtocolRolloutStage::AcceptBothPublishV1);
++            state.update_current_round(poisoned_round);
++
++            let poison_payload =
++                malleate_recoverable_signature(&poisoned_packets[0].payload);
++            assert_eq!(
++                feed(
++                    &mut state,
++                    poison_payload,
++                    poisoned_packets[0].stride,
++                    byzantine,
++                )
++                .len(),
++                0,
++                "one poisoned symbol must not decode the message"
++            );
++
++            let poisoned_decoded: usize = poisoned_packets
++                .iter()
++                .map(|packet| {
++                    feed(
++                        &mut state,
++                        packet.payload.clone(),
++                        packet.stride,
++                        byzantine,
++                    )
++                    .len()
++                })
++                .sum();
++            assert_eq!(
++                poisoned_decoded, 0,
++                "the high-S alias must poison only the Byzantine proposal round"
++            );
++
++            state.update_current_round(recovery_round);
++            let recovered: Vec<_> = recovery_packets
++                .iter()
++                .flat_map(|packet| {
++                    feed(
++                        &mut state,
++                        packet.payload.clone(),
++                        packet.stride,
++                        recovery_proposer,
++                    )
++                })
++                .collect();
++
++            assert_eq!(
++                recovered.len(),
++                1,
++                "a fresh honest V1 proposal in the next round must reconstruct"
++            );
++            assert_eq!(recovered[0].0, recovery_proposer);
++            assert_eq!(recovered[0].1, Bytes::from(recovery_message.clone()));
++        }
++    }
++
++ }
