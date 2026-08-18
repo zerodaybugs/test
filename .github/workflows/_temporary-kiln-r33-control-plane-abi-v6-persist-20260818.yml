@@ -1,0 +1,213 @@
+name: kiln-r33-control-plane-abi-v6-persist
+
+on:
+  push:
+    branches: [agent/kiln-r33-control-plane-exact-v2-20260818]
+    paths:
+      - kiln_r33/build_abi_payloads.py
+      - kiln_r33/control_plane_exact_v4.py
+      - .github/workflows/_temporary-kiln-r33-control-plane-abi-v6-persist-20260818.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  abi-control-plane:
+    strategy:
+      fail-fast: false
+      matrix:
+        network: [ethereum, arbitrum, base, bnb, polygon, optimism]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/kiln-r33-control-plane-exact-v2-20260818
+          fetch-depth: 1
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Install pinned Python runtime
+        run: python3 -m pip install --disable-pip-version-check 'web3==7.13.0' 'requests==2.32.5'
+
+      - name: Verify scanners and canonical slots
+        run: |
+          python3 -m py_compile kiln_r33/control_plane_exact_v2.py kiln_r33/control_plane_exact_v4.py kiln_r33/build_abi_payloads.py
+          PYTHONPATH=kiln_r33 python3 - <<'PY'
+          import control_plane_exact_v4 as module
+          assert hex(module.gate.IMPLEMENTATION_SLOT).endswith('d382bbc')
+          assert hex(module.gate.BEACON_SLOT).endswith('133d50')
+          assert module.gate.ADMIN_SLOT not in {module.gate.IMPLEMENTATION_SLOT,module.gate.BEACON_SLOT}
+          print('R33_V6_SLOT_CHECK=PASS')
+          PY
+
+      - name: Build ABI payload corpus from pinned Kiln source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf mirror r33_abis
+          mkdir r33_abis
+          git clone https://github.com/dumebi042/kiln-vault.git mirror
+          cd mirror
+          git checkout 33359ff399fd9fbf31ca87e3671446eb37a7ee61
+          git submodule update --init --recursive || true
+          forge build > ../r33_forge_build.log 2>&1 || true
+          specs=(
+            'Vault:src/Vault.sol:Vault'
+            'VaultFactory:src/VaultFactory.sol:VaultFactory'
+            'ConnectorRegistry:src/ConnectorRegistry.sol:ConnectorRegistry'
+            'ExternalAccessControl:src/ExternalAccessControl.sol:ExternalAccessControl'
+            'VaultUpgradeableBeacon:src/VaultUpgradeableBeacon.sol:VaultUpgradeableBeacon'
+            'BlockList:src/BlockList.sol:BlockList'
+            'BlockListFactory:src/BlockListFactory.sol:BlockListFactory'
+            'BlockListUpgradeableBeacon:src/BlockListUpgradeableBeacon.sol:BlockListUpgradeableBeacon'
+            'FeeDispatcher:src/FeeDispatcher.sol:FeeDispatcher'
+          )
+          for item in "${specs[@]}"; do
+            name=${item%%:*}
+            spec=${item#*:}
+            if forge inspect "$spec" abi > "../r33_abis/${name}.json" 2>> ../r33_forge_build.log; then
+              python3 -m json.tool "../r33_abis/${name}.json" >/dev/null || rm -f "../r33_abis/${name}.json"
+            else
+              rm -f "../r33_abis/${name}.json"
+            fi
+          done
+          cd ..
+          set +e
+          python3 kiln_r33/build_abi_payloads.py r33_abis r33_payload_corpus.json > r33_payload_builder.log 2>&1
+          corpus_code=$?
+          set -e
+          printf '%s\n' "$corpus_code" > r33_payload_builder_exit_code.txt
+          if [ ! -s r33_payload_corpus.json ]; then
+            printf '%s\n' '{"schema":"kiln-r33-empty-corpus","abi_file_count":0,"payload_count":0,"error_count":1,"entries":[],"errors":[{"error":"ABI corpus unavailable"}]}' > r33_payload_corpus.json
+          fi
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('r33_payload_corpus.json').read_text())
+          assert isinstance(data.get('entries'),list)
+          print(json.dumps({k:data.get(k) for k in ('abi_file_count','payload_count','error_count')},sort_keys=True))
+          PY
+
+      - name: Execute ABI-driven fixed-block takeover gate
+        id: execute
+        continue-on-error: true
+        env:
+          TARGET_NETWORK: ${{ matrix.network }}
+          R33_PAYLOAD_CORPUS: r33_payload_corpus.json
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 kiln_r33/control_plane_exact_v4.py 2>&1 | tee private_run.log
+          printf '%s\n' "${PIPESTATUS[0]}" > private_exit_code.txt
+          exit "$(cat private_exit_code.txt)"
+
+      - name: Fail-closed public gate, corpus metadata, and hashes
+        if: always()
+        env:
+          TARGET_NETWORK: ${{ matrix.network }}
+          STEP_OUTCOME: ${{ steps.execute.outcome }}
+          RUN_ID: ${{ github.run_id }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,time
+          from pathlib import Path
+          network=os.environ['TARGET_NETWORK']; root=Path('r33_exact_results'); root.mkdir(exist_ok=True)
+          try: code=int(Path('private_exit_code.txt').read_text().strip())
+          except Exception: code=999
+          try: gate=json.loads((root/'PUBLIC_GATE.json').read_text())
+          except Exception: gate={}
+          try: corpus=json.loads(Path('r33_payload_corpus.json').read_text())
+          except Exception: corpus={}
+          if not gate:
+              gate={
+                'schema':'kiln-r33-v6-fallback-gate','decision':'INCONCLUSIVE_EXECUTION_FAILURE',
+                'submit_ready':False,'validated_critical':0,'validated_high':0,'network':network,
+                'scope_count':0,'component_count':0,'candidate_count':0,'verified_5of5_count':0,
+                'verified_candidates':[],'rpc_agreement':False,'local_fork_error_count':1,
+                'public_chain_state_changes':0,'transactions_signed':0,'transactions_sent':0,
+                'local_fork_transactions':0,
+              }
+          gate.update({
+            'runner_exit_code':code,'step_outcome':os.environ.get('STEP_OUTCOME'),
+            'run_id':int(os.environ['RUN_ID']),'source_sha':os.environ['SOURCE_SHA'],
+            'pinned_source_commit':'33359ff399fd9fbf31ca87e3671446eb37a7ee61',
+            'abi_file_count':int(corpus.get('abi_file_count',0) or 0),
+            'abi_payload_count':int(corpus.get('payload_count',0) or 0),
+            'abi_payload_error_count':int(corpus.get('error_count',0) or 0),
+            'persisted_at_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+          })
+          if code!=0 or os.environ.get('STEP_OUTCOME')!='success':
+              gate.update({'decision':'INCONCLUSIVE_EXECUTION_FAILURE','submit_ready':False,'validated_critical':0,'validated_high':0})
+          (root/'PUBLIC_GATE.json').write_text(json.dumps(gate,indent=2,sort_keys=True))
+          files=sorted(p for p in root.iterdir() if p.is_file() and p.name!='SHA256SUMS.txt')
+          (root/'SHA256SUMS.txt').write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in files))
+          PY
+
+      - name: Validate safety and integrity
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          root=Path('r33_exact_results'); gate=json.loads((root/'PUBLIC_GATE.json').read_text())
+          assert gate['submit_ready'] is False
+          assert gate['validated_critical']==0 and gate['validated_high']==0
+          assert gate['public_chain_state_changes']==0 and gate['transactions_signed']==0 and gate['transactions_sent']==0
+          for line in (root/'SHA256SUMS.txt').read_text().splitlines():
+              digest,name=line.split('  ',1); assert hashlib.sha256((root/name).read_bytes()).hexdigest()==digest
+          evidence=root/'EVIDENCE.json'
+          if evidence.exists():
+              data=json.loads(evidence.read_text()); safety=data['safety']
+              assert safety['public_chain_state_changes']==0
+              assert safety['transactions_signed']==0
+              assert safety['transactions_sent_to_public_chain']==0
+              assert safety['private_keys_loaded']==0
+          print('R33_V6_SELF_CHECK=PASS')
+          PY
+
+      - name: Persist network gate
+        if: always()
+        env:
+          TARGET_NETWORK: ${{ matrix.network }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          dest="r33_v6_public_gates/${TARGET_NETWORK}"
+          rm -rf "$dest"; mkdir -p "$dest"
+          cp r33_exact_results/PUBLIC_GATE.json "$dest/"
+          cp r33_exact_results/SHA256SUMS.txt "$dest/"
+          printf '%s\n' '${{ github.run_id }}' > "$dest/RUN_ID.txt"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$dest"
+          git commit -m "persist Kiln R33 v6 ${TARGET_NETWORK} gate" || exit 0
+          for attempt in 1 2 3 4 5 6 7 8; do
+            git pull --rebase origin agent/kiln-r33-control-plane-exact-v2-20260818
+            if git push origin HEAD:agent/kiln-r33-control-plane-exact-v2-20260818; then exit 0; fi
+            sleep $((attempt * 3))
+          done
+          exit 1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kiln-r33-v6-${{ matrix.network }}-private-evidence
+          path: |
+            r33_exact_results
+            private_run.log
+            private_exit_code.txt
+            r33_payload_corpus.json
+            r33_payload_builder.log
+            r33_payload_builder_exit_code.txt
+            r33_abis
+            r33_forge_build.log
+            kiln_r33/control_plane_exact_v2.py
+            kiln_r33/control_plane_exact_v4.py
+            kiln_r33/build_abi_payloads.py
+          if-no-files-found: warn
+          retention-days: 3
