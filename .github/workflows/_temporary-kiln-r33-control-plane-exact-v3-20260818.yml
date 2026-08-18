@@ -1,0 +1,171 @@
+name: kiln-r33-control-plane-exact-v3
+
+on:
+  push:
+    branches: [agent/kiln-r33-control-plane-exact-v2-20260818]
+    paths:
+      - kiln_r33/control_plane_exact_v2.py
+      - kiln_r33/control_plane_exact_v3.py
+      - .github/workflows/_temporary-kiln-r33-control-plane-exact-v3-20260818.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  control-plane:
+    strategy:
+      fail-fast: false
+      matrix:
+        network: [ethereum, arbitrum, base, bnb, polygon, optimism]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 210
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/kiln-r33-control-plane-exact-v2-20260818
+          fetch-depth: 1
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Install pinned Python runtime
+        run: python3 -m pip install --disable-pip-version-check 'web3==7.13.0' 'requests==2.32.5'
+
+      - name: Verify sources and canonical slot derivation
+        run: |
+          python3 -m py_compile kiln_r33/control_plane_exact_v2.py
+          python3 -m py_compile kiln_r33/control_plane_exact_v3.py
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          p=Path('kiln_r33/control_plane_exact_v3.py')
+          spec=importlib.util.spec_from_file_location('r33slots',p)
+          module=importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          assert hex(module.gate.IMPLEMENTATION_SLOT).endswith('d382bbc')
+          assert hex(module.gate.BEACON_SLOT).endswith('133d50')
+          assert module.gate.ADMIN_SLOT != module.gate.IMPLEMENTATION_SLOT
+          print('R33_SLOT_DERIVATION=PASS')
+          PY
+
+      - name: Run exact public-quorum and local-fork takeover gate
+        id: gate
+        continue-on-error: true
+        env:
+          TARGET_NETWORK: ${{ matrix.network }}
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 kiln_r33/control_plane_exact_v3.py 2>&1 | tee r33_${{ matrix.network }}.log
+          printf '%s\n' "${PIPESTATUS[0]}" > r33_${{ matrix.network }}_exit_code.txt
+          exit "$(cat r33_${{ matrix.network }}_exit_code.txt)"
+
+      - name: Build fail-closed public gate and refresh hashes
+        if: always()
+        env:
+          TARGET_NETWORK: ${{ matrix.network }}
+          STEP_OUTCOME: ${{ steps.gate.outcome }}
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,time
+          from pathlib import Path
+          network=os.environ['TARGET_NETWORK']
+          root=Path('r33_exact_results'); root.mkdir(exist_ok=True)
+          exit_path=Path(f'r33_{network}_exit_code.txt')
+          try: code=int(exit_path.read_text().strip())
+          except Exception: code=999
+          gate_path=root/'PUBLIC_GATE.json'
+          try: gate=json.loads(gate_path.read_text()) if gate_path.exists() else {}
+          except Exception: gate={}
+          if not gate:
+              gate={
+                'schema':'kiln-r33-fallback-public-gate-v3',
+                'decision':'INCONCLUSIVE_EXECUTION_FAILURE',
+                'submit_ready':False,
+                'validated_critical':0,
+                'validated_high':0,
+                'network':network,
+                'scope_count':0,
+                'component_count':0,
+                'candidate_count':0,
+                'verified_5of5_count':0,
+                'verified_candidates':[],
+                'rpc_agreement':False,
+                'local_fork_error_count':1,
+                'public_chain_state_changes':0,
+                'transactions_signed':0,
+                'transactions_sent':0,
+                'local_fork_transactions':0,
+              }
+          gate['runner_exit_code']=code
+          gate['step_outcome']=os.environ.get('STEP_OUTCOME')
+          gate['persisted_at_utc']=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())
+          if code!=0 or os.environ.get('STEP_OUTCOME')!='success':
+              gate.update({
+                'decision':'INCONCLUSIVE_EXECUTION_FAILURE',
+                'submit_ready':False,
+                'validated_critical':0,
+                'validated_high':0,
+              })
+          gate_path.write_text(json.dumps(gate,indent=2,sort_keys=True))
+          files=sorted(path for path in root.iterdir() if path.is_file() and path.name!='SHA256SUMS.txt')
+          (root/'SHA256SUMS.txt').write_text(''.join(
+              f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n' for path in files
+          ))
+          PY
+
+      - name: Self-check public and private evidence
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          root=Path('r33_exact_results')
+          gate=json.loads((root/'PUBLIC_GATE.json').read_text())
+          assert gate['submit_ready'] is False
+          assert gate['validated_critical']==0 and gate['validated_high']==0
+          assert gate['public_chain_state_changes']==0
+          assert gate['transactions_signed']==0 and gate['transactions_sent']==0
+          for line in (root/'SHA256SUMS.txt').read_text().splitlines():
+              digest,name=line.split('  ',1)
+              assert hashlib.sha256((root/name).read_bytes()).hexdigest()==digest
+          evidence=root/'EVIDENCE.json'
+          if evidence.exists():
+              data=json.loads(evidence.read_text())
+              safety=data['safety']
+              assert safety['public_chain_state_changes']==0
+              assert safety['transactions_signed']==0
+              assert safety['transactions_sent_to_public_chain']==0
+              assert safety['private_keys_loaded']==0
+          print('R33_EXACT_SELF_CHECK=PASS')
+          PY
+
+      - name: Stage public gate
+        if: always()
+        run: |
+          mkdir -p public_gate
+          cp r33_exact_results/PUBLIC_GATE.json public_gate/
+          cp r33_exact_results/SHA256SUMS.txt public_gate/
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kiln-r33-${{ matrix.network }}-private-evidence
+          path: |
+            r33_exact_results
+            r33_${{ matrix.network }}.log
+            r33_${{ matrix.network }}_exit_code.txt
+            kiln_r33/control_plane_exact_v2.py
+            kiln_r33/control_plane_exact_v3.py
+          if-no-files-found: error
+          retention-days: 3
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kiln-r33-${{ matrix.network }}-public-gate
+          path: public_gate
+          if-no-files-found: error
+          retention-days: 3
