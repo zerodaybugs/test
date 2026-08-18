@@ -90,7 +90,7 @@ def connect(network:str,probe:str)->tuple[list[tuple[Web3,str,int]],int,str]:
     return out,block,bh
 
 def read_dispatcher(w3:Web3,vault:str,block:int)->str|None:
-    raw=bytes(w3.eth.get_storage_at(Web3.to_checksum_address(vault),VAULT_SLOT+8,block_identifier=block))
+    raw=bytes(w3.eth.get_storage_at(Web3.to_checksum_address(vault),VAULT_SLOT+9,block_identifier=block))
     if len(raw)<20: return None
     a=Web3.to_checksum_address('0x'+raw[-20:].hex())
     return None if a==ZERO else a
@@ -100,10 +100,13 @@ def query(w3:Web3,row:dict[str,Any],block:int,bh:str)->dict[str,Any]:
     x={'network':TARGET,'label':row['label'],'scope_connector':row['connector'],'vault':vault,'block':block,'block_hash':bh,'vault_code_sha256':codehash(w3,vault,block)}
     getters=['asset','totalAssets','totalSupply','depositFee','rewardFee','pendingDepositFee','pendingRewardFee','collectableRewardFees','connectorName','connectorRegistry','decimals']
     for n in getters: x[n]=safe(getattr(v.functions,n)(),block)
-    asset=checksum(val(x['asset'])); decimals=val(x['decimals'])
-    if not asset or decimals is None: raise RuntimeError('asset/decimals unresolved')
-    decimals=int(decimals); token=w3.eth.contract(asset,abi=ERC20)
+    asset=checksum(val(x['asset'])); share_decimals=val(x['decimals'])
+    if not asset or share_decimals is None: raise RuntimeError('asset/share decimals unresolved')
+    share_decimals=int(share_decimals); token=w3.eth.contract(asset,abi=ERC20)
     x['asset_token']={'address':asset,'symbol':safe(token.functions.symbol(),block),'decimals':safe(token.functions.decimals(),block),'balance_at_vault':safe(token.functions.balanceOf(vault),block),'code_sha256':codehash(w3,asset,block)}
+    underlying_decimals=val(x['asset_token']['decimals'])
+    if underlying_decimals is None: raise RuntimeError('underlying decimals unresolved')
+    underlying_decimals=int(underlying_decimals)
     fd=read_dispatcher(w3,vault,block)
     if not fd: raise RuntimeError('fee dispatcher storage unresolved')
     x['fee_dispatcher']={'address':fd,'code_sha256':codehash(w3,fd,block)}
@@ -124,7 +127,7 @@ def query(w3:Web3,row:dict[str,Any],block:int,bh:str)->dict[str,Any]:
     for r in recipients:
         if isinstance(r,(list,tuple)) and len(r)>=3: normalized.append({'recipient':checksum(r[0]),'depositFeeSplit':int(r[1]),'rewardFeeSplit':int(r[2])})
         elif isinstance(r,dict): normalized.append({'recipient':checksum(r.get('recipient')),'depositFeeSplit':int(r.get('depositFeeSplit',0)),'rewardFeeSplit':int(r.get('rewardFeeSplit',0))})
-    denominator=100*(10**decimals)
+    denominator=100*(10**underlying_decimals)
     dep_sum=sum(r['depositFeeSplit'] for r in normalized); rew_sum=sum(r['rewardFeeSplit'] for r in normalized)
     pending=pd+pr; excess=direct-pending
     signals=[]
@@ -137,10 +140,10 @@ def query(w3:Web3,row:dict[str,Any],block:int,bh:str)->dict[str,Any]:
     if pending>0 and not x['vault_dispatch_eth_call']['ok']: signals.append('dispatch_reverts_with_pending_fee')
     if collectable>total_assets and total_assets>0: signals.append('collectable_reward_fee_exceeds_total_assets')
     if supply>0 and total_assets==0: signals.append('positive_supply_zero_total_assets')
-    material_excess=max(10**decimals, total_assets//10_000 if total_assets else 10**decimals)
+    material_excess=max(10**underlying_decimals, total_assets//10_000 if total_assets else 10**underlying_decimals)
     if excess>material_excess: signals.append('material_direct_asset_excess_over_pending')
     if any(r['recipient'] in {vault,fd,ZERO,None} for r in normalized): signals.append('unsafe_fee_recipient_address')
-    x['fee_state']={'pending_deposit':pd,'pending_reward':pr,'pending_total':pending,'direct_balance':direct,'direct_minus_pending':excess,'allowance':allowance,'collectable_reward_fees':collectable,'total_assets':total_assets,'total_supply':supply,'asset_decimals':decimals,'recipient_count':len(normalized),'deposit_split_sum':dep_sum,'reward_split_sum':rew_sum,'expected_split_sum':denominator,'recipients':normalized}
+    x['fee_state']={'pending_deposit':pd,'pending_reward':pr,'pending_total':pending,'direct_balance':direct,'direct_minus_pending':excess,'allowance':allowance,'collectable_reward_fees':collectable,'total_assets':total_assets,'total_supply':supply,'asset_decimals':underlying_decimals,'share_decimals':share_decimals,'recipient_count':len(normalized),'deposit_split_sum':dep_sum,'reward_split_sum':rew_sum,'expected_split_sum':denominator,'recipients':normalized}
     x['signals']=sorted(set(signals)); return x
 
 def secondary(w3:Web3,x:dict[str,Any],block:int)->dict[str,Any]:
