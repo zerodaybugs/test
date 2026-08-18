@@ -1,0 +1,164 @@
+diff --git a/monad-mock-swarm/src/raptorcast.rs b/monad-mock-swarm/src/raptorcast.rs
+index 8b0b4272..b0316c60 100644
+--- a/monad-mock-swarm/src/raptorcast.rs
++++ b/monad-mock-swarm/src/raptorcast.rs
+@@ -91,6 +91,12 @@ pub struct RaptorcastRouterConfig<
+ 
+     pub proposer_schedule: PS,
+ 
++    // Research-only transport adversary. The exact MonadBFT state machine is
++    // unchanged; this models a Byzantine first-hop validator racing the
++    // recoverable high-S alias before authentic chunks arrive.
++    pub research_high_s_byzantine: Option<NodeId<PT>>,
++    pub research_canonical_commitment: bool,
++
+     pub _phantom: PhantomData<(IM, OM)>,
+ }
+ 
+@@ -115,6 +121,8 @@ where
+             unicast_redundancy: 2.5,
+             symbol_len: regular::MIN_CHUNK_LENGTH as u32,
+             proposer_schedule,
++            research_high_s_byzantine: None,
++            research_canonical_commitment: false,
+             _phantom: PhantomData,
+         }
+     }
+@@ -135,11 +143,22 @@ where
+             config: self,
+             events: BTreeMap::new(),
+             decoding_states: HashMap::new(),
++            research_commitments: HashMap::new(),
+             validator_sets: BTreeMap::new(),
+             current_round: None,
+             _phantom: PhantomData,
+         }
+     }
++
++    pub fn with_research_high_s_attack(
++        mut self,
++        byzantine: NodeId<PT>,
++        canonical_commitment: bool,
++    ) -> Self {
++        self.research_high_s_byzantine = Some(byzantine);
++        self.research_canonical_commitment = canonical_commitment;
++        self
++    }
+ }
+ 
+ #[derive(Clone, PartialEq, Eq)]
+@@ -158,6 +177,9 @@ pub struct ChunkMsg<PT: PubKey> {
+     pub total_chunks: usize,
+     pub num_source_symbols: usize,
+     pub mode: ChunkMode,
++    // False is the authentic low-S packet identity; true is the
++    // recoverable high-S alias of the same proposer signature.
++    pub research_high_s_alias: bool,
+     pub payload: Arc<Bytes>,
+ }
+ 
+@@ -173,6 +195,7 @@ pub struct RaptorcastRouterScheduler<
+     config: RaptorcastRouterConfig<PT, IM, OM, PS>,
+     events: BTreeMap<Duration, VecDeque<RouterEvent<PT, IM, WireMsg<PT>>>>,
+     decoding_states: HashMap<(NodeId<PT>, Round, u64), DecodingState>,
++    research_commitments: HashMap<(NodeId<PT>, Round), bool>,
+     validator_sets: BTreeMap<Epoch, ValidatorSet<PT>>,
+     current_round: Option<Round>,
+     _phantom: PhantomData<(IM, OM)>,
+@@ -222,6 +245,7 @@ where
+                 msg_id,
+                 round,
+                 mode: ChunkMode::Unicast,
++                research_high_s_alias: false,
+                 author: self.config.self_id,
+                 payload: payload.clone(),
+                 total_chunks: num_scaled_chunks,
+@@ -265,6 +289,7 @@ where
+             msg_id,
+             round,
+             mode: ChunkMode::Raptorcast,
++            research_high_s_alias: false,
+             author: self_id,
+             payload: payload.clone(),
+             // to be overridden later
+@@ -278,6 +303,34 @@ where
+         let chunks = encoding.make_chunks().expect("failed to assign chunks");
+         chunk_msg.total_chunks = chunks.len();
+ 
++        // Research-only first-hop race: an honest proposal assigns at least
++        // one signed V1 chunk to the Byzantine validator. The attacker can
++        // transform that recoverable signature to its high-S alias without the
++        // proposer key and race it to the two non-proposer honest validators.
++        if let Some(byzantine) = self.config.research_high_s_byzantine {
++            if self_id != byzantine {
++                if let Some(poison_chunk) = chunks
++                    .iter()
++                    .find(|chunk| *chunk.recipient().node_id() == byzantine)
++                {
++                    let alias = ChunkMsg {
++                        chunk_id: poison_chunk.chunk_id(),
++                        research_high_s_alias: true,
++                        ..chunk_msg.clone()
++                    };
++                    let alias_targets: Vec<_> = validator_set
++                        .get_members()
++                        .keys()
++                        .copied()
++                        .filter(|target| *target != self_id && *target != byzantine)
++                        .collect();
++                    for target in alias_targets {
++                        self.push_tx_event(time, target, WireMsg::Chunk(alias.clone()));
++                    }
++                }
++            }
++        }
++
+         // raptorcast does not build chunks for the publisher, so we
+         // need to emit a direct message to ensure self reception.
+         self.emit_direct(time, payload, self_id);
+@@ -327,6 +380,24 @@ where
+             return;
+         }
+ 
++        // Exact RoundInfo semantics: the first valid commitment for the
++        // (author, round) slot wins. The vulnerable model uses raw recoverable
++        // signature identity; the patched A/B canonicalizes low-S/high-S aliases.
++        let commitment_identity = if self.config.research_canonical_commitment {
++            false
++        } else {
++            message.research_high_s_alias
++        };
++        let commitment_key = (message.author, message.round);
++        if let Some(existing) = self.research_commitments.get(&commitment_key) {
++            if *existing != commitment_identity {
++                return;
++            }
++        } else {
++            self.research_commitments
++                .insert(commitment_key, commitment_identity);
++        }
++
+         let encoding = self.primary_encoding(&message, epoch, validator_set);
+         let assignment = encoding
+             .make_assignment()
+@@ -447,6 +518,11 @@ where
+ 
+         match to {
+             RouterTarget::Raptorcast { round, epoch } => {
++                if self.config.research_high_s_byzantine == Some(self.config.self_id) {
++                    // The Byzantine validator withholds proposals in its own
++                    // scheduled rounds; this remains within the <1/3 model.
++                    return;
++                }
+                 self.emit_raptorcast(time, msg_id, round, epoch, &payload);
+             }
+             RouterTarget::Broadcast(epoch) => {
+@@ -492,6 +568,8 @@ where
+ 
+         let cutoff = round.saturating_sub(PROPOSER_SCHEDULE_CACHE_MAX_PAST_ROUNDS);
+         self.config.proposer_schedule.prune_below(cutoff);
++        self.research_commitments
++            .retain(|(_, message_round), _| *message_round >= cutoff);
+     }
+ 
+     fn peek_tick(&self) -> Option<Duration> {
