@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   census:
@@ -147,7 +147,7 @@ jobs:
           mkdir -p encrypted_delivery public_delivery
           cp r37_results/PUBLIC_GATE.json public_delivery/
           cp r37_results/SHA256SUMS.txt public_delivery/
-          tar -czf /tmp/private_payload.tar.gz r37_results /tmp/private_run.log /tmp/private_exit_code.txt kiln_r37/fee_invariant_census.py
+          tar -czf /tmp/private_payload.tar.gz r33_results /tmp/private_run.log /tmp/private_exit_code.txt kiln_r37/fee_invariant_census.py
           openssl rand 32 > /tmp/aes.key
           openssl enc -aes-256-cbc -salt -pbkdf2 -iter 250000 \
             -in /tmp/private_payload.tar.gz -out encrypted_delivery/payload.aes256 -pass file:/tmp/aes.key
@@ -186,3 +186,121 @@ jobs:
           path: public_delivery
           if-no-files-found: error
           retention-days: 3
+
+
+  persist:
+    needs: census
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/kiln-r37-fee-invariant-census-20260818
+          fetch-depth: 1
+      - name: Download all R37 public gates
+        uses: actions/download-artifact@v4
+        with:
+          pattern: kiln-r37-*-public-gate
+          path: /tmp/r37_public
+      - name: Download all R37 encrypted evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: kiln-r37-*-encrypted
+          path: /tmp/r37_encrypted
+      - name: Aggregate, verify and create lossless encrypted export
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf r37_persisted_results/LATEST
+          mkdir -p r37_persisted_results/LATEST/public_gates r37_persisted_results/LATEST/encrypted_b64
+          python3 - <<'PY'
+          import base64,hashlib,json,shutil,time
+          from pathlib import Path
+          public_root=Path('/tmp/r37_public')
+          encrypted_root=Path('/tmp/r37_encrypted')
+          out=Path('r37_persisted_results/LATEST')
+          expected={
+            ('ethereum',0,4),('ethereum',1,4),('ethereum',2,4),('ethereum',3,4),
+            ('arbitrum',0,2),('arbitrum',1,2),('base',0,1),('bnb',0,1),
+            ('polygon',0,1),('optimism',0,1),
+          }
+          rows=[]; integrity=[]; seen=set()
+          for gate_path in sorted(public_root.rglob('PUBLIC_GATE.json')):
+              raw=gate_path.read_bytes(); gate=json.loads(raw)
+              key=(str(gate.get('network')),int(gate.get('shard_index',-1)),int(gate.get('shard_count',-1)))
+              seen.add(key)
+              sums_path=gate_path.with_name('SHA256SUMS.txt')
+              manifest_ok=False
+              if sums_path.exists():
+                  for line in sums_path.read_text().splitlines():
+                      parts=line.split('  ',1)
+                      if len(parts)==2 and parts[1]=='PUBLIC_GATE.json':
+                          manifest_ok=parts[0]==hashlib.sha256(raw).hexdigest()
+                          break
+              dest=out/'public_gates'/f'{key[0]}_{key[1]}'
+              dest.mkdir(parents=True,exist_ok=True)
+              shutil.copy2(gate_path,dest/'PUBLIC_GATE.json')
+              if sums_path.exists(): shutil.copy2(sums_path,dest/'SHA256SUMS.txt')
+              rows.append(gate)
+              integrity.append({'key':list(key),'gate_sha256':hashlib.sha256(raw).hexdigest(),'manifest_ok':manifest_ok})
+          encrypted_exports=[]
+          for artifact_dir in sorted(p for p in encrypted_root.iterdir() if p.is_dir()):
+              dest=out/'encrypted_b64'/artifact_dir.name
+              dest.mkdir(parents=True,exist_ok=True)
+              files=[]
+              for src in sorted(artifact_dir.rglob('*')):
+                  if not src.is_file(): continue
+                  rel=src.relative_to(artifact_dir).as_posix()
+                  raw=src.read_bytes()
+                  encoded=base64.b64encode(raw)
+                  target=dest/(rel.replace('/','__')+'.b64')
+                  target.write_bytes(encoded+b'\n')
+                  decoded=base64.b64decode(encoded,validate=True)
+                  assert decoded==raw
+                  files.append({'source':rel,'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest(),'roundtrip_ok':True,'b64_file':target.name})
+              (dest/'ROUNDTRIP.json').write_text(json.dumps({'artifact':artifact_dir.name,'files':files},indent=2,sort_keys=True))
+              encrypted_exports.append({'artifact':artifact_dir.name,'file_count':len(files),'all_roundtrip_ok':all(x['roundtrip_ok'] for x in files)})
+          selected=sum(int(x.get('selected_count',0) or 0) for x in rows)
+          inspected=sum(int(x.get('inspected_count',0) or 0) for x in rows)
+          errors=sum(int(x.get('error_count',0) or 0) for x in rows)
+          candidates=sum(int(x.get('candidate_count',0) or 0) for x in rows)
+          exit_errors=sum(int(x.get('runner_exit_code',1) or 0)!=0 for x in rows)
+          manifest_failures=sum(not x['manifest_ok'] for x in integrity)
+          complete=(seen==expected and len(rows)==10 and selected==101 and inspected==101 and errors==0 and exit_errors==0 and manifest_failures==0 and len(encrypted_exports)==10)
+          decision=('HOLD_PRIVATE_FEE_SIGNAL_REVIEW' if complete and candidates else ('KILL_NO_LIVE_FEE_INVARIANT_SIGNAL' if complete else 'INCONCLUSIVE_COVERAGE_OR_INTEGRITY_FAILURE'))
+          aggregate={
+            'schema':'kiln-r37-persisted-aggregate-v1',
+            'generated_at_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+            'source_run_id':'${{ github.run_id }}',
+            'source_commit':'${{ github.sha }}',
+            'decision':decision,'submit_ready':False,'validated_critical':0,'validated_high':0,
+            'coverage_complete':complete,'expected_shards':10,'public_gate_count':len(rows),
+            'encrypted_export_count':len(encrypted_exports),'selected_total':selected,'inspected_total':inspected,
+            'error_total':errors,'candidate_total':candidates,'runner_exit_error_count':exit_errors,
+            'manifest_failure_count':manifest_failures,'seen_shards':[list(x) for x in sorted(seen)],
+            'integrity':integrity,'encrypted_exports':encrypted_exports,'rows':rows,
+            'safety':{'public_chain_state_changes':0,'transactions_signed':0,'transactions_sent':0,'private_keys_included':False}
+          }
+          (out/'AGGREGATE_PUBLIC.json').write_text(json.dumps(aggregate,indent=2,sort_keys=True))
+          files=sorted(p for p in out.rglob('*') if p.is_file() and p.name!='SHA256SUMS.txt')
+          (out/'SHA256SUMS.txt').write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(out).as_posix()}\n' for p in files))
+          assert aggregate['submit_ready'] is False
+          assert aggregate['validated_critical']==0 and aggregate['validated_high']==0
+          print(json.dumps(aggregate,sort_keys=True))
+          PY
+      - name: Commit recoverable R37 evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add r37_persisted_results/LATEST
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'persist recoverable Kiln R37 fee evidence'
+          for attempt in 1 2 3; do
+            git pull --rebase origin agent/kiln-r37-fee-invariant-census-20260818
+            if git push origin HEAD:agent/kiln-r37-fee-invariant-census-20260818; then exit 0; fi
+            sleep $((attempt*3))
+          done
+          exit 1
