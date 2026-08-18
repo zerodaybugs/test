@@ -1,0 +1,277 @@
+name: Temporary isolated ICP15 security hunt
+
+on:
+  push:
+    branches:
+      - tmp-ci-20260818-icp15
+    paths:
+      - ".github/workflows/tmp-ci-icp15-hunt.yml"
+      - "secure-ci-icp15/researcher-public.pem"
+
+permissions:
+  contents: read
+
+jobs:
+  hunt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends git ripgrep jq openssl python3 tar gzip
+
+      - name: Clone current DFINITY IC high-value source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/dfinity/ic.git "$RUNNER_TEMP/ic"
+          cd "$RUNNER_TEMP/ic"
+          git sparse-checkout set \
+            rs/bitcoin/ckbtc \
+            rs/ethereum/cketh \
+            rs/ledger_suite \
+            rs/nns/governance \
+            rs/sns/governance \
+            rs/nns/cmc \
+            rs/nns/handlers/root \
+            rs/nns/sns-wasm \
+            rs/sns/root \
+            rs/sns/swap \
+            rs/execution_environment \
+            rs/cycles_account_manager \
+            rs/consensus \
+            rs/registry \
+            rs/crypto \
+            rs/rosetta-api
+          git rev-parse HEAD > "$RUNNER_TEMP/ic-head.txt"
+          git log -1 --format='%H%n%cI%n%s' > "$RUNNER_TEMP/ic-head-meta.txt"
+
+      - name: Run authority and rollback scanner
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/result"
+          cp "$RUNNER_TEMP/ic-head.txt" "$RUNNER_TEMP/result/IC_HEAD.txt"
+          cp "$RUNNER_TEMP/ic-head-meta.txt" "$RUNNER_TEMP/result/IC_HEAD_META.txt"
+          cat > "$RUNNER_TEMP/scan.py" <<'PY'
+          from __future__ import annotations
+          import json, re
+          from pathlib import Path
+
+          repo = Path(__import__('os').environ['RUNNER_TEMP']) / 'ic'
+          out = Path(__import__('os').environ['RUNNER_TEMP']) / 'result'
+
+          roots = [
+              repo/'rs/bitcoin/ckbtc', repo/'rs/ethereum/cketh', repo/'rs/ledger_suite',
+              repo/'rs/nns/governance', repo/'rs/sns/governance', repo/'rs/nns/cmc',
+              repo/'rs/nns/handlers/root', repo/'rs/nns/sns-wasm', repo/'rs/sns/root',
+              repo/'rs/sns/swap', repo/'rs/execution_environment',
+              repo/'rs/cycles_account_manager', repo/'rs/consensus', repo/'rs/registry',
+              repo/'rs/crypto', repo/'rs/rosetta-api',
+          ]
+
+          files = []
+          for root in roots:
+              if root.exists():
+                  files.extend(root.rglob('*.rs'))
+          files = sorted(set(files))
+
+          fn_start = re.compile(r'(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z0-9_]+)\s*(?:<[^>{}]*>)?\s*\(')
+
+          def functions(text: str):
+              for m in fn_start.finditer(text):
+                  brace = text.find('{', m.end())
+                  if brace < 0:
+                      continue
+                  depth = 0
+                  i = brace
+                  in_str = False
+                  esc = False
+                  while i < len(text):
+                      c = text[i]
+                      if in_str:
+                          if esc: esc = False
+                          elif c == '\\': esc = True
+                          elif c == '"': in_str = False
+                      else:
+                          if c == '"': in_str = True
+                          elif c == '{': depth += 1
+                          elif c == '}':
+                              depth -= 1
+                              if depth == 0:
+                                  yield m.group(1), m.start(), i + 1, text[m.start():i+1]
+                                  break
+                      i += 1
+
+          signals = {
+              'await': r'\.await\b',
+              'mutate_state': r'\bmutate_state\s*\(',
+              'read_state': r'\bread_state\s*\(',
+              'remove': r'\.remove\s*\(|\bremove_[A-Za-z0-9_]*\s*\(',
+              'insert': r'\.insert\s*\(|\binsert_[A-Za-z0-9_]*\s*\(',
+              'record': r'\b(?:record|process|apply|commit|finalize|confirm|accept|mint|burn|transfer|reimburse|refund)_[A-Za-z0-9_]*\s*\(',
+              'external': r'\.(?:transfer|call|try_send|send|sign_with|ecdsa_public_key|get_utxos|get_logs|get_block_by_number|get_transaction_receipt|icrc[0-9]?_[A-Za-z0-9_]+)\s*\(',
+              'guard': r'\b(?:guard|ScopeGuard|scopeguard|TimerGuard|Processing|InFlight|Pending)\b',
+              'error': r'\b(?:Err|error|fail|reject|trap|panic|unwrap|expect)\b',
+              'cursor': r'\b(?:last_[A-Za-z0-9_]*|next_[A-Za-z0-9_]*|cursor|height|block_number|index|nonce|offset)\b',
+              'saturating': r'\bsaturating_(?:add|sub|mul)\b',
+              'checked': r'\bchecked_(?:add|sub|mul)\b',
+              'caller': r'\b(?:caller|controller|principal|owner|sender|source|beneficiary|account)\b',
+          }
+          compiled = {k: re.compile(v, re.I) for k,v in signals.items()}
+
+          candidates = []
+          for path in files:
+              try: text = path.read_text(encoding='utf-8')
+              except Exception: continue
+              rel = str(path.relative_to(repo))
+              line_starts = [0]
+              for mm in re.finditer('\n', text): line_starts.append(mm.end())
+              for name, start, end, body in functions(text):
+                  hits = {k: bool(rx.search(body)) for k,rx in compiled.items()}
+                  score = 0
+                  reasons = []
+                  def add(n, why):
+                      nonlocal_score[0] += n; reasons.append(why)
+                  nonlocal_score = [0]
+                  if hits['await'] and hits['mutate_state']:
+                      add(9, 'await+mutate_state')
+                  if hits['await'] and hits['remove']:
+                      add(8, 'await+remove')
+                  if hits['await'] and hits['record']:
+                      add(7, 'await+record/commit')
+                  if hits['external'] and hits['mutate_state']:
+                      add(7, 'external-call+state-mutation')
+                  if hits['cursor'] and hits['error']:
+                      add(5, 'cursor+error')
+                  if hits['saturating'] and any(x in rel for x in ('ledger','minter','governance','cmc','swap')):
+                      add(5, 'saturating-arithmetic-in-financial-code')
+                  if hits['caller'] and hits['external']:
+                      add(3, 'identity+external-call')
+                  if hits['await'] and not hits['guard'] and (hits['remove'] or hits['record'] or hits['mutate_state']):
+                      add(5, 'async-state-without-obvious-guard')
+                  if re.search(r'\.await[\s\S]{0,2500}(?:mutate_state|\.insert\(|\.remove\(|process_event|record_)', body):
+                      add(6, 'post-await-state-commit')
+                  if re.search(r'(?:mutate_state|\.remove\(|process_event|record_)[\s\S]{0,2500}\.await', body):
+                      add(6, 'pre-await-state-commit')
+                  if re.search(r'(?:Err\(|return\s+Err|continue;|return;)[\s\S]{0,900}(?:insert|remove|record|process_event|mutate_state)', body):
+                      add(3, 'error-path-state-change')
+                  if re.search(r'(?:unwrap_or_else|expect\(|panic!|assert!)', body) and hits['caller']:
+                      add(2, 'panic/expect-near-user-identity')
+                  score = nonlocal_score[0]
+                  if score < 8:
+                      continue
+                  line = text.count('\n', 0, start) + 1
+                  excerpt = body[:16000]
+                  candidates.append({
+                      'score': score, 'file': rel, 'line': line, 'function': name,
+                      'reasons': reasons, 'hits': hits, 'excerpt': excerpt,
+                  })
+
+          candidates.sort(key=lambda x: (-x['score'], x['file'], x['line']))
+          (out/'ASYNC_AUTHORITY_CANDIDATES.json').write_text(json.dumps(candidates[:700], indent=2), encoding='utf-8')
+          with (out/'ASYNC_AUTHORITY_TOP.txt').open('w', encoding='utf-8') as f:
+              for c in candidates[:250]:
+                  f.write(f"\n=== SCORE {c['score']} {c['file']}:{c['line']} {c['function']} ===\n")
+                  f.write('REASONS: ' + ', '.join(c['reasons']) + '\n')
+                  f.write(c['excerpt'] + '\n')
+
+          patterns = {
+              'cursor_advance_on_error': r'(?is)(?:Err\(|error|too large|reject|failed)[\s\S]{0,1800}(?:set_last|update_last|last_[A-Za-z0-9_]*\s*=|next_[A-Za-z0-9_]*\s*=|advance|skip)',
+              'remove_before_await': r'(?is)(?:\.remove\(|remove_[A-Za-z0-9_]*\()[\s\S]{0,1600}\.await',
+              'commit_before_await': r'(?is)(?:process_event|record_[A-Za-z0-9_]*|mutate_state)[\s\S]{0,1600}\.await',
+              'await_then_commit': r'(?is)\.await[\s\S]{0,1600}(?:process_event|record_[A-Za-z0-9_]*|mutate_state)',
+              'saturating_financial': r'(?i)saturating_(?:add|sub|mul)',
+              'panic_user_path': r'(?is)(?:caller|principal|owner|account|sender)[\s\S]{0,1200}(?:expect\(|unwrap\(|panic!|assert!)',
+              'dedup_incomplete_identity': r'(?is)(?:contains_key|entry\(|insert\()[\s\S]{0,800}(?:txid|transaction_hash|block_index|log_index|nonce)',
+          }
+          findings = []
+          for path in files:
+              try: text = path.read_text(encoding='utf-8')
+              except Exception: continue
+              rel = str(path.relative_to(repo))
+              for label, pat in patterns.items():
+                  rx = re.compile(pat)
+                  for m in rx.finditer(text):
+                      line = text.count('\n', 0, m.start()) + 1
+                      lo = max(0, m.start()-900); hi = min(len(text), m.end()+1400)
+                      findings.append({'type':label,'file':rel,'line':line,'excerpt':text[lo:hi]})
+                      if len(findings) >= 2500: break
+                  if len(findings) >= 2500: break
+              if len(findings) >= 2500: break
+          (out/'CROSS_FUNCTION_PATTERNS.json').write_text(json.dumps(findings, indent=2), encoding='utf-8')
+
+          exclusions = [
+              'snapshot', 'SkippedBlockForContract', 'stale_neuron', 'CanisterDetail',
+              'uncertified', 'DisburseMaturity', 'decimals',
+          ]
+          filtered = [c for c in candidates if not any(x.lower() in (c['file']+' '+c['function']+' '+c['excerpt']).lower() for x in exclusions)]
+          (out/'FILTERED_NEW_ROOT_CAUSES.json').write_text(json.dumps(filtered[:500], indent=2), encoding='utf-8')
+
+          summary = {
+              'rust_files_scanned': len(files),
+              'ranked_candidates': len(candidates),
+              'filtered_candidates': len(filtered),
+              'pattern_hits': len(findings),
+              'top': [{k:c[k] for k in ('score','file','line','function','reasons')} for c in filtered[:80]],
+          }
+          (out/'SUMMARY.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+          PY
+          python3 "$RUNNER_TEMP/scan.py"
+
+      - name: Collect targeted grep evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/ic"
+          {
+            echo '=== TODO/FIXME security-critical ==='
+            rg -n -i 'TODO|FIXME|BUG:|unreachable|should never|must not|double (mint|spend|refund)|idempot|quarantin|rollback|reimburse|refund' \
+              rs/bitcoin/ckbtc rs/ethereum/cketh rs/ledger_suite rs/nns/governance rs/sns/governance rs/nns/cmc rs/sns/swap \
+              --glob '*.rs' | head -n 5000 || true
+          } > "$RUNNER_TEMP/result/TARGETED_GREP.txt"
+          {
+            echo '=== external calls ==='
+            rg -n '\.(await|try_send|transfer|call|send)|sign_with|ecdsa_public_key|get_utxos|get_logs|get_transaction_receipt' \
+              rs/bitcoin/ckbtc rs/ethereum/cketh rs/ledger_suite rs/nns/cmc rs/sns/swap --glob '*.rs' | head -n 6000 || true
+          } > "$RUNNER_TEMP/result/EXTERNAL_CALLS.txt"
+          {
+            echo '=== state removals and cursor updates ==='
+            rg -n '\.remove\(|set_last|update_last|last_.*=|next_.*=|mark_|record_|process_event|quarantin' \
+              rs/bitcoin/ckbtc rs/ethereum/cketh rs/ledger_suite rs/nns/governance rs/sns/governance rs/nns/cmc rs/sns/swap --glob '*.rs' | head -n 8000 || true
+          } > "$RUNNER_TEMP/result/STATE_TRANSITIONS.txt"
+
+      - name: Encrypt result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/encrypted"
+          tar -czf "$RUNNER_TEMP/result.tar.gz" -C "$RUNNER_TEMP/result" .
+          openssl rand -hex 32 > "$RUNNER_TEMP/result.pass"
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+            -in "$RUNNER_TEMP/result.tar.gz" \
+            -out "$RUNNER_TEMP/encrypted/result.enc" \
+            -pass file:"$RUNNER_TEMP/result.pass"
+          openssl pkeyutl -encrypt -pubin \
+            -inkey secure-ci-icp15/researcher-public.pem \
+            -in "$RUNNER_TEMP/result.pass" \
+            -out "$RUNNER_TEMP/encrypted/result.key.enc" \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          sha256sum "$RUNNER_TEMP/encrypted/result.enc" "$RUNNER_TEMP/encrypted/result.key.enc" \
+            > "$RUNNER_TEMP/encrypted/SHA256SUMS.txt"
+
+      - name: Upload encrypted result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-result-icp15-hunt
+          path: ${{ runner.temp }}/encrypted/
+          if-no-files-found: error
+          retention-days: 1
