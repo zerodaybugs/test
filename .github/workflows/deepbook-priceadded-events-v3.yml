@@ -1,0 +1,152 @@
+name: DeepBook PriceAdded read-only query v3
+
+on:
+  push:
+    branches:
+      - "sui-round15-readonly-*"
+
+permissions:
+  contents: write
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Query public PriceAdded events
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/deepbook-events
+          cat > /tmp/deepbook-events/query.mjs <<'JS'
+          import fs from 'node:fs';
+
+          const endpoint = 'https://graphql.mainnet.sui.io/graphql';
+          const eventTypes = [
+            '0x2c8d603bc51326b8c13cef9dd07031a408a48dddb541963357661df5d3204809::deep_price::PriceAdded',
+            '0x0e735f8c93a95722efd73521aca7a7652c0bb71ed1daf41b26dfd7d1ff71f748::deep_price::PriceAdded',
+          ];
+          const cutoffMs = Date.now() - 24 * 60 * 60 * 1000;
+          const query = `query PriceAdded($before: String, $type: String!) {
+            events(last: 50, before: $before, filter: { type: $type }) {
+              pageInfo { hasPreviousPage startCursor }
+              nodes { timestamp transaction { digest } contents { json type { repr } } }
+            }
+          }`;
+
+          async function queryType(type) {
+            let before = null;
+            let pages = 0;
+            const events = [];
+            while (pages < 200) {
+              const response = await fetch(endpoint, {
+                method: 'POST',
+                headers: {
+                  'content-type': 'application/json',
+                  'user-agent': 'DeepBookReadOnlyResearch/3.0',
+                },
+                body: JSON.stringify({ query, variables: { before, type } }),
+              });
+              if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+              const body = await response.json();
+              if (body.errors) throw new Error(JSON.stringify(body.errors));
+              const connection = body.data.events;
+              pages += 1;
+              let reachedCutoff = false;
+              for (const node of connection.nodes) {
+                const timestampMs = node.timestamp ? Date.parse(node.timestamp) : 0;
+                if (timestampMs && timestampMs < cutoffMs) {
+                  reachedCutoff = true;
+                  continue;
+                }
+                events.push({
+                  queried_type: type,
+                  timestamp: node.timestamp,
+                  transaction_digest: node.transaction?.digest ?? null,
+                  event_type: node.contents?.type?.repr ?? null,
+                  ...(node.contents?.json ?? {}),
+                });
+              }
+              if (reachedCutoff || !connection.pageInfo.hasPreviousPage || !connection.pageInfo.startCursor) break;
+              before = connection.pageInfo.startCursor;
+            }
+            return { type, pages, events, error: null };
+          }
+
+          const queryResults = [];
+          for (const type of eventTypes) {
+            try {
+              queryResults.push(await queryType(type));
+            } catch (error) {
+              queryResults.push({ type, pages: 0, events: [], error: String(error?.stack ?? error) });
+            }
+          }
+
+          const deduplicated = new Map();
+          for (const result of queryResults) {
+            for (const event of result.events) {
+              const key = [
+                event.transaction_digest ?? '',
+                event.timestamp ?? '',
+                event.target_pool ?? event.targetPool ?? '',
+                event.reference_pool ?? event.referencePool ?? '',
+                event.conversion_rate ?? event.conversionRate ?? '',
+                event.is_base_conversion ?? event.isBaseConversion ?? '',
+              ].join(':');
+              deduplicated.set(key, event);
+            }
+          }
+          const events = [...deduplicated.values()];
+
+          const counts = {};
+          for (const event of events) {
+            const target = String(event.target_pool ?? event.targetPool ?? 'unknown').toLowerCase();
+            const side = Boolean(event.is_base_conversion ?? event.isBaseConversion) ? 'base' : 'quote';
+            counts[target] ??= { base: 0, quote: 0, total: 0, latest: null, min_rate: null, max_rate: null };
+            counts[target][side] += 1;
+            counts[target].total += 1;
+            const rate = Number(event.conversion_rate ?? event.conversionRate);
+            if (Number.isFinite(rate)) {
+              counts[target].min_rate = counts[target].min_rate == null ? rate : Math.min(counts[target].min_rate, rate);
+              counts[target].max_rate = counts[target].max_rate == null ? rate : Math.max(counts[target].max_rate, rate);
+            }
+            if (!counts[target].latest || String(event.timestamp) > String(counts[target].latest)) {
+              counts[target].latest = event.timestamp;
+            }
+          }
+
+          const output = {
+            generated_at: new Date().toISOString(),
+            cutoff_utc: new Date(cutoffMs).toISOString(),
+            write_operations: 0,
+            query_results: queryResults.map(({ type, pages, events, error }) => ({
+              type,
+              pages,
+              event_count: events.length,
+              error,
+            })),
+            deduplicated_event_count: events.length,
+            counts_by_target_pool: counts,
+            events,
+          };
+          fs.writeFileSync('/tmp/deepbook-events/PRICE_ADDED_EVENTS_24H_V3.json', JSON.stringify(output, null, 2));
+          if (queryResults.every((result) => result.error)) process.exit(1);
+          JS
+          node /tmp/deepbook-events/query.mjs
+          sha256sum /tmp/deepbook-events/PRICE_ADDED_EVENTS_24H_V3.json > /tmp/deepbook-events/PRICE_ADDED_EVENTS_24H_V3.json.sha256
+
+      - name: Commit read-only result
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p readonly-snapshots/deepbook-round16
+          cp /tmp/deepbook-events/PRICE_ADDED_EVENTS_24H_V3.json* readonly-snapshots/deepbook-round16/
+          git config user.name "readonly-snapshot-bot"
+          git config user.email "readonly-snapshot-bot@users.noreply.github.com"
+          git add readonly-snapshots/deepbook-round16
+          if ! git diff --cached --quiet; then
+            git commit -m "data: publish DeepBook PriceAdded 24h query v3"
+            git push origin HEAD:${GITHUB_REF_NAME}
+          fi
