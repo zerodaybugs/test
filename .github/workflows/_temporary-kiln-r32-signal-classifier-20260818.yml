@@ -1,0 +1,161 @@
+name: kiln-r32-signal-classifier
+
+on:
+  push:
+    branches: [agent/kiln-r31-runtime-census-20260817]
+    paths:
+      - kiln_r32/classify_runtime.py
+      - .github/workflows/_temporary-kiln-r32-signal-classifier-20260818.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  classify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {network: ethereum, shard_index: 0, shard_count: 4}
+          - {network: ethereum, shard_index: 1, shard_count: 4}
+          - {network: ethereum, shard_index: 2, shard_count: 4}
+          - {network: ethereum, shard_index: 3, shard_count: 4}
+          - {network: bnb, shard_index: 0, shard_count: 1}
+          - {network: base, shard_index: 0, shard_count: 1}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/kiln-r31-runtime-census-20260817
+          fetch-depth: 1
+      - name: Install pinned runtime
+        run: python3 -m pip install --disable-pip-version-check 'web3==7.13.0'
+      - name: Verify sources
+        run: |
+          python3 -m py_compile kiln_r31/runtime_census.py
+          python3 -m py_compile kiln_r32/classify_runtime.py
+      - name: Run exact-block read-only census
+        env:
+          TARGET_NETWORK: ${{ matrix.network }}
+          SHARD_INDEX: ${{ matrix.shard_index }}
+          SHARD_COUNT: ${{ matrix.shard_count }}
+        shell: bash
+        run: |
+          set +e
+          python3 kiln_r31/runtime_census.py > /tmp/r31.log 2>&1
+          code=$?
+          set -e
+          printf '%s\n' "$code" > /tmp/r31.exit
+          test -f r31_results/EVIDENCE.json || {
+            mkdir -p r31_results
+            printf '{"schema":"r32-fallback","matrix":{"network":"%s","shard_index":%s,"shard_count":%s},"rows":[],"errors":[{"error":"R31 execution did not produce evidence"}],"summary":{"inspected_count":0,"error_count":1},"safety":{"read_only":true,"public_chain_state_changes":0,"transactions_signed":0,"transactions_sent":0}}\n' \
+              "$TARGET_NETWORK" "$SHARD_INDEX" "$SHARD_COUNT" > r31_results/EVIDENCE.json
+          }
+      - name: Classify without exposing exact addresses
+        env:
+          TARGET_NETWORK: ${{ matrix.network }}
+          SHARD_INDEX: ${{ matrix.shard_index }}
+        run: |
+          mkdir -p classifier_delivery/${TARGET_NETWORK}_${SHARD_INDEX}
+          python3 kiln_r32/classify_runtime.py r31_results/EVIDENCE.json classifier_delivery/${TARGET_NETWORK}_${SHARD_INDEX}/CLASSIFIER_PUBLIC.json
+          cp /tmp/r31.exit classifier_delivery/${TARGET_NETWORK}_${SHARD_INDEX}/R31_EXIT_CODE.txt
+          python3 - <<'PY'
+          import hashlib,json,os
+          from pathlib import Path
+          root=Path('classifier_delivery')/f"{os.environ['TARGET_NETWORK']}_{os.environ['SHARD_INDEX']}"
+          p=root/'CLASSIFIER_PUBLIC.json'; data=json.loads(p.read_text())
+          assert data['submit_ready'] is False
+          assert data['validated_critical']==0 and data['validated_high']==0
+          assert int((data.get('safety') or {}).get('public_chain_state_changes',0) or 0)==0
+          files=sorted(x for x in root.iterdir() if x.is_file() and x.name!='SHA256SUMS.txt')
+          (root/'SHA256SUMS.txt').write_text(''.join(f"{hashlib.sha256(x.read_bytes()).hexdigest()}  {x.name}\n" for x in files))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kiln-r32-classifier-${{ matrix.network }}-${{ matrix.shard_index }}
+          path: classifier_delivery
+          if-no-files-found: error
+          retention-days: 3
+
+  aggregate:
+    needs: classify
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/kiln-r31-runtime-census-20260817
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kiln-r32-classifier-*
+          path: downloaded
+          merge-multiple: true
+      - name: Aggregate classifier outputs
+        run: |
+          rm -rf r32_classifier_results
+          mkdir -p r32_classifier_results
+          cp -R downloaded/* r32_classifier_results/
+          python3 - <<'PY'
+          import hashlib,json,time
+          from collections import Counter,defaultdict
+          from pathlib import Path
+          root=Path('r32_classifier_results')
+          docs=[json.loads(p.read_text()) for p in sorted(root.rglob('CLASSIFIER_PUBLIC.json'))]
+          categories=Counter(); connectors=defaultdict(Counter); errors=Counter(); amounts=Counter(); ratios=Counter(); classified=[]; escalations=[]
+          for d in docs:
+              s=d.get('summary') or {}
+              categories.update(s.get('category_counts') or {})
+              errors.update(s.get('error_connector_counts') or {})
+              amounts.update(s.get('direct_excess_amount_buckets') or {})
+              ratios.update(s.get('direct_excess_ratio_buckets') or {})
+              for connector,values in (s.get('connector_signal_counts') or {}).items(): connectors[connector].update(values)
+              classified.extend(d.get('classified_rows') or [])
+              escalations.extend(d.get('escalation_rows') or [])
+          checks={
+            'six_documents':len(docs)==6,
+            'all_submit_ready_false':all(d.get('submit_ready') is False for d in docs),
+            'all_severity_zero':all(int(d.get('validated_critical',0) or 0)==0 and int(d.get('validated_high',0) or 0)==0 for d in docs),
+            'all_safety_zero':all(int((d.get('safety') or {}).get('public_chain_state_changes',0) or 0)==0 and int((d.get('safety') or {}).get('transactions_signed',0) or 0)==0 and int((d.get('safety') or {}).get('transactions_sent',0) or 0)==0 for d in docs),
+          }
+          aggregate={
+            'schema':'kiln-r32-classifier-aggregate-v1',
+            'generated_at_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+            'checks':checks,
+            'document_count':len(docs),
+            'inspected_total':sum(int((d.get('summary') or {}).get('inspected_count',0) or 0) for d in docs),
+            'error_total':sum(int((d.get('summary') or {}).get('error_count',0) or 0) for d in docs),
+            'signal_row_total':len(classified),
+            'quorum_confirmed_signal_total':sum(bool(x.get('quorum_confirmed')) for x in classified),
+            'escalation_total':len(escalations),
+            'category_counts':dict(sorted(categories.items())),
+            'connector_signal_counts':{k:dict(sorted(v.items())) for k,v in sorted(connectors.items())},
+            'error_connector_counts':dict(sorted(errors.items())),
+            'direct_excess_amount_buckets':dict(sorted(amounts.items())),
+            'direct_excess_ratio_buckets':dict(sorted(ratios.items())),
+            'escalation_rows':escalations,
+            'decision':'HOLD_PRIVATE_CAUSAL_REVIEW' if escalations else 'KILL_NO_MATERIAL_RUNTIME_SIGNAL',
+            'submit_ready':False,'validated_critical':0,'validated_high':0,
+          }
+          (root/'AGGREGATE_PUBLIC.json').write_text(json.dumps(aggregate,indent=2,sort_keys=True))
+          files=sorted(p for p in root.rglob('*') if p.is_file() and p.name!='PACKAGE_SHA256SUMS.txt')
+          (root/'PACKAGE_SHA256SUMS.txt').write_text(''.join(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(root).as_posix()}\n" for p in files))
+          assert all(checks.values()),checks
+          PY
+      - name: Persist classifier results
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add r32_classifier_results
+          git commit -m 'persist Kiln R32 runtime signal classification'
+          for attempt in 1 2 3; do
+            git pull --rebase origin agent/kiln-r31-runtime-census-20260817
+            if git push origin HEAD:agent/kiln-r31-runtime-census-20260817; then exit 0; fi
+            sleep $((attempt * 3))
+          done
+          exit 1
