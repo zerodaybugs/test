@@ -1,0 +1,77 @@
+name: DeepBook read-only PriceAdded events v3
+
+on:
+  push:
+    branches:
+      - "sui-round15-readonly-*"
+
+permissions:
+  contents: write
+
+jobs:
+  events:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Query last 24h PriceAdded events
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/price-events
+          cat > /tmp/price-events/query.mjs <<'JS'
+          import fs from 'node:fs';
+          const endpoint='https://graphql.mainnet.sui.io/graphql';
+          const types=[
+            '0x2c8d603bc51326b8c13cef9dd07031a408a48dddb541963357661df5d3204809::deep_price::PriceAdded',
+            '0x0e735f8c93a95722efd73521aca7a7652c0bb71ed1daf41b26dfd7d1ff71f748::deep_price::PriceAdded',
+          ];
+          const cutoff=Date.now()-24*60*60*1000;
+          const query=`query Q($before:String,$type:String!){events(last:50,before:$before,filter:{type:$type}){pageInfo{hasPreviousPage startCursor}nodes{timestamp transaction{digest} contents{json type{repr}}}}}`;
+          async function one(type){
+            let before=null,pages=0;const events=[];
+            while(pages<200){
+              const r=await fetch(endpoint,{method:'POST',headers:{'content-type':'application/json','user-agent':'DeepBookReadOnlyEvents/3.0'},body:JSON.stringify({query,variables:{before,type}})});
+              if(!r.ok)throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+              const b=await r.json();if(b.errors)throw new Error(JSON.stringify(b.errors));
+              const c=b.data.events;pages++;let old=false;
+              for(const n of c.nodes){const t=n.timestamp?Date.parse(n.timestamp):0;if(t&&t<cutoff){old=true;continue}events.push({queried_type:type,timestamp:n.timestamp,transaction_digest:n.transaction?.digest??null,event_type:n.contents?.type?.repr??null,...(n.contents?.json??{})})}
+              if(old||!c.pageInfo.hasPreviousPage||!c.pageInfo.startCursor)break;
+              before=c.pageInfo.startCursor;
+            }
+            return {type,pages,events};
+          }
+          const results=[];for(const type of types){try{results.push(await one(type))}catch(error){results.push({type,pages:0,events:[],error:String(error?.stack??error)})}}
+          const unique=new Map();for(const r of results)for(const e of r.events)unique.set(`${e.transaction_digest}:${e.timestamp}:${e.target_pool??e.targetPool}:${e.conversion_rate??e.conversionRate}`,e);
+          const events=[...unique.values()];
+          const pools={
+            '0xf948981b806057580f91622417534f491da5f61aeaf33d0ed8e69fd5691c95ce':'DEEP_USDC',
+            '0xb663828d6217467c8a1838a03793da896cbe745b150ebd57d82f814ca579fc22':'DEEP_SUI',
+            '0xe05dafb5133bcffb8d59f4e12465dc0e9faeaa05e3e342a08fe135800e3e4407':'SUI_USDC',
+            '0x56a1c985c1f1123181d6b881714793689321ba24301b3585eec427436eb1c76d':'WAL_USDC',
+            '0x81f5339934c83ea19dd6bcc75c52e83509629a5f71d3257428c2ce47cc94d08b':'WAL_SUI',
+            '0x0c0fdd4008740d81a8a7d4281322aee71a1b62c449eb5b142656753d89ebc060':'NS_USDC',
+            '0x27c4fdb3b846aa3ae4a65ef5127a309aa3c1f466671471a806d8912a18b253e8':'NS_SUI',
+            '0x20b9a3ec7a02d4f344aa1ebc5774b7b0ccafa9a5d76230662fdc0300bb215307':'XBTC_USDC',
+            '0xfa732993af2b60d04d7049511f801e79426b2b6a5103e22769c0cead982b0f47':'IKA_USDC',
+            '0xfc28a2fb22579c16d672a1152039cbf671e5f4b9f103feddff4ea06ef3c2bc25':'USDT_USDC',
+          };
+          const counts={};
+          for(const e of events){const addr=String(e.target_pool??e.targetPool??'').toLowerCase();const key=pools[addr]??(addr||'unknown');const side=Boolean(e.is_base_conversion??e.isBaseConversion)?'base':'quote';counts[key]??={base:0,quote:0,total:0,min_rate:null,max_rate:null,first:null,latest:null};counts[key][side]++;counts[key].total++;const rate=Number(e.conversion_rate??e.conversionRate);if(Number.isFinite(rate)){counts[key].min_rate=counts[key].min_rate==null?rate:Math.min(counts[key].min_rate,rate);counts[key].max_rate=counts[key].max_rate==null?rate:Math.max(counts[key].max_rate,rate)}if(!counts[key].first||String(e.timestamp)<String(counts[key].first))counts[key].first=e.timestamp;if(!counts[key].latest||String(e.timestamp)>String(counts[key].latest))counts[key].latest=e.timestamp}
+          const out={generated_at:new Date().toISOString(),write_operations:0,cutoff:new Date(cutoff).toISOString(),query_results:results.map(r=>({type:r.type,pages:r.pages,event_count:r.events.length,error:r.error??null})),unique_event_count:events.length,counts};
+          fs.writeFileSync('/tmp/price-events/PRICE_EVENT_COUNTS.json',JSON.stringify(out,null,2));
+          fs.writeFileSync('/tmp/price-events/PRICE_ADDED_EVENTS_24H_V3.json',JSON.stringify(events,null,2));
+          JS
+          node /tmp/price-events/query.mjs
+          node -e "const x=require('/tmp/price-events/PRICE_EVENT_COUNTS.json');if(x.write_operations!==0||x.query_results.every(r=>r.error))process.exit(1)"
+          sha256sum /tmp/price-events/*.json > /tmp/price-events/PRICE_EVENTS_SHA256SUMS
+      - name: Commit read-only outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p readonly-snapshots/deepbook-round15
+          cp /tmp/price-events/{PRICE_EVENT_COUNTS.json,PRICE_ADDED_EVENTS_24H_V3.json,PRICE_EVENTS_SHA256SUMS} readonly-snapshots/deepbook-round15/
+          git config user.name readonly-snapshot-bot
+          git config user.email readonly-snapshot-bot@users.noreply.github.com
+          git add readonly-snapshots/deepbook-round15
+          if ! git diff --cached --quiet; then git commit -m 'data: publish DeepBook PriceAdded event counts v3'; git push origin HEAD:${GITHUB_REF_NAME}; fi
