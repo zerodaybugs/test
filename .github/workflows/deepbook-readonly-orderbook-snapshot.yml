@@ -1,0 +1,113 @@
+name: DeepBook read-only orderbook snapshot
+
+on:
+  push:
+    branches:
+      - "sui-round15-readonly-*"
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install official Mysten SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/deepbook-readonly
+          cd /tmp/deepbook-readonly
+          npm init -y >/dev/null
+          npm install --save-exact @mysten/sui @mysten/deepbook-v3@2.0.0
+          npm ls --json > SDK_VERSIONS.json
+
+      - name: Capture public mainnet orderbook and fee state
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/deepbook-readonly
+          cat > snapshot.mjs <<'JS'
+          import fs from 'node:fs';
+          import { SuiGrpcClient } from '@mysten/sui/grpc';
+          import { deepbook } from '@mysten/deepbook-v3';
+
+          const client = new SuiGrpcClient({
+            network: 'mainnet',
+            baseUrl: 'https://fullnode.mainnet.sui.io:443',
+          }).$extend(deepbook({ address: '0x0' }));
+
+          const pools = [
+            'DEEP_USDC', 'DEEP_SUI', 'SUI_USDC', 'WAL_USDC', 'WAL_SUI',
+            'NS_USDC', 'NS_SUI', 'XBTC_USDC', 'IKA_USDC', 'USDT_USDC',
+          ];
+
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          async function retry(label, fn) {
+            let last;
+            for (let attempt = 1; attempt <= 5; attempt++) {
+              try {
+                return await fn();
+              } catch (error) {
+                last = error;
+                if (attempt === 5) break;
+                await sleep(1000 * attempt);
+              }
+            }
+            throw new Error(`${label}: ${last?.stack ?? last}`);
+          }
+
+          const out = {
+            generated_at: new Date().toISOString(),
+            network: 'mainnet',
+            rpc: 'https://fullnode.mainnet.sui.io:443',
+            write_operations: 0,
+            pools: {},
+          };
+
+          for (const poolKey of pools) {
+            const row = {};
+            for (const [name, fn] of [
+              ['mid_price', () => client.deepbook.midPrice(poolKey)],
+              ['whitelisted', () => client.deepbook.whitelisted(poolKey)],
+              ['trade_params', () => client.deepbook.poolTradeParams(poolKey)],
+              ['book_params', () => client.deepbook.poolBookParams(poolKey)],
+              ['vault_balances', () => client.deepbook.vaultBalances(poolKey)],
+              ['deep_price', () => client.deepbook.getPoolDeepPrice(poolKey)],
+              ['level2_100', () => client.deepbook.getLevel2TicksFromMid(poolKey, 100)],
+            ]) {
+              try {
+                row[name] = await retry(`${poolKey}.${name}`, fn);
+              } catch (error) {
+                row[`${name}_error`] = String(error?.stack ?? error);
+              }
+            }
+            out.pools[poolKey] = row;
+          }
+
+          fs.writeFileSync('MAINNET_SNAPSHOT.json', JSON.stringify(out, null, 2));
+          JS
+          node snapshot.mjs | tee RUN.log
+          test -s MAINNET_SNAPSHOT.json
+          node -e "const x=require('./MAINNET_SNAPSHOT.json'); if(x.write_operations!==0) process.exit(1); console.log(Object.keys(x.pools).length)" | tee VALIDATION.log
+          sha256sum MAINNET_SNAPSHOT.json SDK_VERSIONS.json snapshot.mjs RUN.log VALIDATION.log > SHA256SUMS
+
+      - name: Upload read-only public snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepbook-mainnet-readonly-snapshot
+          path: |
+            /tmp/deepbook-readonly/MAINNET_SNAPSHOT.json
+            /tmp/deepbook-readonly/SDK_VERSIONS.json
+            /tmp/deepbook-readonly/snapshot.mjs
+            /tmp/deepbook-readonly/RUN.log
+            /tmp/deepbook-readonly/VALIDATION.log
+            /tmp/deepbook-readonly/SHA256SUMS
+          compression-level: 6
+          retention-days: 1
+          if-no-files-found: error
