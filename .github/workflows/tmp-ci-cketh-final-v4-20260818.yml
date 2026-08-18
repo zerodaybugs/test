@@ -1,0 +1,112 @@
+name: Temporary isolated ckETH final validation v4
+
+on:
+  push:
+    branches:
+      - tmp-ci-20260818-icp14
+    paths-ignore:
+      - "secure-ci-cketh-final-v4/**"
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install relay prerequisites
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends jq openssl xxd git curl tar gzip zip python3
+
+      - name: Generate and publish run-specific public key
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          base="secure-ci-cketh-final-v4/${GITHUB_RUN_ID}"
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out "$RUNNER_TEMP/runner-private.pem" >/dev/null 2>&1
+          openssl pkey -in "$RUNNER_TEMP/runner-private.pem" -pubout -out "$RUNNER_TEMP/runner-public.pem" >/dev/null 2>&1
+          printf '%s\n' "$GITHUB_RUN_ID" > "$RUNNER_TEMP/run-id.txt"
+          put_file() {
+            local path="$1" file="$2" message="$3"
+            local api="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${path}"
+            local content sha code
+            content=$(base64 -w0 < "$file")
+            code=$(curl -sS -o "$RUNNER_TEMP/get.json" -w '%{http_code}' -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' "${api}?ref=${GITHUB_REF_NAME}")
+            if [[ "$code" == 200 ]]; then sha=$(jq -r '.sha' "$RUNNER_TEMP/get.json"); else sha=''; fi
+            if [[ -n "$sha" ]]; then
+              jq -n --arg message "$message" --arg content "$content" --arg branch "$GITHUB_REF_NAME" --arg sha "$sha" '{message:$message,content:$content,branch:$branch,sha:$sha}' > "$RUNNER_TEMP/put.json"
+            else
+              jq -n --arg message "$message" --arg content "$content" --arg branch "$GITHUB_REF_NAME" '{message:$message,content:$content,branch:$branch}' > "$RUNNER_TEMP/put.json"
+            fi
+            curl -fsS -X PUT -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' "$api" --data-binary @"$RUNNER_TEMP/put.json" >/dev/null
+          }
+          put_file "${base}/runner-public.pem" "$RUNNER_TEMP/runner-public.pem" 'ci: publish run-specific ckETH v4 public key'
+          put_file secure-ci-cketh-final-v4/current-run-id.txt "$RUNNER_TEMP/run-id.txt" 'ci: publish current ckETH v4 run id'
+
+      - name: Wait for raw run-specific encrypted payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/secure-ci-cketh-final-v4/${GITHUB_RUN_ID}"
+          for _ in $(seq 1 2400); do
+            nonce=$(date +%s%N)
+            if curl -fsS -H 'Cache-Control: no-cache' "${raw}/payload.enc.hex?cb=${nonce}" -o "$RUNNER_TEMP/payload.enc.hex" \
+              && curl -fsS -H 'Cache-Control: no-cache' "${raw}/payload.key.enc.hex?cb=${nonce}" -o "$RUNNER_TEMP/payload.key.enc.hex"; then
+              tr -d '\r\n\t ' < "$RUNNER_TEMP/payload.enc.hex" | xxd -r -p > "$RUNNER_TEMP/payload.enc"
+              tr -d '\r\n\t ' < "$RUNNER_TEMP/payload.key.enc.hex" | xxd -r -p > "$RUNNER_TEMP/payload.key.enc"
+              test -s "$RUNNER_TEMP/payload.enc"
+              test -s "$RUNNER_TEMP/payload.key.enc"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo 'raw run-specific payload not received' >&2
+          exit 1
+
+      - name: Decrypt and execute payload
+        shell: bash
+        run: |
+          set +e
+          mkdir -p "$RUNNER_TEMP/payload" "$RUNNER_TEMP/result"
+          openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/runner-private.pem" -in "$RUNNER_TEMP/payload.key.enc" -out "$RUNNER_TEMP/payload.pass" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          rc=$?
+          if [[ $rc -eq 0 ]]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/payload.enc" -out "$RUNNER_TEMP/payload.tar.gz" -pass file:"$RUNNER_TEMP/payload.pass"
+            rc=$?
+          fi
+          if [[ $rc -eq 0 ]]; then
+            tar -xzf "$RUNNER_TEMP/payload.tar.gz" -C "$RUNNER_TEMP/payload"
+            chmod +x "$RUNNER_TEMP/payload/run.sh"
+            bash "$RUNNER_TEMP/payload/run.sh" "$RUNNER_TEMP/result" > "$RUNNER_TEMP/result/driver.stdout.log" 2> "$RUNNER_TEMP/result/driver.stderr.log"
+            rc=$?
+          fi
+          printf '%s\n' "$rc" > "$RUNNER_TEMP/result/PAYLOAD_EXIT.txt"
+          exit 0
+
+      - name: Encrypt result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/result" "$RUNNER_TEMP/encrypted-result"
+          tar -czf "$RUNNER_TEMP/result.tar.gz" -C "$RUNNER_TEMP/result" .
+          openssl rand -hex 32 > "$RUNNER_TEMP/result.pass"
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/result.tar.gz" -out "$RUNNER_TEMP/encrypted-result/result.enc" -pass file:"$RUNNER_TEMP/result.pass"
+          openssl pkeyutl -encrypt -pubin -inkey secure-ci-cketh-final/researcher-public.pem -in "$RUNNER_TEMP/result.pass" -out "$RUNNER_TEMP/encrypted-result/result.key.enc" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          sha256sum "$RUNNER_TEMP/encrypted-result/result.enc" "$RUNNER_TEMP/encrypted-result/result.key.enc" > "$RUNNER_TEMP/encrypted-result/SHA256SUMS.txt"
+          printf '%s\n' "$GITHUB_RUN_ID" > "$RUNNER_TEMP/encrypted-result/run-id.txt"
+
+      - name: Upload encrypted result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-cketh-final-v4-result
+          path: ${{ runner.temp }}/encrypted-result/
+          retention-days: 1
+          if-no-files-found: error
