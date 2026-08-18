@@ -1,0 +1,183 @@
+name: Temporary ICP15 deployed-component security diff
+
+on:
+  push:
+    branches:
+      - tmp-ci-20260818-icp15
+    paths:
+      - ".github/workflows/tmp-ci-icp15-deployed-diff.yml"
+      - "secure-ci-icp15/researcher-public.pem"
+
+permissions:
+  contents: write
+
+jobs:
+  diff:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp-ci-20260818-icp15
+
+      - name: Publish workflow run ID
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$GITHUB_RUN_ID" > secure-ci-icp15/deployed-diff-run-id.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add secure-ci-icp15/deployed-diff-run-id.txt
+          git commit -m 'ci: publish ICP15 deployed-diff run id' || true
+          git push origin HEAD:tmp-ci-20260818-icp15
+
+      - name: Install prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends git jq openssl python3 tar gzip
+
+      - name: Clone IC history
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/dfinity/ic.git "$RUNNER_TEMP/ic"
+          cd "$RUNNER_TEMP/ic"
+          git rev-parse origin/master > "$RUNNER_TEMP/current-head.txt"
+          git log -1 --format='%H%n%cI%n%s' origin/master > "$RUNNER_TEMP/current-head-meta.txt"
+
+      - name: Analyze deployed-to-current component history
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/result"
+          cp "$RUNNER_TEMP/current-head.txt" "$RUNNER_TEMP/result/CURRENT_HEAD.txt"
+          cp "$RUNNER_TEMP/current-head-meta.txt" "$RUNNER_TEMP/result/CURRENT_HEAD_META.txt"
+          cat > "$RUNNER_TEMP/analyze.py" <<'PY'
+          from __future__ import annotations
+          import json, os, re, subprocess
+          from pathlib import Path
+
+          repo = Path(os.environ['RUNNER_TEMP']) / 'ic'
+          out = Path(os.environ['RUNNER_TEMP']) / 'result'
+          head = subprocess.check_output(['git','-C',str(repo),'rev-parse','origin/master'], text=True).strip()
+
+          components = [
+              ('swap','0e4c8234a9e0508ae30c5b8a7498406294c25e95',['rs/sns/swap']),
+              ('sns_governance','b904c9dd1bdef8841bd12f03efbc71180a015e25',['rs/sns/governance']),
+              ('nns_governance','8aa4680e378f3248e7e7b9b8237915aded999bd9',['rs/nns/governance']),
+              ('cmc','59074a9b13b06bb8cc52713d164f860b884b5ade',['rs/nns/cmc']),
+              ('nns_root','3ec5d044f5dc45a93943ec14258891a1c3c272be',['rs/nns/handlers/root']),
+              ('sns_root','724ae4101bfdd8d4443126a6a8b1ec5ca9b68a12',['rs/sns/root']),
+              ('sns_wasm','8aa4680e378f3248e7e7b9b8237915aded999bd9',['rs/nns/sns-wasm']),
+              ('icp_ledger','69b755062f5ef0a7d6efc9a127172b46121420c8',['rs/ledger_suite/icp']),
+              ('sns_ledger','cf41372e3d4dc1accfe2c09a7969f8bddc729dc1',['rs/ledger_suite/icrc1']),
+              ('cycles_minting','59074a9b13b06bb8cc52713d164f860b884b5ade',['rs/nns/cmc']),
+          ]
+
+          high_signal = re.compile(
+              r'(?i)\b(fix|security|vulnerab|bug|panic|trap|double|refund|reimburse|auth|'
+              r'permission|controller|overflow|underflow|race|stuck|loss|mint|burn|transfer|'
+              r'incorrect|invariant|denial|dos|corrupt|leak|replay|idempot|validation|bypass|'
+              r'wrong|stale|unsafe|quarantin|rollback|freeze|deadlock|reentr|alias)\b'
+          )
+          path_signal = re.compile(
+              r'(?i)(ledger|governance|swap|cmc|root|transfer|refund|reimburse|mint|burn|'
+              r'neuron|controller|auth|permission|state|audit|lifecycle|finalize|claim)'
+          )
+
+          def run(args, check=True):
+              p = subprocess.run(args, cwd=repo, text=True, capture_output=True)
+              if check and p.returncode != 0:
+                  raise RuntimeError(f"command failed {args}: {p.stderr}")
+              return p.stdout
+
+          all_results = []
+          for name, base, paths in components:
+              exists = subprocess.run(['git','cat-file','-e',f'{base}^{{commit}}'], cwd=repo).returncode == 0
+              if not exists:
+                  run(['git','fetch','origin',base], check=False)
+              exists = subprocess.run(['git','cat-file','-e',f'{base}^{{commit}}'], cwd=repo).returncode == 0
+              item = {'name':name,'base':base,'head':head,'paths':paths,'base_exists':exists,'commits':[]}
+              if not exists:
+                  all_results.append(item)
+                  continue
+              fmt = '%H%x1f%cI%x1f%s%x1e'
+              raw = run(['git','log',f'--format={fmt}',f'{base}..{head}','--',*paths])
+              entries = []
+              for rec in raw.split('\x1e'):
+                  rec = rec.strip()
+                  if not rec: continue
+                  parts = rec.split('\x1f')
+                  if len(parts) < 3: continue
+                  sha,date,subject = parts[0],parts[1],parts[2]
+                  names = run(['git','diff-tree','--no-commit-id','--name-only','-r',sha,'--',*paths], check=False).splitlines()
+                  score = 0
+                  reasons = []
+                  if high_signal.search(subject): score += 10; reasons.append('message-high-signal')
+                  if subject.lower().startswith('fix'): score += 8; reasons.append('fix-prefix')
+                  if any(path_signal.search(p) for p in names): score += 4; reasons.append('sensitive-path')
+                  if any(re.search(r'(?i)(test|bench|docs|readme|changelog)',p) for p in names) and not any(re.search(r'(?i)/src/|canister|ledger|governance|swap',p) for p in names):
+                      score -= 4
+                  if score < 4:
+                      continue
+                  show = run(['git','show','--format=fuller','--stat','--summary','--find-renames',sha,'--',*paths], check=False)
+                  patch = ''
+                  if score >= 10:
+                      patch = run(['git','show','--format=','--unified=40','--find-renames',sha,'--',*paths], check=False)
+                      if len(patch) > 120000:
+                          patch = patch[:120000] + '\n[TRUNCATED]\n'
+                  entries.append({'sha':sha,'date':date,'subject':subject,'files':names,'score':score,'reasons':reasons,'show':show[:50000],'patch':patch})
+              entries.sort(key=lambda x:(-x['score'],x['date']), reverse=False)
+              item['commits'] = entries[:150]
+              item['changed_files'] = run(['git','diff','--name-status',base,head,'--',*paths], check=False).splitlines()[:5000]
+              all_results.append(item)
+              (out/f'{name.upper()}_COMMITS.json').write_text(json.dumps(item,indent=2),encoding='utf-8')
+              with (out/f'{name.upper()}_TOP.txt').open('w',encoding='utf-8') as f:
+                  for e in item['commits'][:80]:
+                      f.write(f"\n=== SCORE {e['score']} {e['sha']} {e['date']} ===\n{e['subject']}\nFILES:\n")
+                      f.write('\n'.join(e['files'])+'\n')
+                      f.write(e['patch'] or e['show'])
+
+          summary = {
+              'head':head,
+              'components':[{
+                  'name':x['name'],'base':x['base'],'base_exists':x['base_exists'],
+                  'candidate_count':len(x['commits']),
+                  'top':[{'sha':e['sha'],'date':e['date'],'subject':e['subject'],'score':e['score'],'files':e['files']} for e in x['commits'][:25]]
+              } for x in all_results]
+          }
+          (out/'DEPLOYED_DIFF_SUMMARY.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
+          PY
+          python3 "$RUNNER_TEMP/analyze.py"
+
+      - name: Encrypt result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/encrypted" "$RUNNER_TEMP/result"
+          tar -czf "$RUNNER_TEMP/result.tar.gz" -C "$RUNNER_TEMP/result" .
+          openssl rand -hex 32 > "$RUNNER_TEMP/result.pass"
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+            -in "$RUNNER_TEMP/result.tar.gz" \
+            -out "$RUNNER_TEMP/encrypted/result.enc" \
+            -pass file:"$RUNNER_TEMP/result.pass"
+          openssl pkeyutl -encrypt -pubin \
+            -inkey secure-ci-icp15/researcher-public.pem \
+            -in "$RUNNER_TEMP/result.pass" \
+            -out "$RUNNER_TEMP/encrypted/result.key.enc" \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          sha256sum "$RUNNER_TEMP/encrypted/result.enc" "$RUNNER_TEMP/encrypted/result.key.enc" \
+            > "$RUNNER_TEMP/encrypted/SHA256SUMS.txt"
+
+      - name: Upload encrypted result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-result-icp15-deployed-diff
+          path: ${{ runner.temp }}/encrypted/
+          if-no-files-found: error
+          retention-days: 1
