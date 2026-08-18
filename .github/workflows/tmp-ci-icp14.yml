@@ -1,0 +1,105 @@
+name: Temporary isolated ICP validation icp14
+
+on:
+  push:
+    branches:
+      - tmp-ci-20260818-icp14
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends jq openssl xxd git ripgrep python3 tar gzip zip
+
+      - name: Generate one-time runner key
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/runner-public"
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out "$RUNNER_TEMP/runner-private.pem" >/dev/null 2>&1
+          openssl pkey -in "$RUNNER_TEMP/runner-private.pem" -pubout -out "$RUNNER_TEMP/runner-public/runner-public.pem" >/dev/null 2>&1
+          sha256sum "$RUNNER_TEMP/runner-public/runner-public.pem" > "$RUNNER_TEMP/runner-public/runner-public.pem.sha256"
+
+      - name: Publish runner public key
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-public-key-icp14
+          path: ${{ runner.temp }}/runner-public/
+          retention-days: 1
+
+      - name: Wait for encrypted payload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/secure-ci-icp14"
+          for _ in $(seq 1 1200); do
+            a=$(curl -sS -o "$RUNNER_TEMP/a.json" -w '%{http_code}' -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' "${api}/payload.enc.hex?ref=${GITHUB_REF_NAME}")
+            b=$(curl -sS -o "$RUNNER_TEMP/b.json" -w '%{http_code}' -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' "${api}/payload.key.enc.hex?ref=${GITHUB_REF_NAME}")
+            if [[ "$a" == 200 && "$b" == 200 ]]; then
+              jq -r '.content' "$RUNNER_TEMP/a.json" | tr -d '\n' | base64 -d > "$RUNNER_TEMP/payload.enc.hex"
+              jq -r '.content' "$RUNNER_TEMP/b.json" | tr -d '\n' | base64 -d > "$RUNNER_TEMP/payload.key.enc.hex"
+              tr -d '\r\n\t ' < "$RUNNER_TEMP/payload.enc.hex" | xxd -r -p > "$RUNNER_TEMP/payload.enc"
+              tr -d '\r\n\t ' < "$RUNNER_TEMP/payload.key.enc.hex" | xxd -r -p > "$RUNNER_TEMP/payload.key.enc"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo 'encrypted payload not received' >&2
+          exit 1
+
+      - name: Decrypt and execute payload
+        id: payload
+        shell: bash
+        run: |
+          set +e
+          mkdir -p "$RUNNER_TEMP/payload" "$RUNNER_TEMP/secure-result"
+          openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/runner-private.pem" -in "$RUNNER_TEMP/payload.key.enc" -out "$RUNNER_TEMP/payload.pass" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          key_rc=$?
+          if [[ $key_rc -eq 0 ]]; then
+            openssl enc -d -aes-256-cbc -salt -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/payload.enc" -out "$RUNNER_TEMP/payload.tar.gz" -pass file:"$RUNNER_TEMP/payload.pass"
+            dec_rc=$?
+          else
+            dec_rc=$key_rc
+          fi
+          if [[ $dec_rc -eq 0 ]]; then
+            tar -xzf "$RUNNER_TEMP/payload.tar.gz" -C "$RUNNER_TEMP/payload"
+            chmod +x "$RUNNER_TEMP/payload/run.sh"
+            bash "$RUNNER_TEMP/payload/run.sh" "$RUNNER_TEMP/secure-result" > "$RUNNER_TEMP/secure-result/runner.log" 2>&1
+            run_rc=$?
+          else
+            run_rc=$dec_rc
+            echo "payload decryption failed: ${dec_rc}" > "$RUNNER_TEMP/secure-result/runner.log"
+          fi
+          printf '%s\n' "$run_rc" > "$RUNNER_TEMP/secure-result/PAYLOAD_EXIT.txt"
+          exit 0
+
+      - name: Encrypt result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/encrypted-result" "$RUNNER_TEMP/secure-result"
+          tar -czf "$RUNNER_TEMP/result.tar.gz" -C "$RUNNER_TEMP/secure-result" .
+          openssl rand -hex 32 > "$RUNNER_TEMP/result.pass"
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/result.tar.gz" -out "$RUNNER_TEMP/encrypted-result/result.enc" -pass file:"$RUNNER_TEMP/result.pass"
+          openssl pkeyutl -encrypt -pubin -inkey secure-ci-icp14/researcher-public.pem -in "$RUNNER_TEMP/result.pass" -out "$RUNNER_TEMP/encrypted-result/result.key.enc" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          sha256sum "$RUNNER_TEMP/encrypted-result/result.enc" "$RUNNER_TEMP/encrypted-result/result.key.enc" > "$RUNNER_TEMP/encrypted-result/SHA256SUMS.txt"
+
+      - name: Upload encrypted result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-result-icp14
+          path: ${{ runner.temp }}/encrypted-result/
+          retention-days: 1
