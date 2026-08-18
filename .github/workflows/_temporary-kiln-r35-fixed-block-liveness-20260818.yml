@@ -1,0 +1,133 @@
+name: kiln-r35-fixed-block-liveness
+
+on:
+  push:
+    branches: [agent/kiln-r35-fixed-block-liveness-20260818]
+    paths:
+      - kiln_r35/fixed_block_liveness.py
+      - .github/workflows/_temporary-kiln-r35-fixed-block-liveness-20260818.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fixed-block-liveness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/kiln-r35-fixed-block-liveness-20260818
+          fetch-depth: 1
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Install and verify
+        run: |
+          python3 -m pip install --disable-pip-version-check 'web3==7.13.0' 'requests==2.32.5'
+          python3 -m py_compile kiln_r34/liveness_exact_v2.py kiln_r35/fixed_block_liveness.py
+
+      - name: Run R34 plus fixed-block holder control
+        id: gate
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 kiln_r35/fixed_block_liveness.py 2>&1 | tee r35_run.log
+          printf '%s\n' "${PIPESTATUS[0]}" > r35_exit_code.txt
+          exit "$(cat r35_exit_code.txt)"
+
+      - name: Fail-closed public gate and refresh hashes
+        if: always()
+        env:
+          STEP_OUTCOME: ${{ steps.gate.outcome }}
+          RUN_ID: ${{ github.run_id }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,time
+          from pathlib import Path
+          root=Path('r35_results'); root.mkdir(exist_ok=True)
+          try: code=int(Path('r35_exit_code.txt').read_text().strip())
+          except Exception: code=999
+          try: gate=json.loads((root/'PUBLIC_GATE.json').read_text())
+          except Exception: gate={}
+          if not gate:
+              gate={
+                'schema':'kiln-r35-fallback-public-gate','decision':'INCONCLUSIVE_EXECUTION_FAILURE',
+                'submit_ready':False,'validated_critical':0,'validated_high':0,
+                'r34_candidate_count':0,'tested_candidate_count':0,
+                'verified_redeem_failure_5of5_count':0,'inconclusive_count':1,
+                'failure_rows':[],'public_chain_state_changes':0,'transactions_signed':0,
+                'transactions_sent':0,'local_fork_transactions':0,
+              }
+          gate.update({
+              'runner_exit_code':code,'step_outcome':os.environ.get('STEP_OUTCOME'),
+              'run_id':int(os.environ['RUN_ID']),'source_sha':os.environ['SOURCE_SHA'],
+              'persisted_at_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+          })
+          if code!=0 or os.environ.get('STEP_OUTCOME')!='success':
+              gate.update({'decision':'INCONCLUSIVE_EXECUTION_FAILURE','submit_ready':False,'validated_critical':0,'validated_high':0})
+          (root/'PUBLIC_GATE.json').write_text(json.dumps(gate,indent=2,sort_keys=True))
+          files=sorted(path for path in root.iterdir() if path.is_file() and path.name!='SHA256SUMS.txt')
+          (root/'SHA256SUMS.txt').write_text(''.join(f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n' for path in files))
+          PY
+
+      - name: Validate safety and hashes
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          root=Path('r35_results'); gate=json.loads((root/'PUBLIC_GATE.json').read_text())
+          assert gate['submit_ready'] is False
+          assert gate['validated_critical']==0 and gate['validated_high']==0
+          assert gate['public_chain_state_changes']==0 and gate['transactions_signed']==0 and gate['transactions_sent']==0
+          for line in (root/'SHA256SUMS.txt').read_text().splitlines():
+              digest,name=line.split('  ',1); assert hashlib.sha256((root/name).read_bytes()).hexdigest()==digest
+          evidence=root/'EVIDENCE.json'
+          if evidence.exists():
+              data=json.loads(evidence.read_text()); safety=data['safety']
+              assert safety['public_chain_state_changes']==0
+              assert safety['transactions_signed']==0
+              assert safety['transactions_sent_to_public_chain']==0
+              assert safety['private_keys_loaded']==0
+          print('R35_SELF_CHECK=PASS')
+          PY
+
+      - name: Persist public gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf r35_public_gate; mkdir r35_public_gate
+          cp r35_results/PUBLIC_GATE.json r35_public_gate/
+          cp r35_results/SHA256SUMS.txt r35_public_gate/
+          printf '%s\n' '${{ github.run_id }}' > r35_public_gate/RUN_ID.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add r35_public_gate
+          git commit -m 'persist Kiln R35 fixed-block liveness gate' || exit 0
+          for attempt in 1 2 3 4 5 6; do
+            git pull --rebase origin agent/kiln-r35-fixed-block-liveness-20260818
+            if git push origin HEAD:agent/kiln-r35-fixed-block-liveness-20260818; then exit 0; fi
+            sleep $((attempt * 4))
+          done
+          exit 1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kiln-r35-private-evidence
+          path: |
+            r34_exact_results
+            r35_results
+            r35_run.log
+            r35_exit_code.txt
+            kiln_r34/liveness_exact_v2.py
+            kiln_r35/fixed_block_liveness.py
+          if-no-files-found: warn
+          retention-days: 3
