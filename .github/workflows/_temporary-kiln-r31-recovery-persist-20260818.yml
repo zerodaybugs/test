@@ -1,0 +1,112 @@
+name: kiln-r31-recovery-persist
+
+on:
+  push:
+    branches: [agent/kiln-r31-runtime-census-20260817]
+    paths:
+      - .github/workflows/_temporary-kiln-r31-recovery-persist-20260818.yml
+      - kiln_r31/delivery_public.pem
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  recover-and-persist:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/kiln-r31-runtime-census-20260817
+          fetch-depth: 1
+      - name: Install pinned runtime
+        run: python3 -m pip install --disable-pip-version-check 'web3==7.13.0'
+      - name: Verify source
+        run: python3 -m py_compile kiln_r31/runtime_census.py
+      - name: Run selected shards and persist recoverable encrypted evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf r31_recovery_results
+          mkdir -p r31_recovery_results
+          cases=(
+            'ethereum 0 4'
+            'ethereum 1 4'
+            'ethereum 2 4'
+            'ethereum 3 4'
+            'bnb 0 1'
+            'base 0 1'
+          )
+          for spec in "${cases[@]}"; do
+            read -r network shard count <<< "$spec"
+            key="${network}_${shard}"
+            out="r31_recovery_results/${key}"
+            mkdir -p "$out/encrypted"
+            rm -rf r31_results
+            set +e
+            TARGET_NETWORK="$network" SHARD_INDEX="$shard" SHARD_COUNT="$count" \
+              python3 kiln_r31/runtime_census.py > "/tmp/${key}.log" 2>&1
+            code=$?
+            set -e
+            printf '%s\n' "$code" > "/tmp/${key}.exit"
+            python3 - "$network" "$shard" "$count" "$code" <<'PY'
+          import hashlib,json,sys
+          from pathlib import Path
+          network,shard,count,code=sys.argv[1],int(sys.argv[2]),int(sys.argv[3]),int(sys.argv[4])
+          root=Path('r31_results'); root.mkdir(exist_ok=True)
+          gate=root/'PUBLIC_GATE.json'
+          if gate.exists():
+              data=json.loads(gate.read_text())
+          else:
+              data={'schema':'kiln-r31-recovery-fallback-v1','decision':'INCONCLUSIVE_EXECUTION_FAILURE','submit_ready':False,'validated_critical':0,'validated_high':0,'network':network,'shard_index':shard,'shard_count':count,'selected_count':0,'inspected_count':0,'error_count':1,'signal_row_count':0,'unique_connector_count':0,'public_chain_state_changes':0,'transactions_signed':0,'transactions_sent':0}
+          data['runner_exit_code']=code
+          if code!=0:
+              data.update({'decision':'INCONCLUSIVE_EXECUTION_FAILURE','submit_ready':False,'validated_critical':0,'validated_high':0})
+          gate.write_text(json.dumps(data,indent=2,sort_keys=True))
+          sums=root/'SHA256SUMS.txt'
+          files=sorted(p for p in root.iterdir() if p.is_file() and p.name!='SHA256SUMS.txt')
+          sums.write_text(''.join(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n" for p in files))
+          PY
+            cp r31_results/PUBLIC_GATE.json "$out/PUBLIC_GATE.json"
+            cp r31_results/SHA256SUMS.txt "$out/PRIVATE_SHA256SUMS.txt"
+            tar -czf "/tmp/${key}.tar.gz" r31_results "/tmp/${key}.log" "/tmp/${key}.exit" kiln_r31/runtime_census.py
+            openssl rand 32 > "/tmp/${key}.aes"
+            openssl enc -aes-256-cbc -salt -pbkdf2 -iter 250000 \
+              -in "/tmp/${key}.tar.gz" -out "$out/encrypted/payload.aes256" -pass "file:/tmp/${key}.aes"
+            openssl pkeyutl -encrypt -pubin -inkey kiln_r31/delivery_public.pem \
+              -in "/tmp/${key}.aes" -out "$out/encrypted/key.rsa3072" \
+              -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+            sha256sum "$out/encrypted/payload.aes256" "$out/encrypted/key.rsa3072" > "$out/encrypted/SHA256SUMS.txt"
+            python3 - "$network" "$shard" "$count" "$code" "$out" <<'PY'
+          import json,sys
+          from pathlib import Path
+          network,shard,count,code,out=sys.argv[1],int(sys.argv[2]),int(sys.argv[3]),int(sys.argv[4]),Path(sys.argv[5])
+          (out/'MANIFEST.json').write_text(json.dumps({'schema':'kiln-r31-recovery-encrypted-v1','network':network,'shard_index':shard,'shard_count':count,'runner_exit_code':code,'plaintext_evidence_committed':False,'public_chain_state_changes':0,'transactions_signed':0,'transactions_sent':0,'private_keys_loaded':0},indent=2,sort_keys=True))
+          PY
+            rm -rf r31_results
+            rm -f "/tmp/${key}.log" "/tmp/${key}.exit" "/tmp/${key}.tar.gz" "/tmp/${key}.aes"
+          done
+          python3 - <<'PY'
+          import json,time
+          from pathlib import Path
+          rows=[]
+          for p in sorted(Path('r31_recovery_results').glob('*/PUBLIC_GATE.json')):
+              rows.append(json.loads(p.read_text()))
+          aggregate={'schema':'kiln-r31-recovery-aggregate-v1','generated_at_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'shard_count':len(rows),'selected_total':sum(int(x.get('selected_count',0) or 0) for x in rows),'inspected_total':sum(int(x.get('inspected_count',0) or 0) for x in rows),'error_total':sum(int(x.get('error_count',0) or 0) for x in rows),'signal_total':sum(int(x.get('signal_row_count',0) or 0) for x in rows),'positive_shards':[{'network':x.get('network'),'shard_index':x.get('shard_index'),'signals':x.get('signal_row_count'),'decision':x.get('decision')} for x in rows if int(x.get('signal_row_count',0) or 0)>0],'submit_ready':False,'validated_critical':0,'validated_high':0,'rows':rows}
+          Path('r31_recovery_results/AGGREGATE_PUBLIC.json').write_text(json.dumps(aggregate,indent=2,sort_keys=True))
+          PY
+      - name: Commit encrypted recovery evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add r31_recovery_results
+          git commit -m 'persist recoverable Kiln R31 signal evidence'
+          for attempt in 1 2 3; do
+            git pull --rebase origin agent/kiln-r31-runtime-census-20260817
+            if git push origin HEAD:agent/kiln-r31-runtime-census-20260817; then exit 0; fi
+            sleep $((attempt * 3))
+          done
+          exit 1
