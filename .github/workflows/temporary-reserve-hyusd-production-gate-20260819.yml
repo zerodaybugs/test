@@ -1,0 +1,257 @@
+name: temporary-reserve-hyusd-production-gate-20260819
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/temporary-reserve-hyusd-production-gate-20260819.yml
+
+permissions:
+  contents: read
+
+jobs:
+  production-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      FOUNDRY_VERSION: v1.7.1
+      FOUNDRY_SHA256: cf7e688ed0c4c48adffca788b496076e31060b67ac5afe1e43dbb5499c20c88b
+      RTOKEN: 0xCc7FF230365bD730eE4B352cC2492CEdAC49383e
+      EXPECTED_MAIN: 0xA582985c68ED30a052Ff0b07D74931140bd5a00F
+      EXPECTED_BASKET: 0x9306587db04E35981e57013f6E1D867eCa89e2ec
+      EXPECTED_BM: 0xA1E1A94977ec3159DB546bf01d7a8d17DD3EbBeD
+      EXPECTED_STRSR: 0x796d2367AF69deB3319B8E10712b8B65957371c3
+      COLLATERAL: 0x97F9d5ed17A0C99B279887caD5254d15fb1B619B
+      WRAPPER: 0xDB5b8cead52f77De0f6B5255f73F348AAf2CBb8D
+      EXPECTED_POOL: 0x7A034374C89C463DD65D8C9BCfe63BcBCED41f4F
+      EXPECTED_GAUGE: 0x793F22aB88dC91793E5Ce6ADbd7E733B0BD4733e
+      AERO: 0x940181a94A35A4569E4529A3CDfB74e38FD98631
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install and verify official Foundry
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p foundry-bin evidence
+          url="https://github.com/foundry-rs/foundry/releases/download/${FOUNDRY_VERSION}/foundry_${FOUNDRY_VERSION}_linux_amd64.tar.gz"
+          curl --fail --location --retry 5 --retry-all-errors "$url" -o foundry.tar.gz
+          echo "${FOUNDRY_SHA256}  foundry.tar.gz" | sha256sum -c -
+          tar -xzf foundry.tar.gz -C foundry-bin
+          foundry-bin/cast --version | tee evidence/cast-version.txt
+
+      - name: Select public Base RPC and pin a finalized block
+        shell: bash
+        run: |
+          set -euo pipefail
+          endpoints=(
+            https://base-rpc.publicnode.com
+            https://mainnet.base.org
+            https://1rpc.io/base
+            https://base.llamarpc.com
+          )
+          : > evidence/rpc-probes.tsv
+          chosen=''
+          latest=''
+          for rpc in "${endpoints[@]}"; do
+            if n=$(foundry-bin/cast block-number --rpc-url "$rpc" 2>/dev/null); then
+              printf '%s\tPASS\t%s\n' "$rpc" "$n" | tee -a evidence/rpc-probes.tsv
+              if [ -z "$chosen" ]; then chosen="$rpc"; latest="$n"; fi
+            else
+              printf '%s\tFAIL\t-\n' "$rpc" | tee -a evidence/rpc-probes.tsv
+            fi
+          done
+          test -n "$chosen"
+          block=$((latest - 8))
+          hash=$(foundry-bin/cast block "$block" --rpc-url "$chosen" --field hash)
+          {
+            echo "RPC_URL=$chosen"
+            echo "PINNED_BLOCK=$block"
+            echo "PINNED_BLOCK_HASH=$hash"
+          } >> "$GITHUB_ENV"
+          {
+            echo "chain_id=$(foundry-bin/cast chain-id --rpc-url "$chosen")"
+            echo "rpc=$chosen"
+            echo "latest_block=$latest"
+            echo "pinned_block=$block"
+            echo "pinned_block_hash=$hash"
+            echo "observed_utc=$(date -u +%FT%TZ)"
+          } | tee evidence/environment.txt
+
+      - name: Read exact production graph and economic gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          CAST="$GITHUB_WORKSPACE/foundry-bin/cast"
+          : > evidence/calls.tsv
+
+          call_required() {
+            local key="$1" address="$2" sig="$3"; shift 3
+            local out
+            out=$($CAST call --rpc-url "$RPC_URL" --block "$PINNED_BLOCK" "$address" "$sig" "$@")
+            printf '%s\tPASS\t%s\n' "$key" "$(printf '%s' "$out" | tr '\n' ';')" | tee -a evidence/calls.tsv
+          }
+          call_optional() {
+            local key="$1" address="$2" sig="$3"; shift 3
+            local out err rc
+            err=$(mktemp)
+            set +e
+            out=$($CAST call --rpc-url "$RPC_URL" --block "$PINNED_BLOCK" "$address" "$sig" "$@" 2>"$err")
+            rc=$?
+            set -e
+            if [ "$rc" -eq 0 ]; then
+              printf '%s\tPASS\t%s\n' "$key" "$(printf '%s' "$out" | tr '\n' ';')" | tee -a evidence/calls.tsv
+            else
+              printf '%s\tFAIL\t%s\n' "$key" "$(tr '\n' ';' < "$err")" | tee -a evidence/calls.tsv
+            fi
+            rm -f "$err"
+          }
+          value() {
+            awk -F '\t' -v k="$1" '$1==k && $2=="PASS" {sub(/;$/, "", $3); print $3; exit}' evidence/calls.tsv
+          }
+          address_value() {
+            value "$1" | grep -Eo '0x[0-9a-fA-F]{40}' | head -1 | tr '[:upper:]' '[:lower:]'
+          }
+          uint_value() {
+            value "$1" | grep -Eo '^[0-9]+' | head -1
+          }
+          lower() { tr '[:upper:]' '[:lower:]'; }
+
+          call_required rtoken_main "$RTOKEN" 'main()(address)'
+          call_required rtoken_total_supply "$RTOKEN" 'totalSupply()(uint256)'
+          call_optional rtoken_issuance_available "$RTOKEN" 'issuanceAvailable()(uint256)'
+          call_optional rtoken_redemption_available "$RTOKEN" 'redemptionAvailable()(uint256)'
+          call_required rtoken_baskets_needed "$RTOKEN" 'basketsNeeded()(uint192)'
+
+          MAIN=$(address_value rtoken_main)
+          call_required main_basket_handler "$MAIN" 'basketHandler()(address)'
+          call_required main_backing_manager "$MAIN" 'backingManager()(address)'
+          call_required main_st_rsr "$MAIN" 'stRSR()(address)'
+          call_required main_rsr "$MAIN" 'rsr()(address)'
+          call_required main_issuance_paused_or_frozen "$MAIN" 'issuancePausedOrFrozen()(bool)'
+          call_optional main_trading_paused_or_frozen "$MAIN" 'tradingPausedOrFrozen()(bool)'
+          call_optional main_frozen "$MAIN" 'frozen()(bool)'
+
+          BASKET=$(address_value main_basket_handler)
+          BM=$(address_value main_backing_manager)
+          STRSR=$(address_value main_st_rsr)
+
+          call_required basket_enable_issuance_premium "$BASKET" 'enableIssuancePremium()(bool)'
+          call_required basket_nonce "$BASKET" 'nonce()(uint48)'
+          NONCE=$(uint_value basket_nonce)
+          call_required basket_prime "$BASKET" 'getPrimeBasket()(address[],bytes32[],uint192[])'
+          call_required basket_historical "$BASKET" 'getHistoricalBasket(uint48)(address[],uint256[])' "$NONCE"
+          call_required basket_quantity_wrapper "$BASKET" 'quantity(address)(uint192)' "$WRAPPER"
+          call_required basket_price_without_premium "$BASKET" 'price(bool)(uint192,uint192)' false
+          call_required basket_price_with_premium "$BASKET" 'price(bool)(uint192,uint192)' true
+          call_required basket_status "$BASKET" 'status()(uint8)'
+          call_required basket_ready "$BASKET" 'isReady()(bool)'
+          call_required basket_fully_collateralized "$BASKET" 'fullyCollateralized()(bool)'
+
+          call_required collateral_erc20 "$COLLATERAL" 'erc20()(address)'
+          call_required collateral_pool "$COLLATERAL" 'pool()(address)'
+          call_required collateral_saved_peg_price "$COLLATERAL" 'savedPegPrice()(uint192)'
+          call_required collateral_last_save "$COLLATERAL" 'lastSave()(uint48)'
+          call_required collateral_status "$COLLATERAL" 'status()(uint8)'
+          call_required collateral_ref_per_tok "$COLLATERAL" 'refPerTok()(uint192)'
+          call_required collateral_target_per_ref "$COLLATERAL" 'targetPerRef()(uint192)'
+          call_required collateral_peg_bottom "$COLLATERAL" 'pegBottom()(uint192)'
+          call_required collateral_peg_top "$COLLATERAL" 'pegTop()(uint192)'
+          call_required collateral_price "$COLLATERAL" 'price()(uint192,uint192)'
+          call_required collateral_token0_price "$COLLATERAL" 'tokenPrice(uint8)(uint192,uint192)' 0
+          call_required collateral_token1_price "$COLLATERAL" 'tokenPrice(uint8)(uint192,uint192)' 1
+          call_required collateral_token0_reserve "$COLLATERAL" 'tokenReserve(uint8)(uint192)' 0
+          call_required collateral_token1_reserve "$COLLATERAL" 'tokenReserve(uint8)(uint192)' 1
+
+          call_required wrapper_underlying "$WRAPPER" 'underlying()(address)'
+          call_required wrapper_gauge "$WRAPPER" 'gauge()(address)'
+          call_required wrapper_reward_token "$WRAPPER" 'rewardToken()(address)'
+          call_required wrapper_total_supply "$WRAPPER" 'totalSupply()(uint256)'
+          call_required wrapper_bm_balance "$WRAPPER" 'balanceOf(address)(uint256)' "$BM"
+          call_required wrapper_strsr_balance "$WRAPPER" 'balanceOf(address)(uint256)' "$STRSR"
+
+          POOL=$(address_value wrapper_underlying)
+          GAUGE=$(address_value wrapper_gauge)
+          call_required gauge_staking_token "$GAUGE" 'stakingToken()(address)'
+          call_required gauge_reward_token "$GAUGE" 'rewardToken()(address)'
+          call_optional gauge_wrapper_balance "$GAUGE" 'balanceOf(address)(uint256)' "$WRAPPER"
+          call_optional gauge_wrapper_earned "$GAUGE" 'earned(address)(uint256)' "$WRAPPER"
+
+          call_required pool_stable "$POOL" 'stable()(bool)'
+          call_required pool_token0 "$POOL" 'token0()(address)'
+          call_required pool_token1 "$POOL" 'token1()(address)'
+          call_required pool_reserve0 "$POOL" 'reserve0()(uint256)'
+          call_required pool_reserve1 "$POOL" 'reserve1()(uint256)'
+          call_required pool_total_supply "$POOL" 'totalSupply()(uint256)'
+          call_required pool_wrapper_idle_balance "$POOL" 'balanceOf(address)(uint256)' "$WRAPPER"
+
+          graph_pass=true
+          [ "$MAIN" = "$(echo "$EXPECTED_MAIN" | lower)" ] || graph_pass=false
+          [ "$BASKET" = "$(echo "$EXPECTED_BASKET" | lower)" ] || graph_pass=false
+          [ "$BM" = "$(echo "$EXPECTED_BM" | lower)" ] || graph_pass=false
+          [ "$STRSR" = "$(echo "$EXPECTED_STRSR" | lower)" ] || graph_pass=false
+          [ "$(address_value collateral_erc20)" = "$(echo "$WRAPPER" | lower)" ] || graph_pass=false
+          [ "$(address_value collateral_pool)" = "$(echo "$EXPECTED_POOL" | lower)" ] || graph_pass=false
+          [ "$POOL" = "$(echo "$EXPECTED_POOL" | lower)" ] || graph_pass=false
+          [ "$GAUGE" = "$(echo "$EXPECTED_GAUGE" | lower)" ] || graph_pass=false
+          [ "$(address_value wrapper_reward_token)" = "$(echo "$AERO" | lower)" ] || graph_pass=false
+          [ "$(address_value gauge_staking_token)" = "$(echo "$EXPECTED_POOL" | lower)" ] || graph_pass=false
+          [ "$(address_value gauge_reward_token)" = "$(echo "$AERO" | lower)" ] || graph_pass=false
+
+          PRIME=$(value basket_prime | tr '[:upper:]' '[:lower:]')
+          HIST=$(value basket_historical | tr '[:upper:]' '[:lower:]')
+          WRAP_LC=$(echo "$WRAPPER" | lower)
+          prime_contains_wrapper=false
+          historical_contains_wrapper=false
+          grep -q "$WRAP_LC" <<<"$PRIME" && prime_contains_wrapper=true
+          grep -q "$WRAP_LC" <<<"$HIST" && historical_contains_wrapper=true
+
+          total_supply=$(uint_value rtoken_total_supply)
+          wrapper_quantity=$(uint_value basket_quantity_wrapper)
+          active_value_path=false
+          if [ "${total_supply:-0}" -gt 0 ] && [ "${wrapper_quantity:-0}" -gt 0 ] && [ "$historical_contains_wrapper" = true ]; then
+            active_value_path=true
+          fi
+
+          {
+            echo "graph_pass=$graph_pass"
+            echo "rtoken_total_supply=$total_supply"
+            echo "issuance_available=$(uint_value rtoken_issuance_available || true)"
+            echo "issuance_paused_or_frozen=$(value main_issuance_paused_or_frozen)"
+            echo "enable_issuance_premium=$(value basket_enable_issuance_premium)"
+            echo "basket_nonce=$NONCE"
+            echo "prime_contains_wrapper=$prime_contains_wrapper"
+            echo "historical_contains_wrapper=$historical_contains_wrapper"
+            echo "wrapper_quantity=$wrapper_quantity"
+            echo "active_value_path=$active_value_path"
+            echo "basket_status=$(uint_value basket_status)"
+            echo "basket_ready=$(value basket_ready)"
+            echo "basket_fully_collateralized=$(value basket_fully_collateralized)"
+            echo "collateral_status=$(uint_value collateral_status)"
+            echo "collateral_saved_peg_price=$(uint_value collateral_saved_peg_price)"
+            echo "collateral_last_save=$(uint_value collateral_last_save)"
+            echo "pool_stable=$(value pool_stable)"
+          } | tee evidence/verdict.txt
+
+          test "$graph_pass" = true
+
+      - name: Seal and triple-check evidence archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          find evidence -type f -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS.txt
+          tar -czf reserve-hyusd-production-gate-20260819.tar.gz evidence
+          sha256sum reserve-hyusd-production-gate-20260819.tar.gz > reserve-hyusd-production-gate-20260819.tar.gz.sha256
+          for run in 1 2 3; do tar -tzf reserve-hyusd-production-gate-20260819.tar.gz >/dev/null; done
+          test -s reserve-hyusd-production-gate-20260819.tar.gz
+
+      - name: Upload read-only production evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: reserve-hyusd-production-gate-20260819
+          path: |
+            reserve-hyusd-production-gate-20260819.tar.gz
+            reserve-hyusd-production-gate-20260819.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
