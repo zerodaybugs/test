@@ -1,0 +1,289 @@
+name: Monad v0.16.0 sustained V1 high-S transport matrix
+
+on:
+  push:
+    branches:
+      - agent/monad-v0160-deep-hunt-20260817
+    paths:
+      - .github/workflows/monad-v0160-highs-sustained-20260818.yml
+      - scripts/monad_v0160_highs_sustained_inject.py
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: monad-v0160-highs-sustained-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  exact-sustained-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      BFT_COMMIT: c616743d1358186605e1c1b74a3d6c4fdd9dd48c
+      EXEC_COMMIT: e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_HTTP_MULTIPLEXING: "false"
+      RUST_BACKTRACE: "1"
+      TEST_NAME: udp::tests::research_malicious_relay_repeats_high_s_alias_across_honest_rounds
+
+    steps:
+      - name: Check out research harness
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rustup toolchain install 1.91.1 --profile minimal --component rustfmt
+          rustup default 1.91.1
+
+      - name: Clone exact source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config --global advice.detachedHead false
+          git clone --filter=blob:none --no-recurse-submodules \
+            https://github.com/category-labs/monad-bft.git monad-bft
+          git -C monad-bft checkout --detach "$BFT_COMMIT"
+          git -C monad-bft submodule sync --recursive
+          git -C monad-bft submodule update --init --recursive --depth 1
+          test "$(git -C monad-bft rev-parse HEAD)" = "$BFT_COMMIT"
+          test "$(git -C monad-bft/monad-execution rev-parse HEAD)" = "$EXEC_COMMIT"
+
+      - name: Inject sustained exact test
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p evidence/vulnerable evidence/patched
+          sha256sum monad-bft/monad-raptorcast/src/udp.rs > evidence/udp.rs.pristine.sha256
+          python3 scripts/monad_v0160_highs_sustained_inject.py
+          cargo fmt --manifest-path monad-bft/Cargo.toml --all
+          git -C monad-bft diff -- monad-raptorcast/src/udp.rs \
+            > evidence/MONAD_V0160_RAPTORCAST_V1_HIGHS_SUSTAINED_MATRIX_TEST.patch
+          sha256sum monad-bft/monad-raptorcast/src/udp.rs > evidence/udp.rs.injected.sha256
+          test -s evidence/MONAD_V0160_RAPTORCAST_V1_HIGHS_SUSTAINED_MATRIX_TEST.patch
+
+      - name: Fetch locked dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for attempt in 1 2 3 4 5; do
+            cargo fetch --manifest-path monad-bft/Cargo.toml --locked && exit 0
+            sleep $((attempt * 5))
+          done
+          exit 1
+
+      - name: Run vulnerable matrix three times
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          : > evidence/vulnerable/status.tsv
+          for repetition in 1 2 3; do
+            set +e
+            cargo test --manifest-path monad-bft/Cargo.toml --locked \
+              -p monad-raptorcast "$TEST_NAME" \
+              -- --exact --nocapture --test-threads=1 \
+              2>&1 | tee "evidence/vulnerable/run-${repetition}.log"
+            status=${PIPESTATUS[0]}
+            set -e
+            printf '%s\t%s\n' "$repetition" "$status" >> evidence/vulnerable/status.tsv
+          done
+
+      - name: Apply semantic commitment mitigation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("monad-bft/monad-raptorcast/src/round_info.rs")
+          text = path.read_text()
+          old = """        if self.global_merkle_root != *claim.global_merkle_root
+              || self.signature != *claim.signature
+          {
+              return false;
+          }
+"""
+          new = """        // A recoverable ECDSA signature has low-S/high-S aliases that
+          // recover to the same authenticated author. The per-round slot is
+          // already proposer-scoped by validation, so raw signature bytes must
+          // not become a second message identity.
+          if self.global_merkle_root != *claim.global_merkle_root {
+              return false;
+          }
+"""
+          if old not in text:
+              raise SystemExit("exact vulnerable commitment comparison not found")
+          path.write_text(text.replace(old, new, 1))
+          PY
+          cargo fmt --manifest-path monad-bft/Cargo.toml --all
+          git -C monad-bft diff -- monad-raptorcast/src/round_info.rs \
+            > evidence/MONAD_V0160_RAPTORCAST_SEMANTIC_COMMITMENT_MITIGATION.patch
+          sha256sum monad-bft/monad-raptorcast/src/round_info.rs \
+            > evidence/round_info.rs.patched.sha256
+          test -s evidence/MONAD_V0160_RAPTORCAST_SEMANTIC_COMMITMENT_MITIGATION.patch
+
+      - name: Run patched matrix three times
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          : > evidence/patched/status.tsv
+          for repetition in 1 2 3; do
+            set +e
+            cargo test --manifest-path monad-bft/Cargo.toml --locked \
+              -p monad-raptorcast "$TEST_NAME" \
+              -- --exact --nocapture --test-threads=1 \
+              2>&1 | tee "evidence/patched/run-${repetition}.log"
+            status=${PIPESTATUS[0]}
+            set -e
+            printf '%s\t%s\n' "$repetition" "$status" >> evidence/patched/status.tsv
+          done
+
+      - name: Produce machine decision
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          import json
+          import re
+
+          evidence = Path("evidence")
+
+          def parse_phase(name: str):
+              phase = evidence / name
+              statuses = {}
+              for line in (phase / "status.tsv").read_text().splitlines():
+                  repetition, status = line.split("\t")
+                  statuses[int(repetition)] = int(status)
+              runs = []
+              for repetition in (1, 2, 3):
+                  text = (phase / f"run-{repetition}.log").read_text(errors="replace")
+                  rounds = []
+                  for match in re.finditer(
+                      r"MARKER_SUSTAINED_ROUND_([0-9]+)_PROPOSER=([0-2])_COUNTS=([0-9]+),([0-9]+),([0-9]+)",
+                      text,
+                  ):
+                      rounds.append({
+                          "round": int(match.group(1)),
+                          "proposer": int(match.group(2)),
+                          "counts": [int(match.group(3)), int(match.group(4)), int(match.group(5))],
+                      })
+                  complete = bool(re.search(r"MARKER_SUSTAINED_TEST_COMPLETE=1", text))
+                  runs.append({
+                      "repetition": repetition,
+                      "exit_code": statuses.get(repetition),
+                      "complete": complete,
+                      "rounds": rounds,
+                  })
+              return runs
+
+          vulnerable = parse_phase("vulnerable")
+          patched = parse_phase("patched")
+
+          def vulnerable_matrix(run):
+              if run["exit_code"] != 0 or not run["complete"] or len(run["rounds"]) != 12:
+                  return False
+              for row in run["rounds"]:
+                  proposer = row["proposer"]
+                  counts = row["counts"]
+                  if counts[proposer] != 1:
+                      return False
+                  if any(counts[idx] != 0 for idx in range(3) if idx != proposer):
+                      return False
+              return True
+
+          def patched_matrix(run):
+              return (
+                  run["exit_code"] == 0
+                  and run["complete"]
+                  and len(run["rounds"]) == 12
+                  and all(row["counts"] == [1, 1, 1] for row in run["rounds"])
+              )
+
+          vulnerable_pass = all(vulnerable_matrix(run) for run in vulnerable)
+          patched_pass = all(patched_matrix(run) for run in patched)
+
+          if vulnerable_pass and patched_pass:
+              decision = "SUSTAINED_TRANSPORT_POISONING_WITH_MATCHED_SEMANTIC_COMMITMENT_CONTROL"
+          elif vulnerable_pass:
+              decision = "SUSTAINED_TRANSPORT_POISONING_PATCH_CONTROL_INCOMPLETE"
+          elif patched_pass:
+              decision = "VULNERABLE_MATRIX_NOT_REPRODUCED_BUT_PATCHED_MATRIX_HEALTHY"
+          else:
+              decision = "INCOMPLETE_OR_NEGATIVE_SUSTAINED_MATRIX"
+
+          result = {
+              "bft_commit": "c616743d1358186605e1c1b74a3d6c4fdd9dd48c",
+              "execution_commit": "e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0",
+              "decision": decision,
+              "vulnerable_runs": vulnerable,
+              "patched_runs": patched,
+              "sustained_transport_poisoning": vulnerable_pass,
+              "semantic_commitment_control": patched_pass,
+              "network_finality_halt_proven": False,
+              "critical_proven": False,
+              "submit_ready": False,
+          }
+          (evidence / "RESULT.json").write_text(json.dumps(result, indent=2) + "\n")
+          (evidence / "REPORT.md").write_text(f"""# Monad v0.16.0 sustained V1 high-S transport matrix
+
+## Decision
+
+**{decision}**
+
+The exact test rotates all three honest validators as proposer for twelve consecutive rounds.
+For each honest proposal the Byzantine validator takes a V1 chunk assigned to itself, creates
+the recoverable high-S signature alias, and sends that authentic alias to the two non-proposer
+honest receivers before the low-S stream arrives.
+
+- Sustained vulnerable transport matrix: **{result['sustained_transport_poisoning']}**
+- Semantic commitment patched control: **{result['semantic_commitment_control']}**
+- Official consensus/full-node finality halt: **false**
+- Critical proven: **false**
+- Submit-ready: **false**
+
+This is a High candidate only if the same first-hop race is reproduced through the real
+RaptorCast network and prevents QC/finality across repeated honest-leader rounds. The transport
+matrix alone is not submitted.
+""")
+          manifest = []
+          for path in sorted(evidence.rglob("*")):
+              if path.is_file() and path.name != "SHA256SUMS":
+                  manifest.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(evidence)}")
+          (evidence / "SHA256SUMS").write_text("\n".join(manifest) + "\n")
+          print(json.dumps(result, indent=2))
+          PY
+
+      - name: Commit sustained matrix result
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p results/monad-v0160-highs-sustained
+          for file in RESULT.json REPORT.md SHA256SUMS \
+            MONAD_V0160_RAPTORCAST_V1_HIGHS_SUSTAINED_MATRIX_TEST.patch \
+            MONAD_V0160_RAPTORCAST_SEMANTIC_COMMITMENT_MITIGATION.patch; do
+            if [ -f "evidence/$file" ]; then
+              cp "evidence/$file" "results/monad-v0160-highs-sustained/$file"
+            fi
+          done
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add results/monad-v0160-highs-sustained
+          if ! git diff --cached --quiet; then
+            git commit -m "Record exact Monad sustained high-S matrix"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Upload exact evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0160-highs-sustained-${{ github.run_id }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 7
