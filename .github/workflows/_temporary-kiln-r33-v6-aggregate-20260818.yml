@@ -1,0 +1,136 @@
+name: kiln-r33-v6-aggregate
+
+on:
+  push:
+    branches: [agent/kiln-r33-control-plane-exact-v2-20260818]
+    paths:
+      - r33_v6_public_gates/**
+      - .github/workflows/_temporary-kiln-r33-v6-aggregate-20260818.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  aggregate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/kiln-r33-control-plane-exact-v2-20260818
+          fetch-depth: 1
+
+      - name: Build strict master gate
+        run: |
+          rm -rf r33_v6_aggregate
+          mkdir r33_v6_aggregate
+          python3 - <<'PY'
+          import hashlib,json,time
+          from pathlib import Path
+          networks=['ethereum','arbitrum','base','bnb','polygon','optimism']
+          root=Path('r33_v6_public_gates')
+          rows=[]; missing=[]; invalid=[]
+          for network in networks:
+              d=root/network; gate_path=d/'PUBLIC_GATE.json'; sums_path=d/'SHA256SUMS.txt'; run_path=d/'RUN_ID.txt'
+              if not gate_path.exists() or not sums_path.exists() or not run_path.exists():
+                  missing.append(network); continue
+              try:
+                  raw=gate_path.read_bytes(); gate=json.loads(raw); expected=None
+                  for line in sums_path.read_text().splitlines():
+                      if line.strip().endswith('PUBLIC_GATE.json'):
+                          expected=line.split()[0]; break
+                  actual=hashlib.sha256(raw).hexdigest()
+                  if expected!=actual:
+                      invalid.append({'network':network,'reason':'PUBLIC_GATE hash mismatch','expected':expected,'actual':actual}); continue
+                  gate['network']=network
+                  gate['persisted_run_id']=int(run_path.read_text().strip())
+                  rows.append(gate)
+              except Exception as exc:
+                  invalid.append({'network':network,'reason':f'{type(exc).__name__}: {exc}'})
+          complete=len(rows)==len(networks) and not missing and not invalid
+          verified=[
+              candidate
+              for row in rows
+              for candidate in row.get('verified_candidates',[])
+          ]
+          execution_bad=[row['network'] for row in rows if int(row.get('runner_exit_code',999) or 999)!=0 or row.get('step_outcome')!='success']
+          rpc_bad=[row['network'] for row in rows if row.get('rpc_agreement') is not True]
+          local_errors=[row['network'] for row in rows if int(row.get('local_fork_error_count',0) or 0)>0]
+          if not complete or execution_bad or rpc_bad or local_errors:
+              decision='INCONCLUSIVE_INCOMPLETE_OR_FAILED_NETWORK_GATE'
+          elif verified:
+              decision='HOLD_VERIFIED_STATE_MUTATION_REQUIRES_SOURCE_IMPACT_DUPLICATE_REVIEW'
+          else:
+              decision='KILL_NO_PERMISSIONLESS_CONTROL_PLANE_STATE_CHANGE'
+          master={
+              'schema':'kiln-r33-v6-master-gate-v1',
+              'generated_at_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+              'decision':decision,
+              'submit_ready':False,
+              'validated_critical':0,
+              'validated_high':0,
+              'expected_network_count':len(networks),
+              'parsed_network_count':len(rows),
+              'complete':complete,
+              'missing_networks':missing,
+              'invalid_networks':invalid,
+              'execution_bad_networks':execution_bad,
+              'rpc_bad_networks':rpc_bad,
+              'local_error_networks':local_errors,
+              'component_total':sum(int(row.get('component_count',0) or 0) for row in rows),
+              'candidate_total':sum(int(row.get('candidate_count',0) or 0) for row in rows),
+              'verified_5of5_total':sum(int(row.get('verified_5of5_count',0) or 0) for row in rows),
+              'verified_candidates':verified,
+              'abi_payload_counts':{row['network']:int(row.get('abi_payload_count',0) or 0) for row in rows},
+              'network_rows':rows,
+              'safety':{
+                  'public_chain_state_changes':0,
+                  'transactions_signed':0,
+                  'transactions_sent':0,
+              },
+          }
+          out=Path('r33_v6_aggregate')
+          (out/'MASTER_GATE.json').write_text(json.dumps(master,indent=2,sort_keys=True))
+          status=f'''KILN OMNIVAULT R33 V6 CONTROL-PLANE GATE\n\nDecision: {decision}\nSubmit-ready: NEM\nValidated Critical: 0\nValidated High: 0\nParsed networks: {len(rows)}/{len(networks)}\nMissing: {missing}\nInvalid: {invalid}\nExecution failures: {execution_bad}\nRPC disagreement: {rpc_bad}\nLocal fork errors: {local_errors}\nComponents tested: {master["component_total"]}\nRaw mutation candidates: {master["candidate_total"]}\nVerified 5/5 mutations: {master["verified_5of5_total"]}\n\nA verified mutation is still only HOLD until deployed-code binding, unauthorized impact, patched control and duplicate clearance pass.\n'''
+          (out/'STATUS_HU.txt').write_text(status)
+          files=sorted(p for p in out.iterdir() if p.is_file() and p.name!='SHA256SUMS.txt')
+          (out/'SHA256SUMS.txt').write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in files))
+          print(json.dumps({k:master[k] for k in ('decision','complete','component_total','candidate_total','verified_5of5_total')},sort_keys=True))
+          PY
+
+      - name: Self-check aggregate
+        run: |
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          root=Path('r33_v6_aggregate'); gate=json.loads((root/'MASTER_GATE.json').read_text())
+          assert gate['submit_ready'] is False
+          assert gate['validated_critical']==0 and gate['validated_high']==0
+          assert gate['safety']['public_chain_state_changes']==0
+          for line in (root/'SHA256SUMS.txt').read_text().splitlines():
+              digest,name=line.split('  ',1); assert hashlib.sha256((root/name).read_bytes()).hexdigest()==digest
+          print('R33_V6_AGGREGATE_SELF_CHECK=PASS')
+          PY
+
+      - name: Persist aggregate
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add r33_v6_aggregate
+          git commit -m 'persist Kiln R33 v6 aggregate gate' || exit 0
+          for attempt in 1 2 3 4 5 6; do
+            git pull --rebase origin agent/kiln-r33-control-plane-exact-v2-20260818
+            if git push origin HEAD:agent/kiln-r33-control-plane-exact-v2-20260818; then exit 0; fi
+            sleep $((attempt * 3))
+          done
+          exit 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kiln-r33-v6-aggregate
+          path: r33_v6_aggregate
+          if-no-files-found: error
+          retention-days: 3
