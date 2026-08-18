@@ -1,0 +1,213 @@
+name: DeepBook read-only oracle health snapshot
+
+on:
+  push:
+    branches:
+      - "sui-round15-readonly-*"
+
+permissions:
+  contents: write
+
+jobs:
+  health:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Query PriceAdded events and model public orderbook depth
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s readonly-snapshots/deepbook-round15/MAINNET_SNAPSHOT.json
+          mkdir -p /tmp/oracle-health
+          cat > /tmp/oracle-health/analyze.mjs <<'JS'
+          import fs from 'node:fs';
+
+          const snapshot = JSON.parse(fs.readFileSync('readonly-snapshots/deepbook-round15/MAINNET_SNAPSHOT.json', 'utf8'));
+          const endpoint = 'https://graphql.mainnet.sui.io/graphql';
+          const eventType = '0x0e735f8c93a95722efd73521aca7a7652c0bb71ed1daf41b26dfd7d1ff71f748::deep_price::PriceAdded';
+          const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+          let before = null;
+          let pages = 0;
+          const events = [];
+
+          const query = `query PriceAdded($before: String, $type: String!) {
+            events(last: 100, before: $before, filter: { type: $type }) {
+              pageInfo { hasPreviousPage startCursor }
+              nodes { timestamp contents { json } }
+            }
+          }`;
+
+          while (pages < 100) {
+            const response = await fetch(endpoint, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', 'user-agent': 'DeepBookReadOnlyHealth/1.0' },
+              body: JSON.stringify({ query, variables: { before, type: eventType } }),
+            });
+            if (!response.ok) throw new Error(`GraphQL HTTP ${response.status}: ${await response.text()}`);
+            const body = await response.json();
+            if (body.errors) throw new Error(JSON.stringify(body.errors));
+            const conn = body.data.events;
+            pages++;
+            let reachedCutoff = false;
+            for (const node of conn.nodes) {
+              const ts = node.timestamp ? Date.parse(node.timestamp) : 0;
+              if (ts && ts < cutoff) { reachedCutoff = true; continue; }
+              events.push({ timestamp: node.timestamp, ...(node.contents?.json ?? {}) });
+            }
+            if (reachedCutoff || !conn.pageInfo.hasPreviousPage || !conn.pageInfo.startCursor) break;
+            before = conn.pageInfo.startCursor;
+          }
+
+          const poolAddresses = {
+            DEEP_USDC: '0xf948981b806057580f91622417534f491da5f61aeaf33d0ed8e69fd5691c95ce',
+            DEEP_SUI: '0xb663828d6217467c8a1838a03793da896cbe745b150ebd57d82f814ca579fc22',
+            SUI_USDC: '0xe05dafb5133bcffb8d59f4e12465dc0e9faeaa05e3e342a08fe135800e3e4407',
+            WAL_USDC: '0x56a1c985c1f1123181d6b881714793689321ba24301b3585eec427436eb1c76d',
+            WAL_SUI: '0x81f5339934c83ea19dd6bcc75c52e83509629a5f71d3257428c2ce47cc94d08b',
+            NS_USDC: '0x0c0fdd4008740d81a8a7d4281322aee71a1b62c449eb5b142656753d89ebc060',
+            NS_SUI: '0x27c4fdb3b846aa3ae4a65ef5127a309aa3c1f466671471a806d8912a18b253e8',
+            XBTC_USDC: '0x20b9a3ec7a02d4f344aa1ebc5774b7b0ccafa9a5d76230662fdc0300bb215307',
+            IKA_USDC: '0xfa732993af2b60d04d7049511f801e79426b2b6a5103e22769c0cead982b0f47',
+            USDT_USDC: '0xfc28a2fb22579c16d672a1152039cbf671e5f4b9f103feddff4ea06ef3c2bc25',
+          };
+          const byAddress = Object.fromEntries(Object.entries(poolAddresses).map(([k,v]) => [v.toLowerCase(), k]));
+          const counts = {};
+          for (const e of events) {
+            const addr = String(e.target_pool ?? e.targetPool ?? '').toLowerCase();
+            const key = byAddress[addr] ?? addr || 'unknown';
+            const side = Boolean(e.is_base_conversion ?? e.isBaseConversion) ? 'base' : 'quote';
+            counts[key] ??= { base: 0, quote: 0, total: 0, min_rate: null, max_rate: null, latest: null };
+            counts[key][side]++;
+            counts[key].total++;
+            const rate = Number(e.conversion_rate ?? e.conversionRate);
+            if (Number.isFinite(rate)) {
+              counts[key].min_rate = counts[key].min_rate == null ? rate : Math.min(counts[key].min_rate, rate);
+              counts[key].max_rate = counts[key].max_rate == null ? rate : Math.max(counts[key].max_rate, rate);
+            }
+            if (!counts[key].latest || String(e.timestamp) > String(counts[key].latest)) counts[key].latest = e.timestamp;
+          }
+
+          function sellIntoBids(quantity, prices, quantities) {
+            let left = quantity;
+            let proceeds = 0;
+            for (let i = 0; i < prices.length && left > 0; i++) {
+              const fill = Math.min(left, quantities[i]);
+              proceeds += fill * prices[i];
+              left -= fill;
+            }
+            return { proceeds, unsold: left };
+          }
+
+          function referenceModel(poolKey) {
+            const pool = snapshot.pools[poolKey];
+            const l2 = pool.level2_100;
+            const mid = pool.mid_price;
+            const tick = pool.book_params.tickSize;
+            const minSize = pool.book_params.minSize;
+            const multipliers = [1.01,1.05,1.10,1.25,1.50,2,3,5,10];
+            const rows = [];
+            for (const multiplier of multipliers) {
+              const targetMid = mid * multiplier;
+              const attackAsk = Math.ceil((targetMid + tick / 2) / tick) * tick;
+              const attackBid = Math.floor((targetMid - tick / 2) / tick) * tick;
+              let bought = 0;
+              let buyCost = 0;
+              let levelsCleared = 0;
+              for (let i = 0; i < l2.ask_prices.length; i++) {
+                if (l2.ask_prices[i] >= attackAsk) break;
+                bought += l2.ask_quantities[i];
+                buyCost += l2.ask_quantities[i] * l2.ask_prices[i];
+                levelsCleared++;
+              }
+              const unwind = sellIntoBids(bought, l2.bid_prices, l2.bid_quantities);
+              rows.push({
+                multiplier,
+                target_mid: targetMid,
+                attack_bid: attackBid,
+                attack_ask: attackAsk,
+                levels_cleared: levelsCleared,
+                base_bought: bought,
+                quote_buy_cost: buyCost,
+                quote_unwind_proceeds: unwind.proceeds,
+                base_unsold_after_100_bid_levels: unwind.unsold,
+                conservative_roundtrip_loss_quote: buyCost - unwind.proceeds,
+                min_bid_collateral_quote: minSize * attackBid,
+                resulting_deep_per_asset_ratio: 1 / multiplier,
+              });
+            }
+            return { mid, tick, minSize, best_bid: l2.bid_prices[0], best_ask: l2.ask_prices[0], rows };
+          }
+
+          const references = {
+            DEEP_USDC: referenceModel('DEEP_USDC'),
+            DEEP_SUI: referenceModel('DEEP_SUI'),
+          };
+
+          const targetImpact = {};
+          for (const [key, pool] of Object.entries(snapshot.pools)) {
+            if (key.startsWith('DEEP_')) continue;
+            if (!pool.trade_params || !pool.deep_price) continue;
+            const side = pool.deep_price.asset_is_base ? 'base' : 'quote';
+            const nRaw = Math.min(100, counts[key]?.[side] ?? 0);
+            const reference = key.endsWith('_USDC') ? 'DEEP_USDC' : key.endsWith('_SUI') ? 'DEEP_SUI' : null;
+            if (!reference) continue;
+            const impacts = references[reference].rows.map((r) => {
+              const denom = Math.min(100, nRaw + 1);
+              const normalPoints = denom - 1;
+              const avgRatio = denom === 0 ? r.resulting_deep_per_asset_ratio :
+                (normalPoints + r.resulting_deep_per_asset_ratio) / denom;
+              const reduction = 1 - avgRatio;
+              const feeRate = pool.trade_params.takerFee;
+              const savingsPerMillionQuote = 1_000_000 * feeRate * reduction;
+              const loss = r.conservative_roundtrip_loss_quote;
+              return {
+                multiplier: r.multiplier,
+                observed_same_side_points_24h_capped_100: nRaw,
+                one_point_fee_reduction_fraction: reduction,
+                taker_fee_rate: feeRate,
+                fee_savings_per_1m_notional_quote: savingsPerMillionQuote,
+                reference_roundtrip_loss_quote: loss,
+                break_even_target_notional_quote: savingsPerMillionQuote > 0 ? loss / (feeRate * reduction) : null,
+              };
+            });
+            targetImpact[key] = { reference, side, current_deep_price: pool.deep_price, event_count: counts[key] ?? null, impacts };
+          }
+
+          const output = {
+            generated_at: new Date().toISOString(),
+            source_snapshot_at: snapshot.generated_at,
+            write_operations: 0,
+            graphql_pages: pages,
+            price_added_events_last_24h: events.length,
+            price_added_counts: counts,
+            reference_models: references,
+            target_fee_impact_models: targetImpact,
+            assumptions: [
+              'Orderbook clearing uses the 100 returned levels and zero fees on whitelisted DEEP reference pools.',
+              'Unwind sells acquired DEEP into the captured bid book; unsold inventory is valued at zero in the conservative loss.',
+              'Old target price points are modeled at the current fair price; one attacker point has inverse-price ratio 1/multiplier.',
+              'Gas, MEV, external arbitrage and capital opportunity cost are excluded, so modeled attacker cost is a lower bound.',
+            ],
+          };
+          fs.writeFileSync('/tmp/oracle-health/ORACLE_HEALTH.json', JSON.stringify(output, null, 2));
+          fs.writeFileSync('/tmp/oracle-health/PRICE_ADDED_EVENTS_24H.json', JSON.stringify(events, null, 2));
+          JS
+          node /tmp/oracle-health/analyze.mjs
+          node -e "const x=require('/tmp/oracle-health/ORACLE_HEALTH.json'); if(x.write_operations!==0||!x.reference_models.DEEP_USDC) process.exit(1)"
+          sha256sum /tmp/oracle-health/*.json > /tmp/oracle-health/SHA256SUMS
+
+      - name: Commit public read-only health data
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p readonly-snapshots/deepbook-round15
+          cp /tmp/oracle-health/{ORACLE_HEALTH.json,PRICE_ADDED_EVENTS_24H.json,SHA256SUMS} readonly-snapshots/deepbook-round15/
+          git config user.name "readonly-snapshot-bot"
+          git config user.email "readonly-snapshot-bot@users.noreply.github.com"
+          git add readonly-snapshots/deepbook-round15
+          if ! git diff --cached --quiet; then
+            git commit -m "data: publish DeepBook public oracle health snapshot"
+            git push origin HEAD:${GITHUB_REF_NAME}
+          fi
