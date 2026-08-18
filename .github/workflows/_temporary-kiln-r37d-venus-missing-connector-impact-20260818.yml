@@ -1,0 +1,170 @@
+name: kiln-r37d-venus-missing-connector-impact
+
+on:
+  push:
+    branches: [agent/kiln-r37d-venus-missing-connector-impact-20260818]
+    paths:
+      - kiln_r37d/venus_missing_connector_impact.py.gz.b64
+      - kiln_r37d/delivery_public.pem
+      - .github/workflows/_temporary-kiln-r37d-venus-missing-connector-impact-20260818.yml
+      - kiln_r37d/TRIGGER.txt
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  exact-impact-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/kiln-r37d-venus-missing-connector-impact-20260818
+          fetch-depth: 1
+
+      - name: Restore and compile exact gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 -d kiln_r37d/venus_missing_connector_impact.py.gz.b64 | gzip -d > kiln_r37d/venus_missing_connector_impact.py
+          python3 -m py_compile kiln_r37d/venus_missing_connector_impact.py
+          test "$(sha256sum kiln_r37d/venus_missing_connector_impact.py | cut -d' ' -f1)" = "a96bc8fb4441d66d343c6724b7360e05444b6f8a898c38cfdf4ce990276c285f"
+
+      - name: Install pinned runtime
+        run: python3 -m pip install --disable-pip-version-check 'web3==7.13.0'
+
+      - name: Run two-RPC exact-state materiality gate
+        shell: bash
+        run: |
+          set +e
+          python3 kiln_r37d/venus_missing_connector_impact.py > r37d_run.log 2>&1
+          code=$?
+          set -e
+          printf '%s\n' "$code" > r37d_exit.txt
+          cat r37d_run.log
+
+      - name: Fail-closed gate normalization and triple self-check
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          root=Path('r37d_results'); root.mkdir(exist_ok=True)
+          code=int(Path('r37d_exit.txt').read_text().strip())
+          gate_path=root/'PUBLIC_GATE.json'
+          if gate_path.exists():
+              gate=json.loads(gate_path.read_text())
+          else:
+              gate={
+                'schema':'kiln-r37d-fallback-v1',
+                'decision':'INCONCLUSIVE_EXECUTION_FAILURE',
+                'submit_ready':False,'validated_critical':0,'validated_high':0,
+                'coverage_complete':False,'vault_count':2,'inspected_count':0,
+                'error_count':1,'candidate_count':0,'seed_only_count':0,
+                'rows':[],'public_chain_state_changes':0,
+                'transactions_signed':0,'transactions_sent':0,
+              }
+          gate['runner_exit_code']=code
+          if code!=0:
+              gate.update(decision='INCONCLUSIVE_EXECUTION_FAILURE',submit_ready=False,validated_critical=0,validated_high=0)
+          gate_path.write_text(json.dumps(gate,indent=2,sort_keys=True))
+          files=sorted(p for p in root.iterdir() if p.is_file() and p.name!='SHA256SUMS.txt')
+          sums=root/'SHA256SUMS.txt'
+          sums.write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in files))
+          for iteration in range(3):
+              for line in sums.read_text().splitlines():
+                  digest,name=line.split('  ',1)
+                  assert hashlib.sha256((root/name).read_bytes()).hexdigest()==digest,(iteration,name)
+              parsed=json.loads(gate_path.read_text())
+              assert parsed['submit_ready'] is False
+              assert parsed['validated_critical']==0 and parsed['validated_high']==0
+              assert parsed['public_chain_state_changes']==0
+              assert parsed['transactions_signed']==0 and parsed['transactions_sent']==0
+          print('R37D_SELF_CHECK_1=PASS')
+          print('R37D_SELF_CHECK_2=PASS')
+          print('R37D_SELF_CHECK_3=PASS')
+          PY
+
+      - name: Encrypt evidence and verify byte-for-byte round trip
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf r37d_delivery
+          mkdir -p r37d_delivery/encrypted_b64 r37d_delivery/public
+          cp r37d_results/PUBLIC_GATE.json r37d_delivery/public/
+          cp r37d_results/SHA256SUMS.txt r37d_delivery/public/PRIVATE_SHA256SUMS.txt
+          tar -czf /tmp/r37d_evidence.tar.gz r37d_results r37d_run.log r37d_exit.txt kiln_r37d/venus_missing_connector_impact.py
+          openssl rand 32 > /tmp/r37d.aes
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 250000 \
+            -in /tmp/r37d_evidence.tar.gz -out /tmp/payload.aes256 -pass file:/tmp/r37d.aes
+          openssl pkeyutl -encrypt -pubin -inkey kiln_r37d/delivery_public.pem \
+            -in /tmp/r37d.aes -out /tmp/key.rsa3072 \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          base64 -w0 /tmp/payload.aes256 > r37d_delivery/encrypted_b64/payload.aes256.b64
+          printf '\n' >> r37d_delivery/encrypted_b64/payload.aes256.b64
+          base64 -w0 /tmp/key.rsa3072 > r37d_delivery/encrypted_b64/key.rsa3072.b64
+          printf '\n' >> r37d_delivery/encrypted_b64/key.rsa3072.b64
+          base64 -d r37d_delivery/encrypted_b64/payload.aes256.b64 > /tmp/payload.roundtrip
+          base64 -d r37d_delivery/encrypted_b64/key.rsa3072.b64 > /tmp/key.roundtrip
+          cmp /tmp/payload.aes256 /tmp/payload.roundtrip
+          cmp /tmp/key.rsa3072 /tmp/key.roundtrip
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          rows=[]
+          for name in ('payload.aes256','key.rsa3072'):
+              original=Path('/tmp')/name
+              decoded=Path('/tmp')/(name.split('.')[0]+'.roundtrip')
+              if name=='payload.aes256': decoded=Path('/tmp/payload.roundtrip')
+              if name=='key.rsa3072': decoded=Path('/tmp/key.roundtrip')
+              rows.append({'file':name,'bytes':original.stat().st_size,'sha256':hashlib.sha256(original.read_bytes()).hexdigest(),'roundtrip_sha256':hashlib.sha256(decoded.read_bytes()).hexdigest(),'roundtrip_ok':original.read_bytes()==decoded.read_bytes()})
+          assert all(row['roundtrip_ok'] for row in rows)
+          Path('r37d_delivery/encrypted_b64/ROUNDTRIP.json').write_text(json.dumps({'schema':'kiln-r37d-encrypted-roundtrip-v1','all_roundtrip_ok':True,'files':rows,'private_keys_included':False},indent=2,sort_keys=True))
+          PY
+          rm -f /tmp/r37d.aes /tmp/r37d_evidence.tar.gz /tmp/payload.aes256 /tmp/key.rsa3072 /tmp/payload.roundtrip /tmp/key.roundtrip
+
+      - name: Persist recoverable result
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf r37d_persisted/LATEST
+          mkdir -p r37d_persisted/LATEST
+          cp -R r37d_delivery/public r37d_persisted/LATEST/
+          cp -R r37d_delivery/encrypted_b64 r37d_persisted/LATEST/
+          cp kiln_r37d/venus_missing_connector_impact.py.gz.b64 r37d_persisted/LATEST/
+          python3 - <<'PY'
+          import hashlib,json,time
+          from pathlib import Path
+          root=Path('r37d_persisted/LATEST')
+          gate=json.loads((root/'public/PUBLIC_GATE.json').read_text())
+          manifest={
+            'schema':'kiln-r37d-persisted-manifest-v1',
+            'generated_at_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+            'decision':gate.get('decision'),
+            'submit_ready':False,'validated_critical':0,'validated_high':0,
+            'source_commit':'${{ github.sha }}','source_run_id':'${{ github.run_id }}',
+            'public_chain_state_changes':0,'transactions_signed':0,'transactions_sent':0,
+            'private_keys_included':False,
+          }
+          (root/'MANIFEST.json').write_text(json.dumps(manifest,indent=2,sort_keys=True))
+          files=sorted(p for p in root.rglob('*') if p.is_file() and p.name!='SHA256SUMS.txt')
+          (root/'SHA256SUMS.txt').write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(root).as_posix()}\n' for p in files))
+          for iteration in range(3):
+              for line in (root/'SHA256SUMS.txt').read_text().splitlines():
+                  digest,name=line.split('  ',1)
+                  assert hashlib.sha256((root/name).read_bytes()).hexdigest()==digest,(iteration,name)
+          assert not any(b'BEGIN PRIVATE KEY' in p.read_bytes() for p in root.rglob('*') if p.is_file())
+          print(json.dumps(gate,sort_keys=True))
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add r37d_persisted/LATEST
+          git commit -m 'persist self-checked Kiln R37d impact gate'
+          for attempt in 1 2 3; do
+            git pull --rebase origin agent/kiln-r37d-venus-missing-connector-impact-20260818
+            if git push origin HEAD:agent/kiln-r37d-venus-missing-connector-impact-20260818; then exit 0; fi
+            sleep $((attempt*3))
+          done
+          exit 1
