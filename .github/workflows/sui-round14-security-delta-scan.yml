@@ -1,0 +1,257 @@
+name: Sui Round 14 security delta scan
+
+on:
+  push:
+    branches:
+      - "sui-round14-*"
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Fetch exact Sui source revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          fetch_rev() {
+            local dir="$1" rev="$2"
+            git init -q "$dir"
+            git -C "$dir" remote add origin https://github.com/MystenLabs/sui.git
+            git -C "$dir" fetch -q --depth=1 origin "$rev"
+            git -C "$dir" checkout -q --detach FETCH_HEAD
+            test "$(git -C "$dir" rev-parse HEAD)" = "$rev"
+          }
+          fetch_rev /tmp/sui-mainnet 51d177ad7d65102fc368b582408f466d97b31548
+          fetch_rev /tmp/sui-main 39acc82017718b11f8c8240f537a489cece91c1d
+          mkdir -p /tmp/out
+          printf '%s\n' 51d177ad7d65102fc368b582408f466d97b31548 > /tmp/out/MAINNET_COMMIT.txt
+          printf '%s\n' 39acc82017718b11f8c8240f537a489cece91c1d > /tmp/out/MAIN_COMMIT.txt
+
+      - name: Run framework and execution security scans
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/scan.py <<'PY'
+          import csv
+          import json
+          import re
+          from pathlib import Path
+
+          roots = {
+              "mainnet": Path("/tmp/sui-mainnet"),
+              "main": Path("/tmp/sui-main"),
+          }
+          out = Path("/tmp/out")
+
+          def iter_files(root: Path, suffix: str):
+              for p in root.rglob(f"*{suffix}"):
+                  s = str(p)
+                  if any(x in s for x in ("/target/", "/node_modules/", "/tests/", "/test/", "/snapshots/", "/examples/")):
+                      continue
+                  yield p
+
+          def line_no(text: str, pos: int) -> int:
+              return text.count("\n", 0, pos) + 1
+
+          public_returns = []
+          sensitive_mutators = []
+          native_loops = []
+          panic_surfaces = []
+          verifier_files = []
+
+          fun_re = re.compile(
+              r"(?ms)^[ \t]*(?P<vis>public(?:\([^)]*\))?|entry|public\s+entry)\s+fun\s+"
+              r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>{;]*>)?\s*"
+              r"\((?P<params>.*?)\)\s*(?::\s*(?P<ret>[^\{;]+))?\s*\{"
+          )
+          struct_re = re.compile(r"(?m)^\s*public\s+struct\s+([A-Za-z_][A-Za-z0-9_]*)[^\{]*has\s+([^\{]+)\{")
+
+          for rev, root in roots.items():
+              move_roots = [
+                  root / "crates/sui-framework/packages",
+                  root / "bridge",
+                  root / "sui-execution",
+              ]
+              for mr in move_roots:
+                  if not mr.exists():
+                      continue
+                  for p in iter_files(mr, ".move"):
+                      try:
+                          text = p.read_text(encoding="utf-8")
+                      except Exception:
+                          continue
+                      key_structs = {m.group(1) for m in struct_re.finditer(text) if "key" in m.group(2)}
+                      for m in fun_re.finditer(text):
+                          params = " ".join(m.group("params").split())
+                          ret = " ".join((m.group("ret") or "").split())
+                          name = m.group("name")
+                          start = m.end()
+                          depth = 1
+                          i = start
+                          while i < len(text) and depth:
+                              if text[i] == "{": depth += 1
+                              elif text[i] == "}": depth -= 1
+                              i += 1
+                          body = text[start:i-1]
+                          rel = str(p.relative_to(root))
+                          ln = line_no(text, m.start())
+
+                          if re.search(r"&\s*mut\s+(?:UID|ID|[A-Za-z0-9_:<>]*Cap\b|Balance\s*<)", ret):
+                              public_returns.append({
+                                  "revision": rev, "file": rel, "line": ln,
+                                  "function": name, "params": params, "return": ret,
+                              })
+
+                          mut_key = any(re.search(rf"&\s*mut\s+{re.escape(s)}\b", params) for s in key_structs)
+                          sensitive_ops = sorted(set(re.findall(
+                              r"\b(?:withdraw|withdraw_funds_from_object|send_funds|destroy|burn|mint|public_transfer|transfer::transfer|uid_mut|claim|redeem|share_object|freeze_object)\b",
+                              body,
+                          )))
+                          cap_param = bool(re.search(r"(?:Cap|Witness|Admin|Owner|Authority|Treasury)[A-Za-z0-9_:<>]*", params))
+                          if mut_key and sensitive_ops:
+                              sensitive_mutators.append({
+                                  "revision": rev, "file": rel, "line": ln,
+                                  "function": name, "params": params,
+                                  "cap_like_param": cap_param,
+                                  "ops": ",".join(sensitive_ops),
+                              })
+
+              rust_roots = [
+                  root / "sui-execution",
+                  root / "crates/sui-core/src",
+                  root / "crates/sui-types/src",
+                  root / "consensus/core/src",
+              ]
+              for rr in rust_roots:
+                  if not rr.exists():
+                      continue
+                  for p in iter_files(rr, ".rs"):
+                      try:
+                          text = p.read_text(encoding="utf-8")
+                      except Exception:
+                          continue
+                      rel = str(p.relative_to(root))
+                      for m in re.finditer(r"(?m)^\s*(?:pub\s+)?fn\s+(native_[A-Za-z0-9_]+|[A-Za-z0-9_]*deserialize[A-Za-z0-9_]*|[A-Za-z0-9_]*verify[A-Za-z0-9_]*)\b", text):
+                          window = text[m.start():m.start()+7000]
+                          loops = len(re.findall(r"\b(?:for|while|loop)\b", window))
+                          charges = len(re.findall(r"(?:charge|gas|meter|cost)", window, re.I))
+                          if loops and charges == 0:
+                              native_loops.append({
+                                  "revision": rev, "file": rel, "line": line_no(text, m.start()),
+                                  "function": m.group(1), "loops": loops,
+                              })
+                      if any(x in rel for x in ("authority_server", "consensus", "signature", "transaction", "verifier", "adapter")):
+                          for m in re.finditer(r"\b(?:unwrap|expect|panic!|assert!|unreachable!)\s*\(", text):
+                              context = " ".join(text[max(0,m.start()-180):m.start()+220].split())
+                              panic_surfaces.append({
+                                  "revision": rev, "file": rel, "line": line_no(text, m.start()),
+                                  "token": m.group(0).split("(")[0], "context": context,
+                              })
+                      if "verifier" in rel or "bytecode" in rel and "verifier" in text:
+                          verifier_files.append(rel)
+
+          def write_csv(name, rows):
+              p = out / name
+              if not rows:
+                  p.write_text("", encoding="utf-8")
+                  return
+              with p.open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                  w.writeheader(); w.writerows(rows)
+
+          write_csv("PUBLIC_SENSITIVE_RETURNS.csv", public_returns)
+          write_csv("PUBLIC_KEY_MUTATORS.csv", sensitive_mutators)
+          write_csv("UNMETERED_NATIVE_LOOP_CANDIDATES.csv", native_loops)
+          write_csv("PANIC_SURFACES.csv", panic_surfaces)
+
+          # Diff public framework API surfaces between active mainnet and main.
+          def move_signatures(root: Path):
+              sigs = {}
+              for p in iter_files(root / "crates/sui-framework/packages", ".move"):
+                  try: text = p.read_text(encoding="utf-8")
+                  except Exception: continue
+                  for m in fun_re.finditer(text):
+                      rel = str(p.relative_to(root))
+                      sig = " ".join(m.group(0).split())
+                      sigs[f"{rel}:{m.group('name')}"] = sig
+              return sigs
+
+          a = move_signatures(roots["mainnet"])
+          b = move_signatures(roots["main"])
+          api_delta = []
+          for k in sorted(set(a) | set(b)):
+              if a.get(k) != b.get(k):
+                  api_delta.append({"symbol": k, "mainnet": a.get(k, ""), "main": b.get(k, "")})
+          write_csv("FRAMEWORK_PUBLIC_API_DELTA.csv", api_delta)
+
+          summary = {
+              "public_sensitive_returns": len(public_returns),
+              "public_key_mutators": len(sensitive_mutators),
+              "unmetered_native_loop_candidates": len(native_loops),
+              "panic_surfaces": len(panic_surfaces),
+              "framework_public_api_delta": len(api_delta),
+              "verifier_files_unique": len(set(verifier_files)),
+          }
+          (out / "SUMMARY.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+          python3 /tmp/scan.py
+
+      - name: Generate active-versus-main security diff inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C /tmp/sui-main remote add active /tmp/sui-mainnet
+          git -C /tmp/sui-main fetch -q active 51d177ad7d65102fc368b582408f466d97b31548 || true
+          git -C /tmp/sui-main diff --stat 51d177ad7d65102fc368b582408f466d97b31548..39acc82017718b11f8c8240f537a489cece91c1d \
+            -- crates/sui-framework sui-execution crates/sui-core crates/sui-types consensus bridge crates/sui-protocol-config \
+            > /tmp/out/SECURITY_DIFF_STAT.txt || true
+          git -C /tmp/sui-main diff --name-status 51d177ad7d65102fc368b582408f466d97b31548..39acc82017718b11f8c8240f537a489cece91c1d \
+            -- crates/sui-framework sui-execution crates/sui-core crates/sui-types consensus bridge crates/sui-protocol-config \
+            > /tmp/out/SECURITY_DIFF_FILES.txt || true
+          git -C /tmp/sui-main log --no-merges --format='%H%x09%cI%x09%s' \
+            51d177ad7d65102fc368b582408f466d97b31548..39acc82017718b11f8c8240f537a489cece91c1d \
+            -- crates/sui-framework sui-execution crates/sui-core crates/sui-types consensus bridge crates/sui-protocol-config \
+            > /tmp/out/SECURITY_COMMITS.tsv || true
+
+          # Include compact exact source subsets for local adjudication.
+          mkdir -p /tmp/out/source/mainnet /tmp/out/source/main
+          for rev in mainnet main; do
+            src="/tmp/sui-$rev"
+            dst="/tmp/out/source/$rev"
+            for path in \
+              crates/sui-framework/packages/sui-framework/sources \
+              crates/sui-framework/packages/move-stdlib/sources \
+              crates/sui-core/src/authority_server.rs \
+              crates/sui-core/src/execution_driver.rs \
+              crates/sui-core/src/execution_scheduler.rs \
+              crates/sui-core/src/consensus_adapter.rs \
+              crates/sui-types/src/transaction.rs \
+              crates/sui-types/src/signature_verification.rs \
+              crates/sui-types/src/zk_login_authenticator.rs \
+              crates/sui-types/src/accumulator_root.rs \
+              crates/sui-protocol-config/src/lib.rs \
+              sui-execution/latest/sui-verifier/src \
+              sui-execution/latest/sui-adapter/src \
+              external-crates/move/move-execution/v3/crates/move-bytecode-verifier/src; do
+              if [ -e "$src/$path" ]; then
+                mkdir -p "$dst/$(dirname "$path")"
+                cp -a "$src/$path" "$dst/$path"
+              fi
+            done
+          done
+          find /tmp/out -type f -print0 | sort -z | xargs -0 sha256sum > /tmp/out/SHA256SUMS
+          du -sh /tmp/out > /tmp/out/ARTIFACT_SIZE.txt
+
+      - name: Upload scan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sui-round14-security-delta-scan
+          path: /tmp/out/
+          compression-level: 6
+          retention-days: 2
+          include-hidden-files: true
+          if-no-files-found: error
