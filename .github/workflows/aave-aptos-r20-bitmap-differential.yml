@@ -1,0 +1,184 @@
+name: Aave Aptos bitmap differential tests
+
+on:
+  push:
+    branches:
+      - aave-aptos-bitmap-r20-20260818
+    paths:
+      - .github/workflows/aave-aptos-r20-bitmap-differential.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  differential:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout harness repository
+        uses: actions/checkout@v4
+
+      - name: Checkout exact Aave source
+        uses: actions/checkout@v4
+        with:
+          repository: aave/aptos-aave-v3
+          ref: 919362ba93c6291b25a31282b25d3def6e6357b9
+          path: aave
+
+      - name: Install Aptos CLI using Aave repository action
+        uses: ./aave/.github/actions/install-aptos-cli
+
+      - name: Inject deterministic bitmap and reserve-config tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          repo = Path('aave')
+
+          # UserConfiguration exhaustive boundary test.
+          path = repo / 'aave-core/aave-config/sources/user_config.move'
+          source = path.read_text(encoding='utf-8')
+          match = re.search(
+              r'struct\s+([A-Za-z_][A-Za-z0-9_]*)[^{]*\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*u256',
+              source,
+              re.S,
+          )
+          if not match:
+              raise RuntimeError('user config struct not found')
+          struct_name, field_name = match.group(1), match.group(2)
+          lines = ['', '    #[test]', '    fun test_round20_user_bitmap_differential() {']
+          for reserve_id in range(128):
+              borrow_value = 1 << (reserve_id * 2)
+              collateral_value = 1 << (reserve_id * 2 + 1)
+              lines += [
+                  f'        let c_{reserve_id} = {struct_name} {{ {field_name}: 0 }};',
+                  f'        set_borrowing(&mut c_{reserve_id}, {reserve_id}, true);',
+                  f'        assert!(c_{reserve_id}.{field_name} == {borrow_value}, {9000 + reserve_id});',
+                  f'        assert!(is_borrowing(&c_{reserve_id}, {reserve_id}), {9200 + reserve_id});',
+                  f'        set_borrowing(&mut c_{reserve_id}, {reserve_id}, false);',
+                  f'        assert!(c_{reserve_id}.{field_name} == 0, {9400 + reserve_id});',
+                  f'        set_using_as_collateral(&mut c_{reserve_id}, {reserve_id}, true);',
+                  f'        assert!(c_{reserve_id}.{field_name} == {collateral_value}, {9600 + reserve_id});',
+                  f'        assert!(is_using_as_collateral(&c_{reserve_id}, {reserve_id}), {9800 + reserve_id});',
+                  f'        set_using_as_collateral(&mut c_{reserve_id}, {reserve_id}, false);',
+                  f'        assert!(c_{reserve_id}.{field_name} == 0, {10000 + reserve_id});',
+              ]
+          pairs = [(0,1),(0,127),(1,126),(31,32),(63,64),(95,96),(126,127),(7,119),(15,80),(47,96)]
+          for index, (left, right) in enumerate(pairs):
+              expected = (1 << (left * 2 + 1)) | (1 << (right * 2))
+              lines += [
+                  f'        let p_{index} = {struct_name} {{ {field_name}: 0 }};',
+                  f'        set_using_as_collateral(&mut p_{index}, {left}, true);',
+                  f'        set_borrowing(&mut p_{index}, {right}, true);',
+                  f'        assert!(p_{index}.{field_name} == {expected}, {11000 + index});',
+                  f'        assert!(is_using_as_collateral(&p_{index}, {left}), {11100 + index});',
+                  f'        assert!(is_borrowing(&p_{index}, {right}), {11200 + index});',
+                  f'        assert!(!is_borrowing(&p_{index}, {left}), {11300 + index});',
+                  f'        assert!(!is_using_as_collateral(&p_{index}, {right}), {11400 + index});',
+              ]
+          lines += ['    }', '']
+          closing = source.rfind('}')
+          path.write_text(source[:closing] + '\n'.join(lines) + source[closing:], encoding='utf-8')
+
+          # ReserveConfiguration setter/getter non-overlap test.
+          path = repo / 'aave-core/aave-config/sources/reserve_config.move'
+          source = path.read_text(encoding='utf-8')
+          match = re.search(
+              r'struct\s+([A-Za-z_][A-Za-z0-9_]*)[^{]*\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*u256',
+              source,
+              re.S,
+          )
+          if not match:
+              raise RuntimeError('reserve config struct not found')
+          struct_name, field_name = match.group(1), match.group(2)
+          header = re.compile(
+              r'(?P<vis>public(?:\(friend\))?\s+)?(?P<entry>entry\s+)?fun\s+'
+              r'(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\((?P<args>.*?)\)'
+              r'(?:\s*:\s*(?P<ret>[^{]+))?\s*\{',
+              re.S,
+          )
+          functions = {}
+          for item in header.finditer(source):
+              functions[item.group('name')] = {
+                  'args': ' '.join(item.group('args').split()),
+                  'ret': ' '.join((item.group('ret') or '').split()),
+              }
+          def split_args(value):
+              parts, current, depth = [], [], 0
+              for char in value:
+                  if char in '<([{': depth += 1
+                  elif char in '>)]}': depth -= 1
+                  if char == ',' and depth == 0:
+                      parts.append(''.join(current).strip()); current = []
+                  else: current.append(char)
+              if current: parts.append(''.join(current).strip())
+              return parts
+          simple = {'bool','u8','u16','u32','u64','u128','u256'}
+          pairs = []
+          for setter_name, setter in functions.items():
+              if not setter_name.startswith('set_'): continue
+              suffix = setter_name[4:]
+              getter_name = 'get_' + suffix
+              getter = functions.get(getter_name)
+              if not getter: continue
+              setter_args, getter_args = split_args(setter['args']), split_args(getter['args'])
+              if len(setter_args) != 2 or len(getter_args) != 1: continue
+              value_match = re.search(r':\s*(bool|u8|u16|u32|u64|u128|u256)\s*$', setter_args[1])
+              ret = getter['ret'].strip()
+              if not value_match or ret not in simple or value_match.group(1) != ret: continue
+              pairs.append((setter_name, getter_name, ret))
+          values = {'bool':'true','u8':'1','u16':'2','u32':'3','u64':'4','u128':'5','u256':'6'}
+          lines = ['', '    #[test]', '    fun test_round20_reserve_config_roundtrip_and_nonoverlap() {',
+                   f'        let configuration = {struct_name} {{ {field_name}: 0 }};']
+          for index, (setter, getter, typ) in enumerate(pairs):
+              value = values[typ]
+              lines += [f'        {setter}(&mut configuration, {value});',
+                        f'        assert!({getter}(&configuration) == {value}, {20000 + index});']
+          for index, (_, getter, typ) in enumerate(pairs):
+              lines.append(f'        assert!({getter}(&configuration) == {values[typ]}, {21000 + index});')
+          lines += ['    }', '']
+          closing = source.rfind('}')
+          path.write_text(source[:closing] + '\n'.join(lines) + source[closing:], encoding='utf-8')
+          PY
+
+      - name: Run user bitmap differential
+        shell: bash
+        run: |
+          set -o pipefail
+          aptos move test \
+            --package-dir aave/aave-core \
+            --filter test_round20_user_bitmap_differential \
+            --skip-fetch-latest-git-deps 2>&1 | tee user_bitmap.log
+
+      - name: Run reserve-config non-overlap differential
+        shell: bash
+        run: |
+          set -o pipefail
+          aptos move test \
+            --package-dir aave/aave-core \
+            --filter test_round20_reserve_config_roundtrip_and_nonoverlap \
+            --skip-fetch-latest-git-deps 2>&1 | tee reserve_config.log
+
+      - name: Create integrity manifest
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p evidence
+          cp user_bitmap.log reserve_config.log evidence/ 2>/dev/null || true
+          cp aave/aave-core/aave-config/sources/user_config.move evidence/
+          cp aave/aave-core/aave-config/sources/reserve_config.move evidence/
+          find evidence -type f -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS.txt
+
+      - name: Upload differential evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aave-aptos-r20-bitmap-differential
+          path: evidence
+          retention-days: 7
+          if-no-files-found: error
