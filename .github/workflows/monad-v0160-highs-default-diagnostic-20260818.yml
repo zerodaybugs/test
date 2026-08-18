@@ -1,0 +1,183 @@
+name: Monad v0.16.0 high-S default-branch diagnostic
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/monad-v0160-highs-default-diagnostic-20260818.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: monad-v0160-highs-default-diagnostic
+  cancel-in-progress: true
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      RESEARCH_BRANCH: agent/monad-v0160-highs-diagnostic-20260818
+      RESULT_DIR: results/monad-v0160-highs-diagnostic
+      BFT_COMMIT: c616743d1358186605e1c1b74a3d6c4fdd9dd48c
+      EXEC_COMMIT: e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_HTTP_MULTIPLEXING: "false"
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Check out isolated research branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RESEARCH_BRANCH }}
+          fetch-depth: 0
+
+      - name: Commit start heartbeat
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$RESULT_DIR"
+          printf '{"stage":"STARTED","run_id":%s,"workflow_sha":"%s"}\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_SHA" > "$RESULT_DIR/HEARTBEAT.json"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$RESULT_DIR/HEARTBEAT.json"
+          git commit -m "Record Monad high-S default diagnostic heartbeat"
+          git push origin "HEAD:$RESEARCH_BRANCH"
+
+      - name: Install exact Rust toolchain
+        id: rust
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p diagnostic
+          {
+            rustup --version
+            rustup toolchain install 1.91.1 --profile minimal --component rustfmt
+            rustup default 1.91.1
+            rustc --version --verbose
+            cargo --version --verbose
+          } 2>&1 | tee diagnostic/rust.log
+
+      - name: Clone and pin exact source
+        id: clone
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p diagnostic
+          {
+            git config --global advice.detachedHead false
+            git clone --filter=blob:none --no-recurse-submodules https://github.com/category-labs/monad-bft.git monad-bft
+            git -C monad-bft checkout --detach "$BFT_COMMIT"
+            git -C monad-bft submodule sync --recursive
+            git -C monad-bft submodule update --init --recursive --depth 1
+            test "$(git -C monad-bft rev-parse HEAD)" = "$BFT_COMMIT"
+            test "$(git -C monad-bft/monad-execution rev-parse HEAD)" = "$EXEC_COMMIT"
+          } 2>&1 | tee diagnostic/clone.log
+
+      - name: Inject exact recovery test
+        id: inject
+        if: steps.clone.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          {
+            python3 scripts/monad_v0160_highs_recovery_inject.py
+            cargo fmt --manifest-path monad-bft/Cargo.toml --all
+            git -C monad-bft diff --check
+            git -C monad-bft diff -- monad-raptorcast/src/udp.rs > diagnostic/injected.patch
+            test -s diagnostic/injected.patch
+          } 2>&1 | tee diagnostic/inject.log
+
+      - name: Fetch locked dependencies
+        id: fetch
+        if: steps.rust.outcome == 'success' && steps.inject.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for attempt in 1 2 3 4 5; do
+            cargo fetch --manifest-path monad-bft/Cargo.toml --locked 2>&1 | tee -a diagnostic/cargo-fetch.log && exit 0
+            sleep $((attempt * 5))
+          done
+          exit 1
+
+      - name: Compile and run exact recovery test
+        id: test
+        if: steps.fetch.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cargo test --manifest-path monad-bft/Cargo.toml --locked \
+            -p monad-raptorcast \
+            udp::tests_deterministic::malicious_v1_high_s_alias_is_one_round_only_under_accept_both_publish_v0 \
+            -- --exact --nocapture --test-threads=1 2>&1 | tee diagnostic/test.log
+
+      - name: Commit fail-closed diagnostic result
+        if: always()
+        shell: bash
+        env:
+          RUST_OUTCOME: ${{ steps.rust.outcome }}
+          CLONE_OUTCOME: ${{ steps.clone.outcome }}
+          INJECT_OUTCOME: ${{ steps.inject.outcome }}
+          FETCH_OUTCOME: ${{ steps.fetch.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$RESULT_DIR" diagnostic
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json, os, re
+
+          diag = Path('diagnostic')
+          outcomes = {k: os.environ.get(k.upper() + '_OUTCOME') for k in ('rust','clone','inject','fetch','test')}
+          text = (diag / 'test.log').read_text(errors='replace') if (diag / 'test.log').exists() else ''
+          names = [
+              'DEFAULT_STAGE_V1_CONTROL_ROUND42','POISONED_HONEST_ONE_ROUND42',
+              'POISONED_HONEST_TWO_ROUND42','RECOVERED_HONEST_ONE_ROUND43',
+              'RECOVERED_HONEST_TWO_ROUND43','RECOVERED_HONEST_THREE_ROUND43','TEST_COMPLETE'
+          ]
+          markers = {}
+          for name in names:
+              values = re.findall(rf'MARKER_{name}=([0-9]+)', text)
+              markers[name] = int(values[-1]) if values else None
+          failed = next((name.upper() for name in ('rust','clone','inject','fetch','test') if outcomes[name] != 'success'), None)
+          expected = {
+              'DEFAULT_STAGE_V1_CONTROL_ROUND42':1,'POISONED_HONEST_ONE_ROUND42':0,
+              'POISONED_HONEST_TWO_ROUND42':0,'RECOVERED_HONEST_ONE_ROUND43':1,
+              'RECOVERED_HONEST_TWO_ROUND43':1,'RECOVERED_HONEST_THREE_ROUND43':1,
+              'TEST_COMPLETE':1,
+          }
+          exact = failed is None and all(markers.get(k) == v for k,v in expected.items())
+          result = {
+              'run_id': os.environ.get('GITHUB_RUN_ID'), 'outcomes': outcomes,
+              'failed_stage': failed, 'markers': markers,
+              'decision': 'ONE_ROUND_POISONING_RECOVERS_NEXT_HONEST_ROUND' if exact else 'DIAGNOSTIC_FAILURE_LOCALIZED',
+              'submit_ready': False,
+          }
+          root = Path(os.environ['RESULT_DIR']); root.mkdir(parents=True, exist_ok=True)
+          (root / 'DIAGNOSTIC.json').write_text(json.dumps(result, indent=2) + '\n')
+          (root / 'REPORT.md').write_text('# Monad high-S CI diagnostic\n\n```json\n' + json.dumps(result, indent=2) + '\n```\n')
+          for p in diag.glob('*'):
+              if p.is_file(): (root / p.name).write_bytes(p.read_bytes())
+          manifest=[]
+          for p in sorted(root.rglob('*')):
+              if p.is_file() and p.name != 'SHA256SUMS':
+                  manifest.append(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(root)}')
+          (root / 'SHA256SUMS').write_text('\n'.join(manifest) + '\n')
+          print(json.dumps(result, indent=2))
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$RESULT_DIR"
+          if ! git diff --cached --quiet; then
+            git commit -m "Record Monad high-S default diagnostic result"
+            git push origin "HEAD:$RESEARCH_BRANCH"
+          fi
