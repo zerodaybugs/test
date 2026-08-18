@@ -1,0 +1,196 @@
+name: Temporary direct ICP research icp14
+
+on:
+  push:
+    branches:
+      - tmp-ci-20260818-icp14
+    paths:
+      - ".github/workflows/tmp-ci-icp14-direct.yml"
+      - "trigger-icp14-direct-**"
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends git python3 openssl jq ripgrep tar gzip
+
+      - name: Clone current IC security-critical source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout --depth=400 --branch master https://github.com/dfinity/ic.git "$RUNNER_TEMP/ic"
+          cd "$RUNNER_TEMP/ic"
+          git sparse-checkout init --no-cone
+          cat > .git/info/sparse-checkout <<'EOF'
+          /Cargo.toml
+          /Cargo.lock
+          /rust-toolchain.toml
+          /mainnet-icos-revisions.json
+          /mainnet-canister-revisions.json
+          /rs/bitcoin/ckbtc/minter/
+          /rs/bitcoin/ckbtc/kyt/
+          /rs/ethereum/cketh/minter/
+          /rs/ethereum/ledger-suite-orchestrator/
+          /rs/execution_environment/
+          /rs/replicated_state/
+          /rs/https_outcalls/
+          /rs/messaging/
+          /rs/nns/
+          /rs/sns/
+          /rs/ledger_suite/
+          /rs/ledger_canister/
+          /rs/types/
+          /rs/management_canister_types/
+          /rs/consensus/
+          /rs/crypto/
+          /rs/registry/
+          /packages/ic-management-canister-types/
+          EOF
+          git checkout --detach origin/master
+
+      - name: Run authority, custody and rollback scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/result"
+          mkdir -p "$OUT"
+          cd "$RUNNER_TEMP/ic"
+          git rev-parse HEAD > "$OUT/HEAD.txt"
+          git log -1 --format='%H%n%cI%n%s' > "$OUT/HEAD_META.txt"
+          git log -n 500 --format='%H%x09%cI%x09%s' > "$OUT/RECENT_COMMITS.tsv"
+          python3 - "$RUNNER_TEMP/ic" "$OUT" <<'PY'
+          from __future__ import annotations
+          import json,re,sys
+          from pathlib import Path
+          from dataclasses import dataclass,asdict
+
+          repo=Path(sys.argv[1]); out=Path(sys.argv[2])
+          roots=['rs/bitcoin/ckbtc/minter','rs/bitcoin/ckbtc/kyt','rs/ethereum/cketh/minter','rs/ethereum/ledger-suite-orchestrator','rs/execution_environment','rs/replicated_state','rs/https_outcalls','rs/messaging','rs/nns','rs/sns','rs/ledger_suite','rs/ledger_canister','rs/types','rs/management_canister_types','rs/consensus','rs/crypto','rs/registry','packages/ic-management-canister-types']
+          files=[]
+          for r in roots:
+              p=repo/r
+              if p.exists(): files.extend(p.rglob('*.rs'))
+          files=sorted({p for p in files if not any(x in p.parts for x in ('target','fuzz','benches','test_data'))})
+
+          fnre=re.compile(r'(?m)^(?:\s*#\[[^\n]*\]\s*)*(?:\s*pub(?:\([^)]*\))?\s+)?(?:\s*unsafe\s+)?(?P<async>async\s+)?fn\s+(?P<name>[A-Za-z0-9_]+)\s*[^\{;]*\{')
+          def functions(text):
+              for m in fnre.finditer(text):
+                  b=text.find('{',m.start(),m.end()+4)
+                  if b<0: continue
+                  depth=0; i=b; mode='code'; quote=''
+                  while i<len(text):
+                      c=text[i]; n=text[i+1] if i+1<len(text) else ''
+                      if mode=='code':
+                          if c=='/' and n=='/': mode='line'; i+=2; continue
+                          if c=='/' and n=='*': mode='block'; i+=2; continue
+                          if c=='"': mode='str'; quote=c; i+=1; continue
+                          if c=='{': depth+=1
+                          elif c=='}':
+                              depth-=1
+                              if depth==0:
+                                  yield m.group('name'),bool(m.group('async')),m.start(),i+1,text[m.start():i+1]
+                                  break
+                      elif mode=='line':
+                          if c=='\n': mode='code'
+                      elif mode=='block':
+                          if c=='*' and n=='/': mode='code'; i+=2; continue
+                      else:
+                          if c=='\\': i+=2; continue
+                          if c==quote: mode='code'
+                      i+=1
+          def line(text,pos): return text.count('\n',0,pos)+1
+
+          hits=[]
+          mutpat=re.compile(r'(?:mutate_state|with_state_mut|audit::|record_event|\.remove\s*\(|\.take\s*\(|\.drain\s*\(|\.clear\s*\(|\.insert\s*\(|\.push(?:_back|_front)?\s*\()',re.I)
+          destructive=re.compile(r'(?:\.remove\s*\(|\.take\s*\(|\.drain\s*\(|burn|debit|charge|remove_cycles|available_utxos|withdrawal|refund)',re.I)
+          sensitive=re.compile(r'(?:utxo|withdraw|burn|mint|ledger|allowance|refund|payment|cycles|snapshot|controller|neuron|maturity|stake|key_id|transcript)',re.I)
+          auth=re.compile(r'(?:caller\(\)|is_controller|authorized|has_permission|hotkey|guard_|check_access)',re.I)
+          for p in files:
+              try: text=p.read_text()
+              except Exception: continue
+              rel=str(p.relative_to(repo))
+              for name,isasync,s,e,body in functions(text):
+                  score=0; why=[]
+                  ap=body.find('.await')
+                  if ap>=0:
+                      pre=body[:ap]; post=body[ap+6:]
+                      if mutpat.search(pre):
+                          score+=10; why.append('state mutation before first await')
+                          if destructive.search(pre): score+=8; why.append('destructive/custody mutation before await')
+                          if sensitive.search(body): score+=7; why.append('value or authority sensitive')
+                          if not re.search(r'(?:guard|scopeguard|rollback|restore|undo|reinsert|push_from_in_flight)',body,re.I): score+=7; why.append('no obvious rollback guard')
+                          if re.search(r'(?:\?|return\s|match\s|Err\()',post): score+=4; why.append('fallible post-await path')
+                      vals=[]
+                      for lm in re.finditer(r'\blet\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=([^;]{0,260});',pre):
+                          v,x=lm.group(1),lm.group(2)
+                          if re.search(r'(?:read_state|state\.|\.get\(|find|lookup|balance|controllers?|route|version|nonce|status)',x,re.I) and re.search(r'\b'+re.escape(v)+r'\b',post): vals.append(v)
+                      if vals: score+=5+min(8,len(vals)); why.append('pre-await state values reused: '+','.join(vals[:8]))
+                  apos=[m.start() for m in auth.finditer(body)]
+                  if apos:
+                      first=apos[0]
+                      if sensitive.search(body[:first]) and re.search(r'(?:read_state|\.get\(|find|lookup|balance|maturity|stake|snapshot|controllers?)',body[:first],re.I):
+                          score+=8; why.append('sensitive state access before apparent auth')
+                  if re.search(r'#\[(?:ic_cdk::)?(?:update|query)',body[:500]) and re.search(r'(?:unwrap\(|expect\(|assert!\(|panic!\()',body):
+                      score+=6; why.append('panic primitive in exposed endpoint')
+                  if re.search(r'\b(?:amount|cycles|balance|fee|stake|maturity|satoshi|e8s|allowance)\w*[^\n;]{0,140}\bas\s+(?:u8|u16|u32|u64|usize|i32|i64)\b',body,re.I):
+                      score+=5; why.append('lossy cast in value path')
+                  if score>=10:
+                      snip=body if len(body)<18000 else body[:9000]+'\n...TRUNCATED...\n'+body[-9000:]
+                      hits.append({'score':score,'path':rel,'line':line(text,s),'function':name,'reasons':why,'snippet':snip})
+
+          hits.sort(key=lambda h:(-h['score'],h['path'],h['line']))
+          out.joinpath('CANDIDATES.json').write_text(json.dumps(hits[:220],indent=2))
+          with out.joinpath('CANDIDATES.md').open('w') as f:
+              f.write('# Ranked ICP security candidates\n\n')
+              for i,h in enumerate(hits[:120],1):
+                  f.write(f"## {i}. score={h['score']} `{h['path']}:{h['line']}` `{h['function']}`\n\n")
+                  f.write('Reasons: '+'; '.join(h['reasons'])+'\n\n```rust\n'+h['snippet']+'\n```\n\n')
+          versions=[]
+          q=repo/'mainnet-icos-revisions.json'
+          if q.exists():
+              data=json.loads(q.read_text())
+              def walk(x):
+                  if isinstance(x,dict):
+                      for k,v in x.items():
+                          if k=='version' and isinstance(v,str) and len(v)==40: versions.append(v)
+                          walk(v)
+                  elif isinstance(x,list):
+                      for v in x: walk(v)
+              walk(data)
+          out.joinpath('DEPLOYED_REVISIONS.json').write_text(json.dumps({'versions':sorted(set(versions))},indent=2))
+          out.joinpath('SCAN_SUMMARY.json').write_text(json.dumps({'files_scanned':len(files),'hits':len(hits),'top_scores':[h['score'] for h in hits[:30]]},indent=2))
+          print(json.dumps({'files':len(files),'hits':len(hits),'head':(out/'HEAD.txt').read_text().strip()}))
+          PY
+          find "$OUT" -type f -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS.txt"
+
+      - name: Encrypt research result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/result"
+          ENC="$RUNNER_TEMP/encrypted"
+          mkdir -p "$OUT" "$ENC"
+          tar -czf "$RUNNER_TEMP/result.tar.gz" -C "$OUT" .
+          openssl rand -hex 32 > "$RUNNER_TEMP/result.pass"
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/result.tar.gz" -out "$ENC/result.enc" -pass file:"$RUNNER_TEMP/result.pass"
+          openssl pkeyutl -encrypt -pubin -inkey secure-ci-icp14/researcher-public.pem -in "$RUNNER_TEMP/result.pass" -out "$ENC/result.key.enc" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          sha256sum "$ENC/result.enc" "$ENC/result.key.enc" > "$ENC/SHA256SUMS.txt"
+          printf '%s\n' "$GITHUB_RUN_ID" > "$ENC/run-id.txt"
+
+      - name: Upload encrypted research result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-result-icp14-direct
+          path: ${{ runner.temp }}/encrypted/
+          retention-days: 1
