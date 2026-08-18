@@ -20,16 +20,17 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      RESEARCH_BRANCH: agent/monad-v0160-highs-diagnostic-20260818
-      RESULT_DIR: results/monad-v0160-highs-diagnostic
+      RESEARCH_BRANCH: agent/monad-v0160-highs-recovery-v2-20260818
+      RESULT_DIR: results/monad-v0160-highs-recovery-v2
       BFT_COMMIT: c616743d1358186605e1c1b74a3d6c4fdd9dd48c
       EXEC_COMMIT: e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       CARGO_HTTP_MULTIPLEXING: "false"
       RUST_BACKTRACE: "1"
+      TEST_NAME: udp::tests_deterministic::malicious_v1_high_s_alias_is_one_round_only_under_accept_both_publish_v0
 
     steps:
-      - name: Check out isolated research branch
+      - name: Check out corrected isolated research branch
         uses: actions/checkout@v4
         with:
           ref: ${{ env.RESEARCH_BRANCH }}
@@ -40,12 +41,12 @@ jobs:
         run: |
           set -Eeuo pipefail
           mkdir -p "$RESULT_DIR"
-          printf '{"stage":"STARTED","run_id":%s,"workflow_sha":"%s"}\n' \
+          printf '{"stage":"STARTED_V2","run_id":%s,"workflow_sha":"%s"}\n' \
             "$GITHUB_RUN_ID" "$GITHUB_SHA" > "$RESULT_DIR/HEARTBEAT.json"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "$RESULT_DIR/HEARTBEAT.json"
-          git commit -m "Record Monad high-S default diagnostic heartbeat"
+          git commit -m "Record Monad high-S recovery-v2 heartbeat"
           git push origin "HEAD:$RESEARCH_BRANCH"
 
       - name: Install exact Rust toolchain
@@ -80,7 +81,17 @@ jobs:
             test "$(git -C monad-bft/monad-execution rev-parse HEAD)" = "$EXEC_COMMIT"
           } 2>&1 | tee diagnostic/clone.log
 
-      - name: Inject exact recovery test
+      - name: Restore exact Cargo build cache
+        if: steps.clone.outcome == 'success'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            monad-bft/target
+          key: ubuntu-24.04-monad-v0160-raptorcast-c616743d-v2
+
+      - name: Inject corrected exact recovery test
         id: inject
         if: steps.clone.outcome == 'success'
         continue-on-error: true
@@ -88,7 +99,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           {
-            python3 scripts/monad_v0160_highs_recovery_inject.py
+            python3 scripts/monad_v0160_highs_recovery_v2.py
             cargo fmt --manifest-path monad-bft/Cargo.toml --all
             git -C monad-bft diff --check
             git -C monad-bft diff -- monad-raptorcast/src/udp.rs > diagnostic/injected.patch
@@ -108,17 +119,25 @@ jobs:
           done
           exit 1
 
-      - name: Compile and run exact recovery test
+      - name: Compile once and run exact recovery test three times
         id: test
         if: steps.fetch.outcome == 'success'
         continue-on-error: true
         shell: bash
         run: |
           set -Eeuo pipefail
-          cargo test --manifest-path monad-bft/Cargo.toml --locked \
-            -p monad-raptorcast \
-            udp::tests_deterministic::malicious_v1_high_s_alias_is_one_round_only_under_accept_both_publish_v0 \
-            -- --exact --nocapture --test-threads=1 2>&1 | tee diagnostic/test.log
+          : > diagnostic/status.tsv
+          for repetition in 1 2 3; do
+            set +e
+            cargo test --manifest-path monad-bft/Cargo.toml --locked \
+              -p monad-raptorcast "$TEST_NAME" \
+              -- --exact --nocapture --test-threads=1 \
+              2>&1 | tee "diagnostic/test-${repetition}.log"
+            status=${PIPESTATUS[0]}
+            set -e
+            printf '%s\t%s\n' "$repetition" "$status" >> diagnostic/status.tsv
+          done
+          test "$(awk -F '\t' '$2 != 0 {count++} END {print count+0}' diagnostic/status.tsv)" = 0
 
       - name: Commit fail-closed diagnostic result
         if: always()
@@ -138,33 +157,53 @@ jobs:
 
           diag = Path('diagnostic')
           outcomes = {k: os.environ.get(k.upper() + '_OUTCOME') for k in ('rust','clone','inject','fetch','test')}
-          text = (diag / 'test.log').read_text(errors='replace') if (diag / 'test.log').exists() else ''
+          statuses = {}
+          if (diag / 'status.tsv').exists():
+              for line in (diag / 'status.tsv').read_text().splitlines():
+                  rep, code = line.split('\t')
+                  statuses[int(rep)] = int(code)
           names = [
               'DEFAULT_STAGE_V1_CONTROL_ROUND42','POISONED_HONEST_ONE_ROUND42',
               'POISONED_HONEST_TWO_ROUND42','RECOVERED_HONEST_ONE_ROUND43',
               'RECOVERED_HONEST_TWO_ROUND43','RECOVERED_HONEST_THREE_ROUND43','TEST_COMPLETE'
           ]
-          markers = {}
-          for name in names:
-              values = re.findall(rf'MARKER_{name}=([0-9]+)', text)
-              markers[name] = int(values[-1]) if values else None
-          failed = next((name.upper() for name in ('rust','clone','inject','fetch','test') if outcomes[name] != 'success'), None)
+          runs = []
+          for rep in (1,2,3):
+              text = (diag / f'test-{rep}.log').read_text(errors='replace') if (diag / f'test-{rep}.log').exists() else ''
+              markers = {}
+              for name in names:
+                  values = re.findall(rf'MARKER_{name}=([0-9]+)', text)
+                  markers[name] = int(values[-1]) if values else None
+              runs.append({'repetition': rep, 'exit_code': statuses.get(rep), 'markers': markers})
           expected = {
               'DEFAULT_STAGE_V1_CONTROL_ROUND42':1,'POISONED_HONEST_ONE_ROUND42':0,
               'POISONED_HONEST_TWO_ROUND42':0,'RECOVERED_HONEST_ONE_ROUND43':1,
-              'RECOVERED_HONEST_TWO_ROUND43':1,'RECOVERED_HONEST_THREE_ROUND43':1,
+              'RECOVERED_HONEST_TWO_ROUND43':1,'RECOVERED_HONEST_THREE_ROUND43':0,
               'TEST_COMPLETE':1,
           }
-          exact = failed is None and all(markers.get(k) == v for k,v in expected.items())
+          infrastructure = all(outcomes[k] == 'success' for k in ('rust','clone','inject','fetch'))
+          exact = infrastructure and all(
+              run['exit_code'] == 0 and all(run['markers'].get(k) == v for k,v in expected.items())
+              for run in runs
+          )
+          failed = next((name.upper() for name in ('rust','clone','inject','fetch','test') if outcomes[name] != 'success'), None)
           result = {
               'run_id': os.environ.get('GITHUB_RUN_ID'), 'outcomes': outcomes,
-              'failed_stage': failed, 'markers': markers,
-              'decision': 'ONE_ROUND_POISONING_RECOVERS_NEXT_HONEST_ROUND' if exact else 'DIAGNOSTIC_FAILURE_LOCALIZED',
+              'failed_stage': failed, 'runs': runs,
+              'decision': 'ONE_ROUND_POISONING_RECOVERS_NEXT_HONEST_ROUND_3_OF_3' if exact else 'RECOVERY_V2_FAILURE_LOCALIZED',
+              'root_cause_proven': all(
+                  run['markers'].get('DEFAULT_STAGE_V1_CONTROL_ROUND42') == 1
+                  and run['markers'].get('POISONED_HONEST_ONE_ROUND42') == 0
+                  and run['markers'].get('POISONED_HONEST_TWO_ROUND42') == 0
+                  for run in runs
+              ),
+              'both_poisoned_network_receivers_recover': exact,
+              'sustained_high_proven': False,
               'submit_ready': False,
           }
           root = Path(os.environ['RESULT_DIR']); root.mkdir(parents=True, exist_ok=True)
-          (root / 'DIAGNOSTIC.json').write_text(json.dumps(result, indent=2) + '\n')
-          (root / 'REPORT.md').write_text('# Monad high-S CI diagnostic\n\n```json\n' + json.dumps(result, indent=2) + '\n```\n')
+          (root / 'RESULT.json').write_text(json.dumps(result, indent=2) + '\n')
+          (root / 'REPORT.md').write_text('# Monad high-S recovery-v2\n\n```json\n' + json.dumps(result, indent=2) + '\n```\n')
           for p in diag.glob('*'):
               if p.is_file(): (root / p.name).write_bytes(p.read_bytes())
           manifest=[]
@@ -178,6 +217,6 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "$RESULT_DIR"
           if ! git diff --cached --quiet; then
-            git commit -m "Record Monad high-S default diagnostic result"
+            git commit -m "Record corrected Monad high-S recovery-v2 result"
             git push origin "HEAD:$RESEARCH_BRANCH"
           fi
