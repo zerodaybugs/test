@@ -1,0 +1,165 @@
+name: kiln-r42b-live-config-persist
+
+on:
+  push:
+    branches:
+      - agent/kiln-r42-live-config-delta-20260818
+    paths:
+      - kiln_r42/**
+      - .github/workflows/_temporary-kiln-r42b-live-config-persist-20260818.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kiln-r42b-live-config-persist-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  census-and-persist:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compile and enforce read-only boundary
+        run: |
+          set -euo pipefail
+          python -m py_compile kiln_r42/live_config_delta.py
+          python - <<'PY'
+          from pathlib import Path
+          source = Path('kiln_r42/live_config_delta.py').read_text()
+          prohibited = ['eth_sendTransaction', 'eth_sendRawTransaction', 'personal_sign', 'eth_signTransaction']
+          assert not [item for item in prohibited if item in source]
+          print('R42B_SAFETY_STATIC_GATE=PASS')
+          PY
+
+      - name: Run two-RPC exact-block census
+        shell: bash
+        run: |
+          set +e
+          rm -rf r42_results
+          mkdir -p r42_results
+          python kiln_r42/live_config_delta.py > >(tee r42_results/RUN.stdout.log) 2> >(tee r42_results/RUN.stderr.log >&2)
+          code=$?
+          printf '%s\n' "$code" > r42_results/RUNNER_EXIT_CODE.txt
+          exit 0
+
+      - name: Create fail-closed public gate when needed
+        if: always()
+        run: |
+          python - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          out = Path('r42_results'); out.mkdir(exist_ok=True)
+          try:
+              exit_code = int((out / 'RUNNER_EXIT_CODE.txt').read_text().strip())
+          except Exception:
+              exit_code = 255
+          gate_path = out / 'PUBLIC_GATE.json'
+          if gate_path.exists():
+              gate = json.loads(gate_path.read_text())
+          else:
+              gate = {
+                  'schema': 'kiln-omnivault-r42-public-gate-v1',
+                  'decision': 'INCONCLUSIVE_RUNNER_FAILED_BEFORE_GATE',
+                  'submit_ready': False,
+                  'validated_critical': 0,
+                  'validated_high': 0,
+                  'coverage_complete': False,
+                  'scope_count': 0,
+                  'inspected_count': 0,
+                  'chain_count': 0,
+                  'error_count': 1,
+                  'quorum_mismatch_count': 0,
+                  'inventory_trigger_count': 0,
+                  'research_candidate_count': 0,
+                  'duplicate_or_known_signal_count': 0,
+                  'public_chain_state_changes': 0,
+                  'transactions_signed': 0,
+                  'transactions_sent': 0,
+              }
+          gate['runner_exit_code'] = exit_code
+          assert gate.get('submit_ready') is False
+          assert int(gate.get('validated_critical', 0)) == 0
+          assert int(gate.get('validated_high', 0)) == 0
+          assert int(gate.get('public_chain_state_changes', 0)) == 0
+          assert int(gate.get('transactions_signed', 0)) == 0
+          assert int(gate.get('transactions_sent', 0)) == 0
+          gate_path.write_text(json.dumps(gate, indent=2, sort_keys=True))
+          files = sorted(path for path in out.iterdir() if path.is_file() and path.name != 'SHA256SUMS.txt')
+          (out / 'SHA256SUMS.txt').write_text(''.join(
+              f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n' for path in files
+          ))
+          print(json.dumps(gate, sort_keys=True))
+          PY
+
+      - name: Encrypt complete evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf r42_encrypted kiln_r42_persist
+          mkdir -p r42_encrypted kiln_r42_persist
+          tar -czf /tmp/r42-evidence.tar.gz r42_results
+          openssl rand -hex 32 > /tmp/r42-passphrase.txt
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 250000 \
+            -in /tmp/r42-evidence.tar.gz \
+            -out r42_encrypted/payload.aes256 \
+            -pass file:/tmp/r42-passphrase.txt
+          openssl pkeyutl -encrypt -pubin \
+            -inkey kiln_r42/evidence_public.pem \
+            -in /tmp/r42-passphrase.txt \
+            -out r42_encrypted/key.rsa3072 \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          cp kiln_r42/evidence_public.pem r42_encrypted/evidence_public.pem
+          printf '%s\n' 'Kiln R42 encrypted evidence; AES-256-CBC PBKDF2 250000; RSA-3072 OAEP SHA-256.' > r42_encrypted/README.txt
+          sha256sum r42_encrypted/* > r42_encrypted/SHA256SUMS.txt
+          (cd r42_encrypted && zip -q -9 ../kiln-r42-encrypted-evidence.zip ./*)
+          sha256sum kiln-r42-encrypted-evidence.zip > kiln-r42-encrypted-evidence.zip.sha256
+          rm -f /tmp/r42-passphrase.txt /tmp/r42-evidence.tar.gz
+
+      - name: Persist sanitized gate and encrypted evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp r42_results/PUBLIC_GATE.json kiln_r42_persist/PUBLIC_GATE.json
+          cp r42_results/SHA256SUMS.txt kiln_r42_persist/R42_RESULTS_SHA256SUMS.txt
+          cp kiln-r42-encrypted-evidence.zip kiln_r42_persist/kiln-r42-encrypted-evidence.zip
+          cp kiln-r42-encrypted-evidence.zip.sha256 kiln_r42_persist/kiln-r42-encrypted-evidence.zip.sha256
+          python - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          gate = json.loads(Path('kiln_r42_persist/PUBLIC_GATE.json').read_text())
+          status = {
+              'schema': 'kiln-r42-persist-status-v1',
+              'run_id': '${{ github.run_id }}',
+              'run_attempt': '${{ github.run_attempt }}',
+              'head_sha': '${{ github.sha }}',
+              'decision': gate.get('decision'),
+              'submit_ready': False,
+              'validated_critical': 0,
+              'validated_high': 0,
+              'encrypted_evidence_sha256': hashlib.sha256(Path('kiln_r42_persist/kiln-r42-encrypted-evidence.zip').read_bytes()).hexdigest(),
+          }
+          Path('kiln_r42_persist/STATUS.json').write_text(json.dumps(status, indent=2, sort_keys=True))
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add kiln_r42_persist
+          git commit -m 'kiln: persist R42 sanitized gate and encrypted evidence [skip ci]'
+          git push origin HEAD:${{ github.ref_name }}
+
+      - name: Preserve fail-closed status
+        if: always()
+        shell: bash
+        run: |
+          code=$(cat r42_results/RUNNER_EXIT_CODE.txt 2>/dev/null || echo 255)
+          exit "$code"
