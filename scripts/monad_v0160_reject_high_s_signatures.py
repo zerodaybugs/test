@@ -17,7 +17,7 @@ new = """        let signature =
         // boundary so raw signature bytes cannot become a second packet,
         // cache, or commitment identity for the same authenticated signer.
         let standard = signature.to_standard();
-        let mut normalized = standard;
+        let mut normalized = standard.clone();
         normalized.normalize_s();
         if normalized != standard {
             return Err(Error(secp256k1::Error::InvalidSignature));
