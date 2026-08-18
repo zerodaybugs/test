@@ -1,0 +1,84 @@
+name: Publish DeepBook read-only orderbook snapshot
+
+on:
+  push:
+    branches:
+      - "sui-round15-readonly-*"
+
+permissions:
+  contents: write
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install official Mysten SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/deepbook-readonly
+          cd /tmp/deepbook-readonly
+          npm init -y >/dev/null
+          npm install --save-exact @mysten/sui @mysten/deepbook-v3@2.0.0
+          npm ls --json > SDK_VERSIONS.json
+
+      - name: Capture read-only public mainnet state
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/deepbook-readonly
+          cat > snapshot.mjs <<'JS'
+          import fs from 'node:fs';
+          import { SuiGrpcClient } from '@mysten/sui/grpc';
+          import { deepbook } from '@mysten/deepbook-v3';
+
+          const client = new SuiGrpcClient({
+            network: 'mainnet',
+            baseUrl: 'https://fullnode.mainnet.sui.io:443',
+          }).$extend(deepbook({ address: '0x0' }));
+          const pools = ['DEEP_USDC','DEEP_SUI','SUI_USDC','WAL_USDC','WAL_SUI','NS_USDC','NS_SUI','XBTC_USDC','IKA_USDC','USDT_USDC'];
+          const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
+          async function retry(fn){let e;for(let i=1;i<=5;i++){try{return await fn()}catch(x){e=x;if(i<5)await sleep(i*1000)}}throw e}
+          const out={generated_at:new Date().toISOString(),network:'mainnet',write_operations:0,pools:{}};
+          for(const poolKey of pools){
+            const row={};
+            const tasks={
+              mid_price:()=>client.deepbook.midPrice(poolKey),
+              whitelisted:()=>client.deepbook.whitelisted(poolKey),
+              trade_params:()=>client.deepbook.poolTradeParams(poolKey),
+              book_params:()=>client.deepbook.poolBookParams(poolKey),
+              vault_balances:()=>client.deepbook.vaultBalances(poolKey),
+              deep_price:()=>client.deepbook.getPoolDeepPrice(poolKey),
+              level2_100:()=>client.deepbook.getLevel2TicksFromMid(poolKey,100),
+            };
+            for(const [name,fn] of Object.entries(tasks)){
+              try{row[name]=await retry(fn)}catch(error){row[name+'_error']=String(error?.stack??error)}
+            }
+            out.pools[poolKey]=row;
+          }
+          fs.writeFileSync('MAINNET_SNAPSHOT.json',JSON.stringify(out,null,2));
+          JS
+          node snapshot.mjs > RUN.log 2>&1
+          node -e "const x=require('./MAINNET_SNAPSHOT.json'); if(x.write_operations!==0||Object.keys(x.pools).length!==10) process.exit(1)" > VALIDATION.log
+          sha256sum MAINNET_SNAPSHOT.json SDK_VERSIONS.json snapshot.mjs RUN.log VALIDATION.log > SHA256SUMS
+
+      - name: Commit snapshot to this public test branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf readonly-snapshots/deepbook-round15
+          mkdir -p readonly-snapshots/deepbook-round15
+          cp /tmp/deepbook-readonly/{MAINNET_SNAPSHOT.json,SDK_VERSIONS.json,snapshot.mjs,RUN.log,VALIDATION.log,SHA256SUMS} readonly-snapshots/deepbook-round15/
+          git config user.name "readonly-snapshot-bot"
+          git config user.email "readonly-snapshot-bot@users.noreply.github.com"
+          git add readonly-snapshots/deepbook-round15
+          if ! git diff --cached --quiet; then
+            git commit -m "data: publish DeepBook public read-only snapshot"
+            git push origin HEAD:${GITHUB_REF_NAME}
+          fi
