@@ -1,0 +1,165 @@
+name: kiln-r45-fee-share-minsupply-v3
+
+on:
+  pull_request:
+    branches:
+      - agent/kiln-r45-fee-share-minsupply-liveness-20260819
+    paths:
+      - kiln_r45/**
+      - .github/workflows/_temporary-kiln-r45-fee-share-minsupply-v3-20260819.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kiln-r45-v3-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  hardened-r45:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install narrow dependency
+        run: python -m pip install --disable-pip-version-check pycryptodome
+
+      - name: Compile and safety self-check
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile kiln_r45/fee_share_liveness.py kiln_r45/fee_share_liveness_hardened.py
+          python - <<'PY'
+          from pathlib import Path
+          source='\n'.join(Path(p).read_text() for p in ['kiln_r45/fee_share_liveness.py','kiln_r45/fee_share_liveness_hardened.py'])
+          prohibited=['eth_sendTransaction','eth_sendRawTransaction','personal_sign','eth_signTransaction','forge script --broadcast','cast send']
+          assert not [x for x in prohibited if x in source]
+          print('R45_V3_STATIC_SAFETY=PASS')
+          PY
+
+      - name: Fetch exact current source
+        run: |
+          set -euo pipefail
+          rm -rf r45_source
+          git clone --depth 1 https://github.com/dumebi042/kiln-vault.git r45_source
+          git -C r45_source rev-parse HEAD > SOURCE_EXACT_HEAD.txt
+
+      - name: Execute hardened R45 gate
+        shell: bash
+        run: |
+          set +e
+          rm -rf r45_results
+          PYTHONPATH=kiln_r45 python kiln_r45/fee_share_liveness_hardened.py > RUN.stdout.log 2> RUN.stderr.log
+          code=$?
+          printf '%s\n' "$code" > RUNNER_EXIT_CODE.txt
+          exit 0
+
+      - name: Fail closed and construct delivery
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p r45_results r45_delivery
+          python - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          out=Path('r45_results')
+          try: exit_code=int(Path('RUNNER_EXIT_CODE.txt').read_text().strip())
+          except Exception: exit_code=255
+          p=out/'PUBLIC_GATE.json'
+          if p.exists(): gate=json.loads(p.read_text())
+          else: gate={'schema':'kiln-omnivault-r45-v3-public-gate-v1','decision':'INCONCLUSIVE_R45_RUNNER_FAILED_BEFORE_GATE','submit_ready':False,'validated_critical':0,'validated_high':0,'scope_count':0,'inspected_count':0,'coverage_complete':False,'error_count':1,'structural_candidate_count':0,'material_candidate_count':0,'public_chain_state_changes':0,'transactions_signed':0,'transactions_sent':0}
+          gate['runner_exit_code']=exit_code
+          assert gate.get('submit_ready') is False
+          assert int(gate.get('validated_critical',0))==0
+          assert int(gate.get('validated_high',0))==0
+          assert int(gate.get('public_chain_state_changes',0))==0
+          assert int(gate.get('transactions_signed',0))==0
+          assert int(gate.get('transactions_sent',0))==0
+          p.write_text(json.dumps(gate,indent=2,sort_keys=True))
+          files=sorted(x for x in out.iterdir() if x.is_file() and x.name!='SHA256SUMS.txt')
+          (out/'SHA256SUMS.txt').write_text(''.join(f'{hashlib.sha256(x.read_bytes()).hexdigest()}  {x.name}\n' for x in files))
+          Path('r45_delivery/PUBLIC_GATE.json').write_bytes(p.read_bytes())
+          Path('r45_delivery/RUNNER_EXIT_CODE.txt').write_text(str(exit_code)+'\n')
+          Path('r45_delivery/SOURCE_EXACT_HEAD.txt').write_bytes(Path('SOURCE_EXACT_HEAD.txt').read_bytes())
+          Path('r45_delivery/RUN.stdout.log').write_bytes(Path('RUN.stdout.log').read_bytes() if Path('RUN.stdout.log').exists() else b'')
+          Path('r45_delivery/RUN.stderr.log').write_bytes(Path('RUN.stderr.log').read_bytes() if Path('RUN.stderr.log').exists() else b'')
+          PY
+          cp -a r45_results r45_delivery/results
+
+      - name: Build deterministic evidence twice and self-test
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SOURCE_DATE_EPOCH=1770000000
+          rm -f KILN_R45_V3_EVIDENCE_A.zip KILN_R45_V3_EVIDENCE_B.zip
+          find r45_delivery -type f -exec touch -d @${SOURCE_DATE_EPOCH} {} +
+          (cd r45_delivery && find . -type f -print0 | sort -z | xargs -0 zip -q -X -9 ../KILN_R45_V3_EVIDENCE_A.zip)
+          (cd r45_delivery && find . -type f -print0 | sort -z | xargs -0 zip -q -X -9 ../KILN_R45_V3_EVIDENCE_B.zip)
+          cmp KILN_R45_V3_EVIDENCE_A.zip KILN_R45_V3_EVIDENCE_B.zip
+          mv KILN_R45_V3_EVIDENCE_A.zip KILN_R45_V3_EVIDENCE.zip
+          rm KILN_R45_V3_EVIDENCE_B.zip
+          sha256sum KILN_R45_V3_EVIDENCE.zip > KILN_R45_V3_EVIDENCE.zip.sha256
+          python - <<'PY'
+          import hashlib,json,zipfile
+          from pathlib import Path
+          p=Path('KILN_R45_V3_EVIDENCE.zip'); rounds=[]
+          for i in range(7):
+              with zipfile.ZipFile(p) as z:
+                  names=z.namelist(); rounds.append({'round':i+1,'crc_error':z.testzip(),'entries':len(names),'duplicate_names':len(names)!=len(set(names))})
+          assert all(r['crc_error'] is None and not r['duplicate_names'] for r in rounds),rounds
+          Path('KILN_R45_V3_ZIP_AUDIT.json').write_text(json.dumps({'zip_sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'rounds':rounds,'deterministic_rebuild_match':True,'all_pass':True},indent=2,sort_keys=True))
+          PY
+          for i in 1 2 3 4 5 6 7; do unzip -t KILN_R45_V3_EVIDENCE.zip >/dev/null; done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kiln-r45-v3-hardened-evidence
+          path: |
+            KILN_R45_V3_EVIDENCE.zip
+            KILN_R45_V3_EVIDENCE.zip.sha256
+            KILN_R45_V3_ZIP_AUDIT.json
+            r45_delivery/PUBLIC_GATE.json
+            r45_delivery/RUNNER_EXIT_CODE.txt
+            r45_delivery/SOURCE_EXACT_HEAD.txt
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Persist unique immutable result path
+        if: always()
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ github.head_ref }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          target="kiln_r45_v3_persist/${RUN_ID}"
+          mkdir -p "$target"
+          cp r45_delivery/PUBLIC_GATE.json "$target/PUBLIC_GATE.json"
+          cp r45_delivery/RUNNER_EXIT_CODE.txt "$target/RUNNER_EXIT_CODE.txt"
+          cp r45_delivery/SOURCE_EXACT_HEAD.txt "$target/SOURCE_EXACT_HEAD.txt"
+          cp KILN_R45_V3_EVIDENCE.zip "$target/KILN_R45_V3_EVIDENCE.zip"
+          cp KILN_R45_V3_EVIDENCE.zip.sha256 "$target/KILN_R45_V3_EVIDENCE.zip.sha256"
+          cp KILN_R45_V3_ZIP_AUDIT.json "$target/KILN_R45_V3_ZIP_AUDIT.json"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$target"
+          git commit -m "kiln: persist immutable R45 v3 result ${RUN_ID} [skip ci]"
+          git pull --rebase origin "$TARGET_BRANCH"
+          git push origin "HEAD:$TARGET_BRANCH"
+
+      - name: Preserve fail-closed runner status
+        if: always()
+        run: |
+          code=$(cat RUNNER_EXIT_CODE.txt 2>/dev/null || echo 255)
+          exit "$code"
