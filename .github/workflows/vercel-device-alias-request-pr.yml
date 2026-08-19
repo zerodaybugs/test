@@ -1,0 +1,134 @@
+name: Vercel H1 alias device-flow request
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  request:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install browser
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/vercel-device
+          cd /tmp/vercel-device
+          npm init -y >/dev/null
+          npm install playwright@1.55.0 >/dev/null
+          npx playwright install --with-deps chromium >/dev/null
+
+      - name: Start device authorization and request alias email
+        shell: bash
+        env:
+          TEST_EMAIL: kernelpunk-dev@wearehackerone.com
+        run: |
+          set -euo pipefail
+          cd /tmp/vercel-device
+          cat > run.mjs <<'JS'
+          import { chromium } from 'playwright';
+          import fs from 'node:fs';
+
+          const alias = process.env.TEST_EMAIL;
+          const result = { ok: false, stage: 'device-request', text: '', errors: [], api: [] };
+          try {
+            const deviceResponse = await fetch('https://api.vercel.com/login/oauth/device-authorization', {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/x-www-form-urlencoded',
+                'user-agent': 'vercel-research-bootstrap',
+              },
+              body: new URLSearchParams({
+                client_id: 'cl_HYyOPBNtFMfHhaUn9L4QPfTZz6TP47bp',
+                scope: 'openid offline_access',
+              }),
+            });
+            const device = await deviceResponse.json();
+            result.deviceStatus = deviceResponse.status;
+            if (!deviceResponse.ok || !device.verification_uri_complete) {
+              throw new Error(`device authorization failed: ${JSON.stringify(device)}`);
+            }
+
+            result.stage = 'browser';
+            const browser = await chromium.launch({
+              headless: true,
+              args: ['--disable-blink-features=AutomationControlled'],
+            });
+            const context = await browser.newContext({
+              locale: 'en-US',
+              timezoneId: 'Europe/Budapest',
+              viewport: { width: 1360, height: 900 },
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+            });
+            await context.addInitScript(() => Object.defineProperty(navigator, 'webdriver', { get: () => undefined }));
+            const page = await context.newPage();
+            page.on('pageerror', error => result.errors.push(String(error)));
+            page.on('response', async response => {
+              const request = response.request();
+              const url = response.url();
+              if (!url.includes('vercel.com') || request.method() === 'GET') return;
+              const item = { method: request.method(), status: response.status(), url: url.replace(/[?#].*$/, '') };
+              try {
+                const type = response.headers()['content-type'] || '';
+                if (/json|text/.test(type)) {
+                  item.body = (await response.text()).slice(0, 1500).replaceAll(alias, '[H1_ALIAS]');
+                }
+              } catch {}
+              result.api.push(item);
+            });
+
+            await page.goto(device.verification_uri_complete, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await page.waitForTimeout(2500);
+            result.stage = 'verification-page';
+
+            let emailOption = page.getByText('Continue with Email', { exact: false }).first();
+            if (!(await emailOption.count())) {
+              await page.getByText('Show other options', { exact: false }).first().click().catch(() => {});
+              emailOption = page.getByText('Continue with Email', { exact: false }).first();
+            }
+            await emailOption.click();
+            await page.waitForTimeout(1000);
+            const input = page.locator('input[type="email"]').first();
+            await input.waitFor({ state: 'visible', timeout: 20000 });
+            await input.fill(alias);
+
+            const candidates = [
+              page.locator('button[type="submit"]').last(),
+              page.getByRole('button', { name: /continue/i }).last(),
+              page.getByRole('button', { name: /log in|sign up/i }).last(),
+            ];
+            let clicked = false;
+            for (const candidate of candidates) {
+              if (!(await candidate.count())) continue;
+              try { await candidate.click({ timeout: 10000 }); clicked = true; break; } catch {}
+            }
+            if (!clicked) throw new Error('email submit control not found');
+            result.stage = 'submitted';
+            await page.waitForTimeout(8000);
+            result.text = (await page.locator('body').innerText().catch(() => '')).slice(0, 4000);
+            result.finalUrlPath = new URL(page.url()).pathname;
+            const explicitError = /please try again|different (sign up|login) method|account recovery|unknown error/i.test(result.text);
+            const explicitSuccess = /check your (email|inbox)|verification (email|link)|email (was )?sent|magic link/i.test(result.text);
+            result.ok = explicitSuccess && !explicitError;
+            await browser.close();
+          } catch (error) {
+            result.errors.push(String(error?.stack || error).replaceAll(alias, '[H1_ALIAS]'));
+          }
+          fs.writeFileSync('/tmp/vercel-device/status.json', JSON.stringify(result, null, 2));
+          console.log(JSON.stringify({ ok: result.ok, stage: result.stage, errors: result.errors }, null, 2));
+          if (!result.ok) process.exitCode = 2;
+          JS
+          node run.mjs
+
+      - name: Upload status
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vercel-h1-device-flow-status
+          path: /tmp/vercel-device/status.json
+          if-no-files-found: error
+          retention-days: 1
