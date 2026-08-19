@@ -1,0 +1,338 @@
+name: kiln-r45-sharded-live-invariant
+
+on:
+  pull_request:
+    branches:
+      - agent/kiln-r45-sharded-live-invariant-v2-20260819
+    paths:
+      - kiln_r45/**
+      - R45_TRIGGER.txt
+      - .github/workflows/_temporary-kiln-r45-sharded-live-invariant-20260819.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kiln-r45-sharded-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  static-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile and enforce read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile kiln_r42/live_config_delta.py kiln_r45/run_network.py kiln_r45/aggregate.py
+          python - <<'PY'
+          from pathlib import Path
+          files = [Path('kiln_r42/live_config_delta.py'), Path('kiln_r45/run_network.py')]
+          prohibited = [
+              'eth_sendTransaction', 'eth_sendRawTransaction', 'personal_sign',
+              'eth_signTransaction', 'eth_sendBundle', 'eth_sendUserOperation'
+          ]
+          for path in files:
+              source = path.read_text()
+              hits = [item for item in prohibited if item in source]
+              assert not hits, (path, hits)
+          print('R45_STATIC_SAFETY_GATE=PASS')
+          PY
+          openssl pkey -pubin -in kiln_r45/evidence_public.pem -text -noout >/dev/null
+
+  network-census:
+    needs: static-gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        network: [ethereum, optimism, bnb, polygon, base, arbitrum]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run isolated exact-block census
+        shell: bash
+        env:
+          NETWORK: ${{ matrix.network }}
+        run: |
+          set +e
+          rm -rf "r45_results/${NETWORK}"
+          mkdir -p "r45_results/${NETWORK}"
+          python kiln_r45/run_network.py --network "${NETWORK}" \
+            > >(tee "r45_results/${NETWORK}/RUN.stdout.log") \
+            2> >(tee "r45_results/${NETWORK}/RUN.stderr.log" >&2)
+          code=$?
+          printf '%s\n' "$code" > "r45_results/${NETWORK}/RUNNER_EXIT_CODE.txt"
+          exit 0
+
+      - name: Create or harden fail-closed network gate
+        if: always()
+        shell: bash
+        env:
+          NETWORK: ${{ matrix.network }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          network = os.environ['NETWORK']
+          out = Path('r45_results') / network
+          out.mkdir(parents=True, exist_ok=True)
+          try:
+              code = int((out / 'RUNNER_EXIT_CODE.txt').read_text().strip())
+          except Exception:
+              code = 255
+          gate_path = out / 'PUBLIC_GATE.json'
+          if gate_path.exists():
+              gate = json.loads(gate_path.read_text())
+          else:
+              gate = {
+                  'schema': 'kiln-r45-network-public-gate-fallback-v1',
+                  'network': network,
+                  'decision': 'INCONCLUSIVE_RUNNER_FAILED_BEFORE_GATE',
+                  'coverage_complete': False,
+                  'selected_count': 0,
+                  'inspected_count': 0,
+                  'base_error_count': 1,
+                  'base_quorum_mismatch_count': 0,
+                  'extension_quorum_mismatch_count': 0,
+                  'candidate_count': 0,
+                  'inventory_trigger_count': 0,
+                  'known_or_duplicate_signal_count': 0,
+                  'candidate_kinds': {},
+              }
+          gate.update({
+              'runner_exit_code': code,
+              'submit_ready': False,
+              'validated_critical': 0,
+              'validated_high': 0,
+              'public_chain_state_changes': 0,
+              'transactions_signed': 0,
+              'transactions_sent': 0,
+          })
+          if code != 0:
+              gate['coverage_complete'] = False
+              if not str(gate.get('decision', '')).startswith('INCONCLUSIVE'):
+                  gate['decision'] = 'INCONCLUSIVE_NONZERO_RUNNER_EXIT'
+          gate_path.write_text(json.dumps(gate, indent=2, sort_keys=True))
+          evidence_path = out / 'EVIDENCE.json'
+          if not evidence_path.exists():
+              evidence_path.write_text(json.dumps({'gate': gate, 'runner_failed_before_evidence': True}, indent=2, sort_keys=True))
+          candidate_path = out / 'CANDIDATE_SUMMARY.json'
+          if not candidate_path.exists():
+              candidate_path.write_text(json.dumps({'network': network, 'candidates': [], 'submit_ready': False}, indent=2, sort_keys=True))
+          files = sorted(path for path in out.iterdir() if path.is_file() and path.name != 'SHA256SUMS.txt')
+          (out / 'SHA256SUMS.txt').write_text(''.join(
+              f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n' for path in files
+          ))
+          assert gate['submit_ready'] is False
+          assert gate['validated_critical'] == 0
+          assert gate['validated_high'] == 0
+          assert gate['public_chain_state_changes'] == 0
+          assert gate['transactions_signed'] == 0
+          assert gate['transactions_sent'] == 0
+          print(json.dumps(gate, sort_keys=True))
+          PY
+
+      - name: Encrypt full network evidence and build tested package
+        if: always()
+        shell: bash
+        env:
+          NETWORK: ${{ matrix.network }}
+        run: |
+          set -euo pipefail
+          rm -rf "r45_package/${NETWORK}"
+          mkdir -p "r45_package/${NETWORK}/encrypted"
+          cp "r45_results/${NETWORK}/PUBLIC_GATE.json" "r45_package/${NETWORK}/PUBLIC_GATE.json"
+          cp "r45_results/${NETWORK}/RUNNER_EXIT_CODE.txt" "r45_package/${NETWORK}/RUNNER_EXIT_CODE.txt"
+          cp kiln_r45/evidence_public.pem "r45_package/${NETWORK}/encrypted/evidence_public.pem"
+          tar -czf "/tmp/r45-${NETWORK}-evidence.tar.gz" -C "r45_results/${NETWORK}" \
+            EVIDENCE.json CANDIDATE_SUMMARY.json SHA256SUMS.txt RUN.stdout.log RUN.stderr.log RUNNER_EXIT_CODE.txt
+          openssl rand -hex 32 > "/tmp/r45-${NETWORK}-passphrase.txt"
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 250000 \
+            -in "/tmp/r45-${NETWORK}-evidence.tar.gz" \
+            -out "r45_package/${NETWORK}/encrypted/payload.aes256" \
+            -pass file:"/tmp/r45-${NETWORK}-passphrase.txt"
+          openssl pkeyutl -encrypt -pubin \
+            -inkey kiln_r45/evidence_public.pem \
+            -in "/tmp/r45-${NETWORK}-passphrase.txt" \
+            -out "r45_package/${NETWORK}/encrypted/key.rsa3072" \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          printf '%s\n' 'AES-256-CBC/PBKDF2-250000; RSA-3072 OAEP SHA-256. Full evidence encrypted.' \
+            > "r45_package/${NETWORK}/encrypted/README.txt"
+          (cd "r45_package/${NETWORK}/encrypted" && sha256sum evidence_public.pem payload.aes256 key.rsa3072 README.txt > SHA256SUMS.txt)
+          (cd "r45_package/${NETWORK}/encrypted" && sha256sum -c SHA256SUMS.txt)
+          (cd "r45_package/${NETWORK}" && sha256sum PUBLIC_GATE.json RUNNER_EXIT_CODE.txt encrypted/* > PACKAGE_SHA256SUMS.txt)
+          (cd "r45_package/${NETWORK}" && zip -q -9 "../${NETWORK}-network-package.zip" PUBLIC_GATE.json RUNNER_EXIT_CODE.txt PACKAGE_SHA256SUMS.txt encrypted/*)
+          for n in 1 2 3; do unzip -t "r45_package/${NETWORK}-network-package.zip" >/dev/null; done
+          python - <<'PY'
+          import os, zipfile
+          from pathlib import Path
+          network = os.environ['NETWORK']
+          path = Path('r45_package') / f'{network}-network-package.zip'
+          for _ in range(3):
+              with zipfile.ZipFile(path) as archive:
+                  assert archive.testzip() is None
+                  names = archive.namelist()
+                  assert len(names) == len(set(names))
+          print('R45_NETWORK_ZIP_SELF_CHECKS=PASS', network)
+          PY
+          rm -f "/tmp/r45-${NETWORK}-passphrase.txt" "/tmp/r45-${NETWORK}-evidence.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kiln-r45-network-${{ matrix.network }}
+          path: |
+            r45_package/${{ matrix.network }}
+            r45_package/${{ matrix.network }}-network-package.zip
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Preserve fail-closed result
+        if: always()
+        shell: bash
+        env:
+          NETWORK: ${{ matrix.network }}
+        run: |
+          code=$(cat "r45_results/${NETWORK}/RUNNER_EXIT_CODE.txt" 2>/dev/null || echo 255)
+          exit "$code"
+
+  aggregate:
+    needs: network-census
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kiln-r45-network-*
+          path: r45_downloads
+          merge-multiple: true
+
+      - name: Aggregate all network gates fail-closed
+        shell: bash
+        run: |
+          set +e
+          mkdir -p r45_aggregate
+          python kiln_r45/aggregate.py | tee r45_aggregate/RUN.log
+          code=$?
+          printf '%s\n' "$code" > r45_aggregate/RUNNER_EXIT_CODE.txt
+          exit 0
+
+      - name: Build multiply tested R45 research checkpoint
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          out = Path('r45_aggregate'); out.mkdir(exist_ok=True)
+          gate_path = out / 'PUBLIC_GATE.json'
+          if not gate_path.exists():
+              gate = {
+                  'schema': 'kiln-r45-aggregate-fallback-v1',
+                  'decision': 'INCONCLUSIVE_AGGREGATE_FAILED_BEFORE_GATE',
+                  'coverage_complete': False,
+                  'missing_networks': ['ethereum','optimism','bnb','polygon','base','arbitrum'],
+                  'network_gate_count': 0,
+                  'selected_total': 0,
+                  'inspected_total': 0,
+                  'error_total': 1,
+                  'quorum_mismatch_total': 0,
+                  'candidate_total': 0,
+                  'inventory_trigger_total': 0,
+              }
+          else:
+              gate = json.loads(gate_path.read_text())
+          gate.update({
+              'submit_ready': False,
+              'validated_critical': 0,
+              'validated_high': 0,
+              'public_chain_state_changes': 0,
+              'transactions_signed': 0,
+              'transactions_sent': 0,
+          })
+          gate_path.write_text(json.dumps(gate, indent=2, sort_keys=True))
+          (out / 'SHA256SUMS.txt').write_text(
+              f"{hashlib.sha256(gate_path.read_bytes()).hexdigest()}  PUBLIC_GATE.json\n"
+          )
+          PY
+          rm -rf r45_delivery
+          mkdir -p r45_downloads r45_delivery/network_packages r45_delivery/public_gates
+          cp r45_aggregate/PUBLIC_GATE.json r45_delivery/AGGREGATE_PUBLIC_GATE.json
+          cp r45_aggregate/SHA256SUMS.txt r45_delivery/AGGREGATE_SHA256SUMS.txt
+          find r45_downloads -name '*-network-package.zip' -type f -exec cp {} r45_delivery/network_packages/ \;
+          find r45_downloads -path '*/PUBLIC_GATE.json' -type f | while read -r file; do
+            network=$(basename "$(dirname "$file")")
+            cp "$file" "r45_delivery/public_gates/${network}.json"
+          done
+          python - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          root = Path('r45_delivery')
+          manifest = {
+              'schema': 'kiln-r45-delivery-manifest-v1',
+              'purpose': 'research checkpoint only; not a bounty submission',
+              'submit_ready': False,
+              'private_keys_included': False,
+              'files': [],
+          }
+          for path in sorted(root.rglob('*')):
+              if path.is_file() and path.name not in {'MANIFEST.json','SHA256SUMS.txt'}:
+                  manifest['files'].append({
+                      'path': path.relative_to(root).as_posix(),
+                      'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                      'bytes': path.stat().st_size,
+                  })
+          (root / 'MANIFEST.json').write_text(json.dumps(manifest, indent=2, sort_keys=True))
+          files = sorted(path for path in root.rglob('*') if path.is_file() and path.name != 'SHA256SUMS.txt')
+          (root / 'SHA256SUMS.txt').write_text(''.join(
+              f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(root).as_posix()}\n' for path in files
+          ))
+          PY
+          rm -f KILN_OMNIVAULT_R45_RESEARCH_CHECKPOINT_NOT_FOR_SUBMISSION_2026-08-19.zip build2.zip
+          (cd r45_delivery && zip -q -X -9 -r ../KILN_OMNIVAULT_R45_RESEARCH_CHECKPOINT_NOT_FOR_SUBMISSION_2026-08-19.zip .)
+          (cd r45_delivery && zip -q -X -9 -r ../build2.zip .)
+          cmp KILN_OMNIVAULT_R45_RESEARCH_CHECKPOINT_NOT_FOR_SUBMISSION_2026-08-19.zip build2.zip
+          rm build2.zip
+          for n in 1 2 3; do unzip -t KILN_OMNIVAULT_R45_RESEARCH_CHECKPOINT_NOT_FOR_SUBMISSION_2026-08-19.zip >/dev/null; done
+          python - <<'PY'
+          import hashlib, zipfile
+          from pathlib import Path
+          path = Path('KILN_OMNIVAULT_R45_RESEARCH_CHECKPOINT_NOT_FOR_SUBMISSION_2026-08-19.zip')
+          for _ in range(3):
+              with zipfile.ZipFile(path) as archive:
+                  assert archive.testzip() is None
+                  names = archive.namelist()
+                  assert len(names) == len(set(names))
+          Path(str(path)+'.sha256').write_text(f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n')
+          print('R45_FINAL_ZIP_SELF_CHECKS=PASS')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kiln-r45-aggregate
+          path: |
+            r45_aggregate
+            KILN_OMNIVAULT_R45_RESEARCH_CHECKPOINT_NOT_FOR_SUBMISSION_2026-08-19.zip
+            KILN_OMNIVAULT_R45_RESEARCH_CHECKPOINT_NOT_FOR_SUBMISSION_2026-08-19.zip.sha256
+          if-no-files-found: error
+          retention-days: 3
