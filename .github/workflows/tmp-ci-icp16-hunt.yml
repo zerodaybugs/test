@@ -1,0 +1,142 @@
+name: Temporary ICP16 deployed-authority hunt
+
+on:
+  push:
+    branches:
+      - tmp-ci-20260819-icp16
+    paths:
+      - ".github/workflows/tmp-ci-icp16-hunt.yml"
+      - "secure-ci-icp16/scan.py"
+      - "secure-ci-icp16/researcher-public.pem"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hunt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends git jq openssl python3 tar gzip ripgrep
+
+      - name: Clone source and materialize deployed revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo="$RUNNER_TEMP/ic"
+          snapshots="$RUNNER_TEMP/snapshots"
+          result="$RUNNER_TEMP/result"
+          mkdir -p "$snapshots" "$result"
+
+          git clone --filter=blob:none --no-checkout --single-branch https://github.com/dfinity/ic.git "$repo"
+          cd "$repo"
+          current=$(git rev-parse origin/master)
+          git show "${current}:mainnet-canister-revisions.json" > "$RUNNER_TEMP/mainnet-canisters.json"
+          git show "${current}:mainnet-icos-revisions.json" > "$RUNNER_TEMP/mainnet-icos.json"
+
+          declare -A revisions
+          revisions[current_master]="$current"
+          revisions[deployed_swap]=$(jq -r '.swap.rev' "$RUNNER_TEMP/mainnet-canisters.json")
+          revisions[deployed_cmc]=$(jq -r '."cycles-minting".rev' "$RUNNER_TEMP/mainnet-canisters.json")
+          revisions[deployed_governance]=$(jq -r '.governance.rev' "$RUNNER_TEMP/mainnet-canisters.json")
+          revisions[deployed_nns_root]=$(jq -r '.root.rev' "$RUNNER_TEMP/mainnet-canisters.json")
+          revisions[deployed_sns_governance]=$(jq -r '.sns_governance.rev' "$RUNNER_TEMP/mainnet-canisters.json")
+          revisions[deployed_sns_root]=$(jq -r '.sns_root.rev' "$RUNNER_TEMP/mainnet-canisters.json")
+          revisions[deployed_sns_wasm]=$(jq -r '."sns-wasm".rev' "$RUNNER_TEMP/mainnet-canisters.json")
+
+          i=0
+          while IFS= read -r rev; do
+            [[ "$rev" =~ ^[0-9a-f]{40}$ ]] || continue
+            revisions["deployed_core_${i}"]="$rev"
+            i=$((i+1))
+          done < <(jq -r '.. | objects | .version? // empty' "$RUNNER_TEMP/mainnet-icos.json" | sort -u)
+
+          printf '{\n' > "$result/REVISION_MAP.json"
+          first=1
+          for label in "${!revisions[@]}"; do
+            rev="${revisions[$label]}"
+            [[ "$rev" =~ ^[0-9a-f]{40}$ ]] || continue
+            git cat-file -e "${rev}^{commit}" 2>/dev/null || git fetch --depth=1 origin "$rev"
+            dest="$snapshots/$label"
+            mkdir -p "$dest"
+            paths=(
+              rs/nns/cmc
+              rs/sns/swap
+              rs/nns/governance
+              rs/sns/governance
+              rs/sns/root
+              rs/nns/handlers/root
+              rs/nns/sns-wasm
+              rs/bitcoin/ckbtc/minter
+              rs/ethereum/cketh/minter
+              rs/ledger_suite
+              rs/execution_environment
+              rs/cycles_account_manager
+              rs/replicated_state
+              rs/message_routing
+              rs/consensus
+            )
+            for path in "${paths[@]}"; do
+              if git cat-file -e "${rev}:${path}" 2>/dev/null; then
+                git archive "$rev" "$path" | tar -x -C "$dest"
+              fi
+            done
+            if [[ $first -eq 0 ]]; then printf ',\n' >> "$result/REVISION_MAP.json"; fi
+            first=0
+            printf '  %s: %s' "$(jq -Rn --arg v "$label" '$v')" "$(jq -Rn --arg v "$rev" '$v')" >> "$result/REVISION_MAP.json"
+          done
+          printf '\n}\n' >> "$result/REVISION_MAP.json"
+
+          cp "$RUNNER_TEMP/mainnet-canisters.json" "$result/mainnet-canister-revisions.json"
+          cp "$RUNNER_TEMP/mainnet-icos.json" "$result/mainnet-icos-revisions.json"
+          git log -1 --format='%H%n%cI%n%s' origin/master > "$result/CURRENT_HEAD.txt"
+
+      - name: Run source-bound authority and idempotency scanner
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 secure-ci-icp16/scan.py "$RUNNER_TEMP/snapshots" "$RUNNER_TEMP/ic" "$RUNNER_TEMP/result"
+          python3 -m json.tool "$RUNNER_TEMP/result/SUMMARY.json" >/dev/null
+          python3 -m json.tool "$RUNNER_TEMP/result/ALL_CANDIDATES.json" >/dev/null
+          find "$RUNNER_TEMP/result" -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/result/RAW_SHA256SUMS.txt"
+
+      - name: Encrypt research result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/encrypted" "$RUNNER_TEMP/result"
+          if [[ ! -f "$RUNNER_TEMP/result/SUMMARY.json" ]]; then
+            printf '{"scanner_failed":true}\n' > "$RUNNER_TEMP/result/SUMMARY.json"
+          fi
+          tar -czf "$RUNNER_TEMP/result.tar.gz" -C "$RUNNER_TEMP/result" .
+          openssl rand -hex 32 > "$RUNNER_TEMP/result.pass"
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+            -in "$RUNNER_TEMP/result.tar.gz" \
+            -out "$RUNNER_TEMP/encrypted/result.enc" \
+            -pass file:"$RUNNER_TEMP/result.pass"
+          openssl pkeyutl -encrypt -pubin \
+            -inkey secure-ci-icp16/researcher-public.pem \
+            -in "$RUNNER_TEMP/result.pass" \
+            -out "$RUNNER_TEMP/encrypted/result.key.enc" \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          sha256sum "$RUNNER_TEMP/encrypted/result.enc" "$RUNNER_TEMP/encrypted/result.key.enc" \
+            > "$RUNNER_TEMP/encrypted/SHA256SUMS.txt"
+
+      - name: Upload encrypted result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-result-icp16-hunt
+          path: ${{ runner.temp }}/encrypted/
+          if-no-files-found: error
+          retention-days: 1
