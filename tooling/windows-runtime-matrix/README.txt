@@ -1,0 +1,1 @@
+Temporary encrypted Windows runtime compatibility matrix. No source code, credentials, production target, or customer data is included. The payload emits only encrypted research evidence and a minimal runner-health record.
