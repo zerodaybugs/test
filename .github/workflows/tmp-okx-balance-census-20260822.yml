@@ -1,0 +1,259 @@
+name: Temporary public OKX production balance census 2026-08-22
+
+on:
+  pull_request:
+    paths:
+      - 'tmp-okx-balance-trigger.txt'
+      - '.github/workflows/tmp-okx-balance-census-20260822.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Collect one-block-consistent public balance and transfer evidence
+        shell: bash
+        env:
+          ROUTER: '0x5E1f62Dac767b0491e3CE72469C217365D5B48cC'
+          ADAPTER: '0x4ecD468E1010E006f768EC034e5a6d8803183469'
+          PROTOCOL: '0x73b920dC64ab6156f2D22b85AB9A9b06E597e154'
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          import json, os, time, urllib.request, urllib.error
+          from collections import defaultdict
+          from decimal import Decimal, getcontext
+          from pathlib import Path
+
+          getcontext().prec = 80
+          RPCS = [
+              'https://ethereum-rpc.publicnode.com',
+              'https://eth.llamarpc.com',
+              'https://eth-mainnet.public.blastapi.io',
+          ]
+          TARGETS = {
+              'ROUTER': os.environ['ROUTER'].lower(),
+              'ADAPTER': os.environ['ADAPTER'].lower(),
+              'PROTOCOL': os.environ['PROTOCOL'].lower(),
+          }
+          COMMON = {
+              'WETH': '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2',
+              'USDT': '0xdac17f958d2ee523a2206206994597c13d831ec7',
+              'USDC': '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48',
+              'DAI': '0x6b175474e89094c44da98b954eedeac495271d0f',
+              'WBTC': '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599',
+              'cbBTC': '0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf',
+              'USDS': '0xdc035d45d973e3ec169d2276ddab16f1e407384f',
+              'stETH': '0xae7ab96520de3a18e5e111b5eaab095312d7fe84',
+              'wstETH': '0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0',
+              'LINK': '0x514910771af9ca656af840dff83e8264ecf986ca',
+              'UNI': '0x1f9840a85d5af5bf1d1762f925bdaddc4201f984',
+              'AAVE': '0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9',
+              'FRAX': '0x853d955acef822db058eb8505911ed77f175b99e',
+              'LUSD': '0x5f98805a4e8be255a32880fdec7f6728c6568ba0',
+              '0xBTC': '0xb6ed7644c69416d67b522e20bc294a9a9b405b31',
+          }
+          TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+          request_id = 0
+          rpc_success = defaultdict(int)
+          rpc_fail = defaultdict(int)
+
+          def rpc(method, params):
+              global request_id
+              last = None
+              for round_no in range(4):
+                  for endpoint in RPCS:
+                      request_id += 1
+                      body = json.dumps({'jsonrpc':'2.0','id':request_id,'method':method,'params':params}).encode()
+                      req = urllib.request.Request(endpoint, data=body, headers={
+                          'Content-Type':'application/json',
+                          'User-Agent':'public-security-research-readonly-census/1.0',
+                      })
+                      try:
+                          with urllib.request.urlopen(req, timeout=35) as resp:
+                              obj = json.loads(resp.read())
+                          if 'error' in obj:
+                              raise RuntimeError(str(obj['error']))
+                          rpc_success[endpoint] += 1
+                          return obj['result']
+                      except Exception as exc:
+                          rpc_fail[endpoint] += 1
+                          last = exc
+                  time.sleep(1.0 + round_no)
+              raise RuntimeError(f'RPC failure {method}: {last}')
+
+          def topic_address(addr):
+              return '0x' + ('0' * 24) + addr[2:].lower()
+
+          def get_logs_bisect(start, end, topics):
+              try:
+                  return rpc('eth_getLogs', [{
+                      'fromBlock': hex(start),
+                      'toBlock': hex(end),
+                      'topics': topics,
+                  }])
+              except Exception:
+                  if end - start <= 128:
+                      raise
+                  mid = (start + end) // 2
+                  return get_logs_bisect(start, mid, topics) + get_logs_bisect(mid + 1, end, topics)
+
+          def eth_call(to, data, block_hex):
+              return rpc('eth_call', [{'to':to, 'data':data}, block_hex])
+
+          def u256(hex_value):
+              return int(hex_value, 16) if hex_value and hex_value != '0x' else 0
+
+          def decode_symbol(raw):
+              if not raw or raw == '0x':
+                  return ''
+              try:
+                  b = bytes.fromhex(raw[2:])
+                  if len(b) >= 64 and int.from_bytes(b[:32], 'big') == 32:
+                      n = int.from_bytes(b[32:64], 'big')
+                      return b[64:64+n].decode('utf-8', 'replace').strip('\x00')
+                  return b[:32].rstrip(b'\x00').decode('utf-8', 'replace')
+              except Exception:
+                  return ''
+
+          head = u256(rpc('eth_blockNumber', []))
+          block_hex = hex(head)
+          start = max(0, head - 160_000)
+          Path('evidence/BLOCK_NUMBER.txt').write_text(str(head) + '\n')
+          Path('evidence/SCAN_RANGE.txt').write_text(f'{start}\t{head}\n')
+          Path('evidence/BLOCK.json').write_text(json.dumps(rpc('eth_getBlockByNumber', [block_hex, False]), indent=2, sort_keys=True) + '\n')
+
+          all_logs = {}
+          discovered = set(addr.lower() for addr in COMMON.values())
+          for target_name, target in TARGETS.items():
+              target_topic = topic_address(target)
+              collected = []
+              window = 5000
+              for lo in range(start, head + 1, window):
+                  hi = min(head, lo + window - 1)
+                  collected.extend(get_logs_bisect(lo, hi, [TRANSFER, target_topic]))
+                  collected.extend(get_logs_bisect(lo, hi, [TRANSFER, None, target_topic]))
+              dedup = {}
+              for log in collected:
+                  key = (log.get('transactionHash'), log.get('logIndex'))
+                  dedup[key] = log
+                  discovered.add(log['address'].lower())
+              ordered = sorted(dedup.values(), key=lambda x: (u256(x['blockNumber']), u256(x['logIndex'])))
+              all_logs[target_name] = ordered
+              Path(f'evidence/{target_name}_TRANSFER_LOGS.json').write_text(json.dumps(ordered, indent=2, sort_keys=True) + '\n')
+
+          metadata = {}
+          for token in sorted(discovered):
+              try:
+                  dec = u256(eth_call(token, '0x313ce567', block_hex))
+                  if dec > 255:
+                      dec = 18
+              except Exception:
+                  dec = 18
+              try:
+                  sym = decode_symbol(eth_call(token, '0x95d89b41', block_hex))
+              except Exception:
+                  sym = ''
+              known = next((name for name, addr in COMMON.items() if addr.lower() == token), '')
+              metadata[token] = {'symbol': sym or known or token[:10], 'decimals': dec, 'known_name': known}
+
+          balance_rows = []
+          eth_rows = []
+          for target_name, target in TARGETS.items():
+              eth_raw = u256(rpc('eth_getBalance', [target, block_hex]))
+              eth_rows.append({'target':target_name,'address':target,'raw_wei':str(eth_raw),'human_eth':str(Decimal(eth_raw)/(Decimal(10)**18))})
+              for token in sorted(discovered):
+                  data = '0x70a08231' + ('0' * 24) + target[2:]
+                  try:
+                      raw = u256(eth_call(token, data, block_hex))
+                  except Exception:
+                      continue
+                  if raw == 0:
+                      continue
+                  meta = metadata[token]
+                  human = Decimal(raw) / (Decimal(10) ** meta['decimals'])
+                  balance_rows.append({
+                      'target':target_name,'target_address':target,'token':token,
+                      'symbol':meta['symbol'],'decimals':meta['decimals'],
+                      'raw_balance':str(raw),'human_balance':str(human),
+                  })
+
+          flow = defaultdict(lambda: {'incoming_count':0,'outgoing_count':0,'incoming_raw':0,'outgoing_raw':0,'latest_block':0,'latest_tx':''})
+          for target_name, logs in all_logs.items():
+              target = TARGETS[target_name]
+              tt = topic_address(target).lower()
+              for log in logs:
+                  token = log['address'].lower()
+                  amount = u256(log.get('data','0x0'))
+                  topics = [x.lower() for x in log.get('topics',[])]
+                  row = flow[(target_name, token)]
+                  if len(topics) > 1 and topics[1] == tt:
+                      row['outgoing_count'] += 1
+                      row['outgoing_raw'] += amount
+                  if len(topics) > 2 and topics[2] == tt:
+                      row['incoming_count'] += 1
+                      row['incoming_raw'] += amount
+                  bn = u256(log['blockNumber'])
+                  if bn >= row['latest_block']:
+                      row['latest_block'] = bn
+                      row['latest_tx'] = log.get('transactionHash','')
+
+          flow_rows = []
+          for (target_name, token), row in sorted(flow.items()):
+              meta = metadata[token]
+              scale = Decimal(10) ** meta['decimals']
+              flow_rows.append({
+                  'target':target_name,'token':token,'symbol':meta['symbol'],'decimals':meta['decimals'],
+                  **row,
+                  'incoming_human':str(Decimal(row['incoming_raw'])/scale),
+                  'outgoing_human':str(Decimal(row['outgoing_raw'])/scale),
+                  'net_human':str(Decimal(row['incoming_raw']-row['outgoing_raw'])/scale),
+              })
+
+          def write_tsv(path, rows):
+              if not rows:
+                  Path(path).write_text('NO_ROWS\n')
+                  return
+              keys = list(rows[0].keys())
+              with open(path,'w',encoding='utf-8') as f:
+                  f.write('\t'.join(keys)+'\n')
+                  for row in rows:
+                      f.write('\t'.join(str(row.get(k,'')) for k in keys)+'\n')
+
+          write_tsv('evidence/CURRENT_TOKEN_BALANCES.tsv', balance_rows)
+          write_tsv('evidence/CURRENT_ETH_BALANCES.tsv', eth_rows)
+          write_tsv('evidence/TRANSFER_FLOW_SUMMARY.tsv', flow_rows)
+          Path('evidence/TOKEN_METADATA.json').write_text(json.dumps(metadata, indent=2, sort_keys=True) + '\n')
+          Path('evidence/RPC_STATS.json').write_text(json.dumps({'success':dict(rpc_success),'failure':dict(rpc_fail)}, indent=2, sort_keys=True) + '\n')
+          signal = {
+              'block_number': head,
+              'scan_start_block': start,
+              'nonzero_token_balance_count': len(balance_rows),
+              'nonzero_eth_balance_count': sum(1 for x in eth_rows if int(x['raw_wei']) > 0),
+              'balances': balance_rows,
+              'eth_balances': eth_rows,
+              'decision': 'NONZERO_BALANCE_SIGNAL_REQUIRES_FLOW_CLASSIFICATION' if balance_rows or any(int(x['raw_wei']) > 0 for x in eth_rows) else 'NO_CURRENT_BALANCE_SIGNAL',
+          }
+          Path('evidence/CENSUS_VERDICT.json').write_text(json.dumps(signal, indent=2, sort_keys=True) + '\n')
+          print(json.dumps(signal, indent=2, sort_keys=True))
+          PY
+          find evidence -type f -printf '%P\t%s bytes\n' | sort > evidence/ARTIFACT_INDEX.txt
+          (cd evidence && find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt)
+
+      - name: Upload public balance census
+        uses: actions/upload-artifact@v4
+        with:
+          name: okx-production-balance-census-20260822
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
