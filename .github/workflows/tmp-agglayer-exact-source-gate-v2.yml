@@ -1,0 +1,204 @@
+name: Temporary Agglayer exact-source and initializer gate v2
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "tmp-agglayer-exact-source-v2-trigger.txt"
+      - ".github/workflows/tmp-agglayer-exact-source-gate-v2.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  exact-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Capture live implementation bytecode with read-only RPC
+        id: live
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-exact-source-v2"
+          mkdir -p "$OUT/live" "$OUT/exact" "$OUT/probes"
+          RPC=""
+          for candidate in \
+            "https://ethereum-rpc.publicnode.com" \
+            "https://eth.llamarpc.com" \
+            "https://rpc.flashbots.net" \
+            "https://1rpc.io/eth"; do
+            if cast block-number --rpc-url "$candidate" >/dev/null 2>&1; then
+              RPC="$candidate"
+              break
+            fi
+          done
+          test -n "$RPC"
+          BLOCK=$(cast block-number --rpc-url "$RPC")
+          echo "rpc=$RPC" >> "$GITHUB_OUTPUT"
+          echo "block=$BLOCK" >> "$GITHUB_OUTPUT"
+
+          declare -A IMPLS=(
+            [AgglayerBridge]="0x66e0120e3c965552a89acc37b03f762624bac5ad"
+            [AgglayerGER]="0x7f1655d9d570167b2a3ffd1ef809d3fdd74427c5"
+            [AgglayerManager]="0x15caf18ded768e3620e0f656221bf6b400ad2618"
+          )
+          for name in AgglayerBridge AgglayerGER AgglayerManager; do
+            cast code "${IMPLS[$name]}" --block "$BLOCK" --rpc-url "$RPC" | tr -d '\r\n ' > "$OUT/live/$name.implementation.hex"
+          done
+          python3 - "$OUT" "$RPC" "$BLOCK" <<'PY'
+          import json,pathlib,sys,urllib.parse,datetime
+          out=pathlib.Path(sys.argv[1]); rpc=sys.argv[2]; block=int(sys.argv[3])
+          obj={'block':block,'rpc_host':urllib.parse.urlparse(rpc).hostname,'captured_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'mode':'eth_call_eth_getCode_only','transactions_sent':0}
+          (out/'metadata.json').write_text(json.dumps(obj,indent=2)+'\n')
+          PY
+
+      - name: Run read-only initializer probes
+        shell: bash
+        env:
+          RPC: ${{ steps.live.outputs.rpc }}
+          BLOCK: ${{ steps.live.outputs.block }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-exact-source-v2"
+          FROM="0x000000000000000000000000000000000000dEaD"
+          BRIDGE="0x2a3DD3EB832aF982ec71669E178424b10Dca2EDe"
+          GER="0x580bda1e7A0CFAe92Fa7F6c20A3794F169CE3CFb"
+          MANAGER="0x5132A183E9F3CB7C848b0AAC5Ae0c4f0491B7aB2"
+          TAG="0x$(printf '%x' "$BLOCK")"
+          probe() {
+            local name="$1" to="$2" data="$3"
+            curl -sS --retry 3 -H 'content-type: application/json' \
+              --data "{\"jsonrpc\":\"2.0\",\"method\":\"eth_call\",\"params\":[{\"from\":\"$FROM\",\"to\":\"$to\",\"data\":\"$data\"},\"$TAG\"],\"id\":1}" \
+              "$RPC" | jq -c '.' > "$OUT/probes/$name.json"
+          }
+          INIT0=$(cast calldata 'initialize()')
+          INIT_BRIDGE=$(cast calldata 'initialize(uint32,address,uint32,address,address,bytes)' 0 0x0000000000000000000000000000000000000000 0 "$GER" "$MANAGER" 0x)
+          probe bridge_initialize_zero "$BRIDGE" "$INIT0"
+          probe bridge_initialize_parameters "$BRIDGE" "$INIT_BRIDGE"
+          probe ger_initialize_zero "$GER" "$INIT0"
+          probe manager_initialize_zero "$MANAGER" "$INIT0"
+          python3 - "$OUT" <<'PY'
+          import json,pathlib,sys
+          out=pathlib.Path(sys.argv[1]); rows=[]
+          for p in sorted((out/'probes').glob('*.json')):
+              o=json.loads(p.read_text()); rows.append({'probe':p.stem,'success':'result' in o,'result':o.get('result'),'error':o.get('error')})
+          (out/'initializer-probe-summary.json').write_text(json.dumps(rows,indent=2)+'\n')
+          PY
+
+      - name: Recover source bundles cryptographically bound to live bytecode
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-exact-source-v2"
+          python3 -m pip install --disable-pip-version-check --quiet cbor2 base58 requests 'eth-hash[pycryptodome]'
+          python3 - "$OUT" <<'PY'
+          import base58,cbor2,json,pathlib,re,requests,sys,time
+          from eth_hash.auto import keccak
+          out=pathlib.Path(sys.argv[1]); session=requests.Session(); session.headers.update({'User-Agent':'Mozilla/5.0 authorized-security-research'})
+          gateways=['https://ipfs.io/ipfs/','https://dweb.link/ipfs/','https://w3s.link/ipfs/','https://gateway.pinata.cloud/ipfs/']
+          def read_hex(p):
+              s=p.read_text().strip(); s=s[2:] if s.startswith('0x') else s
+              return bytes.fromhex(s)
+          def fetch_ipfs(cid,suffix=''):
+              errs=[]
+              for base in gateways:
+                  url=base+cid+suffix
+                  try:
+                      r=session.get(url,timeout=40)
+                      if r.status_code==200 and r.content:return r.content,url
+                      errs.append(f'{url}:HTTP{r.status_code}')
+                  except Exception as e:errs.append(f'{url}:{type(e).__name__}:{e}')
+                  time.sleep(.3)
+              raise RuntimeError(';'.join(errs))
+          def fetch_source(url):
+              if url.startswith('dweb:/ipfs/'): rest=url[len('dweb:/ipfs/'):]
+              elif url.startswith('ipfs://'): rest=url[len('ipfs://'):]
+              elif '/ipfs/' in url: rest=url.split('/ipfs/',1)[1]
+              elif url.startswith(('https://','http://')):
+                  r=session.get(url,timeout=40);r.raise_for_status();return r.content,url
+              else:raise RuntimeError('unsupported:'+url)
+              cid,sep,suffix=rest.partition('/')
+              return fetch_ipfs(cid,('/'+suffix) if sep else '')
+          manifest=[]
+          for p in sorted((out/'live').glob('*.implementation.hex')):
+              name=p.name.split('.')[0]; code=read_hex(p); n=int.from_bytes(code[-2:],'big'); blob=code[-(n+2):-2]
+              decoded=cbor2.loads(blob); ipfs_raw=decoded.get('ipfs') or decoded.get(b'ipfs')
+              if not isinstance(ipfs_raw,(bytes,bytearray)):raise RuntimeError(f'{name}:no ipfs metadata')
+              cid=base58.b58encode(bytes(ipfs_raw)).decode(); meta_raw,meta_url=fetch_ipfs(cid); meta=json.loads(meta_raw)
+              root=out/'exact'/name; srcroot=root/'sources';srcroot.mkdir(parents=True,exist_ok=True);(root/'metadata.json').write_bytes(meta_raw)
+              rows=[]
+              for source_name,entry in meta.get('sources',{}).items():
+                  raw=None;used=None;errors=[]
+                  for url in entry.get('urls',[]):
+                      if url.startswith('bzz-raw://'):continue
+                      try:
+                          candidate,used=fetch_source(url); expected=entry.get('keccak256'); actual='0x'+keccak(candidate).hex()
+                          if expected and actual.lower()!=expected.lower():raise RuntimeError(f'hash {actual}!={expected}')
+                          raw=candidate;break
+                      except Exception as e:errors.append(f'{url}:{e}')
+                  if raw is None:raise RuntimeError(f'{name}:{source_name}:{errors}')
+                  dst=srcroot/source_name;dst.parent.mkdir(parents=True,exist_ok=True);dst.write_bytes(raw)
+                  rows.append({'source':source_name,'url':used,'keccak256':entry.get('keccak256'),'bytes':len(raw)})
+              (root/'source-manifest.json').write_text(json.dumps(rows,indent=2)+'\n')
+              manifest.append({'name':name,'metadata_cid':cid,'metadata_url':meta_url,'compiler':meta.get('compiler',{}).get('version'),'source_count':len(rows),'compilation_target':meta.get('settings',{}).get('compilationTarget'),'viaIR':meta.get('settings',{}).get('viaIR'),'evmVersion':meta.get('settings',{}).get('evmVersion'),'optimizer':meta.get('settings',{}).get('optimizer')})
+          (out/'exact-source-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+          PY
+
+      - name: Test Solidity compiler-warning source trigger
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-exact-source-v2"
+          python3 - "$OUT" <<'PY'
+          import json,pathlib,re,sys
+          out=pathlib.Path(sys.argv[1])
+          def clean(text):
+              pat=r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*|/\*.*?\*/)'
+              return re.sub(pat,lambda m:'\n'*m.group(0).count('\n') if m.group(0).startswith(('//','/*')) else '""',text,flags=re.S)
+          results=[]
+          for name in ['AgglayerBridge','AgglayerGER','AgglayerManager']:
+              transient=[];deletes=[];clears=[];root=out/'exact'/name/'sources'
+              for p in root.rglob('*'):
+                  if not p.is_file():continue
+                  for i,line in enumerate(clean(p.read_text(errors='replace')).splitlines(),1):
+                      row={'source':str(p.relative_to(root)),'line':i,'text':line.strip()}
+                      if re.search(r'\btransient\b',line):transient.append(row)
+                      if re.search(r'\bdelete\b',line):deletes.append(row)
+                      if re.search(r'\bdelete\b|\.(?:pop|push)\s*\(',line):clears.append(row)
+              results.append({'name':name,'transient_occurrences':transient,'delete_occurrences':deletes,'persistent_clear_occurrences':clears,'required_language_trigger_present':bool(transient and deletes)})
+          (out/'compiler-bug-trigger-scan.json').write_text(json.dumps(results,indent=2)+'\n')
+          probes=json.loads((out/'initializer-probe-summary.json').read_text());manifest=json.loads((out/'exact-source-manifest.json').read_text())
+          verdict={'exact_source_recovered':len(manifest)==3,'initializer_probes':probes,'compiler_bug_scan':results,'compiler_bug_required_source_trigger_present':any(x['required_language_trigger_present'] for x in results),'transactions_sent':0}
+          (out/'GATE_VERDICT.json').write_text(json.dumps(verdict,indent=2)+'\n')
+          lines=['# Agglayer exact-source gate v2','',f"- Exact source bundles recovered: `{verdict['exact_source_recovered']}`",f"- Compiler-bug required language trigger present: `{verdict['compiler_bug_required_source_trigger_present']}`",'- Transactions sent: `0`','','## Initializer probes','']
+          for p in probes:lines.append(f"- {p['probe']}: `{'SUCCESS' if p['success'] else 'REVERT/ERROR'}`")
+          lines+=['','## Metadata-bound source bundles','']
+          for m in manifest:lines.append(f"- {m['name']}: compiler `{m['compiler']}`, sources `{m['source_count']}`, viaIR `{m['viaIR']}`, evmVersion `{m['evmVersion']}`")
+          (out/'RESULT.md').write_text('\n'.join(lines)+'\n')
+          PY
+
+      - name: Integrity and safety gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-exact-source-v2";mkdir -p "$OUT"
+          if grep -RInE '(PRIVATE_KEY|MNEMONIC|BEGIN (RSA|EC|OPENSSH) PRIVATE KEY)' "$OUT";then echo 'Sensitive material detected' >&2;exit 1;fi
+          find "$OUT" -type f ! -name SHA256SUMS.txt -print0|sort -z|xargs -0 -r sha256sum > "$OUT/SHA256SUMS.txt"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agglayer-exact-source-gate-v2
+          path: ${{ runner.temp }}/agglayer-exact-source-v2/
+          retention-days: 3
+          if-no-files-found: error
