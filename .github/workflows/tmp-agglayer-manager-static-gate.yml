@@ -1,0 +1,92 @@
+name: Temporary Agglayer manager static-analysis gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "tmp-agglayer-manager-static-trigger.txt"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: agglayer/agglayer-contracts
+          ref: 110bda5a03e70ee7331bc06407a8e79226d3e520
+          path: target
+          fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: target/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install and compile exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-manager-static"
+          mkdir -p "$OUT"
+          cd target
+          git rev-parse HEAD > "$OUT/source-commit.txt"
+          npm ci --ignore-scripts > "$OUT/npm-ci.log" 2>&1
+          npx hardhat compile --force > "$OUT/compile.log" 2>&1
+          python -m pip install --disable-pip-version-check slither-analyzer > "$OUT/pip-slither.log" 2>&1
+          slither --version > "$OUT/slither-version.txt"
+      - name: Run Slither and isolate manager findings
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          OUT="$RUNNER_TEMP/agglayer-manager-static"
+          cd target
+          slither . \
+            --compile-force-framework hardhat \
+            --exclude-dependencies \
+            --filter-paths '(^|/)(test|script|scripts|mocks|previousVersions|node_modules)(/|$)' \
+            --json "$OUT/slither.json" \
+            > "$OUT/slither.stdout.log" 2> "$OUT/slither.stderr.log"
+          echo "$?" > "$OUT/slither.exit"
+          python3 - "$OUT" <<'PY'
+          import json,pathlib,sys
+          out=pathlib.Path(sys.argv[1])
+          try:data=json.loads((out/'slither.json').read_text())
+          except Exception:data={'success':False,'results':{'detectors':[]}}
+          dets=(data.get('results') or {}).get('detectors') or []
+          manager=[]
+          for d in dets:
+              files=set()
+              for e in d.get('elements') or []:
+                  sm=e.get('source_mapping') or {}
+                  f=sm.get('filename_relative') or sm.get('filename_absolute') or ''
+                  if f: files.add(f)
+              if any(f.endswith('contracts/AgglayerManager.sol') or f=='contracts/AgglayerManager.sol' for f in files):
+                  manager.append({
+                    'check':d.get('check'),
+                    'impact':d.get('impact'),
+                    'confidence':d.get('confidence'),
+                    'description':d.get('description'),
+                    'files':sorted(files),
+                  })
+          high=[x for x in manager if str(x.get('impact')).lower()=='high']
+          med=[x for x in manager if str(x.get('impact')).lower()=='medium']
+          result={'source_commit':(out/'source-commit.txt').read_text().strip(),'slither_exit':int((out/'slither.exit').read_text()),'all_detector_count':len(dets),'manager_detector_count':len(manager),'manager_high_count':len(high),'manager_medium_count':len(med),'manager_findings':manager,'transactions_sent':0}
+          (out/'VERDICT.json').write_text(json.dumps(result,indent=2)+'\n')
+          PY
+          find "$OUT" -type f ! -name SHA256SUMS.txt -print0|sort -z|xargs -0 sha256sum > "$OUT/SHA256SUMS.txt"
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: agglayer-manager-static-gate
+          path: ${{ runner.temp }}/agglayer-manager-static/
+          retention-days: 3
+          if-no-files-found: error
