@@ -1,0 +1,205 @@
+name: Temporary Agglayer v0.5 historical bytecode binding gate v2
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "tmp-agglayer-v05-bytecode-v2-trigger.txt"
+      - ".github/workflows/tmp-agglayer-v05-bytecode-binding-v2.yml"
+
+permissions:
+  contents: read
+
+env:
+  FOUNDRY_PROFILE: ci
+
+jobs:
+  bind:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout exact deployment commit
+        uses: actions/checkout@v4
+        with:
+          repository: agglayer/vault-bridge
+          ref: 595c6328203c7a10ac2ae91cf5daaa677f853b8f
+          path: target
+          fetch-depth: 1
+
+      - name: Resolve and install deployment-era Foundry nightly
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-v05-bytecode-v2"
+          mkdir -p "$OUT/compiled" "$OUT/live" "$OUT/broadcast"
+          cutoff='2025-05-22T10:35:17Z'
+          best_tag=''
+          best_time=''
+          for page in $(seq 1 12); do
+            body=$(curl -fsSL --retry 3 \
+              -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/foundry-rs/foundry/releases?per_page=100&page=$page")
+            while IFS=$'\t' read -r published tag; do
+              [[ -n "$published" && -n "$tag" ]] || continue
+              if [[ "$published" < "$cutoff" || "$published" == "$cutoff" ]]; then
+                if [[ -z "$best_time" || "$published" > "$best_time" ]]; then
+                  best_time="$published"
+                  best_tag="$tag"
+                fi
+              fi
+            done < <(jq -r '.[] | select(.prerelease == true and (.tag_name | startswith("nightly-"))) | [.published_at,.tag_name] | @tsv' <<<"$body")
+            [[ -z "$best_tag" ]] || break
+          done
+          test -n "$best_tag"
+          printf '%s\n%s\n' "$best_tag" "$best_time" | tee "$OUT/resolved-nightly.txt"
+          asset="https://github.com/foundry-rs/foundry/releases/download/${best_tag}/foundry_nightly_linux_amd64.tar.gz"
+          curl -fL --retry 3 "$asset" -o "$RUNNER_TEMP/foundry.tar.gz"
+          mkdir -p "$RUNNER_TEMP/foundry-bin"
+          tar -xzf "$RUNNER_TEMP/foundry.tar.gz" -C "$RUNNER_TEMP/foundry-bin"
+          echo "$RUNNER_TEMP/foundry-bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/foundry-bin/forge" --version | tee "$OUT/foundry-version.txt"
+
+      - name: Build deployment source and export compiled bytecode
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-v05-bytecode-v2"
+          cd target
+          git rev-parse HEAD > "$OUT/source-commit.txt"
+          forge soldeer install 2>&1 | tee "$OUT/soldeer-output.txt"
+          forge build --force 2>&1 | tee "$OUT/build-output.txt"
+          declare -A SPECS=(
+            [MigrationManager]='src/MigrationManager.sol:MigrationManager'
+            [GenericVaultBridgeToken]='src/vault-bridge-tokens/GenericVaultBridgeToken.sol:GenericVaultBridgeToken'
+            [VbETH]='src/vault-bridge-tokens/vbETH/VbETH.sol:VbETH'
+            [VaultBridgeTokenPart2]='src/VaultBridgeTokenPart2.sol:VaultBridgeTokenPart2'
+            [VaultBridgeTokenInitializer]='src/VaultBridgeTokenInitializer.sol:VaultBridgeTokenInitializer'
+          )
+          for name in MigrationManager GenericVaultBridgeToken VbETH VaultBridgeTokenPart2 VaultBridgeTokenInitializer; do
+            forge inspect "${SPECS[$name]}" bytecode | tr -d '\r\n ' > "$OUT/compiled/$name.creation.hex"
+            forge inspect "${SPECS[$name]}" deployedBytecode | tr -d '\r\n ' > "$OUT/compiled/$name.runtime.hex"
+          done
+
+      - name: Export broadcast creation inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-v05-bytecode-v2"
+          cd target
+          python3 - "$OUT" <<'PY'
+          import json, pathlib, sys
+          out = pathlib.Path(sys.argv[1])
+          data = json.loads(pathlib.Path('broadcast/DeployLayerX.s.sol/1/run-1747910117.json').read_text())
+          targets = {
+              'MigrationManager': '0xc6dd6399eae419a0a33a8dc307f4c1db26d30e45',
+              'GenericVaultBridgeToken': '0xcc865b0324121b43728176024f58bdbb3afd6f29',
+              'VbETH': '0x81c16f89222c32806daf01f5129937dfe19d525e',
+              'VaultBridgeTokenPart2': '0x1c8565f454f8239b854fe62c99b90b3fc9298e80',
+              'VaultBridgeTokenInitializer': '0xb2ec4d99c82417257f41b2c8ceda0962c03945f5',
+          }
+          by_address = {str(x.get('contractAddress','')).lower(): x for x in data['transactions'] if x.get('contractAddress')}
+          summary = {'commit':data.get('commit'),'timestamp':data.get('timestamp'),'chain':data.get('chain'),'contracts':{}}
+          for name, address in targets.items():
+              tx = by_address.get(address)
+              if tx is None:
+                  summary['contracts'][name] = {'found':False,'address':address}
+                  continue
+              raw = tx['transaction']['input']
+              (out/'broadcast'/f'{name}.creation.hex').write_text(raw)
+              summary['contracts'][name] = {
+                  'found':True,'address':address,'contractName':tx.get('contractName'),
+                  'txHash':tx.get('hash'),'input_hex_length':len(raw)
+              }
+          (out/'broadcast-summary.json').write_text(json.dumps(summary,indent=2)+'\n')
+          PY
+
+      - name: Fetch block-pinned live runtimes
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-v05-bytecode-v2"
+          RPC='https://ethereum-rpc.publicnode.com'
+          BLOCK=25809501
+          declare -A ADDRS=(
+            [MigrationManager]='0xc6dd6399eae419a0a33a8dc307f4c1db26d30e45'
+            [GenericVaultBridgeToken]='0xcc865b0324121b43728176024f58bdbb3afd6f29'
+            [VbETH]='0x81c16f89222c32806daf01f5129937dfe19d525e'
+            [VaultBridgeTokenPart2]='0x1c8565f454f8239b854fe62c99b90b3fc9298e80'
+            [VaultBridgeTokenInitializer]='0xb2ec4d99c82417257f41b2c8ceda0962c03945f5'
+          )
+          for name in MigrationManager GenericVaultBridgeToken VbETH VaultBridgeTokenPart2 VaultBridgeTokenInitializer; do
+            cast code "${ADDRS[$name]}" --block "$BLOCK" --rpc-url "$RPC" | tr -d '\r\n ' > "$OUT/live/$name.runtime.hex"
+          done
+          printf 'block=%s\nmode=eth_getCode_only\ntransactions_sent=0\n' "$BLOCK" > "$OUT/live-binding.txt"
+
+      - name: Compare bytecode
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-v05-bytecode-v2"
+          python3 - "$OUT" <<'PY'
+          import hashlib,json,pathlib,sys
+          out=pathlib.Path(sys.argv[1])
+          names=['MigrationManager','GenericVaultBridgeToken','VbETH','VaultBridgeTokenPart2','VaultBridgeTokenInitializer']
+          def raw(p):
+              s=p.read_text().strip(); s=s[2:] if s.startswith('0x') else s
+              return bytes.fromhex(s)
+          def strip_cbor(b):
+              if len(b)<2:return b,b''
+              n=int.from_bytes(b[-2:],'big')
+              if n==0 or n+2>len(b):return b,b''
+              m=b[-(n+2):]
+              return (b[:-(n+2)],m) if (m[0]>>5)==5 else (b,b'')
+          def solc(m):
+              h=m.hex(); marker='64736f6c6343'; i=h.find(marker)
+              if i<0:return None
+              v=h[i+len(marker):i+len(marker)+6]
+              return '.'.join(str(int(v[j:j+2],16)) for j in (0,2,4)) if len(v)==6 else None
+          result={
+              'source_commit':(out/'source-commit.txt').read_text().strip(),
+              'foundry_version':(out/'foundry-version.txt').read_text().strip(),
+              'resolved_nightly':(out/'resolved-nightly.txt').read_text().splitlines(),
+              'broadcast':json.loads((out/'broadcast-summary.json').read_text()),'contracts':{}
+          }
+          for name in names:
+              c=raw(out/'compiled'/f'{name}.runtime.hex'); l=raw(out/'live'/f'{name}.runtime.hex')
+              cs,cm=strip_cbor(c); ls,lm=strip_cbor(l)
+              cc=raw(out/'compiled'/f'{name}.creation.hex'); bp=out/'broadcast'/f'{name}.creation.hex'; b=raw(bp) if bp.exists() else b''
+              result['contracts'][name]={
+                  'runtime_full_equal':c==l,'runtime_semantic_equal':cs==ls,
+                  'compiled_runtime_bytes':len(c),'live_runtime_bytes':len(l),
+                  'compiled_semantic_bytes':len(cs),'live_semantic_bytes':len(ls),
+                  'compiled_metadata_bytes':len(cm),'live_metadata_bytes':len(lm),
+                  'compiled_solc':solc(cm),'live_solc':solc(lm),
+                  'compiled_semantic_sha256':hashlib.sha256(cs).hexdigest(),
+                  'live_semantic_sha256':hashlib.sha256(ls).hexdigest(),
+                  'creation_exact_equal_broadcast':cc==b,
+                  'compiled_creation_is_prefix':bool(cc and b.startswith(cc)),
+                  'compiled_creation_bytes':len(cc),'broadcast_creation_bytes':len(b)
+              }
+          (out/'comparison.json').write_text(json.dumps(result,indent=2)+'\n')
+          lines=['# Agglayer v0.5 historical bytecode binding v2','',f"- Source: `{result['source_commit']}`",f"- Foundry: `{result['foundry_version']}`",f"- Nightly: `{result['resolved_nightly'][0]}` ({result['resolved_nightly'][1]})",'','## Binding','']
+          for n,x in result['contracts'].items():
+              lines.append(f"- {n}: full={'MATCH' if x['runtime_full_equal'] else 'MISMATCH'}, semantic={'MATCH' if x['runtime_semantic_equal'] else 'MISMATCH'}, creation={'MATCH' if x['creation_exact_equal_broadcast'] else 'MISMATCH'}, solc={x['compiled_solc']}/{x['live_solc']}")
+          (out/'RESULT.md').write_text('\n'.join(lines)+'\n')
+          PY
+
+      - name: Integrity manifest
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-v05-bytecode-v2"
+          mkdir -p "$OUT"
+          find "$OUT" -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 -r sha256sum > "$OUT/SHA256SUMS.txt"
+
+      - name: Upload binding evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agglayer-v05-bytecode-binding-v2
+          path: ${{ runner.temp }}/agglayer-v05-bytecode-v2/
+          retention-days: 3
+          if-no-files-found: warn
