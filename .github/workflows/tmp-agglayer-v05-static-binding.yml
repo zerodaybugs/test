@@ -1,0 +1,186 @@
+name: Temporary Agglayer v0.5 static binding gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "tmp-agglayer-v05-static-trigger.txt"
+      - ".github/workflows/tmp-agglayer-v05-static-binding.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  static-binding:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout exact deployed-source candidate
+        uses: actions/checkout@v4
+        with:
+          repository: agglayer/vault-bridge
+          ref: 595c6328203c7a10ac2ae91cf5daaa677f853b8f
+          path: target
+          fetch-depth: 1
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Install dependencies and build
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-v05-static"
+          mkdir -p "$OUT/methods"
+          cd target
+          git rev-parse HEAD > "$OUT/source-commit.txt"
+          forge --version > "$OUT/foundry-version.txt"
+          forge soldeer install 2>&1 | tee "$OUT/soldeer-output.txt"
+          set +e
+          set -o pipefail
+          forge build --force 2>&1 | tee "$OUT/build-output.txt"
+          status=${PIPESTATUS[0]}
+          echo "$status" > "$OUT/build-exit.txt"
+          set -e
+          test "$status" -eq 0
+
+      - name: Export selectors and runtime hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-v05-static"
+          cd target
+          declare -A CONTRACTS=(
+            [GenericVaultBridgeToken]='src/vault-bridge-tokens/GenericVaultBridgeToken.sol:GenericVaultBridgeToken'
+            [VbETH]='src/vault-bridge-tokens/vbETH/VbETH.sol:VbETH'
+            [VaultBridgeTokenPart2]='src/VaultBridgeTokenPart2.sol:VaultBridgeTokenPart2'
+            [VaultBridgeTokenInitializer]='src/VaultBridgeTokenInitializer.sol:VaultBridgeTokenInitializer'
+            [MigrationManager]='src/MigrationManager.sol:MigrationManager'
+          )
+          : > "$OUT/runtime-hashes.tsv"
+          for name in GenericVaultBridgeToken VbETH VaultBridgeTokenPart2 VaultBridgeTokenInitializer MigrationManager; do
+            spec="${CONTRACTS[$name]}"
+            forge inspect "$spec" methodIdentifiers --json > "$OUT/methods/$name.json"
+            bytecode=$(forge inspect "$spec" deployedBytecode | tr -d '\r\n ')
+            printf '%s\t%s\t%s\n' "$name" "$(cast keccak "$bytecode")" "${#bytecode}" >> "$OUT/runtime-hashes.tsv"
+          done
+
+          cat > "$OUT/live-codehashes.json" <<'JSON'
+          {
+            "GenericVaultBridgeToken": "0xaf8cb04951346aeea69fd7d6ee8ef127f095f4ce810d6e27f15e565244f3a030",
+            "VbETH": "0x5ee6792c72c7bb343dfe1e30bc83a1732caef883156931537501f2e2e5b5ba9c",
+            "VaultBridgeTokenPart2": "0x80a685b76ee2967b542b8a2bdd7962504678cc991236cd9add4111b161783dbd",
+            "VaultBridgeTokenInitializer": "0xa77307d4441bfe4955d5b094d2b0c4e1b31e2789c6d8290d35cf86a4fa09586c",
+            "MigrationManager": "0xdacf1a0bc891b0f543ad7a1abbce88e3db3f198ba79215eef39f76befa91b465"
+          }
+          JSON
+
+      - name: Analyze selector collisions and binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-v05-static"
+          python3 - "$OUT" <<'PY'
+          import json, pathlib, sys
+          out = pathlib.Path(sys.argv[1])
+          methods = {p.stem: json.loads(p.read_text()) for p in (out/'methods').glob('*.json')}
+          live = json.loads((out/'live-codehashes.json').read_text())
+          compiled = {}
+          lengths = {}
+          for line in (out/'runtime-hashes.tsv').read_text().splitlines():
+              name, digest, length = line.split('\t')
+              compiled[name] = digest.lower()
+              lengths[name] = int(length)
+
+          def collision_report(primary_name):
+              primary = methods[primary_name]
+              part2 = methods['VaultBridgeTokenPart2']
+              by_selector = {}
+              for sig, sel in primary.items():
+                  by_selector.setdefault(sel.lower(), []).append(sig)
+              specific = {sig: sel for sig, sel in part2.items() if sig not in primary}
+              collisions = []
+              for sig, sel in specific.items():
+                  for primary_sig in by_selector.get(sel.lower(), []):
+                      collisions.append({
+                          'primary': primary_name,
+                          'part2_signature': sig,
+                          'primary_signature': primary_sig,
+                          'selector': sel,
+                      })
+              return specific, collisions
+
+          reports = {}
+          all_collisions = []
+          for primary in ('GenericVaultBridgeToken','VbETH'):
+              specific, collisions = collision_report(primary)
+              reports[primary] = {
+                  'part2_specific_method_count': len(specific),
+                  'part2_specific_methods': specific,
+                  'collisions': collisions,
+              }
+              all_collisions.extend(collisions)
+
+          bindings = {
+              name: {
+                  'compiled': compiled.get(name),
+                  'live': expected.lower(),
+                  'match': compiled.get(name) == expected.lower(),
+                  'runtime_hex_length': lengths.get(name),
+              }
+              for name, expected in live.items()
+          }
+          result = {
+              'source_commit': (out/'source-commit.txt').read_text().strip(),
+              'bindings': bindings,
+              'selector_reports': reports,
+              'collision_count': len(all_collisions),
+          }
+          (out/'analysis.json').write_text(json.dumps(result, indent=2) + '\n')
+
+          lines = ['# Agglayer v0.5 static binding gate', '']
+          lines += [f"- Source commit: `{result['source_commit']}`"]
+          lines += [f"- Build exit: `{(out/'build-exit.txt').read_text().strip()}`"]
+          lines += [f"- Part2 selector-collision count: `{len(all_collisions)}`", '', '## Runtime bytecode binding', '']
+          for name, item in bindings.items():
+              lines.append(f"- {name}: `{'MATCH' if item['match'] else 'MISMATCH'}` — compiled `{item['compiled']}`, live `{item['live']}`")
+          lines += ['', '## Part2 selector collisions', '']
+          if all_collisions:
+              for item in all_collisions:
+                  lines.append(f"- `{item['selector']}`: `{item['part2_signature']}` vs `{item['primary_signature']}` on {item['primary']}")
+          else:
+              lines.append('- None')
+          (out/'RESULT.md').write_text('\n'.join(lines) + '\n')
+          PY
+
+      - name: Run repository baseline tests
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          OUT="$RUNNER_TEMP/agglayer-v05-static"
+          cd target
+          forge test -vvv 2>&1 | tee "$OUT/test-output.txt"
+          echo "${PIPESTATUS[0]}" > "$OUT/test-exit.txt"
+          exit 0
+
+      - name: Finalize integrity manifest
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-v05-static"
+          find "$OUT" -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS.txt"
+
+      - name: Upload static evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agglayer-v05-static-binding
+          path: ${{ runner.temp }}/agglayer-v05-static/
+          retention-days: 3
+          if-no-files-found: error
