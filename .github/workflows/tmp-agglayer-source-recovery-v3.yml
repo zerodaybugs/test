@@ -1,0 +1,175 @@
+name: Temporary Agglayer explorer source recovery gate v3
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "tmp-agglayer-source-recovery-v3-trigger.txt"
+      - ".github/workflows/tmp-agglayer-source-recovery-v3.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch explorer and Sourcify records
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-source-v3"
+          mkdir -p "$OUT/raw" "$OUT/sources"
+          cat > "$OUT/targets.tsv" <<'EOF'
+          AgglayerBridge	0x66e0120e3c965552a89acc37b03f762624bac5ad
+          AgglayerGER	0x7f1655d9d570167b2a3ffd1ef809d3fdd74427c5
+          AgglayerManager	0x15caf18ded768e3620e0f656221bf6b400ad2618
+          EOF
+          while IFS=$'\t' read -r name address; do
+            curl -sS -L --retry 3 --max-time 45 \
+              "https://api.etherscan.io/v2/api?chainid=1&module=contract&action=getsourcecode&address=$address" \
+              -o "$OUT/raw/$name.etherscan.json" || true
+            curl -sS -L --retry 3 --max-time 45 \
+              "https://eth.blockscout.com/api/v2/smart-contracts/$address" \
+              -o "$OUT/raw/$name.blockscout-v2.json" || true
+            curl -sS -L --retry 3 --max-time 45 \
+              "https://eth.blockscout.com/api?module=contract&action=getsourcecode&address=$address" \
+              -o "$OUT/raw/$name.blockscout-v1.json" || true
+            curl -sS -L --retry 3 --max-time 45 \
+              "https://repo.sourcify.dev/contracts/full_match/1/$address/metadata.json" \
+              -o "$OUT/raw/$name.sourcify-full.json" || true
+            curl -sS -L --retry 3 --max-time 45 \
+              "https://repo.sourcify.dev/contracts/partial_match/1/$address/metadata.json" \
+              -o "$OUT/raw/$name.sourcify-partial.json" || true
+          done < "$OUT/targets.tsv"
+
+      - name: Parse source bundles and scan compiler-bug trigger
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-source-v3"
+          python3 - "$OUT" <<'PY'
+          import json,pathlib,re,sys,urllib.parse,urllib.request
+          out=pathlib.Path(sys.argv[1])
+          targets={}
+          for line in (out/'targets.tsv').read_text().splitlines():
+              name,address=line.split('\t');targets[name]=address
+
+          def load(path):
+              try:return json.loads(path.read_text())
+              except Exception:return None
+          def parse_standard_source(raw):
+              if not isinstance(raw,str) or not raw.strip():return None
+              s=raw.strip()
+              if s.startswith('{{') and s.endswith('}}'):s=s[1:-1]
+              try:
+                  obj=json.loads(s)
+                  if isinstance(obj,dict) and isinstance(obj.get('sources'),dict):return obj
+              except Exception:pass
+              return {'language':'Solidity','sources':{'Contract.sol':{'content':raw}},'settings':{}}
+          def blockscout_bundle(obj):
+              if not isinstance(obj,dict):return None
+              sources={}
+              main=obj.get('source_code') or obj.get('SourceCode')
+              path=obj.get('file_path') or obj.get('name') or obj.get('contract_name') or 'Contract.sol'
+              if isinstance(main,str) and main.strip():sources[path]={'content':main}
+              extra=obj.get('additional_sources') or obj.get('AdditionalSources') or []
+              if isinstance(extra,list):
+                  for i,e in enumerate(extra):
+                      if not isinstance(e,dict):continue
+                      p=e.get('file_path') or e.get('FileName') or e.get('name') or f'Additional_{i}.sol'
+                      c=e.get('source_code') or e.get('SourceCode') or e.get('content')
+                      if isinstance(c,str):sources[p]={'content':c}
+              if not sources:return None
+              settings=obj.get('compiler_settings') or obj.get('CompilerSettings') or {}
+              return {'language':'Solidity','sources':sources,'settings':settings}
+
+          def sourcify_bundle(name,address,metadata,kind):
+              if not isinstance(metadata,dict) or not isinstance(metadata.get('sources'),dict):return None
+              sources={}
+              for source_name,entry in metadata['sources'].items():
+                  content=None
+                  # Sourcify repository stores files below /sources/ using the original path.
+                  encoded='/'.join(urllib.parse.quote(x,safe='') for x in source_name.split('/'))
+                  url=f'https://repo.sourcify.dev/contracts/{kind}/1/{address}/sources/{encoded}'
+                  try:
+                      req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0'})
+                      with urllib.request.urlopen(req,timeout=35) as r:content=r.read().decode()
+                  except Exception:pass
+                  if content is None:
+                      continue
+                  sources[source_name]={'content':content}
+              return {'language':metadata.get('language','Solidity'),'sources':sources,'settings':metadata.get('settings',{})} if sources else None
+
+          manifests=[]
+          for name,address in targets.items():
+              candidates=[]
+              eth=load(out/'raw'/f'{name}.etherscan.json')
+              if isinstance(eth,dict) and eth.get('status')=='1' and isinstance(eth.get('result'),list) and eth['result']:
+                  item=eth['result'][0];bundle=parse_standard_source(item.get('SourceCode'))
+                  if bundle:candidates.append(('etherscan-v2',bundle,item))
+              b2=load(out/'raw'/f'{name}.blockscout-v2.json');bundle=blockscout_bundle(b2)
+              if bundle:candidates.append(('blockscout-v2',bundle,b2))
+              b1=load(out/'raw'/f'{name}.blockscout-v1.json')
+              if isinstance(b1,dict) and isinstance(b1.get('result'),list) and b1['result']:
+                  item=b1['result'][0];bundle=parse_standard_source(item.get('SourceCode'))
+                  if bundle:candidates.append(('blockscout-v1',bundle,item))
+              sf=load(out/'raw'/f'{name}.sourcify-full.json');bundle=sourcify_bundle(name,address,sf,'full_match')
+              if bundle:candidates.insert(0,('sourcify-full',bundle,sf))
+              sp=load(out/'raw'/f'{name}.sourcify-partial.json');bundle=sourcify_bundle(name,address,sp,'partial_match')
+              if bundle:candidates.append(('sourcify-partial',bundle,sp))
+              if not candidates:
+                  manifests.append({'name':name,'address':address,'recovered':False,'raw_statuses':{p.name:p.stat().st_size for p in (out/'raw').glob(f'{name}.*')}})
+                  continue
+              provider,bundle,record=max(candidates,key=lambda x:len(x[1].get('sources',{})))
+              root=out/'sources'/name;root.mkdir(parents=True,exist_ok=True)
+              (root/'standard-input.json').write_text(json.dumps(bundle,indent=2)+'\n')
+              for source_name,entry in bundle['sources'].items():
+                  dst=root/'files'/source_name;dst.parent.mkdir(parents=True,exist_ok=True);dst.write_text(entry.get('content',''))
+              meta={'name':name,'address':address,'recovered':True,'provider':provider,'source_count':len(bundle['sources']),'compiler_version':(record.get('CompilerVersion') if isinstance(record,dict) else None) or (record.get('compiler_version') if isinstance(record,dict) else None) or ((record.get('compiler') or {}).get('version') if isinstance(record,dict) and isinstance(record.get('compiler'),dict) else None),'optimization':record.get('OptimizationUsed') if isinstance(record,dict) else None,'runs':record.get('Runs') if isinstance(record,dict) else None,'evm_version':record.get('EVMVersion') if isinstance(record,dict) else None}
+              (root/'provider-metadata.json').write_text(json.dumps(meta,indent=2)+'\n');manifests.append(meta)
+          (out/'source-recovery-manifest.json').write_text(json.dumps(manifests,indent=2)+'\n')
+
+          def strip(text):
+              pat=r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*|/\*.*?\*/)'
+              return re.sub(pat,lambda m:'\n'*m.group(0).count('\n') if m.group(0).startswith(('//','/*')) else '""',text,flags=re.S)
+          scans=[]
+          for item in manifests:
+              name=item['name'];trans=[];deletes=[];clears=[]
+              root=out/'sources'/name/'files'
+              if item.get('recovered'):
+                  for p in root.rglob('*'):
+                      if not p.is_file():continue
+                      for i,line in enumerate(strip(p.read_text(errors='replace')).splitlines(),1):
+                          row={'source':str(p.relative_to(root)),'line':i,'text':line.strip()}
+                          if re.search(r'\btransient\b',line):trans.append(row)
+                          if re.search(r'\bdelete\b',line):deletes.append(row)
+                          if re.search(r'\bdelete\b|\.(?:pop|push)\s*\(',line):clears.append(row)
+              scans.append({'name':name,'transient_occurrences':trans,'delete_occurrences':deletes,'persistent_clear_occurrences':clears,'required_language_trigger_present':bool(trans and deletes)})
+          (out/'compiler-bug-trigger-scan.json').write_text(json.dumps(scans,indent=2)+'\n')
+          verdict={'all_sources_recovered':all(x.get('recovered') for x in manifests),'manifests':manifests,'compiler_bug_required_source_trigger_present':any(x['required_language_trigger_present'] for x in scans),'scans':scans}
+          (out/'GATE_VERDICT.json').write_text(json.dumps(verdict,indent=2)+'\n')
+          lines=['# Agglayer explorer source recovery v3','',f"- All source bundles recovered: `{verdict['all_sources_recovered']}`",f"- Compiler-bug required source trigger present: `{verdict['compiler_bug_required_source_trigger_present']}`",'','## Sources','']
+          for m in manifests:lines.append(f"- {m['name']}: recovered `{m.get('recovered')}`, provider `{m.get('provider')}`, files `{m.get('source_count')}`")
+          (out/'RESULT.md').write_text('\n'.join(lines)+'\n')
+          PY
+
+      - name: Integrity gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-source-v3";mkdir -p "$OUT"
+          find "$OUT" -type f ! -name SHA256SUMS.txt -print0|sort -z|xargs -0 -r sha256sum > "$OUT/SHA256SUMS.txt"
+
+      - name: Upload source evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agglayer-source-recovery-v3
+          path: ${{ runner.temp }}/agglayer-source-v3/
+          retention-days: 3
+          if-no-files-found: error
