@@ -1,0 +1,389 @@
+name: Temporary Agglayer core deployed-code binding gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "tmp-agglayer-core-binding-trigger.txt"
+      - ".github/workflows/tmp-agglayer-core-binding.yml"
+
+permissions:
+  contents: read
+
+env:
+  CORE_COMMIT: 110bda5a03e70ee7331bc06407a8e79226d3e520
+
+jobs:
+  bind:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout exact current Agglayer source
+        uses: actions/checkout@v4
+        with:
+          repository: agglayer/agglayer-contracts
+          ref: ${{ env.CORE_COMMIT }}
+          path: target
+          fetch-depth: 1
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: target/package-lock.json
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Select a current public Ethereum RPC
+        id: rpc
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-core-binding"
+          mkdir -p "$OUT/live" "$OUT/candidates" "$OUT/calls"
+          RPC=""
+          for candidate in \
+            "https://ethereum-rpc.publicnode.com" \
+            "https://eth.llamarpc.com" \
+            "https://rpc.flashbots.net" \
+            "https://1rpc.io/eth" \
+            "https://rpc.ankr.com/eth"; do
+            if cast block-number --rpc-url "$candidate" >/dev/null 2>&1; then
+              RPC="$candidate"
+              break
+            fi
+          done
+          test -n "$RPC"
+          BLOCK=$(cast block-number --rpc-url "$RPC")
+          echo "rpc=$RPC" >> "$GITHUB_OUTPUT"
+          echo "block=$BLOCK" >> "$GITHUB_OUTPUT"
+          {
+            echo "source_commit=$CORE_COMMIT"
+            echo "block=$BLOCK"
+            echo "rpc_host=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.urlparse(sys.argv[1]).hostname)' "$RPC")"
+            echo "captured_at=$(date -u +%FT%TZ)"
+            echo "mode=eth_call_eth_getCode_eth_getStorageAt_only"
+            echo "transactions_sent=0"
+          } > "$OUT/metadata.txt"
+
+      - name: Capture current proxy and implementation state
+        shell: bash
+        env:
+          RPC: ${{ steps.rpc.outputs.rpc }}
+          BLOCK: ${{ steps.rpc.outputs.block }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-core-binding"
+          IMPL_SLOT="0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+          ADMIN_SLOT="0xb53127684a568b3173ae13b9f8a6016e019eb68a5d6e8d6a717850b5d6103"
+          # Correct full EIP-1967 admin slot.
+          ADMIN_SLOT="0xb53127684a568b3173ae13b9f8a6016e019eb68a5d6e8d6a717850b5d6103"
+          BEACON_SLOT="0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50"
+
+          # JSON-RPC helper avoids cast's strict slot formatting for arbitrary reads.
+          rpc() {
+            local method="$1" params="$2"
+            curl -fsSL --retry 3 -H 'content-type: application/json' \
+              --data "{\"jsonrpc\":\"2.0\",\"method\":\"$method\",\"params\":$params,\"id\":1}" "$RPC" | jq -er '.result'
+          }
+          storage() {
+            local address="$1" slot="$2"
+            rpc eth_getStorageAt "[\"$address\",\"$slot\",\"0x$(printf '%x' "$BLOCK")\"]"
+          }
+          code() {
+            local address="$1"
+            rpc eth_getCode "[\"$address\",\"0x$(printf '%x' "$BLOCK")\"]"
+          }
+          addr_from_slot() {
+            local raw="$1"
+            if [[ "$raw" =~ ^0x[0-9a-fA-F]{64}$ ]]; then
+              printf '0x%s' "${raw: -40}"
+            else
+              printf '0x0000000000000000000000000000000000000000'
+            fi
+          }
+          safe_call0() {
+            local address="$1" sig="$2" result=""
+            if result=$(cast call "$address" "$sig" --block "$BLOCK" --rpc-url "$RPC" 2>&1); then
+              printf '%s' "$result"
+            else
+              printf 'REVERT_OR_ERROR: %s' "$result"
+            fi
+          }
+
+          cat > "$OUT/addresses.tsv" <<'EOF'
+          AgglayerBridge	0x2a3DD3EB832aF982ec71669E178424b10Dca2EDe
+          AgglayerGER	0x580bda1e7A0CFAe92Fa7F6c20A3794F169CE3CFb
+          AgglayerManager	0x5132A183E9F3CB7C848b0AAC5Ae0c4f0491B7aB2
+          EOF
+
+          : > "$OUT/proxy-state.tsv"
+          while IFS=$'\t' read -r name proxy; do
+            pcode=$(code "$proxy")
+            printf '%s' "$pcode" > "$OUT/live/$name.proxy.hex"
+            impl_raw=$(storage "$proxy" "$IMPL_SLOT")
+            admin_raw=$(storage "$proxy" "$ADMIN_SLOT" || true)
+            beacon_raw=$(storage "$proxy" "$BEACON_SLOT" || true)
+            impl=$(addr_from_slot "$impl_raw")
+            admin=$(addr_from_slot "$admin_raw")
+            beacon=$(addr_from_slot "$beacon_raw")
+            icode=$(code "$impl")
+            printf '%s' "$icode" > "$OUT/live/$name.implementation.hex"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$name" "$proxy" "$impl" "$admin" "$beacon" \
+              "$(cast keccak "$pcode")" "$(cast keccak "$icode")" >> "$OUT/proxy-state.tsv"
+          done < "$OUT/addresses.tsv"
+
+          : > "$OUT/view-calls.tsv"
+          emit_call() {
+            local name="$1" address="$2" sig="$3"
+            local value
+            value=$(safe_call0 "$address" "$sig" | tr '\t\r\n' '   ')
+            printf '%s\t%s\t%s\t%s\n' "$name" "$address" "$sig" "$value" >> "$OUT/view-calls.tsv"
+          }
+
+          BRIDGE="0x2a3DD3EB832aF982ec71669E178424b10Dca2EDe"
+          GER="0x580bda1e7A0CFAe92Fa7F6c20A3794F169CE3CFb"
+          MANAGER="0x5132A183E9F3CB7C848b0AAC5Ae0c4f0491B7aB2"
+          for sig in \
+            'version()(string)' 'networkID()(uint32)' 'globalExitRootManager()(address)' \
+            'polygonRollupManager()(address)' 'gasTokenAddress()(address)' 'gasTokenNetwork()(uint32)' \
+            'bridgeLib()(address)' 'getWrappedTokenBridgeImplementation()(address)' \
+            'getProxiedTokensManager()(address)' 'depositCount()(uint256)' \
+            'lastUpdatedDepositCount()(uint32)' 'isEmergencyState()(bool)'; do
+            emit_call AgglayerBridge "$BRIDGE" "$sig"
+          done
+          for sig in \
+            'version()(string)' 'GER_VERSION()(string)' 'bridgeAddress()(address)' \
+            'rollupManager()(address)' 'lastMainnetExitRoot()(bytes32)' 'lastRollupExitRoot()(bytes32)' \
+            'getLastGlobalExitRoot()(bytes32)' 'getRoot()(bytes32)' 'depositCount()(uint256)'; do
+            emit_call AgglayerGER "$GER" "$sig"
+          done
+          for sig in \
+            'version()(string)' 'ROLLUP_MANAGER_VERSION()(string)' 'globalExitRootManager()(address)' \
+            'bridgeAddress()(address)' 'pol()(address)' 'aggLayerGateway()(address)' \
+            'rollupCount()(uint32)' 'rollupTypeCount()(uint32)' \
+            'totalSequencedBatches()(uint64)' 'totalVerifiedBatches()(uint64)' \
+            'isEmergencyState()(bool)'; do
+            emit_call AgglayerManager "$MANAGER" "$sig"
+          done
+
+          # Read-only initializer probes. These calls cannot persist state.
+          : > "$OUT/initializer-probes.tsv"
+          probe() {
+            local name="$1" address="$2" data="$3" from="0x000000000000000000000000000000000000dEaD"
+            local response
+            response=$(curl -sS --retry 3 -H 'content-type: application/json' \
+              --data "{\"jsonrpc\":\"2.0\",\"method\":\"eth_call\",\"params\":[{\"from\":\"$from\",\"to\":\"$address\",\"data\":\"$data\"},\"0x$(printf '%x' "$BLOCK")\"],\"id\":1}" "$RPC")
+            printf '%s\t%s\t%s\n' "$name" "$data" "$(jq -c '.' <<<"$response" | tr '\t\r\n' '   ')" >> "$OUT/initializer-probes.tsv"
+          }
+          probe AgglayerGER.initialize "$GER" "$(cast calldata 'initialize()')"
+
+      - name: Install dependencies and compile exact current source
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-core-binding"
+          cd target
+          git rev-parse HEAD > "$OUT/checked-out-source.txt"
+          node --version > "$OUT/node-version.txt"
+          npm --version > "$OUT/npm-version.txt"
+          npm ci --ignore-scripts 2>&1 | tee "$OUT/npm-ci.txt"
+          npx hardhat compile --force 2>&1 | tee "$OUT/hardhat-compile.txt"
+
+      - name: Match live implementation runtimes to all compiled source candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-core-binding"
+          cd target
+          python3 - "$OUT" <<'PY'
+          import json, pathlib, hashlib, sys
+
+          out = pathlib.Path(sys.argv[1])
+          repo = pathlib.Path('.')
+          targets = ['AgglayerBridge', 'AgglayerGER', 'AgglayerManager']
+
+          def read_hex(path):
+              s = path.read_text().strip()
+              if s.startswith('0x'):
+                  s = s[2:]
+              return bytes.fromhex(s) if s else b''
+
+          def strip_metadata(data):
+              if len(data) < 2:
+                  return data, b''
+              n = int.from_bytes(data[-2:], 'big')
+              if n <= 0 or n + 2 > len(data):
+                  return data, b''
+              meta = data[-(n + 2):]
+              if not meta or meta[0] >> 5 != 5:
+                  return data, b''
+              return data[:-(n + 2)], meta
+
+          def flatten_refs(refs):
+              ranges = []
+              if not isinstance(refs, dict):
+                  return ranges
+              for value in refs.values():
+                  if isinstance(value, dict):
+                      for entries in value.values():
+                          if isinstance(entries, list):
+                              for e in entries:
+                                  if isinstance(e, dict) and 'start' in e and 'length' in e:
+                                      ranges.append((int(e['start']), int(e['length'])))
+                  elif isinstance(value, list):
+                      for e in value:
+                          if isinstance(e, dict) and 'start' in e and 'length' in e:
+                              ranges.append((int(e['start']), int(e['length'])))
+              return sorted(set(ranges))
+
+          def normalized(data, ranges):
+              b = bytearray(data)
+              for start, length in ranges:
+                  if 0 <= start <= len(b) and start + length <= len(b):
+                      b[start:start+length] = b'\x00' * length
+              return bytes(b)
+
+          live = {name: read_hex(out/'live'/f'{name}.implementation.hex') for name in targets}
+          records = []
+
+          # Hardhat build-info gives immutable and link-reference offsets.
+          for build_path in pathlib.Path('artifacts/build-info').glob('*.json'):
+              try:
+                  build = json.loads(build_path.read_text())
+              except Exception:
+                  continue
+              output = build.get('output', {}).get('contracts', {})
+              for source_name, contracts in output.items():
+                  for contract_name, obj in contracts.items():
+                      deployed = obj.get('evm', {}).get('deployedBytecode', {})
+                      bytecode_hex = deployed.get('object', '')
+                      if not isinstance(bytecode_hex, str) or not bytecode_hex:
+                          continue
+                      try:
+                          compiled = bytes.fromhex(bytecode_hex)
+                      except ValueError:
+                          continue
+                      ranges = flatten_refs(deployed.get('immutableReferences', {}))
+                      ranges += flatten_refs(deployed.get('linkReferences', {}))
+                      ranges = sorted(set(ranges))
+                      comp_sem, comp_meta = strip_metadata(compiled)
+                      for target_name, live_bytes in live.items():
+                          live_sem, live_meta = strip_metadata(live_bytes)
+                          if len(comp_sem) != len(live_sem):
+                              continue
+                          comp_norm = normalized(comp_sem, ranges)
+                          live_norm = normalized(live_sem, ranges)
+                          equal = comp_norm == live_norm
+                          # Similarity is diagnostic only and never establishes source binding.
+                          common = sum(a == b for a, b in zip(comp_norm, live_norm))
+                          similarity = common / len(comp_norm) if comp_norm else 0.0
+                          if equal or similarity >= 0.97:
+                              records.append({
+                                  'target': target_name,
+                                  'source': source_name,
+                                  'contract': contract_name,
+                                  'build_info': str(build_path),
+                                  'runtime_bytes': len(compiled),
+                                  'semantic_bytes': len(comp_sem),
+                                  'immutable_or_link_ranges': ranges,
+                                  'normalized_equal': equal,
+                                  'similarity': similarity,
+                                  'compiled_sha256': hashlib.sha256(comp_norm).hexdigest(),
+                                  'live_sha256': hashlib.sha256(live_norm).hexdigest(),
+                              })
+
+          records.sort(key=lambda x: (x['target'], not x['normalized_equal'], -x['similarity'], x['source']))
+          (out/'runtime-candidates.json').write_text(json.dumps(records, indent=2) + '\n')
+
+          summary = {}
+          for target in targets:
+              candidates = [r for r in records if r['target'] == target]
+              exact = [r for r in candidates if r['normalized_equal']]
+              summary[target] = {
+                  'exact_count': len(exact),
+                  'exact': exact,
+                  'top_candidates': candidates[:10],
+              }
+          (out/'runtime-binding-summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+
+          lines = ['# Agglayer core deployed-code binding', '']
+          meta = dict(line.split('=', 1) for line in (out/'metadata.txt').read_text().splitlines() if '=' in line)
+          lines += [
+              f"- Source commit: `{meta.get('source_commit')}`",
+              f"- Ethereum block: `{meta.get('block')}`",
+              f"- Mode: `{meta.get('mode')}`",
+              f"- Transactions sent: `{meta.get('transactions_sent')}`",
+              '', '## Runtime matches', ''
+          ]
+          for target in targets:
+              item = summary[target]
+              lines.append(f"### {target}")
+              lines.append(f"- Exact normalized matches: `{item['exact_count']}`")
+              if item['exact']:
+                  for r in item['exact']:
+                      lines.append(f"- `{r['source']}::{r['contract']}` — similarity `{r['similarity']:.6f}`")
+              elif item['top_candidates']:
+                  r = item['top_candidates'][0]
+                  lines.append(f"- Best non-binding candidate: `{r['source']}::{r['contract']}` — similarity `{r['similarity']:.6f}`")
+              else:
+                  lines.append('- No same-length candidate above 97% similarity')
+              lines.append('')
+          (out/'RESULT.md').write_text('\n'.join(lines) + '\n')
+          PY
+
+      - name: Capture ABI initializer and upgrade surfaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-core-binding"
+          cd target
+          python3 - "$OUT" <<'PY'
+          import json, pathlib, sys
+          out = pathlib.Path(sys.argv[1])
+          rows = []
+          for path in pathlib.Path('artifacts/contracts').rglob('*.json'):
+              try:
+                  art = json.loads(path.read_text())
+              except Exception:
+                  continue
+              name = art.get('contractName')
+              if name not in {'AgglayerBridge','AgglayerGER','AgglayerManager'}:
+                  continue
+              for item in art.get('abi', []):
+                  if item.get('type') != 'function':
+                      continue
+                  fn = item.get('name','')
+                  if fn.startswith('initialize') or fn.startswith('reinitialize') or fn in {'upgradeTo','upgradeToAndCall'}:
+                      rows.append({'contract':name,'source':art.get('sourceName'),'function':fn,'inputs':item.get('inputs',[]),'stateMutability':item.get('stateMutability')})
+          (out/'initializer-upgrade-surfaces.json').write_text(json.dumps(rows,indent=2)+'\n')
+          PY
+
+      - name: Integrity and safety gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/agglayer-core-binding"
+          mkdir -p "$OUT"
+          if grep -RInE '(PRIVATE_KEY|MNEMONIC|BEGIN (RSA|EC|OPENSSH) PRIVATE KEY)' "$OUT"; then
+            echo 'Sensitive material detected' >&2
+            exit 1
+          fi
+          find "$OUT" -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 -r sha256sum > "$OUT/SHA256SUMS.txt"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agglayer-core-binding
+          path: ${{ runner.temp }}/agglayer-core-binding/
+          retention-days: 3
+          if-no-files-found: error
