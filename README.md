@@ -1,7 +1,5 @@
 # Public Sample: ERC-4626 Inflation / Donation Invariant Harness
 
-[Temporary official BlockSec OKX Smart Wallet audit PDF](https://cdn.jsdelivr.net/gh/okxlabs/okx-smart-wallet-evm@95aa59bbc22acd4573a9932e959384fe56c7b543/docs/audits/blocksec_okx_smart_wallet_v1.0-signed.pdf)
-
 A small, standalone, self-contained Foundry project that demonstrates **how an
 accounting-invariant harness proves it can actually catch a bug** — not just that
 "the tests are green."
