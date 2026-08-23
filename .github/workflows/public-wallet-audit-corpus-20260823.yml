@@ -1,0 +1,116 @@
+name: Public smart-wallet audit corpus inspection
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/public-wallet-audit-corpus-20260823.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract-public-audits:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF inspection tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Download immutable public audit documents
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit-corpus/pdf audit-corpus/text audit-corpus/matches audit-corpus/rendered
+          base='https://raw.githubusercontent.com/okxlabs/okx-smart-wallet-evm/95aa59bbc22acd4573a9932e959384fe56c7b543/docs/audits'
+          curl --fail --location --silent --show-error --retry 3 \
+            "$base/blocksec_okx_smart_wallet_v1.0-signed.pdf" \
+            -o audit-corpus/pdf/blocksec.pdf
+          curl --fail --location --silent --show-error --retry 3 \
+            "$base/certik_okx_smart_wallet.pdf" \
+            -o audit-corpus/pdf/certik.pdf
+          curl --fail --location --silent --show-error --retry 3 \
+            "$base/okx_security_audit_report.pdf" \
+            -o audit-corpus/pdf/internal.pdf
+          file audit-corpus/pdf/*.pdf
+          sha256sum audit-corpus/pdf/*.pdf | tee audit-corpus/PDF_SHA256SUMS.txt
+
+      - name: Extract text, page map, and targeted contexts
+        shell: bash
+        run: |
+          set -euo pipefail
+          terms='DecodeLib|decodeCalls|executeUserOp|PackedUserOperation|UserOperation|calldata|signature|EntryPoint|out[- ]of[- ]bounds|bounds check|offset|abi.decode'
+          for pdf in audit-corpus/pdf/*.pdf; do
+            name=$(basename "$pdf" .pdf)
+            pdfinfo "$pdf" > "audit-corpus/text/${name}.pdfinfo.txt"
+            pdftotext -layout "$pdf" "audit-corpus/text/${name}.txt"
+            {
+              echo "===== ${name}: metadata ====="
+              cat "audit-corpus/text/${name}.pdfinfo.txt"
+              echo "===== ${name}: targeted matches ====="
+              grep -aEin -C 5 "$terms" "audit-corpus/text/${name}.txt" || true
+            } | tee "audit-corpus/matches/${name}.matches.txt"
+
+            python3 - "$name" "audit-corpus/text/${name}.txt" <<'PY'
+          import re, sys
+          from pathlib import Path
+          name, source = sys.argv[1], Path(sys.argv[2])
+          pages = source.read_text(errors='replace').split('\f')
+          rx = re.compile(r'DecodeLib|decodeCalls|executeUserOp|PackedUserOperation|UserOperation|calldata|signature|EntryPoint|out[- ]of[- ]bounds|bounds check|offset|abi\.decode', re.I)
+          hit_pages = []
+          out = []
+          for i, page in enumerate(pages, 1):
+              if rx.search(page):
+                  hit_pages.append(i)
+                  out.append(f'===== PAGE {i} =====\n{page}')
+          Path(f'audit-corpus/matches/{name}.hit-pages.txt').write_text(','.join(map(str, hit_pages)) + '\n')
+          Path(f'audit-corpus/matches/{name}.hit-page-text.txt').write_text('\n'.join(out))
+          print(f'{name}_HIT_PAGES=' + ','.join(map(str, hit_pages)))
+          PY
+          done
+
+      - name: Render all targeted pages for visual review
+        shell: bash
+        run: |
+          set -euo pipefail
+          for pdf in audit-corpus/pdf/*.pdf; do
+            name=$(basename "$pdf" .pdf)
+            pages=$(cat "audit-corpus/matches/${name}.hit-pages.txt")
+            IFS=',' read -ra page_array <<< "$pages"
+            for p in "${page_array[@]}"; do
+              [ -n "$p" ] || continue
+              pdftoppm -f "$p" -l "$p" -png -r 120 -singlefile "$pdf" \
+                "audit-corpus/rendered/${name}-page-${p}"
+            done
+          done
+          find audit-corpus/rendered -type f -maxdepth 1 -printf '%f %s bytes\n' | sort
+
+      - name: Corpus verdict summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo 'PUBLIC_AUDIT_CORPUS_PIN=95aa59bbc22acd4573a9932e959384fe56c7b543'
+            echo '--- exact identifier scan ---'
+            grep -aEin 'DecodeLib|decodeCalls' audit-corpus/text/*.txt || true
+            echo '--- execution and calldata contexts ---'
+            grep -aEin -C 3 'executeUserOp|PackedUserOperation|calldata|EntryPoint' audit-corpus/text/*.txt || true
+          } | tee audit-corpus/CORPUS_SUMMARY.txt
+          find audit-corpus -type f -not -path '*/pdf/*' -print0 | sort -z | xargs -0 sha256sum \
+            > audit-corpus/EXTRACTED_SHA256SUMS.txt
+
+      - name: Upload public audit inspection evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-smart-wallet-audit-corpus-inspection
+          path: audit-corpus
+          retention-days: 1
+          if-no-files-found: error
