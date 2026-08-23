@@ -14,25 +14,25 @@ permissions:
 jobs:
   census:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Install pinned Foundry
         uses: foundry-rs/foundry-toolchain@v1
         with:
           version: v1.7.1
 
-      - name: Capture exact-out deployments and common token balances
+      - name: Capture exact-out deployments, holdings, and transfer inventory
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p artifact/code artifact/storage artifact/balances artifact/calls
+          mkdir -p artifact/code artifact/storage artifact/balances artifact/calls artifact/blockscout
 
           cat > artifact/deployments.tsv <<'EOF'
-          chain	chain_id	rpc	router
-          ethereum	1	https://ethereum-rpc.publicnode.com	0xa875Fb2204cE71679BE054d97f7fAFFeb6536D67
-          arbitrum	42161	https://arbitrum-one-rpc.publicnode.com	0x9736d9a45115E33411390EbD54e5A5C3A6E25aA6
-          base	8453	https://base-rpc.publicnode.com	0x77449Ff075C0A385796Da0762BCB46fd5cc884c6
-          bsc	56	https://bsc-rpc.publicnode.com	0x5cb43Bae4f36E2f9f858232B4Dce0dbE27bb85e3
+          chain	chain_id	rpc	blockscout	router
+          ethereum	1	https://ethereum-rpc.publicnode.com	https://eth.blockscout.com	0xa875Fb2204cE71679BE054d97f7fAFFeb6536D67
+          arbitrum	42161	https://arbitrum-one-rpc.publicnode.com	https://arbitrum.blockscout.com	0x9736d9a45115E33411390EbD54e5A5C3A6E25aA6
+          base	8453	https://base-rpc.publicnode.com	https://base.blockscout.com	0x77449Ff075C0A385796Da0762BCB46fd5cc884c6
+          bsc	56	https://bsc-rpc.publicnode.com	https://bsc.blockscout.com	0x5cb43Bae4f36E2f9f858232B4Dce0dbE27bb85e3
           EOF
 
           cat > artifact/tokens.tsv <<'EOF'
@@ -55,18 +55,14 @@ jobs:
           bsc	WBNB	0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c
           bsc	USDT	0x55d398326f99059fF775485246999027B3197955
           bsc	USDC	0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d
-          bsc	FDUSD	0xc5f0f7B66764F6e6D0A8b2D49F7D9d7A6E3c0D3A
+          bsc	FDUSD	0xc5f0f7b66764F6ec8C8Dff7BA683102295E16409
           bsc	BTCB	0x7130d2A12B9BCbFae4f2634d864A1Ee1Ce3Ead9c
           bsc	ETH	0x2170Ed0880ac9A755fd29B2688956BD959F933F8
           EOF
 
           impl_slot='0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
-          admin_slot='0xb53127684a568b3173ae13b9f8a6016e019a1f5a7a6e7f5d5e8f5e9e8a5b8d610'
-          # Canonical EIP-1967 admin slot, retained separately to avoid relying on the label above.
-          admin_slot_canonical='0xb53127684a568b3173ae13b9f8a6016e019a1f5a7a6e7f5d5e8f5e9e8a5b8d610'
-
           printf 'chain\tchain_id\tblock\trouter\tcode_bytes\tcode_sha256\tnative_balance_wei\tversion\towner\timplementation_slot\n' > artifact/deployment-summary.tsv
-          tail -n +2 artifact/deployments.tsv | while IFS=$'\t' read -r chain chain_id rpc router; do
+          tail -n +2 artifact/deployments.tsv | while IFS=$'\t' read -r chain chain_id rpc blockscout router; do
             block="$(cast block-number --rpc-url "$rpc")"
             code_file="artifact/code/${chain}-router.hex"
             cast code "$router" --rpc-url "$rpc" > "$code_file"
@@ -79,12 +75,20 @@ jobs:
             printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
               "$chain" "$chain_id" "$block" "$router" "$code_bytes" "$code_sha" "$native" "$version" "$owner" "$impl" \
               >> artifact/deployment-summary.tsv
+
+            for endpoint in token-balances 'tokens?type=ERC-20' 'token-transfers?type=ERC-20'; do
+              safe_name="$(printf '%s' "$endpoint" | tr '?=&/' '____')"
+              url="${blockscout}/api/v2/addresses/${router}/${endpoint}"
+              status="$(curl --location --silent --show-error --retry 2 --connect-timeout 15 --max-time 60 \
+                --output "artifact/blockscout/${chain}-${safe_name}.json" --write-out '%{http_code}' "$url" || true)"
+              printf '%s\t%s\t%s\t%s\n' "$chain" "$endpoint" "$status" "$url" >> artifact/blockscout-http-status.tsv
+            done
           done
 
           printf 'chain\tsymbol\ttoken\trouter\tdecimals\traw_balance\tformatted_balance\n' > artifact/token-balances.tsv
           tail -n +2 artifact/tokens.tsv | while IFS=$'\t' read -r chain symbol token; do
             row="$(awk -F '\t' -v c="$chain" '$1==c {print; exit}' artifact/deployments.tsv)"
-            IFS=$'\t' read -r _ chain_id rpc router <<< "$row"
+            IFS=$'\t' read -r _ chain_id rpc blockscout router <<< "$row"
             decimals="$(cast call "$token" 'decimals()(uint8)' --rpc-url "$rpc" 2>"artifact/balances/${chain}-${symbol}-decimals.err" || echo ERR)"
             raw="$(cast call "$token" 'balanceOf(address)(uint256)' "$router" --rpc-url "$rpc" 2>"artifact/balances/${chain}-${symbol}-balance.err" || echo ERR)"
             formatted='ERR'
@@ -92,13 +96,65 @@ jobs:
               formatted="$(python3 - "$raw" "$decimals" <<'PY'
           import decimal, sys
           decimal.getcontext().prec = 100
-          raw = decimal.Decimal(sys.argv[1])
-          d = int(sys.argv[2])
-          print(raw / (decimal.Decimal(10) ** d))
+          print(decimal.Decimal(sys.argv[1]) / (decimal.Decimal(10) ** int(sys.argv[2])))
           PY
               )"
             fi
             printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$chain" "$symbol" "$token" "$router" "$decimals" "$raw" "$formatted" >> artifact/token-balances.tsv
+          done
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          base = Path('artifact/blockscout')
+          nonzero = []
+          recent = set()
+          parse_errors = []
+          for path in sorted(base.glob('*.json')):
+              chain = path.name.split('-', 1)[0]
+              try:
+                  data = json.loads(path.read_text())
+              except Exception as exc:
+                  parse_errors.append((path.name, str(exc)))
+                  continue
+              items = data if isinstance(data, list) else data.get('items', []) if isinstance(data, dict) else []
+              for item in items:
+                  if not isinstance(item, dict):
+                      continue
+                  token = item.get('token') or {}
+                  addr = token.get('address_hash') or token.get('address') or item.get('token_address')
+                  symbol = token.get('symbol') or ''
+                  decimals = token.get('decimals')
+                  value = item.get('value') or item.get('balance') or '0'
+                  if addr:
+                      recent.add((chain, symbol, addr, str(decimals or '')))
+                  try:
+                      if int(str(value), 0) > 0:
+                          nonzero.append((chain, symbol, addr or '', str(decimals or ''), str(value), path.name))
+                  except Exception:
+                      pass
+          Path('artifact/blockscout-nonzero.tsv').write_text(
+              'chain\tsymbol\ttoken\tdecimals\traw_value\tsource\n' +
+              ''.join('\t'.join(x) + '\n' for x in nonzero)
+          )
+          Path('artifact/blockscout-observed-tokens.tsv').write_text(
+              'chain\tsymbol\ttoken\tdecimals\n' +
+              ''.join('\t'.join(x) + '\n' for x in sorted(recent))
+          )
+          Path('artifact/blockscout-parse-errors.tsv').write_text(
+              'file\terror\n' + ''.join(f'{a}\t{b}\n' for a, b in parse_errors)
+          )
+          PY
+
+          printf 'chain\tsymbol\ttoken\trouter\tdecimals\traw_balance\n' > artifact/observed-token-rpc-balances.tsv
+          tail -n +2 artifact/blockscout-observed-tokens.tsv | while IFS=$'\t' read -r chain symbol token reported_decimals; do
+            [[ -n "$token" ]] || continue
+            row="$(awk -F '\t' -v c="$chain" '$1==c {print; exit}' artifact/deployments.tsv)"
+            IFS=$'\t' read -r _ chain_id rpc blockscout router <<< "$row"
+            decimals="$(cast call "$token" 'decimals()(uint8)' --rpc-url "$rpc" 2>/dev/null || echo ERR)"
+            raw="$(cast call "$token" 'balanceOf(address)(uint256)' "$router" --rpc-url "$rpc" 2>/dev/null || echo ERR)"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$chain" "$symbol" "$token" "$router" "$decimals" "$raw" >> artifact/observed-token-rpc-balances.tsv
           done
 
           cast --version > artifact/cast-version.txt
