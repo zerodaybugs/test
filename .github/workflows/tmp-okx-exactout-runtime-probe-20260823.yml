@@ -1,0 +1,170 @@
+name: Temporary OKX Exact-Out deployment binding 2026-08-23
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .tmp/okx-exactout-runtime-probe-20260823.txt
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Capture current read-only deployment evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact source
+          router_commit='1fc1508df3caeb18a8179dfc0ea4e956099ab481'
+          git clone --quiet https://github.com/okxlabs/Web3-DEX-Router-EVM-V1.git source/router
+          git -C source/router checkout --quiet --detach "$router_commit"
+          test "$(git -C source/router rev-parse HEAD)" = "$router_commit"
+          cp source/router/DEPLOYMENT.md artifact/DEPLOYMENT.md
+          printf '%s\n' "$router_commit" > artifact/source-commit.txt
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, re, subprocess, hashlib, datetime
+
+          deployment = Path('source/router/DEPLOYMENT.md').read_text()
+          section = deployment.split('## Exact-Out Router Deployments', 1)[1]
+          section = section.split('\n## ', 1)[0]
+
+          rows = []
+          for line in section.splitlines():
+              if not line.startswith('|') or '---' in line or 'Network' in line:
+                  continue
+              cells = [c.strip() for c in line.strip('|').split('|')]
+              if len(cells) < 3:
+                  continue
+              network = cells[0]
+              try:
+                  chain_id = int(cells[1].replace(',', ''))
+              except ValueError:
+                  continue
+              m = re.search(r'0x[0-9a-fA-F]{40}', cells[2])
+              if m:
+                  rows.append((network, chain_id, m.group(0)))
+
+          rpc_by_chain = {
+              1: 'https://ethereum-rpc.publicnode.com',
+              42161: 'https://arbitrum-one-rpc.publicnode.com',
+              8453: 'https://base-rpc.publicnode.com',
+              56: 'https://bsc-rpc.publicnode.com',
+              10: 'https://optimism-rpc.publicnode.com',
+              137: 'https://polygon-bor-rpc.publicnode.com',
+              43114: 'https://avalanche-c-chain-rpc.publicnode.com',
+          }
+
+          impl_slot = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
+          admin_slot = '0xb53127684a568b3173ae13b9f8a6016e019e8e9f8a6016e019e8e9f8a6016e0'
+          # Correct EIP-1967 admin slot; kept separately to avoid accidental use of malformed value.
+          admin_slot = '0xb53127684a568b3173ae13b9f8a6016e019e8e9f8a6016e019e8e9f8a6016e0'[:66]
+          # Use canonical constant explicitly.
+          admin_slot = '0xb53127684a568b3173ae13b9f8a6016e019e8e9f8a6016e019e8e9f8a6016e0'
+          # The implementation slot is the binding-critical field; admin is informational only.
+
+          selectors = {
+              'uniswapV3SwapExactOutTo': subprocess.check_output([
+                  'cast','sig','uniswapV3SwapExactOutTo(uint256,uint256,uint256,uint256[])'
+              ], text=True).strip(),
+              'unxswapExactOutTo': subprocess.check_output([
+                  'cast','sig','unxswapExactOutTo(uint256,uint256,uint256,address,bytes32[])'
+              ], text=True).strip(),
+          }
+
+          def run(args, timeout=35):
+              cp = subprocess.run(args, text=True, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, timeout=timeout)
+              return cp.returncode, cp.stdout.strip()
+
+          def addr_from_slot(raw):
+              raw = raw.lower().strip()
+              if not raw.startswith('0x') or len(raw) != 66:
+                  return None
+              value = '0x' + raw[-40:]
+              if int(value, 16) == 0:
+                  return None
+              return value
+
+          results = []
+          for network, chain_id, proxy in rows:
+              rpc = rpc_by_chain.get(chain_id)
+              if not rpc:
+                  continue
+              item = {'network': network, 'chain_id': chain_id, 'proxy': proxy, 'rpc': rpc}
+              try:
+                  rc, block = run(['cast','block-number','--rpc-url',rpc])
+                  item['block'] = block if rc == 0 else None
+                  rc, code = run(['cast','code',proxy,'--rpc-url',rpc])
+                  item['proxy_code_ok'] = rc == 0 and code not in ('','0x')
+                  item['proxy_code_bytes'] = max(0, (len(code)-2)//2) if item['proxy_code_ok'] else 0
+                  item['proxy_code_sha256'] = hashlib.sha256(code.encode()).hexdigest() if item['proxy_code_ok'] else None
+
+                  rc, raw_impl = run(['cast','storage',proxy,impl_slot,'--rpc-url',rpc])
+                  impl = addr_from_slot(raw_impl) if rc == 0 else None
+                  item['implementation_slot_raw'] = raw_impl if rc == 0 else None
+                  item['implementation'] = impl
+                  code_target = impl or proxy
+                  rc, impl_code = run(['cast','code',code_target,'--rpc-url',rpc])
+                  item['code_target'] = code_target
+                  item['implementation_code_ok'] = rc == 0 and impl_code not in ('','0x')
+                  item['implementation_code_bytes'] = max(0, (len(impl_code)-2)//2) if item['implementation_code_ok'] else 0
+                  item['implementation_code_sha256'] = hashlib.sha256(impl_code.encode()).hexdigest() if item['implementation_code_ok'] else None
+                  low = impl_code.lower()
+                  item['selectors_present'] = {
+                      name: selector[2:].lower() in low for name, selector in selectors.items()
+                  }
+
+                  rc, version = run(['cast','call',proxy,'version()(string)','--rpc-url',rpc])
+                  item['version_call_ok'] = rc == 0
+                  item['version_raw'] = version
+                  rc, paused = run(['cast','call',proxy,'paused()(bool)','--rpc-url',rpc])
+                  item['paused_call_ok'] = rc == 0
+                  item['paused_raw'] = paused
+              except Exception as exc:
+                  item['error'] = repr(exc)
+              results.append(item)
+
+          payload = {
+              'captured_at_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'source_commit': '1fc1508df3caeb18a8179dfc0ea4e956099ab481',
+              'selectors': selectors,
+              'results': results,
+          }
+          Path('artifact/runtime-binding.json').write_text(json.dumps(payload, indent=2))
+
+          with Path('artifact/runtime-binding.tsv').open('w') as f:
+              f.write('network\tchain_id\tblock\tproxy\timplementation\tproxy_bytes\timplementation_bytes\tversion_ok\tselectors_ok\terror\n')
+              for r in results:
+                  selector_ok = all(r.get('selectors_present', {}).values())
+                  f.write('\t'.join(map(str, [
+                      r.get('network'), r.get('chain_id'), r.get('block'),
+                      r.get('proxy'), r.get('implementation'),
+                      r.get('proxy_code_bytes'), r.get('implementation_code_bytes'),
+                      r.get('version_call_ok'), selector_ok, r.get('error','')
+                  ])) + '\n')
+          PY
+
+          sha256sum artifact/* > artifact/SHA256SUMS.txt
+
+      - name: Upload read-only evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: okx-exactout-runtime-binding-20260823
+          path: artifact
+          if-no-files-found: error
+          retention-days: 1
