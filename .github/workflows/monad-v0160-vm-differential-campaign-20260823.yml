@@ -1,0 +1,218 @@
+name: Monad v0.16.0 VM differential campaign 20260823
+
+on:
+  push:
+    branches:
+      - tooling/monad-v0160-vm-differential-campaign-20260823
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  differential:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - name: Checkout tooling branch
+        uses: actions/checkout@v4
+
+      - name: Clone exact public execution source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global submodule.fetchJobs "$(nproc)"
+          git clone --recurse-submodules https://github.com/category-labs/monad.git monad-execution
+          cd monad-execution
+          git checkout e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+          git submodule update --init --recursive
+          test "$(git rev-parse HEAD)" = "e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0"
+          git status --porcelain=v1 > ../SOURCE_STATUS.txt
+          test ! -s ../SOURCE_STATUS.txt
+          git submodule status --recursive > ../SUBMODULES.txt
+
+      - name: Build official dependency image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --target base -t monad-v0160-base -f monad-execution/docker/Dockerfile monad-execution
+
+      - name: Build exact official differential fuzzer
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/logs out/rc out/meta out/focus
+          docker run --name monad-v0160-campaign \
+            -v "$PWD/monad-execution:/src" \
+            -v "$PWD/out:/out" \
+            monad-v0160-base bash -lc '
+              set -euo pipefail
+              cd /src
+              rm -rf build
+              CC=gcc-15 CXX=g++-15 cmake -S . -B build -GNinja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_TOOLCHAIN_FILE=category/core/toolchains/gcc-avx2.cmake \
+                -DMONAD_COMPILER_TESTING=On
+              cmake --build build -t monad-compiler-fuzzer --parallel "$(nproc)"
+              cp build/test/vm/fuzzer/monad-compiler-fuzzer /out/
+              sha256sum /out/monad-compiler-fuzzer > /out/meta/FUZZER_SHA256.txt
+              gcc-15 --version > /out/meta/GCC_VERSION.txt
+              g++-15 --version > /out/meta/GXX_VERSION.txt
+              cmake --version > /out/meta/CMAKE_VERSION.txt
+              ninja --version > /out/meta/NINJA_VERSION.txt
+              ldd /out/monad-compiler-fuzzer > /out/meta/FUZZER_LDD.txt
+            '
+
+      - name: Execute multi-lane campaigns
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > out/focus/pow2.json <<'JSON'
+          {
+            "power_of_two_constant_prob": 0.25,
+            "power_of_32_constant_prob": 0.25,
+            "negated_power_of_32_constant_prob": 0.15,
+            "negated_power_of_two_constant_prob": 0.15,
+            "valid_jump_prob": 1.0
+          }
+          JSON
+          cat > out/focus/dynjump.json <<'JSON'
+          {
+            "valid_jumpdest_prob": 0.50,
+            "meaningful_constant_prob": 0.20,
+            "small_constant_prob": 0.20,
+            "valid_jump_prob": 0.0,
+            "block_dist_p1": 0.03,
+            "block_dist_p2": 0.03,
+            "block_dist_p3": 0.03
+          }
+          JSON
+          cat > out/focus/callheavy.json <<'JSON'
+          {
+            "valid_address_prob": 0.80,
+            "meaningful_constant_prob": 0.20,
+            "small_constant_prob": 0.20,
+            "push_weight": 0.20,
+            "dup_weight": 0.20,
+            "call_weight": 0.20,
+            "returndatacopy_weight": 0.10,
+            "create_weight": 0.10,
+            "uncommon_non_term_weight": 0.15,
+            "valid_jump_prob": 0.90
+          }
+          JSON
+          cat > out/focus/stateheavy.json <<'JSON'
+          {
+            "valid_address_prob": 0.65,
+            "random_constant_with_cleared_words_prob": 0.20,
+            "meaningful_constant_prob": 0.20,
+            "small_constant_prob": 0.20,
+            "push_weight": 0.16,
+            "dup_weight": 0.16,
+            "call_weight": 0.02,
+            "returndatacopy_weight": 0.02,
+            "create_weight": 0.02,
+            "uncommon_non_term_weight": 0.40,
+            "valid_jump_prob": 0.95
+          }
+          JSON
+
+          docker start monad-v0160-campaign >/dev/null
+          docker exec monad-v0160-campaign bash -lc '
+            set -euo pipefail
+            F=/out/monad-compiler-fuzzer
+            run_lane() {
+              name="$1"; impl="$2"; seed="$3"; focus="$4"
+              args=(--implementation "$impl" --revision OSAKA --seed "$seed" --iterations-per-run 100 --messages 4 --runs 100000000 --print-stats)
+              if [[ -n "$focus" ]]; then args+=(--focus "$focus"); fi
+              set +e
+              MONAD_COMPILER_FUZZING=1 timeout --signal=TERM --kill-after=20s 900s \
+                stdbuf -oL -eL "$F" "${args[@]}" >"/out/logs/${name}.log" 2>&1
+              rc=$?
+              set -e
+              printf "%s\n" "$rc" >"/out/rc/${name}.rc"
+            }
+            export -f run_lane
+            export F
+
+            run_lane compiler_generic_a compiler 1000003 "" &
+            run_lane compiler_generic_b compiler 1000033 "" &
+            run_lane interpreter_generic_a interpreter 2000003 "" &
+            run_lane interpreter_generic_b interpreter 2000033 "" &
+            wait
+
+            run_lane compiler_pow2 compiler 3000017 /out/focus/pow2.json &
+            run_lane compiler_dynjump compiler 4000037 /out/focus/dynjump.json &
+            run_lane compiler_callheavy compiler 5000087 /out/focus/callheavy.json &
+            run_lane compiler_stateheavy compiler 6000119 /out/focus/stateheavy.json &
+            wait
+          '
+
+      - name: Analyze results fail-closed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, pathlib, re
+          root = pathlib.Path('out')
+          lanes = []
+          candidate = False
+          for rc_path in sorted((root/'rc').glob('*.rc')):
+              name = rc_path.stem
+              rc = int(rc_path.read_text().strip())
+              log_path = root/'logs'/f'{name}.log'
+              text = log_path.read_text(errors='replace')
+              seeds = re.findall(r'Fuzzing with seed @ [^:]+: ([0-9]+)', text)
+              anomaly_terms = [
+                  'Assertion', 'assertion', 'terminate called', 'Aborted',
+                  'Segmentation fault', 'MONAD_ASSERT', 'FUZZER TIMEOUT',
+                  'state root', 'mismatch', 'FAILED'
+              ]
+              hits = sorted({term for term in anomaly_terms if term in text})
+              timed_out_normally = rc in (124, 137, 143)
+              lane_candidate = (not timed_out_normally and rc != 0) or bool(hits)
+              candidate |= lane_candidate
+              lanes.append({
+                  'name': name,
+                  'return_code': rc,
+                  'normal_timeout_or_success': timed_out_normally or rc == 0,
+                  'candidate_signal': lane_candidate,
+                  'anomaly_terms': hits,
+                  'seed_count': len(seeds),
+                  'first_seed': seeds[0] if seeds else None,
+                  'last_seed': seeds[-1] if seeds else None,
+                  'log_sha256': hashlib.sha256(log_path.read_bytes()).hexdigest(),
+                  'log_bytes': log_path.stat().st_size,
+              })
+          result = {
+              'source_commit': 'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0',
+              'reference': 'evmone',
+              'revision': 'OSAKA',
+              'lanes': lanes,
+              'candidate_signal': candidate,
+              'decision': 'CANDIDATE_REQUIRES_MINIMIZATION' if candidate else 'NO_DIFFERENTIAL_SIGNAL_IN_CAMPAIGN',
+          }
+          (root/'CAMPAIGN_RESULT.json').write_text(json.dumps(result, indent=2, sort_keys=True)+'\n')
+          print(json.dumps(result, indent=2))
+          PY
+          sha256sum out/logs/* out/rc/* out/focus/* out/meta/* out/CAMPAIGN_RESULT.json > out/SHA256SUMS
+          cp SOURCE_STATUS.txt SUBMODULES.txt out/meta/
+          tar --sort=name --mtime='UTC 2026-08-23' --owner=0 --group=0 --numeric-owner \
+            -C out -czf monad-v0160-vm-differential-campaign-20260823.tar.gz \
+            CAMPAIGN_RESULT.json SHA256SUMS logs rc focus meta monad-compiler-fuzzer
+          sha256sum monad-v0160-vm-differential-campaign-20260823.tar.gz > monad-v0160-vm-differential-campaign-20260823.tar.gz.sha256
+
+      - name: Upload campaign evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: monad-v0160-vm-differential-campaign-20260823
+          path: |
+            monad-v0160-vm-differential-campaign-20260823.tar.gz
+            monad-v0160-vm-differential-campaign-20260823.tar.gz.sha256
+            out/CAMPAIGN_RESULT.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
