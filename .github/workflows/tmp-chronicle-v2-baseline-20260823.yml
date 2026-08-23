@@ -1,0 +1,135 @@
+name: Temporary Chronicle Scribe v2 baseline 20260823
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "tmp-chronicle-v2-baseline-trigger.txt"
+      - ".github/workflows/tmp-chronicle-v2-baseline-20260823.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout exact Chronicle bounty source
+        uses: actions/checkout@v4
+        with:
+          repository: chronicleprotocol/scribe
+          ref: a5e0da3a498cb5883502a8fe05e16096254ec3ab
+          path: target
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Foundry nightly
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: nightly
+
+      - name: Install utilities and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils jq
+          OUT="$RUNNER_TEMP/chronicle-v2-baseline"
+          mkdir -p "$OUT/logs" "$OUT/audit_text" "$OUT/audit_renders"
+          cd target
+          git rev-parse HEAD | tee "$OUT/target-commit.txt"
+          git status --porcelain=v1 | tee "$OUT/worktree-before.txt"
+          git submodule status --recursive | tee "$OUT/submodules.txt"
+          forge --version | tee "$OUT/foundry-version.txt"
+          node --version | tee "$OUT/node-version.txt"
+          yarn --version | tee "$OUT/yarn-version.txt"
+          yarn install --frozen-lockfile 2>&1 | tee "$OUT/logs/yarn-install.log"
+
+      - name: Run official baseline and compatibility gates
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          OUT="$RUNNER_TEMP/chronicle-v2-baseline"
+          cd target
+          run_gate() {
+            local name="$1"; shift
+            echo "== $name ==" | tee "$OUT/logs/$name.log"
+            "$@" 2>&1 | tee -a "$OUT/logs/$name.log"
+            local rc=${PIPESTATUS[0]}
+            echo "$rc" > "$OUT/$name.exit"
+            return 0
+          }
+          run_gate forge-build forge build --force
+          run_gate official-ci env FOUNDRY_PROFILE=ci forge test -vvv --nmt FuzzDifferentialOracleSuite
+          run_gate solc-0.8.16 forge test --use 0.8.16 -vvv --nmt FuzzDifferentialOracleSuite
+          run_gate solc-0.8.27 forge test --use 0.8.27 -vvv --nmt FuzzDifferentialOracleSuite
+          run_gate no-via-ir env FOUNDRY_PROFILE=no-via-ir forge build --force
+          run_gate invariant-suite env FOUNDRY_PROFILE=ci forge test -vvv --match-path 'test/invariants/*'
+          git status --porcelain=v1 | tee "$OUT/worktree-after.txt"
+
+      - name: Export source, audits, and branch delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/chronicle-v2-baseline"
+          cd target
+          git fetch origin main --quiet
+          git log --oneline --decorate --all --max-count=100 > "$OUT/git-log.txt"
+          git diff --stat a5e0da3a498cb5883502a8fe05e16096254ec3ab..origin/main > "$OUT/v2-to-main.stat.txt"
+          git diff a5e0da3a498cb5883502a8fe05e16096254ec3ab..origin/main -- src docs test > "$OUT/v2-to-main.patch"
+          for pdf in audits/*.pdf; do
+            base=$(basename "$pdf" .pdf)
+            pdfinfo "$pdf" > "$OUT/audit_text/$base.pdfinfo.txt" || true
+            pdftotext -layout "$pdf" "$OUT/audit_text/$base.txt" || true
+            pdftoppm -f 1 -singlefile -png -r 120 "$pdf" "$OUT/audit_renders/$base-page1" || true
+          done
+          tar --exclude='./.git' --exclude='./out' --exclude='./cache' --exclude='./node_modules' -czf "$OUT/chronicle-scribe-v2-source.tar.gz" .
+
+      - name: Build machine-readable verdict
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/chronicle-v2-baseline"
+          mkdir -p "$OUT"
+          python3 - "$OUT" <<'PY'
+          import json, pathlib, sys
+          out = pathlib.Path(sys.argv[1])
+          names = ['forge-build','official-ci','solc-0.8.16','solc-0.8.27','no-via-ir','invariant-suite']
+          gates = {}
+          for name in names:
+              p = out / f'{name}.exit'
+              gates[name] = int(p.read_text().strip()) if p.exists() else None
+          result = {
+              'target': 'chronicleprotocol/scribe',
+              'branch': 'v2',
+              'commit': (out/'target-commit.txt').read_text().strip() if (out/'target-commit.txt').exists() else None,
+              'gates': gates,
+              'baseline_pass': all(v == 0 for v in gates.values() if v is not None) and all(v is not None for v in gates.values()),
+              'transactions_sent': 0,
+              'production_state_mutations': 0,
+          }
+          (out/'BASELINE.json').write_text(json.dumps(result, indent=2) + '\n')
+          lines = ['# Chronicle Scribe v2 baseline', '', f"- Commit: `{result['commit']}`", f"- Baseline pass: `{result['baseline_pass']}`", '- Transactions sent: `0`', '', '## Gates', '']
+          for name, rc in gates.items():
+              lines.append(f'- {name}: `exit={rc}`')
+          (out/'BASELINE.md').write_text('\n'.join(lines) + '\n')
+          PY
+          find "$OUT" -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 -r sha256sum > "$OUT/SHA256SUMS.txt"
+
+      - name: Upload baseline evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronicle-scribe-v2-baseline-20260823
+          path: ${{ runner.temp }}/chronicle-v2-baseline/
+          retention-days: 3
+          if-no-files-found: error
