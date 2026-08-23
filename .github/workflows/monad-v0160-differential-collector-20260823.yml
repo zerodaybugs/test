@@ -1,0 +1,203 @@
+name: Monad v0.16.0 differential collector 20260823
+
+on:
+  push:
+    branches:
+      - tooling/monad-v0160-differential-collector-20260823
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: zerodaybugs/test
+      RUN_OSAKA: '32661049895'
+      RUN_NATIVE: '32661386526'
+    steps:
+      - name: Checkout collector branch
+        uses: actions/checkout@v4
+        with:
+          ref: tooling/monad-v0160-differential-collector-20260823
+          fetch-depth: 0
+
+      - name: Wait for both campaigns and download their artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p collector/download collector/osaka collector/native
+
+          wait_run() {
+            local id="$1"
+            for _ in $(seq 1 140); do
+              status=$(gh api "repos/${REPO}/actions/runs/${id}" --jq .status)
+              if [[ "$status" == completed ]]; then
+                conclusion=$(gh api "repos/${REPO}/actions/runs/${id}" --jq .conclusion)
+                printf '%s\n' "$conclusion" > "collector/run-${id}.conclusion"
+                [[ "$conclusion" == success ]]
+                return
+              fi
+              sleep 30
+            done
+            echo "run ${id} did not complete inside collector window" >&2
+            exit 124
+          }
+
+          wait_run "$RUN_OSAKA" & p1=$!
+          wait_run "$RUN_NATIVE" & p2=$!
+          wait "$p1"
+          wait "$p2"
+
+          download_named_artifact() {
+            local run_id="$1" name="$2" out="$3"
+            artifact_id=$(gh api "repos/${REPO}/actions/runs/${run_id}/artifacts?per_page=100" \
+              --jq ".artifacts[] | select(.name == \"${name}\") | .id" | head -n1)
+            [[ -n "$artifact_id" ]]
+            gh api "repos/${REPO}/actions/artifacts/${artifact_id}/zip" > "$out"
+            unzip -t "$out" >/dev/null
+          }
+
+          download_named_artifact "$RUN_OSAKA" \
+            monad-v0160-vm-differential-campaign-20260823 \
+            collector/download/osaka.zip
+          download_named_artifact "$RUN_NATIVE" \
+            monad-v0160-native-revision-differential-20260823 \
+            collector/download/native.zip
+
+          unzip -q collector/download/osaka.zip -d collector/osaka
+          unzip -q collector/download/native.zip -d collector/native
+          find collector -maxdepth 3 -type f -printf '%P\n' | sort > collector/FILES.txt
+
+      - name: Create fail-closed combined decision
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, pathlib
+
+          root = pathlib.Path('collector')
+          def locate(name):
+              hits = list(root.rglob(name))
+              if len(hits) != 1:
+                  raise SystemExit(f'expected exactly one {name}, found {len(hits)}')
+              return hits[0]
+
+          osaka_path = locate('CAMPAIGN_RESULT.json')
+          native_path = locate('NATIVE_REVISION_RESULT.json')
+          osaka = json.loads(osaka_path.read_text())
+          native = json.loads(native_path.read_text())
+
+          candidate_lanes = []
+          for campaign_name, obj in [('osaka_reference', osaka), ('monad_native', native)]:
+              for lane in obj.get('lanes', []):
+                  if lane.get('candidate_signal'):
+                      candidate_lanes.append({
+                          'campaign': campaign_name,
+                          'name': lane.get('name'),
+                          'return_code': lane.get('return_code'),
+                          'anomaly_terms': lane.get('anomaly_terms', []),
+                          'first_seed': lane.get('first_seed'),
+                          'last_seed': lane.get('last_seed'),
+                          'log_sha256': lane.get('log_sha256'),
+                      })
+
+          combined = {
+              'scope': {
+                  'monad_bft_tag': 'v0.16.0',
+                  'monad_bft_commit': 'c616743d1358186605e1c1b74a3d6c4fdd9dd48c',
+                  'execution_commit': 'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0',
+              },
+              'campaigns': {
+                  'osaka_reference': osaka,
+                  'monad_native': native,
+              },
+              'candidate_lanes': candidate_lanes,
+              'candidate_count': len(candidate_lanes),
+              'submission_ready': False,
+              'critical_proven': False,
+              'high_proven': False,
+              'decision': (
+                  'CANDIDATES_REQUIRE_EXACT_MINIMIZATION_AND_FULLNODE_IMPACT_GATE'
+                  if candidate_lanes else
+                  'NO_VM_DIFFERENTIAL_SIGNAL_IN_CURRENT_EXACT_SOURCE_CAMPAIGNS'
+              ),
+              'reason_submission_closed': (
+                  'Raw fuzzer signals are never sufficient for a bounty report. Each signal must be '
+                  'replayed from the exact seed, minimized to one valid transaction or block, proven '
+                  'as an interpreter/compiler or slot/page state-root differential, and then bound to '
+                  'the normal monad-bft block-validation/finality path with negative and fixed controls.'
+              ),
+          }
+          out = root / 'MONAD_V0160_DIFFERENTIAL_COMBINED_DECISION.json'
+          out.write_text(json.dumps(combined, indent=2, sort_keys=True) + '\n')
+
+          md = [
+              '# Monad v0.16.0 differential campaign decision',
+              '',
+              f"**Decision:** `{combined['decision']}`",
+              '',
+              f"- Candidate lanes: **{len(candidate_lanes)}**",
+              '- Submit-ready: **no**',
+              '- High proven: **no**',
+              '- Critical proven: **no**',
+              '',
+          ]
+          if candidate_lanes:
+              md += ['## Candidate lanes', '']
+              for x in candidate_lanes:
+                  md.append(
+                      f"- `{x['campaign']} / {x['name']}`: rc={x['return_code']}, "
+                      f"terms={x['anomaly_terms']}, first_seed={x['first_seed']}, "
+                      f"last_seed={x['last_seed']}"
+                  )
+              md += ['', 'These are minimization inputs, not findings.']
+          else:
+              md += [
+                  'Both the official Osaka/reference campaign and the custom Monad-native '
+                  '`MONAD_NINE` / `MONAD_TEN` interpreter-versus-compiler campaign completed '
+                  'without a machine-classified differential signal.',
+              ]
+          md += [
+              '',
+              '## Release boundary',
+              '',
+              combined['reason_submission_closed'],
+              '',
+          ]
+          (root / 'MONAD_V0160_DIFFERENTIAL_COMBINED_DECISION.md').write_text('\n'.join(md))
+
+          checksums = []
+          for p in sorted(root.rglob('*')):
+              if p.is_file() and p.name != 'SHA256SUMS':
+                  checksums.append(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(root)}")
+          (root / 'SHA256SUMS').write_text('\n'.join(checksums) + '\n')
+          print(json.dumps({'decision': combined['decision'], 'candidate_count': len(candidate_lanes)}))
+          PY
+
+      - name: Commit compact result to collector branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add collector/MONAD_V0160_DIFFERENTIAL_COMBINED_DECISION.json \
+                  collector/MONAD_V0160_DIFFERENTIAL_COMBINED_DECISION.md \
+                  collector/SHA256SUMS \
+                  collector/FILES.txt \
+                  collector/run-*.conclusion
+          git commit -m 'research: collect Monad differential decisions [skip ci]'
+          git push origin HEAD:tooling/monad-v0160-differential-collector-20260823
+
+      - name: Upload full collection
+        uses: actions/upload-artifact@v7
+        with:
+          name: monad-v0160-differential-collector-20260823
+          path: collector
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
