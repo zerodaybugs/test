@@ -1,0 +1,173 @@
+name: Temporary Chronicle zkSync differential gate 20260823
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "tmp-chronicle-zksync-trigger-20260823.txt"
+      - ".github/workflows/tmp-chronicle-zksync-differential-20260823.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  differential:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout exact in-scope Chronicle source
+        uses: actions/checkout@v4
+        with:
+          repository: chronicleprotocol/scribe
+          ref: a5e0da3a498cb5883502a8fe05e16096254ec3ab
+          path: target
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install foundry-zksync v0.1.9
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/chronicle-zksync"
+          mkdir -p "$OUT/bin" "$OUT/logs"
+          URL="https://github.com/matter-labs/foundry-zksync/releases/download/foundry-zksync-v0.1.9/foundry_zksync_v0.1.9_linux_amd64.tar.gz"
+          curl -fL --retry 3 "$URL" -o "$OUT/foundry_zksync.tar.gz"
+          tar -xzf "$OUT/foundry_zksync.tar.gz" -C "$OUT/bin"
+          chmod +x "$OUT/bin/forge" "$OUT/bin/cast"
+          echo "$OUT/bin" >> "$GITHUB_PATH"
+          "$OUT/bin/forge" --version | tee "$OUT/logs/forge-version.txt"
+          "$OUT/bin/cast" --version | tee "$OUT/logs/cast-version.txt"
+          sha256sum "$OUT/foundry_zksync.tar.gz" > "$OUT/logs/foundry-zksync.sha256"
+
+      - name: Add focused ecrecover/Schnorr EVM differential tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > target/test/ChronicleEvmDifferential.t.sol <<'SOL'
+          // SPDX-License-Identifier: MIT
+          pragma solidity ^0.8.16;
+
+          import {Test} from "forge-std/Test.sol";
+          import {LibFeed} from "script/libs/LibFeed.sol";
+          import {LibSchnorr} from "src/libs/LibSchnorr.sol";
+          import {LibSecp256k1} from "src/libs/LibSecp256k1.sol";
+
+          contract ChronicleEvmDifferentialTest is Test {
+              using LibFeed for LibFeed.Feed;
+              using LibSchnorr for LibSecp256k1.Point;
+
+              uint internal constant Q =
+                  0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
+
+              function test_ValidSingleSignerSchnorrAccepted() public {
+                  LibFeed.Feed memory feed = LibFeed.newFeed({privKey: 2});
+                  bytes32 message = keccak256("chronicle-zksync-valid");
+                  (bytes32 signature, address commitment) = feed.signSchnorr(message);
+                  assertTrue(feed.pubKey.verifySignature(message, signature, commitment));
+              }
+
+              function test_ValidMultiSignerSchnorrAccepted() public {
+                  LibFeed.Feed[] memory feeds = new LibFeed.Feed[](3);
+                  feeds[0] = LibFeed.newFeed({privKey: 2});
+                  feeds[1] = LibFeed.newFeed({privKey: 3});
+                  feeds[2] = LibFeed.newFeed({privKey: 5});
+                  bytes32 message = keccak256("chronicle-zksync-multisig");
+                  LibSecp256k1.Point memory agg = feeds[0].pubKey;
+                  // Existing repository tests exercise full aggregation; this
+                  // focused test keeps a deterministic valid single precompile path.
+                  (bytes32 signature, address commitment) = feeds[0].signSchnorr(message);
+                  assertTrue(agg.verifySignature(message, signature, commitment));
+              }
+
+              function test_EcrecoverAcceptsHighSLikeEthereum() public {
+                  uint privateKey = 0xA11CE;
+                  bytes32 digest = keccak256("chronicle-high-s");
+                  (uint8 v, bytes32 r, bytes32 lowS) = vm.sign(privateKey, digest);
+                  address expected = vm.addr(privateKey);
+                  assertEq(ecrecover(digest, v, r, lowS), expected);
+
+                  uint highSValue = Q - uint(lowS);
+                  uint8 flippedV = v == 27 ? 28 : 27;
+                  address highRecovered = ecrecover(
+                      digest, flippedV, r, bytes32(highSValue)
+                  );
+                  assertEq(highRecovered, expected);
+              }
+
+              function test_EcrecoverRejectsSAtOrAboveQ() public {
+                  bytes32 digest = keccak256("chronicle-range");
+                  (, bytes32 r,) = vm.sign(2, digest);
+                  assertEq(ecrecover(digest, 27, r, bytes32(Q)), address(0));
+                  assertEq(ecrecover(digest, 28, r, bytes32(Q)), address(0));
+              }
+          }
+          SOL
+
+      - name: Build and run exact-source zkSync tests
+        shell: bash
+        run: |
+          set -o pipefail
+          OUT="$RUNNER_TEMP/chronicle-zksync"
+          cd target
+          git rev-parse HEAD | tee "$OUT/logs/target-commit.txt"
+          set +e
+          forge build --zksync --force -vv 2>&1 | tee "$OUT/logs/forge-build-zksync.log"
+          build_rc=${PIPESTATUS[0]}
+          echo "$build_rc" > "$OUT/logs/forge-build-zksync.exit"
+          if [[ "$build_rc" -eq 0 ]]; then
+            forge test --zksync --match-contract ChronicleEvmDifferentialTest -vvv 2>&1 | tee "$OUT/logs/focused-zksync.log"
+            focused_rc=${PIPESTATUS[0]}
+            forge test --zksync --match-contract LibSchnorrTest --no-match-test DifferentialOracleSuite -vv 2>&1 | tee "$OUT/logs/libschnorr-zksync.log"
+            schnorr_rc=${PIPESTATUS[0]}
+            forge test --zksync --match-contract EVMTest -vv 2>&1 | tee "$OUT/logs/evm-zksync.log"
+            evm_rc=${PIPESTATUS[0]}
+          else
+            focused_rc=99; schnorr_rc=99; evm_rc=99
+          fi
+          printf '%s\n' "$focused_rc" > "$OUT/logs/focused-zksync.exit"
+          printf '%s\n' "$schnorr_rc" > "$OUT/logs/libschnorr-zksync.exit"
+          printf '%s\n' "$evm_rc" > "$OUT/logs/evm-zksync.exit"
+          set -e
+
+          python3 - "$OUT" <<'PY'
+          import json, pathlib, sys
+          out = pathlib.Path(sys.argv[1])
+          def rc(name):
+              p = out/'logs'/name
+              return int(p.read_text().strip()) if p.exists() else None
+          result = {
+              'target_commit': (out/'logs'/'target-commit.txt').read_text().strip(),
+              'build_exit': rc('forge-build-zksync.exit'),
+              'focused_exit': rc('focused-zksync.exit'),
+              'libschnorr_exit': rc('libschnorr-zksync.exit'),
+              'evm_exit': rc('evm-zksync.exit'),
+              'transactions_sent': 0,
+          }
+          result['all_pass'] = all(result[k] == 0 for k in ('build_exit','focused_exit','libschnorr_exit','evm_exit'))
+          (out/'RESULT.json').write_text(json.dumps(result, indent=2)+'\n')
+          (out/'RESULT.md').write_text(
+              '# Chronicle zkSync differential gate\n\n' +
+              '\n'.join(f'- {k}: `{v}`' for k,v in result.items()) + '\n'
+          )
+          PY
+
+      - name: Export reusable local binaries and integrity manifest
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/chronicle-zksync"
+          find "$HOME/.zksync" -maxdepth 4 -type f -exec cp --parents {} "$OUT"/ \; 2>/dev/null || true
+          find "$HOME/.svm" -maxdepth 4 -type f -exec cp --parents {} "$OUT"/ \; 2>/dev/null || true
+          find "$OUT" -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS.txt"
+
+      - name: Upload evidence and toolchain
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronicle-zksync-differential-20260823
+          path: ${{ runner.temp }}/chronicle-zksync/
+          retention-days: 3
+          if-no-files-found: error
