@@ -1,0 +1,232 @@
+name: Monad v0.16.0 VM sanitizer campaign 20260823
+
+on:
+  push:
+    branches:
+      - tooling/monad-v0160-vm-sanitizer-campaign-20260823
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sanitizer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 105
+    steps:
+      - name: Checkout tooling branch
+        uses: actions/checkout@v4
+
+      - name: Clone exact public execution source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global submodule.fetchJobs "$(nproc)"
+          git clone --recurse-submodules https://github.com/category-labs/monad.git monad-execution
+          cd monad-execution
+          git checkout e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+          git submodule update --init --recursive
+          test "$(git rev-parse HEAD)" = "e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0"
+          git status --porcelain=v1 > ../SOURCE_STATUS.txt
+          test ! -s ../SOURCE_STATUS.txt
+          git submodule status --recursive > ../SUBMODULES.txt
+
+      - name: Build official dependency image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --target base -t monad-v0160-base -f monad-execution/docker/Dockerfile monad-execution
+
+      - name: Build exact differential fuzzer with ASan and UBSan
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/bin out/logs out/rc out/meta out/focus
+          docker run --name monad-v0160-sanitizer \
+            -v "$PWD/monad-execution:/src" \
+            -v "$PWD/out:/out" \
+            monad-v0160-base bash -lc '
+              set -euo pipefail
+              cd /src
+              rm -rf build-sanitize
+              SAN="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all"
+              CC=clang-19 CXX=clang++-19 cmake -S . -B build-sanitize -GNinja \
+                -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DCMAKE_TOOLCHAIN_FILE=category/core/toolchains/gcc-avx2.cmake \
+                -DMONAD_COMPILER_TESTING=On \
+                -DCMAKE_C_FLAGS="$SAN" \
+                -DCMAKE_CXX_FLAGS="$SAN" \
+                -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+                -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
+              cmake --build build-sanitize -t monad-compiler-fuzzer --parallel "$(nproc)"
+              cp build-sanitize/test/vm/fuzzer/monad-compiler-fuzzer /out/bin/
+              sha256sum /out/bin/monad-compiler-fuzzer > /out/meta/BINARY_SHA256.txt
+              clang-19 --version > /out/meta/CLANG_VERSION.txt
+              clang++-19 --version > /out/meta/CLANGXX_VERSION.txt
+              cmake --version > /out/meta/CMAKE_VERSION.txt
+              ninja --version > /out/meta/NINJA_VERSION.txt
+              ldd /out/bin/monad-compiler-fuzzer > /out/meta/BINARY_LDD.txt
+            '
+
+      - name: Execute sanitizer baseline and campaigns
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > out/focus/stateheavy.json <<'JSON'
+          {
+            "valid_address_prob": 0.80,
+            "random_constant_with_cleared_words_prob": 0.22,
+            "meaningful_constant_prob": 0.22,
+            "small_constant_prob": 0.18,
+            "push_weight": 0.14,
+            "dup_weight": 0.14,
+            "call_weight": 0.03,
+            "returndatacopy_weight": 0.03,
+            "create_weight": 0.03,
+            "uncommon_non_term_weight": 0.45,
+            "valid_jump_prob": 0.95
+          }
+          JSON
+          cat > out/focus/callheavy.json <<'JSON'
+          {
+            "valid_address_prob": 0.95,
+            "meaningful_constant_prob": 0.20,
+            "small_constant_prob": 0.20,
+            "push_weight": 0.16,
+            "dup_weight": 0.16,
+            "call_weight": 0.22,
+            "returndatacopy_weight": 0.12,
+            "create_weight": 0.12,
+            "uncommon_non_term_weight": 0.15,
+            "valid_jump_prob": 0.95
+          }
+          JSON
+          docker start monad-v0160-sanitizer >/dev/null
+          docker exec monad-v0160-sanitizer bash -lc '
+            set -euo pipefail
+            F=/out/bin/monad-compiler-fuzzer
+            export ASAN_OPTIONS=abort_on_error=1:detect_leaks=0:strict_string_checks=1:check_initialization_order=1:allocator_may_return_null=0
+            export UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
+
+            set +e
+            MONAD_COMPILER_FUZZING=1 timeout --signal=TERM --kill-after=15s 180s \
+              stdbuf -oL -eL "$F" --implementation compiler --revision OSAKA \
+              --seed 919191 --iterations-per-run 3 --messages 2 --runs 3 --print-stats \
+              >/out/logs/baseline.log 2>&1
+            rc=$?
+            set -e
+            printf "%s\n" "$rc" >/out/rc/baseline.rc
+
+            run_lane() {
+              name="$1"; impl="$2"; seed="$3"; focus="$4"
+              args=(--implementation "$impl" --revision OSAKA --seed "$seed" --iterations-per-run 50 --messages 4 --runs 100000000 --print-stats)
+              if [[ -n "$focus" ]]; then args+=(--focus "$focus"); fi
+              set +e
+              MONAD_COMPILER_FUZZING=1 timeout --signal=TERM --kill-after=20s 720s \
+                stdbuf -oL -eL "$F" "${args[@]}" >"/out/logs/${name}.log" 2>&1
+              rc=$?
+              set -e
+              printf "%s\n" "$rc" >"/out/rc/${name}.rc"
+            }
+            export -f run_lane
+            export F ASAN_OPTIONS UBSAN_OPTIONS
+            run_lane compiler_generic compiler 920003 "" &
+            run_lane compiler_stateheavy compiler 920033 /out/focus/stateheavy.json &
+            run_lane compiler_callheavy compiler 920087 /out/focus/callheavy.json &
+            run_lane interpreter_generic interpreter 920119 "" &
+            wait
+          '
+
+      - name: Analyze sanitizer evidence fail-closed
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp SOURCE_STATUS.txt SUBMODULES.txt out/meta/
+          python3 - <<'PY'
+          import hashlib, json, pathlib, re
+          root = pathlib.Path('out')
+          sanitizer_patterns = [
+              r'ERROR: AddressSanitizer',
+              r'AddressSanitizer:DEADLYSIGNAL',
+              r'runtime error:',
+              r'UndefinedBehaviorSanitizer',
+              r'SUMMARY: AddressSanitizer',
+              r'SUMMARY: UndefinedBehaviorSanitizer',
+              r'heap-use-after-free',
+              r'stack-use-after',
+              r'buffer-overflow',
+              r'out of bounds',
+              r'misaligned address',
+              r'signed integer overflow',
+          ]
+          baseline_text = (root/'logs'/'baseline.log').read_text(errors='replace')
+          baseline_hits = [p for p in sanitizer_patterns if re.search(p, baseline_text, re.I)]
+          baseline_rc = int((root/'rc'/'baseline.rc').read_text().strip())
+          baseline_clean = baseline_rc == 0 and not baseline_hits
+          lanes = []
+          candidates = []
+          for log_path in sorted((root/'logs').glob('*.log')):
+              if log_path.name == 'baseline.log':
+                  continue
+              name = log_path.stem
+              text = log_path.read_text(errors='replace')
+              rc = int((root/'rc'/f'{name}.rc').read_text().strip())
+              hits = [p for p in sanitizer_patterns if re.search(p, text, re.I)]
+              seed_lines = re.findall(r'Fuzzing with seed @ [^:]+: ([0-9]+)', text)
+              normal_timeout = rc in (124, 137, 143)
+              candidate = baseline_clean and (bool(hits) or (not normal_timeout and rc != 0))
+              item = {
+                  'name': name,
+                  'return_code': rc,
+                  'normal_timeout_or_success': normal_timeout or rc == 0,
+                  'sanitizer_hits': hits,
+                  'candidate_signal': candidate,
+                  'seed_count': len(seed_lines),
+                  'first_seed': seed_lines[0] if seed_lines else None,
+                  'last_seed': seed_lines[-1] if seed_lines else None,
+                  'log_sha256': hashlib.sha256(log_path.read_bytes()).hexdigest(),
+                  'log_bytes': log_path.stat().st_size,
+              }
+              lanes.append(item)
+              if candidate:
+                  candidates.append(item)
+          decision = (
+              'BASELINE_SANITIZER_FAILURE_NOT_A_FINDING'
+              if not baseline_clean else
+              ('CANDIDATE_REQUIRES_SEED_REPLAY_AND_MINIMIZATION' if candidates else 'NO_SANITIZER_SIGNAL')
+          )
+          result = {
+              'source_commit': 'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0',
+              'baseline_return_code': baseline_rc,
+              'baseline_hits': baseline_hits,
+              'baseline_clean': baseline_clean,
+              'lanes': lanes,
+              'candidate_count': len(candidates),
+              'submission_ready': False,
+              'high_proven': False,
+              'critical_proven': False,
+              'decision': decision,
+          }
+          (root/'SANITIZER_RESULT.json').write_text(json.dumps(result, indent=2, sort_keys=True)+'\n')
+          print(json.dumps(result, indent=2))
+          PY
+          sha256sum out/bin/* out/logs/* out/rc/* out/focus/* out/meta/* out/SANITIZER_RESULT.json > out/SHA256SUMS
+          tar --sort=name --mtime='UTC 2026-08-23' --owner=0 --group=0 --numeric-owner \
+            -C out -czf monad-v0160-vm-sanitizer-campaign-20260823.tar.gz \
+            SANITIZER_RESULT.json SHA256SUMS bin logs rc focus meta
+          sha256sum monad-v0160-vm-sanitizer-campaign-20260823.tar.gz > monad-v0160-vm-sanitizer-campaign-20260823.tar.gz.sha256
+
+      - name: Upload sanitizer evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: monad-v0160-vm-sanitizer-campaign-20260823
+          path: |
+            monad-v0160-vm-sanitizer-campaign-20260823.tar.gz
+            monad-v0160-vm-sanitizer-campaign-20260823.tar.gz.sha256
+            out/SANITIZER_RESULT.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
