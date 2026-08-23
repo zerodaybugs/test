@@ -1,0 +1,125 @@
+name: Temporary OKX Aptos escrow read-only census 2026-08-23
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .tmp/okx-aptos-escrow-census-20260823.txt
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Query public Aptos mainnet APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          python3 - <<'PY'
+          import json, re, urllib.request, urllib.error
+          from pathlib import Path
+
+          REST = 'https://api.mainnet.aptoslabs.com/v1'
+          GRAPHQL = 'https://api.mainnet.aptoslabs.com/v1/graphql'
+          DEPLOYER = '0x14b2864b0df3553a864dc8560925309ff05bde4dec5a731b54e6f3cee541ef91'
+          PACKAGE = '0xd7ed3ceeb92c4e5a413e8ad7fab83ced12bf4141a49248a91b5485cb45a0ef4b'
+          out = Path('artifact')
+
+          def get(url):
+              req = urllib.request.Request(url, headers={'User-Agent':'okx-readonly-census/1.0'})
+              try:
+                  with urllib.request.urlopen(req, timeout=45) as r:
+                      body = r.read()
+                      return r.status, body
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read()
+              except Exception as e:
+                  return 0, repr(e).encode()
+
+          def post_json(url, obj):
+              data = json.dumps(obj).encode()
+              req = urllib.request.Request(url, data=data, method='POST', headers={
+                  'Content-Type':'application/json', 'User-Agent':'okx-readonly-census/1.0'
+              })
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      body = r.read()
+                      return r.status, body
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read()
+              except Exception as e:
+                  return 0, repr(e).encode()
+
+          status, body = get(f'{REST}/accounts/{DEPLOYER}/resources')
+          (out/'deployer-resources.json').write_bytes(body)
+          (out/'deployer-resources.status').write_text(str(status)+'\n')
+          resources = json.loads(body) if status == 200 else []
+          ra = [r for r in resources if isinstance(r,dict) and r.get('type','').endswith('::proxy::ResourceAccount')]
+          (out/'resource-account-resource.json').write_text(json.dumps(ra, indent=2, sort_keys=True))
+
+          candidates = set()
+          def walk(v, key=''):
+              if isinstance(v, dict):
+                  for k,x in v.items(): walk(x,k)
+              elif isinstance(v, list):
+                  for x in v: walk(x,key)
+              elif isinstance(v, str):
+                  s=v.lower()
+                  if re.fullmatch(r'0x[0-9a-f]{1,64}', s) and ('account' in key.lower() or 'address' in key.lower()):
+                      candidates.add('0x'+s[2:].rjust(64,'0'))
+          walk(ra)
+          candidates.discard('0x'+DEPLOYER[2:].rjust(64,'0'))
+          candidates.discard('0x'+PACKAGE[2:].rjust(64,'0'))
+          (out/'resource-address-candidates.txt').write_text('\n'.join(sorted(candidates))+'\n')
+
+          summary=[]
+          for addr in sorted(candidates):
+              status, body = get(f'{REST}/accounts/{addr}/resources')
+              safe=addr[2:10]
+              (out/f'{safe}-resources.json').write_bytes(body)
+              (out/f'{safe}-resources.status').write_text(str(status)+'\n')
+              coin_nonzero=[]
+              if status == 200:
+                  try:
+                      items=json.loads(body)
+                  except Exception:
+                      items=[]
+                  for item in items:
+                      typ=item.get('type','') if isinstance(item,dict) else ''
+                      data=item.get('data',{}) if isinstance(item,dict) else {}
+                      if '::coin::CoinStore<' in typ:
+                          value=((data.get('coin') or {}).get('value'))
+                          try: amount=int(value)
+                          except Exception: amount=None
+                          if amount:
+                              coin_nonzero.append({'type':typ,'amount':str(amount)})
+                  (out/f'{safe}-nonzero-coinstores.json').write_text(json.dumps(coin_nonzero, indent=2, sort_keys=True))
+
+              # Minimal GraphQL balance query, no metadata relation required.
+              query='''query Balances($owner: String!) { current_fungible_asset_balances(where: {owner_address: {_eq: $owner}, amount: {_gt: "0"}}, limit: 1000) { owner_address asset_type amount token_standard is_frozen storage_id } }'''
+              gs, gb = post_json(GRAPHQL, {'query':query,'variables':{'owner':addr}})
+              (out/f'{safe}-fa-balances-graphql.json').write_bytes(gb)
+              (out/f'{safe}-fa-balances-graphql.status').write_text(str(gs)+'\n')
+
+              txs, tb = get(f'{REST}/accounts/{addr}/transactions?limit=100')
+              (out/f'{safe}-transactions.json').write_bytes(tb)
+              (out/f'{safe}-transactions.status').write_text(str(txs)+'\n')
+              summary.append({'address':addr,'resources_status':status,'nonzero_coin_stores':coin_nonzero,'graphql_status':gs,'transactions_status':txs})
+
+          (out/'summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True))
+          (out/'captured-at-utc.txt').write_text(__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()+'\n')
+          PY
+          find artifact -type f -print0 | sort -z | xargs -0 sha256sum > artifact/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: okx-aptos-escrow-readonly-census
+          path: artifact
+          retention-days: 1
+          if-no-files-found: error
