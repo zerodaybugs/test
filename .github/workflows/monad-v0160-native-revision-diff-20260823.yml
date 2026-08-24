@@ -1,4 +1,4 @@
-name: Monad v0.16.0 native revision differential 20260823
+name: Monad v0.16.0 native revision differential 20260824
 
 on:
   push:
@@ -15,7 +15,7 @@ permissions:
 jobs:
   differential:
     runs-on: ubuntu-latest
-    timeout-minutes: 105
+    timeout-minutes: 80
     steps:
       - name: Checkout tooling branch
         uses: actions/checkout@v4
@@ -95,7 +95,6 @@ jobs:
               start = s.index("    auto evmone_vm = evmc::VM(evmc_create_evmone());")
               end = s.index("    auto monad_state = [&] {", start)
               s = s[:start] + (
-                  "    // Reference engine: exact Monad interpreter under the same native revision.\n"
                   "    auto evmone_state =\n"
                   "        std::make_shared<FuzzerTestState>(vm::VM::InterpreterOnly);\n\n"
               ) + s[end:]
@@ -185,99 +184,135 @@ jobs:
 
           docker start monad-v0160-native-diff >/dev/null
           docker exec monad-v0160-native-diff bash -lc '
-            set -euo pipefail
+            set -uo pipefail
             run_lane() {
               name="$1"; binary="$2"; seed="$3"; focus="$4"; nohook="$5"
               args=(--implementation compiler --revision OSAKA --seed "$seed" --iterations-per-run 100 --messages 4 --runs 100000000 --print-stats)
               if [[ -n "$focus" ]]; then args+=(--focus "$focus"); fi
-              set +e
               if [[ "$nohook" == 1 ]]; then
-                MONAD_COMPILER_FUZZING=1 MONAD_FUZZ_NO_HOOK=1 timeout --signal=TERM --kill-after=20s 720s \
+                timeout --signal=TERM --kill-after=20s 300s \
+                  env MONAD_COMPILER_FUZZING=1 MONAD_FUZZ_NO_HOOK=1 \
                   stdbuf -oL -eL "$binary" "${args[@]}" >"/out/logs/${name}.log" 2>&1
               else
-                MONAD_COMPILER_FUZZING=1 timeout --signal=TERM --kill-after=20s 720s \
+                timeout --signal=TERM --kill-after=20s 300s \
+                  env MONAD_COMPILER_FUZZING=1 \
                   stdbuf -oL -eL "$binary" "${args[@]}" >"/out/logs/${name}.log" 2>&1
               fi
               rc=$?
-              set -e
               printf "%s\n" "$rc" >"/out/rc/${name}.rc"
+              return 0
             }
-            export -f run_lane
+            wait_group() {
+              local pid
+              for pid in "$@"; do
+                wait "$pid" || true
+              done
+            }
 
             for rev in nine ten; do
               B="/out/bin/monad-${rev}-differential-fuzzer"
               base=$([[ "$rev" == nine ]] && echo 7100000 || echo 8100000)
-              run_lane "${rev}_nohook_generic" "$B" "$((base + 3))" "" 1 &
-              run_lane "${rev}_nohook_stateheavy" "$B" "$((base + 31))" /out/focus/stateheavy.json 1 &
-              run_lane "${rev}_hook_generic" "$B" "$((base + 67))" "" 0 &
-              run_lane "${rev}_hook_callcreate" "$B" "$((base + 103))" /out/focus/callcreate.json 0 &
-              wait
+              run_lane "${rev}_nohook_generic" "$B" "$((base + 3))" "" 1 & p1=$!
+              run_lane "${rev}_nohook_stateheavy" "$B" "$((base + 31))" /out/focus/stateheavy.json 1 & p2=$!
+              run_lane "${rev}_hook_generic" "$B" "$((base + 67))" "" 0 & p3=$!
+              run_lane "${rev}_hook_callcreate" "$B" "$((base + 103))" /out/focus/callcreate.json 0 & p4=$!
+              wait_group "$p1" "$p2" "$p3" "$p4"
             done
+
+            test "$(find /out/rc -maxdepth 1 -type f -name "*.rc" | wc -l)" -eq 8
+            test "$(find /out/logs -maxdepth 1 -type f -name "*.log" | wc -l)" -eq 8
           '
 
       - name: Analyze native-revision results fail-closed
+        if: always()
         shell: bash
         run: |
-          set -euo pipefail
-          cp SOURCE_STATUS.txt SUBMODULES.txt out/meta/
+          set -uo pipefail
+          mkdir -p out/meta out/logs out/rc out/bin
+          cp SOURCE_STATUS.txt SUBMODULES.txt out/meta/ 2>/dev/null || true
           python3 - <<'PY'
           import hashlib, json, pathlib, re
           root = pathlib.Path('out')
+          expected = [
+              'nine_nohook_generic', 'nine_nohook_stateheavy',
+              'nine_hook_generic', 'nine_hook_callcreate',
+              'ten_nohook_generic', 'ten_nohook_stateheavy',
+              'ten_hook_generic', 'ten_hook_callcreate',
+          ]
+          expected_timeout_codes = {124, 137, 143}
+          markers = [
+              'MONAD_ASSERT', 'Assertion `', 'Assertion failed',
+              'terminate called', 'Segmentation fault', 'Illegal instruction',
+              'Aborted (core dumped)', 'AddressSanitizer', 'UndefinedBehaviorSanitizer',
+          ]
           lanes = []
+          missing = []
           candidate = False
-          for rc_path in sorted((root/'rc').glob('*.rc')):
-              name = rc_path.stem
-              rc = int(rc_path.read_text().strip())
+          for name in expected:
+              rc_path = root/'rc'/f'{name}.rc'
               log_path = root/'logs'/f'{name}.log'
+              if not rc_path.is_file() or not log_path.is_file():
+                  missing.append(name)
+                  continue
+              try:
+                  rc = int(rc_path.read_text().strip())
+              except Exception:
+                  missing.append(name)
+                  continue
               text = log_path.read_text(errors='replace')
               seeds = re.findall(r'Fuzzing with seed @ [^:]+: ([0-9]+)', text)
-              terms = [
-                  'Assertion', 'assertion', 'terminate called', 'Aborted',
-                  'Segmentation fault', 'MONAD_ASSERT', 'FUZZER TIMEOUT',
-                  'state root', 'mismatch', 'FAILED', 'Illegal instruction'
-              ]
-              hits = sorted({term for term in terms if term in text})
-              expected_timeout = rc in (124, 137, 143)
-              signal = (not expected_timeout and rc != 0) or bool(hits)
+              hits = sorted({term for term in markers if term in text})
+              signal = (rc not in expected_timeout_codes and rc != 0) or bool(hits)
               candidate |= signal
               lanes.append({
                   'name': name,
                   'return_code': rc,
-                  'expected_timeout_or_success': expected_timeout or rc == 0,
+                  'expected_timeout_or_success': rc in expected_timeout_codes or rc == 0,
                   'candidate_signal': signal,
-                  'anomaly_terms': hits,
+                  'anomaly_markers': hits,
                   'seed_count': len(seeds),
                   'first_seed': seeds[0] if seeds else None,
                   'last_seed': seeds[-1] if seeds else None,
                   'log_sha256': hashlib.sha256(log_path.read_bytes()).hexdigest(),
                   'log_bytes': log_path.stat().st_size,
               })
+          if missing:
+              decision = 'HARNESS_INCOMPLETE'
+          elif candidate:
+              decision = 'CANDIDATE_REQUIRES_MINIMIZATION'
+          else:
+              decision = 'NO_NATIVE_REVISION_DIFFERENTIAL_SIGNAL'
           result = {
               'source_commit': 'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0',
               'reference_engine': 'Monad InterpreterOnly',
               'candidate_engine': 'Monad CompilerOnly',
               'native_revisions': ['MONAD_NINE', 'MONAD_TEN'],
               'monad_ten_page_encoded_state': True,
+              'expected_lane_count': len(expected),
+              'completed_lane_count': len(lanes),
+              'missing_lanes': missing,
               'lanes': lanes,
               'candidate_signal': candidate,
-              'decision': 'CANDIDATE_REQUIRES_MINIMIZATION' if candidate else 'NO_NATIVE_REVISION_DIFFERENTIAL_SIGNAL',
+              'decision': decision,
+              'submission_ready': False,
           }
           (root/'NATIVE_REVISION_RESULT.json').write_text(json.dumps(result, indent=2, sort_keys=True)+'\n')
           print(json.dumps(result, indent=2))
           PY
-          sha256sum out/bin/* out/logs/* out/rc/* out/focus/* out/meta/* out/NATIVE_REVISION_RESULT.json > out/SHA256SUMS
-          tar --sort=name --mtime='UTC 2026-08-23' --owner=0 --group=0 --numeric-owner \
-            -C out -czf monad-v0160-native-revision-differential-20260823.tar.gz \
+          find out -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > out/SHA256SUMS
+          tar --sort=name --mtime='UTC 2026-08-24' --owner=0 --group=0 --numeric-owner \
+            -C out -czf monad-v0160-native-revision-differential-20260824.tar.gz \
             NATIVE_REVISION_RESULT.json SHA256SUMS bin logs rc focus meta
-          sha256sum monad-v0160-native-revision-differential-20260823.tar.gz > monad-v0160-native-revision-differential-20260823.tar.gz.sha256
+          sha256sum monad-v0160-native-revision-differential-20260824.tar.gz > monad-v0160-native-revision-differential-20260824.tar.gz.sha256
 
       - name: Upload native-revision evidence
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: monad-v0160-native-revision-differential-20260823
+          name: monad-v0160-native-revision-differential-20260824
           path: |
-            monad-v0160-native-revision-differential-20260823.tar.gz
-            monad-v0160-native-revision-differential-20260823.tar.gz.sha256
+            monad-v0160-native-revision-differential-20260824.tar.gz
+            monad-v0160-native-revision-differential-20260824.tar.gz.sha256
             out/NATIVE_REVISION_RESULT.json
           if-no-files-found: error
           retention-days: 1
