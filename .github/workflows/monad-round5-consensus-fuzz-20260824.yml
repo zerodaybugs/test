@@ -1,0 +1,146 @@
+name: Monad v0.16.0 Round 5 consensus fuzz 20260824
+
+on:
+  push:
+    branches:
+      - tooling/monad-round5-consensus-fuzz-20260824
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone exact scoped source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --recurse-submodules https://github.com/category-labs/monad-bft.git monad-bft
+          cd monad-bft
+          git checkout c616743d1358186605e1c1b74a3d6c4fdd9dd48c
+          git submodule update --init --recursive
+          test "$(git rev-parse HEAD)" = "c616743d1358186605e1c1b74a3d6c4fdd9dd48c"
+          git status --porcelain=v1 > ../SOURCE_STATUS.txt
+          test ! -s ../SOURCE_STATUS.txt
+          git submodule status --recursive > ../SUBMODULES.txt
+
+      - name: Install fuzz toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly install cargo-fuzz --locked
+          rustc +nightly --version > RUSTC_NIGHTLY.txt
+          cargo +nightly fuzz --version > CARGO_FUZZ_VERSION.txt
+
+      - name: Inventory and select security-relevant targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/logs out/rc out/artifacts out/meta
+          cp SOURCE_STATUS.txt SUBMODULES.txt RUSTC_NIGHTLY.txt CARGO_FUZZ_VERSION.txt out/meta/
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,json
+          root=Path('monad-bft')
+          targets=[]
+          for manifest in root.rglob('fuzz/Cargo.toml'):
+              text=manifest.read_text(errors='replace')
+              for block in re.findall(r'\[\[bin\]\](.*?)(?=\n\[|\Z)',text,re.S):
+                  m=re.search(r'(?m)^\s*name\s*=\s*["\']([^"\']+)',block)
+                  if not m: continue
+                  name=m.group(1)
+                  low=(str(manifest)+' '+name).lower()
+                  score=sum(w for token,w in {
+                      'consensus':10,'certificate':10,'message':8,'validation':8,
+                      'parser':8,'decode':7,'rlp':7,'raptor':7,'vote':6,
+                      'timeout':6,'proposal':6,'network':5,'state':3
+                  }.items() if token in low)
+                  targets.append({'fuzz_dir':str(manifest.parent),'manifest':str(manifest),'target':name,'score':score})
+          targets.sort(key=lambda x:(-x['score'],x['fuzz_dir'],x['target']))
+          selected=targets[:8]
+          Path('out/TARGET_INVENTORY.json').write_text(json.dumps({'all':targets,'selected':selected},indent=2)+'\n')
+          with open('out/SELECTED.tsv','w') as f:
+              for x in selected: f.write(f"{x['fuzz_dir']}\t{x['target']}\t{x['score']}\n")
+          PY
+
+      - name: Build and run selected fuzz targets
+        shell: bash
+        run: |
+          set -u
+          while IFS=$'\t' read -r dir target score; do
+            [[ -n "$dir" && -n "$target" ]] || continue
+            slug=$(printf '%s__%s' "$dir" "$target" | sed 's#[^A-Za-z0-9_.-]#_#g')
+            mkdir -p "out/artifacts/$slug"
+            set +e
+            (
+              cd "$dir"
+              timeout --signal=TERM --kill-after=20s 1500s cargo +nightly fuzz build "$target"
+            ) >"out/logs/${slug}.build.log" 2>&1
+            brc=$?
+            printf '%s\n' "$brc" >"out/rc/${slug}.build.rc"
+            if [[ "$brc" == 0 ]]; then
+              (
+                cd "$dir"
+                timeout --signal=TERM --kill-after=20s 300s cargo +nightly fuzz run "$target" -- \
+                  -max_total_time=240 -timeout=15 -rss_limit_mb=4096 \
+                  -artifact_prefix="$GITHUB_WORKSPACE/out/artifacts/$slug/"
+              ) >"out/logs/${slug}.run.log" 2>&1
+              rrc=$?
+            else
+              rrc=125
+              printf 'BUILD_FAILED\n' >"out/logs/${slug}.run.log"
+            fi
+            printf '%s\n' "$rrc" >"out/rc/${slug}.run.rc"
+            set -e
+          done < out/SELECTED.tsv
+          exit 0
+
+      - name: Analyze fuzz evidence fail closed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,hashlib,re
+          root=Path('out')
+          inventory=json.loads((root/'TARGET_INVENTORY.json').read_text())
+          rows=[]; candidates=[]
+          for runrc in sorted((root/'rc').glob('*.run.rc')):
+              slug=runrc.name[:-7]
+              rrc=int(runrc.read_text().strip())
+              brc=int((root/'rc'/f'{slug}.build.rc').read_text().strip())
+              log=root/'logs'/f'{slug}.run.log'; text=log.read_text(errors='replace')
+              arts=[p for p in (root/'artifacts'/slug).rglob('*') if p.is_file()]
+              terms=[x for x in ['ERROR: AddressSanitizer','runtime error:','panicked at','thread panicked','Assertion failed','Segmentation fault','stack-overflow','deadly signal'] if x in text]
+              signal=bool(arts) or bool(terms) or (rrc not in (0,124,137,143) and brc==0)
+              row={'slug':slug,'build_rc':brc,'run_rc':rrc,'artifact_count':len(arts),'anomaly_terms':terms,'candidate_signal':signal,'log_sha256':hashlib.sha256(log.read_bytes()).hexdigest(),'artifact_sha256':[{'path':str(p.relative_to(root)),'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'bytes':p.stat().st_size} for p in arts]}
+              rows.append(row)
+              if signal: candidates.append(row)
+          result={'source_commit':'c616743d1358186605e1c1b74a3d6c4fdd9dd48c','selected_targets':inventory.get('selected',[]),'runs':rows,'candidate_count':len(candidates),'candidates':candidates,'decision':'CRASH_CANDIDATES_REQUIRE_MINIMIZATION' if candidates else 'NO_REACHABLE_CRASH_SIGNAL_IN_CAMPAIGN','submission_ready':False,'high_proven':False,'critical_proven':False}
+          (root/'FUZZ_RESULT.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(result,indent=2))
+          PY
+          find out -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > out/SHA256SUMS
+          tar --sort=name --mtime='UTC 2026-08-24' --owner=0 --group=0 --numeric-owner -C out -czf monad-v0160-r5-consensus-fuzz.tar.gz .
+          sha256sum monad-v0160-r5-consensus-fuzz.tar.gz > monad-v0160-r5-consensus-fuzz.tar.gz.sha256
+
+      - name: Upload fuzz evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: monad-v0160-r5-consensus-fuzz
+          path: |
+            monad-v0160-r5-consensus-fuzz.tar.gz
+            monad-v0160-r5-consensus-fuzz.tar.gz.sha256
+            out/FUZZ_RESULT.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
