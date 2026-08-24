@@ -1,0 +1,202 @@
+name: Monad v0.16.0 RaptorCast global limiter starvation 20260824
+
+on:
+  push:
+    branches:
+      - tooling/monad-v0160-frontier-source-dossier-20260824
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout research tooling
+        uses: actions/checkout@v4
+
+      - name: Clone exact scoped source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-recurse-submodules \
+            https://github.com/category-labs/monad-bft.git monad-bft
+          git -C monad-bft checkout c616743d1358186605e1c1b74a3d6c4fdd9dd48c
+          test "$(git -C monad-bft rev-parse HEAD)" = \
+            "c616743d1358186605e1c1b74a3d6c4fdd9dd48c"
+          test -z "$(git -C monad-bft status --porcelain=v1)"
+
+      - name: Record production ownership and limiter configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/meta out/raw
+          grep -RIn --binary-files=without-match \
+            -E 'ChunkSignatureVerifier|SignatureVerifier|with_rate_limit|signature_verifier' \
+            monad-bft/monad-raptorcast monad-bft/monad-node monad-bft/monad-state \
+            > out/meta/VERIFIER_OWNERSHIP_INDEX.txt || true
+          python3 - <<'PY'
+          from pathlib import Path
+          roots=[Path('monad-bft/monad-raptorcast'),Path('monad-bft/monad-node'),Path('monad-bft/monad-state')]
+          out=[]
+          for root in roots:
+              if not root.exists(): continue
+              for p in root.rglob('*.rs'):
+                  lines=p.read_text(errors='replace').splitlines()
+                  for i,line in enumerate(lines):
+                      if any(x in line for x in ('ChunkSignatureVerifier','with_rate_limit','signature_verifier')):
+                          out.append(f'===== {p}:{i+1} =====\n'+'\n'.join(lines[max(0,i-10):min(len(lines),i+14)]))
+          Path('out/meta/VERIFIER_OWNERSHIP_CONTEXTS.txt').write_text('\n\n'.join(out)+'\n')
+          PY
+
+      - name: Install deterministic cross-principal starvation test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >> monad-bft/monad-raptorcast/src/parser/signature_verifier.rs <<'RS'
+
+          #[cfg(test)]
+          mod global_limiter_cross_principal_research {
+              use std::fs;
+
+              use monad_crypto::{hasher::Hasher, signing_domain};
+              use monad_secp::{KeyPair, SecpSignature};
+
+              use super::{SignatureVerifier, SignatureVerifierError};
+
+              type TestVerifier = SignatureVerifier<
+                  SecpSignature,
+                  [u8; 8],
+                  signing_domain::RaptorcastChunk,
+              >;
+
+              fn keypair(seed: u8) -> KeyPair {
+                  let mut hasher = monad_crypto::hasher::HasherType::new();
+                  hasher.update([seed]);
+                  let mut hash = hasher.hash();
+                  KeyPair::from_bytes(&mut hash.0).expect("deterministic key")
+              }
+
+              #[test]
+              fn one_unknown_principal_starves_independent_honest_principal() {
+                  let attacker = keypair(7);
+                  let honest = keypair(9);
+                  let attacker_data = b"structurally-valid-unknown-author-packet";
+                  let honest_data = b"valid-authorized-validator-packet";
+                  let attacker_sig = attacker.sign::<signing_domain::RaptorcastChunk>(attacker_data);
+                  let honest_sig = honest.sign::<signing_domain::RaptorcastChunk>(honest_data);
+
+                  let shared: TestVerifier = SignatureVerifier::new().with_rate_limit(1);
+                  let attacker_result = shared.verify(attacker_sig, attacker_data);
+                  let honest_after_attacker = shared.verify(honest_sig, honest_data);
+
+                  let isolated_honest: TestVerifier = SignatureVerifier::new().with_rate_limit(1);
+                  let honest_isolated = isolated_honest.verify(honest_sig, honest_data);
+
+                  assert!(attacker_result.is_ok(), "unknown principal consumes shared quota");
+                  assert!(matches!(
+                      honest_after_attacker,
+                      Err(SignatureVerifierError::RateLimited)
+                  ));
+                  assert!(honest_isolated.is_ok(), "separate principal budget preserves honest packet");
+
+                  let path = std::env::var("MONAD_RAPTOR_STARVATION_RESULT")
+                      .expect("MONAD_RAPTOR_STARVATION_RESULT is required");
+                  fs::write(
+                      path,
+                      concat!(
+                          "{\n",
+                          "  \"unknown_principal_consumed_quota\": true,\n",
+                          "  \"independent_honest_principal_rate_limited\": true,\n",
+                          "  \"isolated_honest_control_passed\": true\n",
+                          "}\n"
+                      ),
+                  )
+                  .expect("write result");
+              }
+          }
+          RS
+
+      - name: Build and run exact release test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd monad-bft
+          MONAD_RAPTOR_STARVATION_RESULT="$PWD/../out/STARVATION_RESULT.json" \
+            cargo test --release -p monad-raptorcast \
+              -- --exact global_limiter_cross_principal_research::one_unknown_principal_starves_independent_honest_principal \
+              --nocapture --test-threads=1 \
+              2>&1 | tee ../out/raw/test.log
+          test -s ../out/STARVATION_RESULT.json
+          rustc --version --verbose > ../out/meta/RUSTC_VERSION.txt
+          cargo --version --verbose > ../out/meta/CARGO_VERSION.txt
+
+      - name: Static API and ownership adjudication
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib,re
+          out=pathlib.Path('out')
+          result=json.loads((out/'STARVATION_RESULT.json').read_text())
+          verifier=pathlib.Path('monad-bft/monad-raptorcast/src/parser/signature_verifier.rs').read_text(errors='replace')
+          contexts=(out/'meta/VERIFIER_OWNERSHIP_CONTEXTS.txt').read_text(errors='replace')
+          direct_limiter='DefaultDirectRateLimiter' in verifier
+          verify_has_no_source_parameter=bool(re.search(
+              r'pub fn verify\s*\(\s*&self,\s*signature:\s*ST,\s*data:\s*&\[u8\]',
+              verifier,re.S
+          ))
+          production_shared_instance=('ChunkSignatureVerifier' in contexts and 'signature_verifier' in contexts)
+          primitive=all(result.values()) and direct_limiter and verify_has_no_source_parameter
+          decision=(
+              'HOLD_CROSS_PRINCIPAL_STARVATION_PRIMITIVE_REQUIRES_PARSER_MEMBERSHIP_AND_PRIMARY_EPOCH_IMPACT'
+              if primitive else 'KILL_PRIMITIVE_NOT_PROVEN'
+          )
+          adjudication={
+              'source_commit':'c616743d1358186605e1c1b74a3d6c4fdd9dd48c',
+              'decision':decision,
+              'submission_ready':False,
+              'primitive_proven':primitive,
+              'direct_global_rate_limiter':direct_limiter,
+              'verify_api_has_no_source_or_key_parameter':verify_has_no_source_parameter,
+              'production_shared_instance_evidence_present':production_shared_instance,
+              'parser_level_author_membership_rejection_after_quota_consumption_proven':False,
+              'primary_epoch_or_consensus_liveness_impact_proven':False,
+              'public_network_contacted':False,
+              'next_required_gate':(
+                  'Feed an unknown-author and then an authorized-author structurally valid packet '
+                  'through one production parser/verifier instance; establish quota consumption '
+                  'before membership rejection; bind the affected traffic class to consensus-critical primary RaptorCast.'
+              ),
+          }
+          (out/'ADJUDICATION.json').write_text(json.dumps(adjudication,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(adjudication,indent=2))
+          if decision.startswith('KILL'):
+              raise SystemExit(2)
+          PY
+          git -C monad-bft status --porcelain=v1 > out/meta/WORKTREE_STATUS.txt
+          sha256sum out/STARVATION_RESULT.json out/ADJUDICATION.json out/meta/* out/raw/* \
+            > out/SHA256SUMS
+          tar --sort=name --mtime='UTC 2026-08-24' --owner=0 --group=0 --numeric-owner \
+            -C out -czf monad-v0160-raptorcast-global-limiter-starvation-20260824.tar.gz .
+          sha256sum monad-v0160-raptorcast-global-limiter-starvation-20260824.tar.gz \
+            > monad-v0160-raptorcast-global-limiter-starvation-20260824.tar.gz.sha256
+
+      - name: Upload bounded evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0160-raptorcast-global-limiter-starvation-20260824
+          path: |
+            monad-v0160-raptorcast-global-limiter-starvation-20260824.tar.gz
+            monad-v0160-raptorcast-global-limiter-starvation-20260824.tar.gz.sha256
+            out/ADJUDICATION.json
+            out/STARVATION_RESULT.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
