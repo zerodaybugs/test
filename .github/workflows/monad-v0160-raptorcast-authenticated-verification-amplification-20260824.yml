@@ -1,0 +1,280 @@
+name: Monad v0.16.0 RaptorCast authenticated verification amplification 20260824
+
+on:
+  push:
+    branches:
+      - tooling/monad-v0160-frontier-source-dossier-20260824
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - name: Checkout research tooling
+        uses: actions/checkout@v4
+
+      - name: Clone exact scoped source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-recurse-submodules \
+            https://github.com/category-labs/monad-bft.git monad-bft
+          cd monad-bft
+          git checkout c616743d1358186605e1c1b74a3d6c4fdd9dd48c
+          test "$(git rev-parse HEAD)" = "c616743d1358186605e1c1b74a3d6c4fdd9dd48c"
+          test -z "$(git status --porcelain=v1)"
+
+      - name: Record exact production callsites
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/meta out/raw out/fix
+          grep -RIn --binary-files=without-match \
+            -E 'verify_force|bypass_rate_limiter|with_rate_limit|SignatureVerifier' \
+            monad-bft/monad-raptorcast monad-bft/monad-node monad-bft/monad-state \
+            > out/meta/PRODUCTION_CALLSITE_INDEX.txt || true
+          python3 - <<'PY'
+          from pathlib import Path
+          roots = [
+              Path('monad-bft/monad-raptorcast'),
+              Path('monad-bft/monad-node'),
+              Path('monad-bft/monad-state'),
+          ]
+          needles = ('verify_force', 'bypass_rate_limiter', 'with_rate_limit', 'SignatureVerifier')
+          out=[]
+          for root in roots:
+              if not root.exists():
+                  continue
+              for p in root.rglob('*.rs'):
+                  text=p.read_text(errors='replace').splitlines()
+                  for i,line in enumerate(text):
+                      if any(n in line for n in needles):
+                          lo=max(0,i-8); hi=min(len(text),i+10)
+                          out.append(f'===== {p}:{i+1} =====\n'+'\n'.join(text[lo:hi]))
+          Path('out/meta/PRODUCTION_CALLSITE_CONTEXTS.txt').write_text('\n\n'.join(out)+'\n')
+          PY
+
+      - name: Install release benchmark test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >> monad-bft/monad-raptorcast/src/parser/signature_verifier.rs <<'RS'
+
+          #[cfg(test)]
+          mod authenticated_verification_amplification_research {
+              use std::{fs, time::Instant};
+
+              use monad_crypto::{hasher::Hasher, signing_domain};
+              use monad_secp::{KeyPair, SecpSignature};
+
+              use super::{SignatureVerifier, SignatureVerifierError};
+
+              type BenchVerifier = SignatureVerifier<
+                  SecpSignature,
+                  [u8; 8],
+                  signing_domain::RaptorcastChunk,
+              >;
+
+              fn keypair(seed: u8) -> KeyPair {
+                  let mut hasher = monad_crypto::hasher::HasherType::new();
+                  hasher.update([seed]);
+                  let mut hash = hasher.hash();
+                  KeyPair::from_bytes(&mut hash.0).expect("deterministic key")
+              }
+
+              #[test]
+              fn authenticated_force_bypass_release_benchmark() {
+                  const N: usize = 4096;
+                  let key = keypair(91);
+                  let mut messages = Vec::with_capacity(N);
+                  let mut signatures = Vec::with_capacity(N);
+                  for i in 0..N {
+                      let msg = format!("valid-current-epoch-chunk-{i:08}").into_bytes();
+                      signatures.push(key.sign::<signing_domain::RaptorcastChunk>(&msg));
+                      messages.push(msg);
+                  }
+
+                  let limited: BenchVerifier = SignatureVerifier::new().with_rate_limit(1);
+                  let limited_started = Instant::now();
+                  let mut limited_ok = 0usize;
+                  let mut limited_rate_limited = 0usize;
+                  for i in 0..N {
+                      match limited.verify(signatures[i], &messages[i]) {
+                          Ok(_) => limited_ok += 1,
+                          Err(SignatureVerifierError::RateLimited) => limited_rate_limited += 1,
+                          Err(e) => panic!("unexpected limited-path error: {e:?}"),
+                      }
+                  }
+                  let limited_ns = limited_started.elapsed().as_nanos();
+
+                  let forced: BenchVerifier = SignatureVerifier::new().with_rate_limit(1);
+                  let forced_started = Instant::now();
+                  let mut forced_ok = 0usize;
+                  for i in 0..N {
+                      match forced.verify_force(signatures[i], &messages[i]) {
+                          Ok(_) => forced_ok += 1,
+                          Err(e) => panic!("valid forced verification failed: {e:?}"),
+                      }
+                  }
+                  let forced_ns = forced_started.elapsed().as_nanos();
+                  let ratio = forced_ns as f64 / limited_ns.max(1) as f64;
+
+                  assert_eq!(limited_ok, 1, "control must admit exactly the first recovery");
+                  assert_eq!(limited_rate_limited, N - 1);
+                  assert_eq!(forced_ok, N, "force path must perform every recovery");
+
+                  let path = std::env::var("MONAD_RAPTOR_BENCH_RESULT")
+                      .expect("MONAD_RAPTOR_BENCH_RESULT is required");
+                  fs::write(
+                      path,
+                      format!(
+                          concat!(
+                              "{{\n",
+                              "  \"iterations\": {N},\n",
+                              "  \"limited_ok\": {limited_ok},\n",
+                              "  \"limited_rate_limited\": {limited_rate_limited},\n",
+                              "  \"forced_ok\": {forced_ok},\n",
+                              "  \"limited_elapsed_ns\": {limited_ns},\n",
+                              "  \"forced_elapsed_ns\": {forced_ns},\n",
+                              "  \"forced_to_limited_ratio\": {ratio:.6}\n",
+                              "}}\n"
+                          )
+                      ),
+                  )
+                  .expect("write benchmark result");
+              }
+          }
+          RS
+
+      - name: Build and run exact release benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd monad-bft
+          MONAD_RAPTOR_BENCH_RESULT="$PWD/../out/RAPTOR_BENCH_RESULT.json" \
+            cargo test --release -p monad-raptorcast \
+              authenticated_force_bypass_release_benchmark \
+              -- --exact authenticated_verification_amplification_research::authenticated_force_bypass_release_benchmark \
+              --nocapture --test-threads=1 \
+              2>&1 | tee ../out/raw/benchmark.log
+          test -s ../out/RAPTOR_BENCH_RESULT.json
+          rustc --version --verbose > ../out/meta/RUSTC_VERSION.txt
+          cargo --version --verbose > ../out/meta/CARGO_VERSION.txt
+          cargo metadata --no-deps --format-version 1 > ../out/meta/CARGO_METADATA.json
+
+      - name: Run matched-fix control
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp monad-bft/monad-raptorcast/src/parser/signature_verifier.rs \
+            out/fix/signature_verifier.before.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('monad-bft/monad-raptorcast/src/parser/signature_verifier.rs')
+          s=p.read_text()
+          old='''        // We still register the verification in the rate limiter, but
+                  // ignore the result.
+                  let _ = self.check_rate_limit();
+                  self.verify_unchecked(signature, data)'''
+          new='''        if !self.check_rate_limit() {
+                      return Err(SignatureVerifierError::RateLimited);
+                  }
+                  self.verify_unchecked(signature, data)'''
+          if old not in s:
+              raise SystemExit('exact verify_force implementation not found')
+          p.write_text(s.replace(old,new,1))
+          PY
+          git -C monad-bft diff -- monad-raptorcast/src/parser/signature_verifier.rs \
+            > out/fix/MATCHED_FIX.patch
+          cd monad-bft
+          set +e
+          MONAD_RAPTOR_BENCH_RESULT="$PWD/../out/fix/FIXED_BENCH_RESULT.json" \
+            cargo test --release -p monad-raptorcast \
+              authenticated_force_bypass_release_benchmark \
+              -- --exact authenticated_verification_amplification_research::authenticated_force_bypass_release_benchmark \
+              --nocapture --test-threads=1 \
+              > ../out/raw/matched_fix.log 2>&1
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > ../out/fix/MATCHED_FIX_TEST_RC.txt
+          test "$rc" -ne 0
+          grep -q 'valid forced verification failed: RateLimited' ../out/raw/matched_fix.log
+
+      - name: Fail-closed adjudication
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib, re
+          out=pathlib.Path('out')
+          bench=json.loads((out/'RAPTOR_BENCH_RESULT.json').read_text())
+          contexts=(out/'meta/PRODUCTION_CALLSITE_CONTEXTS.txt').read_text(errors='replace')
+          primitive=(
+              bench['limited_ok']==1 and
+              bench['limited_rate_limited']==bench['iterations']-1 and
+              bench['forced_ok']==bench['iterations']
+          )
+          force_path='verify_force' in contexts
+          bypass_plumbing='bypass_rate_limiter' in contexts
+          configured_rate_limit='with_rate_limit' in contexts
+          fixed_rc=int((out/'fix/MATCHED_FIX_TEST_RC.txt').read_text().strip())
+          matched_fix=(fixed_rc != 0 and 'RateLimited' in (out/'raw/matched_fix.log').read_text(errors='replace'))
+          ratio=float(bench['forced_to_limited_ratio'])
+          # This gate intentionally refuses to claim a vulnerability from a primitive alone.
+          decision=(
+              'HOLD_PRIMITIVE_PROVEN_REQUIRES_VALID_PACKET_CALLSITE_AND_MULTI_NODE_LIVENESS_IMPACT'
+              if primitive and force_path and bypass_plumbing and configured_rate_limit and matched_fix
+              else 'KILL_PRIMITIVE_OR_CONTROL_NOT_PROVEN'
+          )
+          adjudication={
+              'source_commit':'c616743d1358186605e1c1b74a3d6c4fdd9dd48c',
+              'decision':decision,
+              'submission_ready':False,
+              'primitive_proven':primitive,
+              'production_force_path_present':force_path,
+              'bypass_predicate_plumbing_present':bypass_plumbing,
+              'configured_rate_limit_present':configured_rate_limit,
+              'matched_fix_control_passed':matched_fix,
+              'iterations':bench['iterations'],
+              'forced_to_limited_ratio':ratio,
+              'direct_multi_node_liveness_impact_proven':False,
+              'public_network_contacted':False,
+              'next_required_gate':(
+                  'Construct valid parser-level current-epoch packets from one authorized validator; '
+                  'replay against multiple exact nodes; demonstrate deterministic finality degradation; '
+                  'then perform public and natural-fix duplicate clearance.'
+              ),
+          }
+          (out/'ADJUDICATION.json').write_text(json.dumps(adjudication,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(adjudication,indent=2))
+          if decision.startswith('KILL'):
+              raise SystemExit(2)
+          PY
+          git -C monad-bft status --porcelain=v1 > out/meta/WORKTREE_STATUS.txt
+          sha256sum out/RAPTOR_BENCH_RESULT.json out/ADJUDICATION.json \
+            out/meta/* out/raw/* out/fix/* > out/SHA256SUMS
+          tar --sort=name --mtime='UTC 2026-08-24' --owner=0 --group=0 --numeric-owner \
+            -C out -czf monad-v0160-raptorcast-authenticated-verification-amplification-20260824.tar.gz \
+            RAPTOR_BENCH_RESULT.json ADJUDICATION.json SHA256SUMS meta raw fix
+          sha256sum monad-v0160-raptorcast-authenticated-verification-amplification-20260824.tar.gz \
+            > monad-v0160-raptorcast-authenticated-verification-amplification-20260824.tar.gz.sha256
+
+      - name: Upload bounded evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0160-raptorcast-authenticated-verification-amplification-20260824
+          path: |
+            monad-v0160-raptorcast-authenticated-verification-amplification-20260824.tar.gz
+            monad-v0160-raptorcast-authenticated-verification-amplification-20260824.tar.gz.sha256
+            out/ADJUDICATION.json
+            out/RAPTOR_BENCH_RESULT.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
