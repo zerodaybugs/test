@@ -1,0 +1,274 @@
+name: Monad v0.16.0 deep differential fuzz Round 9
+
+on:
+  push:
+    branches:
+      - tooling/monad-round9-deep-differential-20260824
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone exact BFT source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global submodule.fetchJobs "$(nproc)"
+          git clone --filter=blob:none --no-recurse-submodules https://github.com/category-labs/monad-bft.git bft
+          git -C bft checkout c616743d1358186605e1c1b74a3d6c4fdd9dd48c
+          git -C bft submodule update --init monad-execution
+          test "$(git -C bft rev-parse HEAD)" = c616743d1358186605e1c1b74a3d6c4fdd9dd48c
+          test "$(git -C bft/monad-execution rev-parse HEAD)" = e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+          test -z "$(git -C bft status --porcelain=v1)"
+          mkdir -p out/raw out/meta out/artifacts out/repro
+      - name: Install cargo-fuzz
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-fuzz --locked
+          rustc --version --verbose > out/meta/RUSTC_VERSION.txt
+          cargo --version --verbose > out/meta/CARGO_VERSION.txt
+      - name: Discover and run security-relevant fuzz targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd bft/monad-fuzz
+          cargo fuzz list > ../../out/raw/FUZZ_TARGETS_ALL.txt
+          python3 - <<'PY'
+          import pathlib,re
+          root=pathlib.Path('.')
+          names=[x.strip() for x in pathlib.Path('../../out/raw/FUZZ_TARGETS_ALL.txt').read_text().splitlines() if x.strip()]
+          ranked=[]
+          keywords=('block','proposal','transaction','txn','validate','validator','consensus','certificate','cert','qc','tc','timeout','vote','message','state','epoch','execution','raptor','parse')
+          for n in names:
+              score=sum(k in n.lower() for k in keywords)
+              for p in root.rglob(f'{n}.rs'):
+                  text=p.read_text(errors='replace').lower()
+                  score += sum(text.count(k) for k in keywords)
+              ranked.append((score,n))
+          ranked.sort(key=lambda x:(-x[0],x[1]))
+          selected=[n for s,n in ranked if s>0][:12]
+          pathlib.Path('../../out/raw/FUZZ_TARGETS_SELECTED.txt').write_text('\n'.join(selected)+'\n')
+          pathlib.Path('../../out/raw/FUZZ_TARGET_RANKING.tsv').write_text('\n'.join(f'{s}\t{n}' for s,n in ranked)+'\n')
+          print('selected',selected)
+          PY
+          mapfile -t TARGETS < ../../out/raw/FUZZ_TARGETS_SELECTED.txt
+          : > ../../out/raw/FUZZ_RESULTS.tsv
+          for target in "${TARGETS[@]}"; do
+            [ -n "$target" ] || continue
+            mkdir -p "../../out/artifacts/$target"
+            set +e
+            RUST_BACKTRACE=1 timeout --signal=TERM --kill-after=20s 420s \
+              cargo fuzz run "$target" \
+              --artifact-prefix "../../out/artifacts/$target/" \
+              -- -max_total_time=390 -timeout=15 -rss_limit_mb=6000 -print_final_stats=1 \
+              > "../../out/raw/fuzz_${target}.log" 2>&1
+            rc=$?
+            set -e
+            printf '%s\t%s\n' "$target" "$rc" >> ../../out/raw/FUZZ_RESULTS.tsv
+          done
+      - name: Reproduce any Rust artifacts three times
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd bft/monad-fuzz
+          : > ../../out/raw/RUST_REPRO_RESULTS.tsv
+          shopt -s nullglob
+          for target_dir in ../../out/artifacts/*; do
+            target="$(basename "$target_dir")"
+            for artifact in "$target_dir"/*; do
+              [ -f "$artifact" ] || continue
+              for rep in 1 2 3; do
+                set +e
+                RUST_BACKTRACE=1 timeout --signal=TERM --kill-after=10s 90s \
+                  cargo fuzz run "$target" "$artifact" \
+                  > "../../out/repro/${target}__$(basename "$artifact")__rep${rep}.log" 2>&1
+                rc=$?
+                set -e
+                printf '%s\t%s\t%s\t%s\n' "$target" "$(basename "$artifact")" "$rep" "$rc" \
+                  >> ../../out/raw/RUST_REPRO_RESULTS.tsv
+              done
+            done
+          done
+      - name: Adjudicate Rust fuzz fail-closed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib,hashlib,re
+          out=pathlib.Path('out')
+          results=[]
+          for line in (out/'raw/FUZZ_RESULTS.tsv').read_text().splitlines():
+              if not line.strip(): continue
+              target,rc=line.split('\t'); results.append({'target':target,'return_code':int(rc)})
+          artifacts=[]
+          for p in sorted((out/'artifacts').rglob('*')):
+              if p.is_file():
+                  artifacts.append({'path':str(p.relative_to(out)),'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()})
+          repro=[]
+          rp=out/'raw/RUST_REPRO_RESULTS.tsv'
+          if rp.exists():
+              for line in rp.read_text().splitlines():
+                  if not line.strip(): continue
+                  t,a,r,rc=line.split('\t'); repro.append({'target':t,'artifact':a,'rep':int(r),'return_code':int(rc)})
+          groups={}
+          for r in repro: groups.setdefault((r['target'],r['artifact']),[]).append(r['return_code'])
+          stable=[{'target':k[0],'artifact':k[1],'return_codes':v} for k,v in groups.items() if len(v)==3 and all(x!=0 for x in v)]
+          d={
+              'source_commit':'c616743d1358186605e1c1b74a3d6c4fdd9dd48c',
+              'targets':results,'artifacts':artifacts,'stable_reproductions':stable,
+              'candidate_signal':bool(stable),'submission_ready':False,
+              'decision':'STABLE_CRASH_REQUIRES_VALID_INPUT_AND_IMPACT_ADJUDICATION' if stable else 'NO_STABLE_RUST_FUZZ_CRASH',
+          }
+          (out/'RUST_FUZZ_ADJUDICATION.json').write_text(json.dumps(d,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({'decision':d['decision'],'stable':len(stable),'submission_ready':False}))
+          PY
+          sha256sum out/raw/* out/meta/* out/RUST_FUZZ_ADJUDICATION.json > out/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: monad-round9-rust-fuzz
+          path: |
+            out
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  execution-differential:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone exact execution source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone https://github.com/category-labs/monad.git execution
+          git -C execution checkout e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+          git -C execution submodule update --init --recursive
+          test "$(git -C execution rev-parse HEAD)" = e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+          test -z "$(git -C execution status --porcelain=v1)"
+          mkdir -p out/raw out/meta out/artifacts out/repro out/corpus
+      - name: Build official execution fuzz/test targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --target base -t monad-r9-exec-base -f execution/docker/Dockerfile execution
+          docker run --name monad-r9-exec \
+            -v "$PWD/execution:/src" -v "$PWD/out:/out" \
+            monad-r9-exec-base bash -lc '
+              set -euo pipefail
+              cd /src
+              rm -rf build-r9-fuzz
+              CC=clang-19 CXX=clang++-19 cmake -S . -B build-r9-fuzz -GNinja \
+                -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DCMAKE_TOOLCHAIN_FILE=category/core/toolchains/gcc-avx2.cmake \
+                -DMONAD_COMPILER_TESTING=On
+              ninja -C build-r9-fuzz -t targets all > /out/raw/NINJA_TARGETS.txt
+              cmake --build build-r9-fuzz --parallel "$(nproc)"
+              find build-r9-fuzz -type f -perm -111 -printf "%p\n" | sort > /out/raw/EXECUTABLES.txt
+              clang-19 --version > /out/meta/CLANG_VERSION.txt
+              cmake --version > /out/meta/CMAKE_VERSION.txt
+              ninja --version > /out/meta/NINJA_VERSION.txt
+            '
+      - name: Run discovered validation and VM differential fuzzers
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker start monad-r9-exec >/dev/null
+          docker exec monad-r9-exec bash -lc '
+            set -euo pipefail
+            python3 - <<"PY"
+          import pathlib
+          paths=[pathlib.Path(x.strip()) for x in pathlib.Path("/out/raw/EXECUTABLES.txt").read_text().splitlines() if x.strip()]
+          keys=("fuzz","validation","validator","transaction","block","compiler-fuzzer")
+          selected=[]
+          for p in paths:
+              n=p.name.lower()
+              if "fuzz" in n and any(k in n for k in keys): selected.append(str(p))
+          # Ensure official compiler differential is included when built.
+          for p in paths:
+              if p.name == "monad-compiler-fuzzer" and str(p) not in selected: selected.append(str(p))
+          pathlib.Path("/out/raw/EXEC_FUZZERS_SELECTED.txt").write_text("\n".join(selected[:10])+"\n")
+          PY
+            : > /out/raw/EXEC_FUZZ_RESULTS.tsv
+            while IFS= read -r exe; do
+              [ -n "$exe" ] || continue
+              name="$(basename "$exe")"
+              mkdir -p "/out/artifacts/$name" "/out/corpus/$name"
+              set +e
+              timeout --signal=TERM --kill-after=20s 600s \
+                "$exe" "/out/corpus/$name" \
+                -max_total_time=560 -timeout=20 -rss_limit_mb=8000 \
+                -artifact_prefix="/out/artifacts/$name/" -print_final_stats=1 \
+                > "/out/raw/exec_fuzz_${name}.log" 2>&1
+              rc=$?
+              set -e
+              printf "%s\t%s\n" "$exe" "$rc" >> /out/raw/EXEC_FUZZ_RESULTS.tsv
+            done < /out/raw/EXEC_FUZZERS_SELECTED.txt
+          '
+      - name: Reproduce execution artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker exec monad-r9-exec bash -lc '
+            set -euo pipefail
+            : > /out/raw/EXEC_REPRO_RESULTS.tsv
+            shopt -s nullglob
+            while IFS= read -r exe; do
+              [ -n "$exe" ] || continue
+              name="$(basename "$exe")"
+              for artifact in "/out/artifacts/$name"/*; do
+                [ -f "$artifact" ] || continue
+                for rep in 1 2 3; do
+                  set +e
+                  timeout --signal=TERM --kill-after=10s 90s "$exe" "$artifact" \
+                    > "/out/repro/${name}__$(basename "$artifact")__rep${rep}.log" 2>&1
+                  rc=$?
+                  set -e
+                  printf "%s\t%s\t%s\t%s\n" "$exe" "$(basename "$artifact")" "$rep" "$rc" \
+                    >> /out/raw/EXEC_REPRO_RESULTS.tsv
+                done
+              done
+            done < /out/raw/EXEC_FUZZERS_SELECTED.txt
+          '
+      - name: Adjudicate execution fuzz fail-closed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib,hashlib
+          out=pathlib.Path('out')
+          artifacts=[]
+          for p in sorted((out/'artifacts').rglob('*')):
+              if p.is_file(): artifacts.append({'path':str(p.relative_to(out)),'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()})
+          repro=[]
+          p=out/'raw/EXEC_REPRO_RESULTS.tsv'
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  if not line.strip(): continue
+                  exe,a,r,rc=line.split('\t'); repro.append({'exe':exe,'artifact':a,'rep':int(r),'return_code':int(rc)})
+          groups={}
+          for r in repro: groups.setdefault((r['exe'],r['artifact']),[]).append(r['return_code'])
+          stable=[{'exe':k[0],'artifact':k[1],'return_codes':v} for k,v in groups.items() if len(v)==3 and all(x!=0 for x in v)]
+          d={'source_commit':'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0','artifacts':artifacts,'stable_reproductions':stable,'candidate_signal':bool(stable),'submission_ready':False,'decision':'STABLE_EXECUTION_CRASH_REQUIRES_VALID_BLOCK_AND_STATE_ROOT_ADJUDICATION' if stable else 'NO_STABLE_EXECUTION_FUZZ_CRASH'}
+          (out/'EXECUTION_FUZZ_ADJUDICATION.json').write_text(json.dumps(d,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({'decision':d['decision'],'stable':len(stable),'submission_ready':False}))
+          PY
+          sha256sum out/raw/* out/meta/* out/EXECUTION_FUZZ_ADJUDICATION.json > out/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: monad-round9-execution-fuzz
+          path: |
+            out
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
