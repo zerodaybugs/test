@@ -1,0 +1,220 @@
+name: Monad v0.16.0 delayed execution commitment mutation gate
+
+on:
+  push:
+    branches:
+      - tooling/monad-round9-delayed-execution-mutations-20260824
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutation-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone exact scoped source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global submodule.fetchJobs "$(nproc)"
+          git clone --filter=blob:none --no-recurse-submodules https://github.com/category-labs/monad-bft.git bft
+          git -C bft checkout c616743d1358186605e1c1b74a3d6c4fdd9dd48c
+          git -C bft submodule update --init monad-execution
+          test "$(git -C bft rev-parse HEAD)" = c616743d1358186605e1c1b74a3d6c4fdd9dd48c
+          test "$(git -C bft/monad-execution rev-parse HEAD)" = e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+          test -z "$(git -C bft status --porcelain=v1)"
+          mkdir -p out/raw out/meta out/repro
+
+      - name: Locate and synthesize exact mutation probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,json
+          root=Path('bft')
+
+          def funcs(text):
+              out=[]
+              for m in re.finditer(r'(?m)^\s*(?:#\[[^\n]+\]\s*)*(?:pub(?:\([^)]*\))?\s+)?fn\s+([A-Za-z0-9_]+)\s*\(',text):
+                  b=text.find('{',m.end())
+                  if b<0:continue
+                  dep=0;i=b;ins=False;esc=False
+                  while i<len(text):
+                      c=text[i]
+                      if ins:
+                          if esc:esc=False
+                          elif c=='\\':esc=True
+                          elif c=='"':ins=False
+                      else:
+                          if c=='"':ins=True
+                          elif c=='{':dep+=1
+                          elif c=='}':
+                              dep-=1
+                              if dep==0:out.append((m.group(1),m.start(),i+1,text[m.start():i+1]));break
+                      i+=1
+              return out
+
+          seeds=[]
+          for p in root.rglob('*.rs'):
+              if p.stat().st_size>2_000_000:continue
+              t=p.read_text(errors='replace')
+              if 'delayed_execution_results' not in t:continue
+              for name,a,b,fn in funcs(t):
+                  low=fn.lower()
+                  if 'delayed_execution_results' in low and any(k in low for k in ('validate','handle_proposal','assert')):
+                      named=re.search(r'delayed_execution_results\s*:\s*vec!\s*\[',fn)
+                      if named:seeds.append((len(fn),p,name,a,b,fn))
+          seeds.sort(key=lambda x:x[0])
+          if not seeds:
+              Path('out/meta/SYNTHESIS.json').write_text(json.dumps({'decision':'NO_MUTABLE_TEST_SEED'},indent=2)+'\n')
+              raise SystemExit(0)
+          _,p,name,a,b,fn=seeds[0]
+          m=re.search(r'delayed_execution_results\s*:\s*vec!\s*\[',fn)
+          start=m.end();dep=1;i=start
+          while i<len(fn) and dep:
+              if fn[i]=='[':dep+=1
+              elif fn[i]==']':dep-=1
+              i+=1
+          if dep:raise SystemExit('vector bracket mismatch')
+          original_expr=fn[start:i-1].strip()
+          # Only generate duplicate when the seed vector is a single top-level expression.
+          top_comma=False;d1=d2=d3=0
+          for c in original_expr:
+              if c=='(':d1+=1
+              elif c==')':d1-=1
+              elif c=='{':d2+=1
+              elif c=='}':d2-=1
+              elif c=='[':d3+=1
+              elif c==']':d3-=1
+              elif c==',' and d1==d2==d3==0:top_comma=True
+          variants={'control':original_expr,'empty':''}
+          if original_expr and not top_comma:
+              variants['duplicate']=original_expr+', '+original_expr+'.clone()'
+
+          generated=[]
+          for variant,replacement in variants.items():
+              g=fn
+              g=re.sub(r'\bfn\s+'+re.escape(name)+r'\s*\(',f'fn delayed_execution_probe_{variant}(',g,count=1)
+              mm=re.search(r'delayed_execution_results\s*:\s*vec!\s*\[',g)
+              st=mm.end();dep=1;j=st
+              while j<len(g) and dep:
+                  if g[j]=='[':dep+=1
+                  elif g[j]==']':dep-=1
+                  j+=1
+              g=g[:st]+replacement+g[j-1:]
+              # Convert a direct is_ok/is_err assertion into a machine-readable observation.
+              am=re.search(r'assert!\s*\(\s*([^;]*?(?:validate|handle_proposal)[^;]*?)\.is_(ok|err)\(\)\s*\)\s*;',g,re.S)
+              if am:
+                  expr=am.group(1);obs=f'let __probe_result = {expr};\n    println!("DELAYED_EXECUTION_PROBE_{variant.upper()}={{}}", __probe_result.is_ok());'
+                  g=g[:am.start()]+obs+g[am.end():]
+              else:
+                  # Result assignment followed by assertion fallback.
+                  rm=re.search(r'let\s+(\w+)\s*=\s*([^;]*?(?:validate|handle_proposal)[^;]*);',g,re.S)
+                  if not rm:continue
+                  var=rm.group(1)
+                  insert=rm.end()
+                  g=g[:insert]+f'\n    println!("DELAYED_EXECUTION_PROBE_{variant.upper()}={{}}", {var}.is_ok());'+g[insert:]
+              generated.append((variant,g))
+
+          if not generated:
+              Path('out/meta/SYNTHESIS.json').write_text(json.dumps({'decision':'NO_OBSERVABLE_VALIDATION_CALL','seed_file':str(p),'seed_function':name},indent=2)+'\n')
+              raise SystemExit(0)
+          text=p.read_text()
+          insertion='\n\n'.join(g for _,g in generated)
+          text=text[:b]+'\n\n'+insertion+'\n'+text[b:]
+          p.write_text(text)
+          Path('out/meta/SYNTHESIS.json').write_text(json.dumps({'decision':'PROBES_GENERATED','seed_file':str(p),'seed_function':name,'variants':[v for v,_ in generated],'original_expression':original_expr},indent=2,sort_keys=True)+'\n')
+          Path('out/meta/GENERATED_PROBES.rs').write_text(insertion+'\n')
+          PY
+
+      - name: Compile and execute probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! grep -q 'PROBES_GENERATED' out/meta/SYNTHESIS.json; then
+            printf '%s\n' '0' > out/raw/PROBE_BUILD.rc
+            exit 0
+          fi
+          seed_file="$(python3 -c 'import json; print(json.load(open("out/meta/SYNTHESIS.json"))["seed_file"])')"
+          crate="$(python3 - <<'PY'
+          import json,pathlib
+          p=pathlib.Path(json.load(open('out/meta/SYNTHESIS.json'))['seed_file'])
+          cur=p.parent
+          while cur != cur.parent:
+              if (cur/'Cargo.toml').exists():
+                  import tomllib
+                  d=tomllib.loads((cur/'Cargo.toml').read_text())
+                  print(d['package']['name']);break
+              cur=cur.parent
+          PY
+          )"
+          cd bft
+          set +e
+          cargo test -p "$crate" delayed_execution_probe_ --no-run > ../out/raw/PROBE_BUILD.log 2>&1
+          build_rc=$?
+          set -e
+          printf '%s\n' "$build_rc" > ../out/raw/PROBE_BUILD.rc
+          if [ "$build_rc" -ne 0 ]; then exit 0; fi
+          for rep in 1 2 3; do
+            set +e
+            RUST_BACKTRACE=1 timeout --signal=TERM --kill-after=15s 900s \
+              cargo test -p "$crate" delayed_execution_probe_ -- --nocapture --test-threads=1 \
+              > "../out/repro/probes_rep${rep}.log" 2>&1
+            rc=$?
+            set -e
+            printf '%s\t%s\n' "$rep" "$rc" >> ../out/raw/PROBE_RUNS.tsv
+          done
+          rustc --version --verbose > ../out/meta/RUSTC_VERSION.txt
+          cargo --version --verbose > ../out/meta/CARGO_VERSION.txt
+
+      - name: Adjudicate fail-closed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib,re
+          out=pathlib.Path('out')
+          synth=json.loads((out/'meta/SYNTHESIS.json').read_text())
+          build_rc=int((out/'raw/PROBE_BUILD.rc').read_text().strip()) if (out/'raw/PROBE_BUILD.rc').exists() else 1
+          observations={}
+          for p in sorted((out/'repro').glob('*.log')):
+              text=p.read_text(errors='replace')
+              for variant,value in re.findall(r'DELAYED_EXECUTION_PROBE_([A-Z]+)=(true|false)',text):
+                  observations.setdefault(variant,[]).append(value=='true')
+          control=observations.get('CONTROL',[])
+          invalid={k:v for k,v in observations.items() if k!='CONTROL'}
+          stable_control=len(control)==3 and all(control)
+          stable_invalid_accept={k:v for k,v in invalid.items() if len(v)==3 and all(v)}
+          candidate=stable_control and bool(stable_invalid_accept)
+          d={
+              'source_commit':'c616743d1358186605e1c1b74a3d6c4fdd9dd48c',
+              'synthesis':synth,'build_return_code':build_rc,'observations':observations,
+              'stable_positive_control':stable_control,
+              'stable_invalid_acceptances':stable_invalid_accept,
+              'candidate_signal':candidate,'submission_ready':False,
+              'decision':(
+                  'CANDIDATE_REQUIRES_SEMANTIC_INVALIDITY_AND_FULLNODE_PROMOTION' if candidate else
+                  'INFRASTRUCTURE_BLOCKED' if synth.get('decision')!='PROBES_GENERATED' or build_rc!=0 else
+                  'NO_DELAYED_EXECUTION_MUTATION_ACCEPTANCE'
+              ),
+          }
+          (out/'DELAYED_EXECUTION_ADJUDICATION.json').write_text(json.dumps(d,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({'decision':d['decision'],'candidate':candidate,'submission_ready':False}))
+          PY
+          sha256sum out/meta/* out/raw/* out/DELAYED_EXECUTION_ADJUDICATION.json > out/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: monad-round9-delayed-execution-mutations
+          path: |
+            out
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
