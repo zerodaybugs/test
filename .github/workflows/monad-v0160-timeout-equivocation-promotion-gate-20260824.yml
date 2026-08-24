@@ -1,0 +1,278 @@
+name: Monad v0.16.0 timeout equivocation promotion gate 20260824
+
+on:
+  push:
+    branches:
+      - tooling/monad-v0160-frontier-source-dossier-20260824
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - name: Checkout research tooling
+        uses: actions/checkout@v4
+
+      - name: Download exact V4 evidence
+        id: prior
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p prior out/meta out/raw
+          gh run download 32753213805 \
+            --repo zerodaybugs/test \
+            --name monad-v0160-selective-timeout-equivocation-v4-20260824 \
+            --dir prior
+          find prior -type f -printf '%P\n' | LC_ALL=C sort > out/meta/PRIOR_FILE_LIST.txt
+          adj="$(find prior -type f -name ADJUDICATION.json -print -quit)"
+          result="$(find prior -type f -name SELECTIVE_TIMEOUT_EQUIVOCATION_RESULT.json -print -quit)"
+          test -n "$adj" -a -s "$adj"
+          test -n "$result" -a -s "$result"
+          cp "$adj" out/PRIOR_ADJUDICATION.json
+          cp "$result" out/PRIOR_RESULT.json
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, pathlib
+          out=pathlib.Path('out')
+          adj=json.loads((out/'PRIOR_ADJUDICATION.json').read_text())
+          result=json.loads((out/'PRIOR_RESULT.json').read_text())
+          failures=[r for r in result.get('records',[]) if not r.get('pass')]
+          candidate=bool(failures) and adj.get('controls_pass') is True
+          print(f'candidate={str(candidate).lower()}')
+          print(f'failed_count={len(failures)}')
+          print('first_case='+(failures[0]['case'] if failures else ''))
+          PY
+
+      - name: Write negative promotion decision
+        if: steps.prior.outputs.candidate != 'true'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, pathlib
+          out=pathlib.Path('out')
+          prior=json.loads((out/'PRIOR_ADJUDICATION.json').read_text())
+          decision={
+              'source_commit':'c616743d1358186605e1c1b74a3d6c4fdd9dd48c',
+              'decision':'KILL_NO_TIMEOUT_EQUIVOCATION_FAILURE_TO_PROMOTE',
+              'submission_ready':False,
+              'prior_decision':prior.get('decision'),
+              'prior_failure_count':prior.get('failure_count'),
+              'public_network_contacted':False,
+          }
+          (out/'PROMOTION_ADJUDICATION.json').write_text(json.dumps(decision,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(decision,indent=2))
+          PY
+
+      - name: Clone exact scoped source
+        if: steps.prior.outputs.candidate == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-recurse-submodules \
+            https://github.com/category-labs/monad-bft.git monad-bft
+          cd monad-bft
+          git checkout c616743d1358186605e1c1b74a3d6c4fdd9dd48c
+          git submodule update --init monad-execution
+          test "$(git rev-parse HEAD)" = "c616743d1358186605e1c1b74a3d6c4fdd9dd48c"
+          test "$(git -C monad-execution rev-parse HEAD)" = "e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0"
+          test -z "$(git status --porcelain=v1)"
+
+      - name: Install filtered exact scenario reproducer
+        if: steps.prior.outputs.candidate == 'true'
+        env:
+          FAILED_CASE: ${{ steps.prior.outputs.first_case }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('monad-bft/monad-mock-swarm/src/transformer.rs')
+          s=p.read_text()
+          needle='ProtocolMessage::Timeout(_) => TwinsCapture::Spread(pid),'
+          if s.count(needle)!=1:
+              raise SystemExit(f'expected one timeout spread token, got {s.count(needle)}')
+          replacement='''ProtocolMessage::Timeout(t) => {
+                              TwinsCapture::Process(pid, t.0.tminfo.round)
+                          },'''
+          p.write_text(s.replace(needle,replacement,1))
+          PY
+          cp research/monad-v0160/selective_equivocation_matrix.rs \
+            monad-bft/monad-twins/tests/timeout_promotion.rs
+          cp research/monad-v0160/selective_equivocation_base.json \
+            monad-bft/monad-twins/tests/selective_equivocation_base.json
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('monad-bft/monad-twins/tests/timeout_promotion.rs')
+          s=p.read_text()
+          s=s.replace('fn selective_equivocation_matrix()', 'fn timeout_promotion()')
+          s=s.replace('MONAD_SELECTIVE_EQUIVOCATION_RESULT','MONAD_TIMEOUT_PROMOTION_RESULT')
+          old='''    let scenarios = scenarios();
+              assert!(scenarios.len() >= 250);'''
+          new='''    let scenario_filter = std::env::var("MONAD_SCENARIO_FILTER")
+                  .expect("MONAD_SCENARIO_FILTER is required");
+              let scenarios: Vec<_> = scenarios()
+                  .into_iter()
+                  .filter(|scenario| scenario.name == scenario_filter)
+                  .collect();
+              assert_eq!(scenarios.len(), 1, "exactly one minimized scenario required");'''
+          if old not in s:
+              raise SystemExit('scenario selection fragment not found')
+          s=s.replace(old,new,1)
+          old_run='''            run_twins_test::<_, _, _, MonadMessageNoSerSwarm>(1, case);'''
+          new_run='''            let seed: u64 = std::env::var("MONAD_SWARM_SEED")
+                      .expect("MONAD_SWARM_SEED is required")
+                      .parse()
+                      .expect("valid seed");
+                  run_twins_test::<_, _, _, MonadMessageNoSerSwarm>(seed, case);'''
+          if old_run not in s:
+              raise SystemExit('run_twins_test fragment not found')
+          p.write_text(s.replace(old_run,new_run,1))
+          PY
+          cat >> monad-bft/monad-twins/Cargo.toml <<'TOML'
+          monad-types = { workspace = true }
+          TOML
+          printf '%s\n' "$FAILED_CASE" > out/meta/FAILED_CASE.txt
+
+      - name: Compile exact promotion reproducer
+        if: steps.prior.outputs.candidate == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd monad-bft
+          cargo test --release -p monad-twins --test timeout_promotion --no-run \
+            2>&1 | tee ../out/raw/build.log
+
+      - name: Reproduce across independent seeds
+        if: steps.prior.outputs.candidate == 'true'
+        env:
+          FAILED_CASE: ${{ steps.prior.outputs.first_case }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/repro
+          : > out/repro/SEED_RESULTS.tsv
+          for seed in $(seq 1 20); do
+            rm -f out/repro/result-$seed.json
+            set +e
+            (
+              cd monad-bft
+              MONAD_SCENARIO_FILTER="$FAILED_CASE" \
+              MONAD_SWARM_SEED="$seed" \
+              MONAD_TIMEOUT_PROMOTION_RESULT="$PWD/../out/repro/result-$seed.json" \
+              RUST_BACKTRACE=1 \
+              timeout --signal=TERM --kill-after=10s 180s \
+              cargo test --release -p monad-twins --test timeout_promotion \
+                -- --exact timeout_promotion --nocapture --test-threads=1
+            ) > "out/raw/repro-$seed.log" 2>&1
+            rc=$?
+            set -e
+            test -s "out/repro/result-$seed.json"
+            printf '%s\t%s\n' "$seed" "$rc" >> out/repro/SEED_RESULTS.tsv
+          done
+
+      - name: Run original-delivery matched control
+        if: steps.prior.outputs.candidate == 'true'
+        env:
+          FAILED_CASE: ${{ steps.prior.outputs.first_case }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C monad-bft checkout -- monad-mock-swarm/src/transformer.rs
+          mkdir -p out/control
+          : > out/control/CONTROL_RESULTS.tsv
+          for seed in 1 2 3 4 5; do
+            rm -f out/control/result-$seed.json
+            set +e
+            (
+              cd monad-bft
+              MONAD_SCENARIO_FILTER="$FAILED_CASE" \
+              MONAD_SWARM_SEED="$seed" \
+              MONAD_TIMEOUT_PROMOTION_RESULT="$PWD/../out/control/result-$seed.json" \
+              timeout --signal=TERM --kill-after=10s 180s \
+              cargo test --release -p monad-twins --test timeout_promotion \
+                -- --exact timeout_promotion --nocapture --test-threads=1
+            ) > "out/raw/control-$seed.log" 2>&1
+            rc=$?
+            set -e
+            test -s "out/control/result-$seed.json"
+            printf '%s\t%s\n' "$seed" "$rc" >> out/control/CONTROL_RESULTS.tsv
+          done
+
+      - name: Adjudicate promotion
+        if: steps.prior.outputs.candidate == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib
+          out=pathlib.Path('out')
+          def records(folder):
+              rows=[]
+              for p in sorted((out/folder).glob('result-*.json')):
+                  d=json.loads(p.read_text())
+                  rows.append({'file':p.name, **d})
+              return rows
+          repro=records('repro')
+          control=records('control')
+          repro_fail=sum(1 for d in repro if d.get('failure_count',0)>0)
+          control_fail=sum(1 for d in control if d.get('failure_count',0)>0)
+          stable=repro_fail>=18 and len(repro)==20
+          controls=control_fail==0 and len(control)==5
+          decision=(
+              'HOLD_STABLE_TIMEOUT_EQUIVOCATION_HARNESS_SIGNAL_REQUIRES_UNMODIFIED_FULLNODE_PROMOTION'
+              if stable and controls else
+              'KILL_NONDETERMINISTIC_OR_CONTROL_FAILURE'
+          )
+          adjudication={
+              'source_commit':'c616743d1358186605e1c1b74a3d6c4fdd9dd48c',
+              'decision':decision,
+              'submission_ready':False,
+              'reproduction_seeds':len(repro),
+              'reproduction_failures':repro_fail,
+              'control_seeds':len(control),
+              'control_failures':control_fail,
+              'stable_signal':stable,
+              'matched_control_passed':controls,
+              'direct_unmodified_fullnode_impact_proven':False,
+              'public_network_contacted':False,
+          }
+          (out/'PROMOTION_ADJUDICATION.json').write_text(json.dumps(adjudication,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(adjudication,indent=2))
+          if decision.startswith('KILL'):
+              raise SystemExit(2)
+          PY
+
+      - name: Package bounded promotion evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s out/PROMOTION_ADJUDICATION.json
+          find out -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum \
+            > out/SHA256SUMS
+          tar --sort=name --mtime='UTC 2026-08-24' --owner=0 --group=0 --numeric-owner \
+            -C out -czf monad-v0160-timeout-equivocation-promotion-20260824.tar.gz .
+          sha256sum monad-v0160-timeout-equivocation-promotion-20260824.tar.gz \
+            > monad-v0160-timeout-equivocation-promotion-20260824.tar.gz.sha256
+
+      - name: Upload promotion evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0160-timeout-equivocation-promotion-20260824
+          path: |
+            monad-v0160-timeout-equivocation-promotion-20260824.tar.gz
+            monad-v0160-timeout-equivocation-promotion-20260824.tar.gz.sha256
+            out/PROMOTION_ADJUDICATION.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
