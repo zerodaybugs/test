@@ -1,0 +1,231 @@
+name: Monad v0.16.0 manual RLP canonicality scan 20260825
+
+on:
+  push:
+    branches:
+      - tooling/monad-v0160-rlp-canonicality-scan-20260825
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout tooling
+        uses: actions/checkout@v4
+
+      - name: Clone exact public BFT source and current public history
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/category-labs/monad-bft.git monad-bft
+          git -C monad-bft fetch --no-tags origin \
+            c616743d1358186605e1c1b74a3d6c4fdd9dd48c \
+            4b1883159dd3c9353ab856401f24b7b43c4b84c8
+          git -C monad-bft checkout --detach c616743d1358186605e1c1b74a3d6c4fdd9dd48c
+          test "$(git -C monad-bft rev-parse HEAD)" = "c616743d1358186605e1c1b74a3d6c4fdd9dd48c"
+          test -z "$(git -C monad-bft status --porcelain=v1)"
+          mkdir -p out/context out/meta
+          git -C monad-bft show -s --format=fuller HEAD > out/meta/SCOPED_COMMIT.txt
+          git -C monad-bft show -s --format=fuller 4b1883159dd3c9353ab856401f24b7b43c4b84c8 > out/meta/CURRENT_REFERENCE.txt
+
+      - name: Parse manual Rust RLP decoders fail-closed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import re
+          import subprocess
+          from collections import defaultdict
+
+          root = pathlib.Path('monad-bft')
+          out = pathlib.Path('out')
+          exclude = {'.git','target','vendor','test','tests','benches','bench','examples','fuzz','fuzzer','monad-execution'}
+
+          files = {}
+          for p in root.rglob('*.rs'):
+              rel = p.relative_to(root)
+              if any(part in exclude for part in rel.parts):
+                  continue
+              try:
+                  files[rel.as_posix()] = p.read_text(errors='replace')
+              except Exception:
+                  pass
+
+          impl_re = re.compile(r'impl(?:\s*<[^>{}]*>)?\s+[^\n{]*\bDecodable\s+for\s+([^\n{]+)\s*\{', re.M)
+
+          def matching_brace(text, open_pos):
+              depth = 0
+              in_str = False
+              esc = False
+              in_line = False
+              in_block = 0
+              i = open_pos
+              while i < len(text):
+                  c = text[i]
+                  n = text[i+1] if i+1 < len(text) else ''
+                  if in_line:
+                      if c == '\n': in_line = False
+                      i += 1; continue
+                  if in_block:
+                      if c == '/' and n == '*': in_block += 1; i += 2; continue
+                      if c == '*' and n == '/': in_block -= 1; i += 2; continue
+                      i += 1; continue
+                  if in_str:
+                      if esc: esc = False
+                      elif c == '\\': esc = True
+                      elif c == '"': in_str = False
+                      i += 1; continue
+                  if c == '/' and n == '/': in_line = True; i += 2; continue
+                  if c == '/' and n == '*': in_block = 1; i += 2; continue
+                  if c == '"': in_str = True; i += 1; continue
+                  if c == '{': depth += 1
+                  elif c == '}':
+                      depth -= 1
+                      if depth == 0: return i
+                  i += 1
+              return None
+
+          security_dirs = (
+              'monad-consensus','monad-consensus-types','monad-consensus-state',
+              'monad-blocksync','monad-raptorcast','monad-validator',
+              'monad-peer-discovery','monad-state','monad-types','monad-crypto',
+              'monad-executor-glue','monad-eth-block-policy','monad-eth-block-validator'
+          )
+          signed_patterns = re.compile(
+              r'\bsign\s*::<|\bverify\s*::<|recover_pubkey\s*::<|signing_domain|'
+              r'get_id\s*\(|hash\s*\(|keccak|certificate|signature|BlockId|PayloadId', re.I)
+
+          decoders = []
+          contexts = []
+          for path, text in files.items():
+              line_starts = [0]
+              for m in re.finditer('\n', text): line_starts.append(m.end())
+              for m in impl_re.finditer(text):
+                  open_pos = text.find('{', m.start())
+                  end = matching_brace(text, open_pos)
+                  if end is None: continue
+                  body = text[open_pos:end+1]
+                  start_line = text.count('\n',0,m.start())+1
+                  end_line = text.count('\n',0,end)+1
+                  typ = re.sub(r'\s+',' ',m.group(1).strip())
+                  list_decoder = bool(re.search(r'Header::decode_bytes\s*\([^\n]*true|decode_list|list_payload', body))
+                  explicit_tail_check = bool(re.search(
+                      r'!\s*\w+\.is_empty\s*\(\)|\w+\.is_empty\s*\(\)\s*\{\s*return\s+Err|'
+                      r'UnexpectedLength|InputTooLong|ensure\w*empty|decode_exact|payload\.len\s*\(\)\s*==\s*0',
+                      body, re.I|re.S))
+                  returns_struct = bool(re.search(r'Ok\s*\(\s*(?:Self|[A-Za-z_][A-Za-z0-9_:<>]*)\s*\{', body))
+                  reads_fields = len(re.findall(r'::decode\s*\(', body))
+                  security_path = path.startswith(security_dirs)
+
+                  # Search all production source for signed/id consumers of the decoded type's base token.
+                  base_token_match = re.search(r'([A-Za-z_][A-Za-z0-9_]*)\s*(?:<|$)', typ)
+                  base_token = base_token_match.group(1) if base_token_match else typ
+                  consumers = []
+                  if base_token and len(base_token) >= 4:
+                      token_re = re.compile(r'\b'+re.escape(base_token)+r'\b')
+                      for other_path, other_text in files.items():
+                          if not token_re.search(other_text): continue
+                          lines = other_text.splitlines()
+                          for idx,line in enumerate(lines):
+                              if token_re.search(line):
+                                  lo=max(0,idx-3); hi=min(len(lines),idx+5)
+                                  ctx='\n'.join(lines[lo:hi])
+                                  if signed_patterns.search(ctx):
+                                      consumers.append({'path':other_path,'line':idx+1,'text':line.strip()})
+                                      if len(consumers)>=25: break
+                          if len(consumers)>=25: break
+
+                  candidate = security_path and list_decoder and reads_fields > 0 and not explicit_tail_check
+                  rec = {
+                      'path': path,
+                      'type': typ,
+                      'base_token': base_token,
+                      'start_line': start_line,
+                      'end_line': end_line,
+                      'body_sha256': hashlib.sha256(body.encode()).hexdigest(),
+                      'list_decoder': list_decoder,
+                      'explicit_tail_check': explicit_tail_check,
+                      'decoded_field_calls': reads_fields,
+                      'returns_struct': returns_struct,
+                      'security_path': security_path,
+                      'candidate_missing_tail_check': candidate,
+                      'signed_or_id_consumers': consumers,
+                  }
+                  decoders.append(rec)
+                  if candidate:
+                      contexts.append(f'===== {path}:{start_line}-{end_line} type={typ} =====\n{body}\n')
+
+          shortlist = [x for x in decoders if x['candidate_missing_tail_check']]
+
+          # Search public history for every shortlisted file, because a later fix is prior art.
+          history=[]
+          for path in sorted({x['path'] for x in shortlist}):
+              proc=subprocess.run([
+                  'git','-C','monad-bft','log','--format=%H%x09%aI%x09%s',
+                  'c616743d1358186605e1c1b74a3d6c4fdd9dd48c..4b1883159dd3c9353ab856401f24b7b43c4b84c8',
+                  '--',path],text=True,capture_output=True,check=True)
+              commits=[]
+              for line in proc.stdout.splitlines():
+                  parts=line.split('\t',2)
+                  if len(parts)==3: commits.append({'sha':parts[0],'date':parts[1],'subject':parts[2]})
+              history.append({'path':path,'later_commits':commits})
+
+          result={
+              'exact_source_commit':'c616743d1358186605e1c1b74a3d6c4fdd9dd48c',
+              'current_reference':'4b1883159dd3c9353ab856401f24b7b43c4b84c8',
+              'production_rust_files_scanned':len(files),
+              'manual_decoders_found':len(decoders),
+              'missing_tail_check_shortlist_count':len(shortlist),
+              'shortlist':shortlist,
+              'public_history':history,
+              'release_semantics':{
+                  'shortlist_is_not_a_finding':True,
+                  'required_next_gate':'type-specific mutation test proving non-canonical acceptance, distinct signed/hash/cache identity, normal wire or block ingress, direct safety/liveness/state-root impact, matched canonical decoder fix, current scope and public/private duplicate assessment'
+              }
+          }
+          (out/'RLP_CANONICALITY_SCAN.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          (out/'ALL_MANUAL_DECODERS.json').write_text(json.dumps(decoders,indent=2,sort_keys=True)+'\n')
+          (out/'context'/'SHORTLIST_DECODERS.txt').write_text('\n'.join(contexts))
+          with (out/'RLP_SHORTLIST.tsv').open('w') as f:
+              f.write('path\ttype\tstart_line\tend_line\tconsumer_count\n')
+              for x in shortlist:
+                  f.write(f"{x['path']}\t{x['type']}\t{x['start_line']}\t{x['end_line']}\t{len(x['signed_or_id_consumers'])}\n")
+          print(json.dumps({
+              'production_rust_files_scanned':len(files),
+              'manual_decoders_found':len(decoders),
+              'missing_tail_check_shortlist_count':len(shortlist),
+              'types':[x['type'] for x in shortlist],
+          },indent=2))
+          PY
+
+      - name: Package deterministic evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          find out -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > out/SHA256SUMS
+          tar --sort=name --mtime='UTC 2026-08-25' --owner=0 --group=0 --numeric-owner \
+            -C out -czf monad-v0160-rlp-canonicality-scan-20260825.tar.gz .
+          sha256sum monad-v0160-rlp-canonicality-scan-20260825.tar.gz > monad-v0160-rlp-canonicality-scan-20260825.tar.gz.sha256
+
+      - name: Upload scan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0160-rlp-canonicality-scan-20260825
+          path: |
+            monad-v0160-rlp-canonicality-scan-20260825.tar.gz
+            monad-v0160-rlp-canonicality-scan-20260825.tar.gz.sha256
+            out/RLP_CANONICALITY_SCAN.json
+            out/RLP_SHORTLIST.tsv
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
