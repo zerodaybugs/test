@@ -1,0 +1,222 @@
+name: Monad v0.16.0 authority and blob gates Round 11
+
+on:
+  push:
+    branches:
+      - tooling/monad-round11-authority-blob-gates-20260825
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 110
+    steps:
+      - name: Checkout tooling
+        uses: actions/checkout@v4
+
+      - name: Clone exact public scoped sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global submodule.fetchJobs "$(nproc)"
+          git clone --recurse-submodules https://github.com/category-labs/monad.git execution
+          git -C execution checkout e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+          git -C execution submodule update --init --recursive
+          test "$(git -C execution rev-parse HEAD)" = "e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0"
+
+          git clone --filter=blob:none --no-recurse-submodules \
+            https://github.com/category-labs/monad-bft.git bft
+          git -C bft checkout c616743d1358186605e1c1b74a3d6c4fdd9dd48c
+          test "$(git -C bft rev-parse HEAD)" = "c616743d1358186605e1c1b74a3d6c4fdd9dd48c"
+          test -z "$(git -C execution status --porcelain=v1)"
+          test -z "$(git -C bft status --porcelain=v1)"
+          mkdir -p out/logs out/meta out/evidence
+          git -C execution submodule status --recursive > out/meta/EXECUTION_SUBMODULES.txt
+          git -C execution show -s --format=fuller HEAD > out/meta/EXECUTION_COMMIT.txt
+          git -C bft show -s --format=fuller HEAD > out/meta/BFT_COMMIT.txt
+
+      - name: Install focused authority-account conflict control
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >> execution/category/execution/ethereum/state2/test/test_state.cpp <<'CPP'
+
+          // Round 11 research control: EIP-7702 authority account effects use the
+          // same State original/current account maps as normal account writes.
+          // A stale optimistic transaction touching the same authority must fail
+          // BlockState::can_merge after the earlier transaction commits, while an
+          // independent authority remains mergeable.
+          TEST_F(InMemoryStateTest, Round11AuthorityAccountConflictIsDetected)
+          {
+              BlockState bs{this->tdb, this->vm};
+
+              State first{bs, Incarnation{1, 1}};
+              first.create_account_no_rollback(a);
+              first.set_nonce(a, 1);
+              first.set_code(a, code1);
+
+              State stale_same_authority{bs, Incarnation{1, 2}};
+              EXPECT_EQ(stale_same_authority.get_nonce(a), 0);
+              EXPECT_EQ(stale_same_authority.get_code_hash(a), NULL_HASH);
+              stale_same_authority.create_account_no_rollback(a);
+              stale_same_authority.set_nonce(a, 1);
+              stale_same_authority.set_code(a, code2);
+
+              State independent_authority{bs, Incarnation{1, 3}};
+              independent_authority.create_account_no_rollback(b);
+              independent_authority.set_nonce(b, 1);
+              independent_authority.set_code(b, code2);
+
+              ASSERT_TRUE(bs.can_merge(first));
+              bs.merge(first);
+
+              EXPECT_FALSE(bs.can_merge(stale_same_authority));
+              EXPECT_TRUE(bs.can_merge(independent_authority));
+          }
+          CPP
+          git -C execution diff -- \
+            category/execution/ethereum/state2/test/test_state.cpp \
+            > out/evidence/AUTHORITY_CONFLICT_TEST.patch
+          test -s out/evidence/AUTHORITY_CONFLICT_TEST.patch
+
+      - name: Build official execution dependency image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --target base -t monad-r11-base \
+            -f execution/docker/Dockerfile execution \
+            > out/logs/docker_build.log 2>&1
+
+      - name: Build and repeat focused exact-source test
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/execution:/src" \
+            -v "$PWD/out:/out" \
+            monad-r11-base bash -lc '
+              set -euo pipefail
+              cd /src
+              rm -rf build-r11
+              CC=gcc-15 CXX=g++-15 cmake -S . -B build-r11 -GNinja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_TOOLCHAIN_FILE=category/core/toolchains/gcc-avx2.cmake \
+                > /out/logs/cmake.log 2>&1
+              cmake --build build-r11 --target test_state --parallel "$(nproc)" \
+                > /out/logs/build_test_state.log 2>&1
+              ./build-r11/category/execution/test_state \
+                --gtest_filter=InMemoryStateTest.Round11AuthorityAccountConflictIsDetected \
+                --gtest_repeat=20 --gtest_break_on_failure \
+                > /out/logs/authority_conflict_test.log 2>&1
+              printf "0\n" > /out/evidence/AUTHORITY_CONFLICT_TEST.rc
+              sha256sum build-r11/category/execution/test_state \
+                > /out/meta/TEST_STATE_BINARY.sha256
+              gcc-15 --version > /out/meta/GCC_VERSION.txt
+              g++-15 --version > /out/meta/GXX_VERSION.txt
+              cmake --version > /out/meta/CMAKE_VERSION.txt
+              ninja --version > /out/meta/NINJA_VERSION.txt
+            '
+
+      - name: Exact BFT blob admission and package-test gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib, re
+          root = pathlib.Path('bft')
+          validator = (root/'monad-eth-block-validator/src/lib.rs').read_text()
+          policy = (root/'monad-eth-block-policy/src/validation.rs').read_text()
+          evidence = {
+              'exact_bft_commit': 'c616743d1358186605e1c1b74a3d6c4fdd9dd48c',
+              'eip4844_tx_rejected': 'if tx.is_eip4844()' in policy and 'UnsupportedTransactionType' in policy,
+              'blob_gas_used_must_be_zero': re.search(r'if blob_gas_used != &0', validator) is not None,
+              'excess_blob_gas_must_be_zero': re.search(r'if excess_blob_gas != &0', validator) is not None,
+              'parent_beacon_root_must_be_zero': re.search(r'if parent_beacon_block_root != &\[0_u8; 32\]', validator) is not None,
+          }
+          evidence['all_blob_admission_controls_present'] = all(
+              evidence[k] for k in (
+                  'eip4844_tx_rejected',
+                  'blob_gas_used_must_be_zero',
+                  'excess_blob_gas_must_be_zero',
+                  'parent_beacon_root_must_be_zero',
+              )
+          )
+          pathlib.Path('out/evidence/BFT_BLOB_ADMISSION_GATE.json').write_text(
+              json.dumps(evidence, indent=2, sort_keys=True)+'\n'
+          )
+          if not evidence['all_blob_admission_controls_present']:
+              raise SystemExit('blob admission source gate failed')
+          PY
+
+          rustup toolchain install 1.91.1 --profile minimal
+          rustup override set 1.91.1
+          (
+            cd bft
+            cargo test --locked \
+              -p monad-eth-block-policy \
+              -p monad-eth-block-validator \
+              > ../out/logs/bft_blob_and_validation_tests.log 2>&1
+          )
+          printf '0\n' > out/evidence/BFT_PACKAGE_TESTS.rc
+
+      - name: Fail-closed adjudication
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, pathlib
+          out = pathlib.Path('out')
+          blob = json.loads((out/'evidence/BFT_BLOB_ADMISSION_GATE.json').read_text())
+          auth_rc = int((out/'evidence/AUTHORITY_CONFLICT_TEST.rc').read_text().strip())
+          rust_rc = int((out/'evidence/BFT_PACKAGE_TESTS.rc').read_text().strip())
+          auth_log = (out/'logs/authority_conflict_test.log').read_text(errors='replace')
+          auth_pass = auth_rc == 0 and '[  PASSED  ]' in auth_log
+          result = {
+              'project': 'Monad v0.16.0 Round 11 authority/blob gates',
+              'exact_execution_commit': 'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0',
+              'exact_bft_commit': 'c616743d1358186605e1c1b74a3d6c4fdd9dd48c',
+              'authority_account_conflict_detected': auth_pass,
+              'authority_test_repetitions': 20,
+              'independent_authority_negative_control_included': True,
+              'bft_blob_admission_controls_present': blob['all_blob_admission_controls_present'],
+              'bft_package_tests_passed': rust_rc == 0,
+              'candidate_signal': False,
+              'submission_ready': False,
+              'decision': (
+                  'KILL_AUTHORITY_CONFLICT_TRACKED_AND_BLOB_FIELDS_REJECTED_AT_BFT'
+                  if auth_pass and blob['all_blob_admission_controls_present'] and rust_rc == 0
+                  else 'INFRASTRUCTURE_OR_CONTROL_FAILURE'
+              ),
+          }
+          (out/'ADJUDICATION.json').write_text(json.dumps(result, indent=2, sort_keys=True)+'\n')
+          print(json.dumps(result, indent=2))
+          if result['decision'] == 'INFRASTRUCTURE_OR_CONTROL_FAILURE':
+              raise SystemExit(2)
+          PY
+          git -C execution status --porcelain=v1 > out/meta/EXECUTION_STATUS.txt
+          git -C bft status --porcelain=v1 > out/meta/BFT_STATUS.txt
+          sha256sum out/evidence/* out/logs/* out/meta/* out/ADJUDICATION.json \
+            > out/SHA256SUMS
+          tar --sort=name --mtime='UTC 2026-08-25' --owner=0 --group=0 --numeric-owner \
+            -C out -czf monad-v0160-round11-authority-blob-gates-20260825.tar.gz \
+            ADJUDICATION.json SHA256SUMS evidence logs meta
+          sha256sum monad-v0160-round11-authority-blob-gates-20260825.tar.gz \
+            > monad-v0160-round11-authority-blob-gates-20260825.tar.gz.sha256
+
+      - name: Upload gate evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0160-round11-authority-blob-gates-20260825
+          path: |
+            monad-v0160-round11-authority-blob-gates-20260825.tar.gz
+            monad-v0160-round11-authority-blob-gates-20260825.tar.gz.sha256
+            out/ADJUDICATION.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
