@@ -1,0 +1,256 @@
+name: Monad v0.16.0 native VM adjudicator V2 20260825
+
+on:
+  push:
+    branches:
+      - tooling/monad-v0160-native-diff-adjudicator-20260825
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  adjudicate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 105
+    steps:
+      - name: Checkout tooling
+        uses: actions/checkout@v4
+
+      - name: Clone exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global submodule.fetchJobs "$(nproc)"
+          git clone --recurse-submodules https://github.com/category-labs/monad.git monad-execution
+          cd monad-execution
+          git checkout e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+          git submodule update --init --recursive
+          test "$(git rev-parse HEAD)" = "e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0"
+          git status --porcelain=v1 > ../SOURCE_STATUS.txt
+          test ! -s ../SOURCE_STATUS.txt
+          git submodule status --recursive > ../SUBMODULES.txt
+
+      - name: Build official dependency image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --target base -t monad-v0160-base -f monad-execution/docker/Dockerfile monad-execution
+
+      - name: Build diagnostic binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/bin out/meta out/logs out/rc out/focus
+          docker run --name monad-v0160-native-adjudicator-v2 \
+            -v "$PWD/monad-execution:/src" \
+            -v "$PWD/research/monad-v0160:/tooling:ro" \
+            -v "$PWD/out:/out" \
+            monad-v0160-base bash -lc '
+              set -euo pipefail
+              cd /src
+              cp test/vm/fuzzer/fuzzer.cpp /tmp/fuzzer.original.cpp
+              cp test/vm/fuzzer/assertions.cpp /tmp/assertions.original.cpp
+              python3 /tooling/instrument_native_diff.py --source /src --out /tmp/generated
+              python3 - <<"PY"
+          from pathlib import Path
+          for p in (Path("/tmp/generated/fuzzer.MONAD_NINE.cpp"), Path("/tmp/generated/fuzzer.MONAD_TEN.cpp")):
+              s = p.read_text()
+              if "#include <cstdio>" not in s:
+                  s = s.replace("#include <cstdint>\n", "#include <cstdint>\n#include <cstdio>\n", 1)
+              old = "            monad_diag_input.assign(msg->input_data, msg->input_data + msg->input_size);"
+              new = (
+                  "            if (msg->input_size == 0) { monad_diag_input.clear(); }\n"
+                  "            else { monad_diag_input.assign(msg->input_data, msg->input_data + msg->input_size); }"
+              )
+              if old not in s:
+                  raise SystemExit(f"input diagnostic marker missing in {p}")
+              p.write_text(s.replace(old, new, 1))
+          PY
+
+              cp /tmp/generated/fuzzer.MONAD_NINE.cpp test/vm/fuzzer/fuzzer.cpp
+              rm -rf build-native
+              CC=clang-19 CXX=clang++-19 cmake -S . -B build-native -GNinja \
+                -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DCMAKE_TOOLCHAIN_FILE=category/core/toolchains/gcc-avx2.cmake \
+                -DMONAD_COMPILER_TESTING=On
+              cmake --build build-native -t monad-compiler-fuzzer --parallel "$(nproc)"
+              cp build-native/test/vm/fuzzer/monad-compiler-fuzzer /out/bin/monad-nine-adjudicator
+
+              cp /tmp/generated/fuzzer.MONAD_TEN.cpp test/vm/fuzzer/fuzzer.cpp
+              cmake --build build-native -t monad-compiler-fuzzer --parallel "$(nproc)"
+              cp build-native/test/vm/fuzzer/monad-compiler-fuzzer /out/bin/monad-ten-adjudicator
+
+              cp /tmp/fuzzer.original.cpp test/vm/fuzzer/fuzzer.cpp
+              cp /tmp/assertions.original.cpp test/vm/fuzzer/assertions.cpp
+              sha256sum /out/bin/* > /out/meta/BINARY_SHA256.txt
+              clang-19 --version > /out/meta/CLANG_VERSION.txt
+              cmake --version > /out/meta/CMAKE_VERSION.txt
+              ninja --version > /out/meta/NINJA_VERSION.txt
+            '
+
+      - name: Execute four opaque candidate cases three times
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > out/focus/stateheavy.json <<'JSON'
+          {
+            "valid_address_prob": 0.70,
+            "random_constant_with_cleared_words_prob": 0.20,
+            "meaningful_constant_prob": 0.20,
+            "small_constant_prob": 0.20,
+            "push_weight": 0.16,
+            "dup_weight": 0.16,
+            "call_weight": 0.02,
+            "returndatacopy_weight": 0.02,
+            "create_weight": 0.02,
+            "uncommon_non_term_weight": 0.42,
+            "valid_jump_prob": 0.95
+          }
+          JSON
+          cat > out/focus/callcreate.json <<'JSON'
+          {
+            "valid_address_prob": 0.90,
+            "meaningful_constant_prob": 0.20,
+            "small_constant_prob": 0.20,
+            "push_weight": 0.18,
+            "dup_weight": 0.18,
+            "call_weight": 0.20,
+            "returndatacopy_weight": 0.10,
+            "create_weight": 0.10,
+            "uncommon_non_term_weight": 0.18,
+            "valid_jump_prob": 0.95
+          }
+          JSON
+          docker start monad-v0160-native-adjudicator-v2 >/dev/null
+          docker exec monad-v0160-native-adjudicator-v2 bash -lc '
+            set -uo pipefail
+            run_one() {
+              case_name="$1"; binary="$2"; seed="$3"; focus="$4"; nohook="$5"; rep="$6"
+              args=(--implementation compiler --revision OSAKA --seed "$seed" --iterations-per-run 100 --messages 4 --runs 1 --print-stats --focus "$focus")
+              log="/out/logs/${case_name}.rep${rep}.log"
+              rcfile="/out/rc/${case_name}.rep${rep}.rc"
+              if [[ "$nohook" == 1 ]]; then
+                timeout --signal=TERM --kill-after=20s 900s env MONAD_COMPILER_FUZZING=1 MONAD_FUZZ_NO_HOOK=1 \
+                  stdbuf -oL -eL "$binary" "${args[@]}" >"$log" 2>&1
+              else
+                timeout --signal=TERM --kill-after=20s 900s env MONAD_COMPILER_FUZZING=1 \
+                  stdbuf -oL -eL "$binary" "${args[@]}" >"$log" 2>&1
+              fi
+              printf "%s\n" "$?" >"$rcfile"
+              return 0
+            }
+            for rep in 1 2 3; do
+              run_one C1 /out/bin/monad-nine-adjudicator 11956999547095953342 /out/focus/stateheavy.json 1 "$rep"
+              run_one C2 /out/bin/monad-nine-adjudicator 2863043607998573456 /out/focus/callcreate.json 0 "$rep"
+              run_one C3 /out/bin/monad-ten-adjudicator 8255388444298519423 /out/focus/stateheavy.json 1 "$rep"
+              run_one C4 /out/bin/monad-ten-adjudicator 14820068421627436469 /out/focus/callcreate.json 0 "$rep"
+            done
+          '
+
+      - name: Machine adjudication
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/meta out/logs out/rc out/bin out/focus
+          cp SOURCE_STATUS.txt SUBMODULES.txt out/meta/ 2>/dev/null || true
+          python3 - <<'PY'
+          import hashlib, json, pathlib, re
+          root = pathlib.Path('out')
+          case_names = ['C1', 'C2', 'C3', 'C4']
+          cases = []
+          all_ok = True
+          for case in case_names:
+              reps = []
+              hashes = []
+              for rep in (1, 2, 3):
+                  lp = root/'logs'/f'{case}.rep{rep}.log'
+                  rp = root/'rc'/f'{case}.rep{rep}.rc'
+                  if not lp.is_file() or not rp.is_file():
+                      reps.append({'rep': rep, 'missing': True})
+                      all_ok = False
+                      continue
+                  text = lp.read_text(errors='replace')
+                  rc = int(rp.read_text().strip())
+                  start = text.find('DIAG_STATE_MAP_SIZE')
+                  end = text.find('DIAG_CONTEXT_END', start)
+                  diag = text[start:end + len('DIAG_CONTEXT_END')] if start >= 0 and end >= 0 else ''
+                  dh = hashlib.sha256(diag.encode()).hexdigest() if diag else None
+                  if dh:
+                      hashes.append(dh)
+                  context = re.search(
+                      r'DIAG_CONTEXT seed=(\d+) iteration=(-?\d+) message=(-?\d+) kind=(-?\d+) flags=(\d+) depth=(-?\d+) gas=(-?\d+) block=(\d+) timestamp=(\d+) contract_size=(\d+) input_size=(\d+)',
+                      diag,
+                  )
+                  sizes = re.search(r'DIAG_STATE_MAP_SIZE interpreter=(\d+) compiler=(\d+)', diag)
+                  reproduced = rc == 134 and context is not None and sizes is not None
+                  all_ok &= reproduced
+                  reps.append({
+                      'rep': rep,
+                      'return_code': rc,
+                      'reproduced': reproduced,
+                      'diagnostic_sha256': dh,
+                      'context': ({
+                          'seed': context.group(1),
+                          'iteration': int(context.group(2)),
+                          'message': int(context.group(3)),
+                          'kind': int(context.group(4)),
+                          'flags': int(context.group(5)),
+                          'depth': int(context.group(6)),
+                          'gas': int(context.group(7)),
+                          'block': int(context.group(8)),
+                          'timestamp': context.group(9),
+                          'contract_size': int(context.group(10)),
+                          'input_size': int(context.group(11)),
+                      } if context else None),
+                      'state_map_sizes': ({
+                          'interpreter': int(sizes.group(1)),
+                          'compiler': int(sizes.group(2)),
+                      } if sizes else None),
+                      'only_interpreter': re.findall(r'DIAG_ONLY_INTERPRETER=([0-9a-f]{40})', diag),
+                      'only_compiler': re.findall(r'DIAG_ONLY_COMPILER=([0-9a-f]{40})', diag),
+                      'log_sha256': hashlib.sha256(lp.read_bytes()).hexdigest(),
+                  })
+              stable = len(hashes) == 3 and len(set(hashes)) == 1
+              all_ok &= stable
+              cases.append({
+                  'case': case,
+                  'reproduced_3_of_3': all(r.get('reproduced') for r in reps),
+                  'diagnostic_stable_3_of_3': stable,
+                  'repetitions': reps,
+              })
+          result = {
+              'source_commit': 'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0',
+              'reference_engine': 'Monad InterpreterOnly',
+              'candidate_engine': 'Monad CompilerOnly',
+              'cases': cases,
+              'all_cases_reproduced_3_of_3': all_ok,
+              'decision': ('REPRODUCED_STATE_MAP_DIVERGENCE_REQUIRES_MINIMIZATION' if all_ok else 'NONDETERMINISTIC_OR_INFRASTRUCTURE_SIGNAL'),
+              'submission_ready': False,
+          }
+          (root/'ADJUDICATION.json').write_text(json.dumps(result, indent=2, sort_keys=True)+'\n')
+          print(json.dumps(result, indent=2))
+          PY
+          find out -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > out/SHA256SUMS
+          tar --sort=name --mtime='UTC 2026-08-25' --owner=0 --group=0 --numeric-owner \
+            -C out -czf monad-v0160-native-diff-adjudicator-v2-20260825.tar.gz \
+            ADJUDICATION.json SHA256SUMS bin focus logs meta rc
+          sha256sum monad-v0160-native-diff-adjudicator-v2-20260825.tar.gz \
+            > monad-v0160-native-diff-adjudicator-v2-20260825.tar.gz.sha256
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: monad-v0160-native-diff-adjudicator-v2-20260825
+          path: |
+            monad-v0160-native-diff-adjudicator-v2-20260825.tar.gz
+            monad-v0160-native-diff-adjudicator-v2-20260825.tar.gz.sha256
+            out/ADJUDICATION.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
