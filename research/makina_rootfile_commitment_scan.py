@@ -8,6 +8,8 @@ checks the exact Weiroll command encoding used by Makina v1.2.0:
 * state vectors longer than the uint128 commitment bitmap;
 * state reads that are neither committed, declared runtime inputs, nor written
   by an earlier command;
+* permissionless ACCOUNTING instructions with runtime input slots or unbound
+  state reads;
 * input-slot indexes outside the addressable 0..127 Weiroll range;
 * malformed command words and bitmap bits outside the state vector.
 """
@@ -22,7 +24,6 @@ import tomllib
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable
 
-IDX_VARIABLE_LENGTH = 0x80
 IDX_VALUE_MASK = 0x7F
 IDX_DYNAMIC_END = 0xFB
 IDX_TUPLE_START = 0xFC
@@ -30,25 +31,21 @@ IDX_ARRAY_START = 0xFD
 IDX_USE_STATE = 0xFE
 IDX_END_OF_ARGS = 0xFF
 FLAG_EXTENDED_COMMAND = 0x40
-
-MARKERS = {
-    IDX_DYNAMIC_END,
-    IDX_TUPLE_START,
-    IDX_ARRAY_START,
-    IDX_USE_STATE,
-    IDX_END_OF_ARGS,
-}
+ACCOUNTING = 1
 
 
 @dataclass(frozen=True)
 class Hit:
     file: str
     instruction: str
+    instruction_type: int
     kind: str
     detail: str
 
 
-def walk_instruction_tables(node: Any, path: tuple[str, ...] = ()) -> Iterable[tuple[tuple[str, ...], dict[str, Any]]]:
+def walk_instruction_tables(
+    node: Any, path: tuple[str, ...] = ()
+) -> Iterable[tuple[tuple[str, ...], dict[str, Any]]]:
     if isinstance(node, dict):
         if "commands" in node and "state" in node and "bitmap" in node:
             yield path, node
@@ -87,31 +84,46 @@ def bitmap_committed(bitmap: int, index: int) -> bool:
     return bool(bitmap & (1 << (127 - index)))
 
 
-def analyze_instruction(file: pathlib.Path, name: str, inst: dict[str, Any]) -> tuple[list[Hit], dict[str, Any]]:
+def analyze_instruction(
+    file: pathlib.Path, name: str, inst: dict[str, Any]
+) -> tuple[list[Hit], dict[str, Any]]:
     hits: list[Hit] = []
     commands_raw = inst.get("commands", [])
     state = inst.get("state", [])
     bitmap = int(inst.get("bitmap", 0))
+    instruction_type = int(inst.get("instruction_type", -1))
     input_slots_raw = inst.get("inputs_slots", [])
+
+    def add(kind: str, detail: str) -> None:
+        hits.append(Hit(str(file), name, instruction_type, kind, detail))
 
     input_slots: set[int] = set()
     for slot in input_slots_raw:
         try:
             index = int(slot["index"])
         except (KeyError, TypeError, ValueError):
-            hits.append(Hit(str(file), name, "MALFORMED_INPUT_SLOT", repr(slot)))
+            add("MALFORMED_INPUT_SLOT", repr(slot))
             continue
         input_slots.add(index)
         if index >= 128:
-            hits.append(Hit(str(file), name, "INPUT_SLOT_OUT_OF_RANGE", f"index={index}"))
+            add("INPUT_SLOT_OUT_OF_RANGE", f"index={index}")
+        if bitmap_committed(bitmap, index):
+            add("INPUT_SLOT_COMMITTED", f"index={index}")
+
+    if instruction_type == ACCOUNTING and input_slots:
+        add(
+            "ACCOUNTING_WITH_INPUT_SLOTS",
+            f"permissionless accounting exposes runtime indexes={sorted(input_slots)}",
+        )
 
     if len(state) > 128:
-        hits.append(Hit(str(file), name, "STATE_OVER_128", f"len={len(state)}"))
+        add("STATE_OVER_128", f"len={len(state)}")
 
     for bit_index in range(128):
         if bitmap_committed(bitmap, bit_index) and bit_index >= len(state):
-            hits.append(
-                Hit(str(file), name, "BITMAP_BIT_OUTSIDE_STATE", f"index={bit_index}, state_len={len(state)}")
+            add(
+                "BITMAP_BIT_OUTSIDE_STATE",
+                f"index={bit_index}, state_len={len(state)}",
             )
 
     words: list[bytes] = []
@@ -119,7 +131,7 @@ def analyze_instruction(file: pathlib.Path, name: str, inst: dict[str, Any]) -> 
         try:
             words.append(decode_word(raw))
         except (TypeError, ValueError) as exc:
-            hits.append(Hit(str(file), name, "MALFORMED_COMMAND", str(exc)))
+            add("MALFORMED_COMMAND", str(exc))
 
     written: set[int] = set()
     referenced: set[int] = set()
@@ -136,7 +148,7 @@ def analyze_instruction(file: pathlib.Path, name: str, inst: dict[str, Any]) -> 
 
         if flags & FLAG_EXTENDED_COMMAND:
             if i + 1 >= len(words):
-                hits.append(Hit(str(file), name, "TRUNCATED_EXTENDED_COMMAND", f"word={i}"))
+                add("TRUNCATED_EXTENDED_COMMAND", f"word={i}")
                 break
             arg_bytes = words[i + 1]
             i += 2
@@ -148,40 +160,55 @@ def analyze_instruction(file: pathlib.Path, name: str, inst: dict[str, Any]) -> 
         referenced.update(refs)
         if use_state:
             use_state_commands.append(logical_command)
-            hits.append(Hit(str(file), name, "IDX_USE_STATE_ARGUMENT", f"command={logical_command}"))
+            add("IDX_USE_STATE_ARGUMENT", f"command={logical_command}")
 
         for index in refs:
             if index >= len(state):
-                hits.append(
-                    Hit(str(file), name, "READ_OUTSIDE_STATE", f"command={logical_command}, index={index}, state_len={len(state)}")
+                add(
+                    "READ_OUTSIDE_STATE",
+                    f"command={logical_command}, index={index}, state_len={len(state)}",
                 )
-            elif not bitmap_committed(bitmap, index) and index not in input_slots and index not in written:
+            elif (
+                not bitmap_committed(bitmap, index)
+                and index not in input_slots
+                and index not in written
+            ):
                 unbound_reads.add(index)
 
         if ret == IDX_USE_STATE:
             raw_state_returns.append(logical_command)
-            hits.append(Hit(str(file), name, "IDX_USE_STATE_RETURN", f"command={logical_command}"))
+            add("IDX_USE_STATE_RETURN", f"command={logical_command}")
         elif ret != IDX_END_OF_ARGS:
             out_index = ret & IDX_VALUE_MASK
             if out_index >= 128:
-                hits.append(Hit(str(file), name, "RETURN_SLOT_OUT_OF_RANGE", f"command={logical_command}, index={out_index}"))
+                add(
+                    "RETURN_SLOT_OUT_OF_RANGE",
+                    f"command={logical_command}, index={out_index}",
+                )
             written.add(out_index)
 
         logical_command += 1
 
     for index in sorted(unbound_reads):
         value = state[index] if index < len(state) else None
-        hits.append(
-            Hit(
-                str(file),
-                name,
-                "UNBOUND_STATE_READ",
-                f"index={index}, value={value!r}, committed=false, input=false, prior_write=false",
-            )
+        kind = (
+            "ACCOUNTING_UNBOUND_STATE_READ"
+            if instruction_type == ACCOUNTING
+            else "UNBOUND_STATE_READ"
         )
+        add(
+            kind,
+            f"index={index}, value={value!r}, committed=false, "
+            "input=false, prior_write=false",
+        )
+
+    unused_inputs = sorted(input_slots - referenced)
+    for index in unused_inputs:
+        add("UNUSED_INPUT_SLOT", f"index={index}")
 
     summary = {
         "instruction": name,
+        "instruction_type": instruction_type,
         "state_len": len(state),
         "bitmap_popcount": bitmap.bit_count(),
         "input_slots": sorted(input_slots),
@@ -207,13 +234,16 @@ def main() -> int:
 
     max_state_len = 0
     instruction_count = 0
+    instruction_type_counts: dict[str, int] = {}
 
     for file in rootfiles:
         try:
             with file.open("rb") as handle:
                 doc = tomllib.load(handle)
-        except Exception as exc:  # report and continue across the public corpus
-            parse_errors.append({"file": str(file), "error": f"{type(exc).__name__}: {exc}"})
+        except Exception as exc:
+            parse_errors.append(
+                {"file": str(file), "error": f"{type(exc).__name__}: {exc}"}
+            )
             continue
 
         for path, inst in walk_instruction_tables(doc.get("instructions", {})):
@@ -221,19 +251,26 @@ def main() -> int:
             name = ".".join(path)
             inst_hits, summary = analyze_instruction(file, name, inst)
             max_state_len = max(max_state_len, summary["state_len"])
+            key = str(summary["instruction_type"])
+            instruction_type_counts[key] = instruction_type_counts.get(key, 0) + 1
             hits.extend(inst_hits)
             summaries.append({"file": str(file), **summary})
 
     by_kind: dict[str, int] = {}
+    by_type_and_kind: dict[str, int] = {}
     for hit in hits:
         by_kind[hit.kind] = by_kind.get(hit.kind, 0) + 1
+        compound = f"type_{hit.instruction_type}:{hit.kind}"
+        by_type_and_kind[compound] = by_type_and_kind.get(compound, 0) + 1
 
     report = {
         "rootfiles": len(rootfiles),
         "instructions": instruction_count,
+        "instruction_type_counts": dict(sorted(instruction_type_counts.items())),
         "max_state_len": max_state_len,
         "parse_errors": parse_errors,
         "hits_by_kind": dict(sorted(by_kind.items())),
+        "hits_by_type_and_kind": dict(sorted(by_type_and_kind.items())),
         "hits": [asdict(hit) for hit in hits],
     }
 
@@ -251,12 +288,15 @@ def main() -> int:
         f"max_state_len={max_state_len}",
         f"parse_errors={len(parse_errors)}",
     ]
+    lines.extend(
+        f"instruction_type_{kind}={count}"
+        for kind, count in sorted(instruction_type_counts.items())
+    )
     lines.extend(f"{kind}={count}" for kind, count in sorted(by_kind.items()))
-    (args.out / "rootfile_commitment_scan.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (args.out / "rootfile_commitment_scan.txt").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8"
+    )
     print("\n".join(lines))
-
-    # The scanner itself succeeds even when it finds anomalies; the evidence
-    # report is the decision input and must be reviewed before any submission.
     return 0
 
 
