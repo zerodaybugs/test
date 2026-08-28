@@ -1,25 +1,168 @@
-name: Compatibility probe 20260828
+name: Compatibility matrix 20260828
 
 on:
   push:
     branches:
       - ci/compat-probe-20260828
+    paths:
+      - .github/workflows/z-compat-probe-20260828.yml
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  probe:
+  matrix:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 25
+    env:
+      EVIDENCE_DIR: ${{ runner.temp }}/compat-evidence
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
     steps:
-      - name: Runner check
+      - name: Read temporary compatibility data
+        uses: actions/checkout@v4
+
+      - name: Install serviced SDKs
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            8.0.424
+            9.0.317
+            10.0.400
+
+      - name: Prepare isolated payload
         shell: bash
         run: |
           set -euo pipefail
-          echo "runner=${RUNNER_OS}-${RUNNER_ARCH}"
-          uname -a
-          command -v dotnet || true
-          dotnet --list-sdks || true
-          openssl version
+          mkdir -p work "$EVIDENCE_DIR"
+          cat .ci/runtime/part* > work/payload.b64
+          printf '%s  %s\n' '6da9c905577655377cd5e772fa7cc480a78d342dfede835ebafce8203cfd58f0' 'work/payload.b64' | sha256sum -c -
+          base64 -d work/payload.b64 | gzip -d > work/Program.cs
+          rm -f work/payload.b64
+          cp .ci/runtime/cert.pem work/evidence-cert.pem
+          test "$(openssl x509 -in work/evidence-cert.pem -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':')" = 'CEAD08CD9FA3006A771582A1C6C9BDA89DA97429317DEF9A36AF7CB27F6BA1DA'
+          chmod 600 work/Program.cs
+
+      - name: Execute exact runtime matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet --list-sdks > "$EVIDENCE_DIR/sdk-list.txt" 2>&1
+          dotnet --list-runtimes > "$EVIDENCE_DIR/runtime-list.txt" 2>&1
+          uname -a > "$EVIDENCE_DIR/uname.txt" 2>&1
+          cp work/Program.cs "$EVIDENCE_DIR/payload-source.cs"
+
+          matrix=(
+            "8.0.424|net8.0|8.0.30|8"
+            "9.0.317|net9.0|9.0.19|9"
+            "10.0.400|net10.0|10.0.11|10"
+          )
+
+          : > "$EVIDENCE_DIR/exit-codes.txt"
+          for item in "${matrix[@]}"; do
+            IFS='|' read -r sdk tfm fx label <<< "$item"
+            dir="work/harness-$label"
+            mkdir -p "$dir"
+            cp work/Program.cs "$dir/Program.cs"
+
+            cat > "$dir/Harness.csproj" <<XML
+          <Project Sdk="Microsoft.NET.Sdk.Web">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>${tfm}</TargetFramework>
+              <ImplicitUsings>enable</ImplicitUsings>
+              <Nullable>enable</Nullable>
+              <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+            </PropertyGroup>
+          </Project>
+          XML
+
+            cat > "$dir/global.json" <<JSON
+          {
+            "sdk": {
+              "version": "${sdk}",
+              "rollForward": "disable"
+            }
+          }
+          JSON
+
+            set +e
+            (
+              cd "$dir"
+              dotnet --version > "$EVIDENCE_DIR/sdk-version-$label.txt" 2>&1
+              dotnet --info > "$EVIDENCE_DIR/dotnet-info-$label.txt" 2>&1
+              dotnet restore Harness.csproj --ignore-failed-sources > "$EVIDENCE_DIR/restore-$label.log" 2>&1
+            )
+            restore_rc=$?
+
+            if [ "$restore_rc" -eq 0 ]; then
+              (
+                cd "$dir"
+                dotnet build Harness.csproj -c Release --no-restore > "$EVIDENCE_DIR/build-$label.log" 2>&1
+              )
+              build_rc=$?
+            else
+              build_rc=98
+            fi
+
+            if [ "$build_rc" -eq 0 ]; then
+              dotnet --fx-version "$fx" \
+                "$dir/bin/Release/$tfm/Harness.dll" \
+                "$EVIDENCE_DIR/results-$label.json" \
+                > "$EVIDENCE_DIR/run-$label.log" 2>&1
+              run_rc=$?
+            else
+              run_rc=99
+            fi
+            set -e
+
+            printf '%s restore=%s build=%s run=%s\n' \
+              "$label" "$restore_rc" "$build_rc" "$run_rc" \
+              >> "$EVIDENCE_DIR/exit-codes.txt"
+          done
+
+      - name: Seal evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR" work
+          if [ ! -f work/evidence-cert.pem ]; then
+            cp .ci/runtime/cert.pem work/evidence-cert.pem
+          fi
+          {
+            echo "generated_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "workflow_sha=${GITHUB_SHA}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "external_targets=none"
+            echo "network_scope=loopback_only"
+          } > "$EVIDENCE_DIR/manifest.txt"
+
+          (
+            cd "$EVIDENCE_DIR"
+            find . -type f ! -name SHA256SUMS.txt -print0 \
+              | sort -z \
+              | xargs -0 sha256sum > SHA256SUMS.txt
+          )
+
+          tar -C "$EVIDENCE_DIR" -czf work/plain-evidence.tar.gz .
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in work/plain-evidence.tar.gz \
+            -outform DER \
+            -out work/bundle.bin \
+            work/evidence-cert.pem
+          sha256sum work/bundle.bin > work/bundle.sha256
+          rm -rf "$EVIDENCE_DIR" work/plain-evidence.tar.gz work/Program.cs
+
+      - name: Upload sealed bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compatibility-bundle-20260828
+          path: |
+            work/bundle.bin
+            work/bundle.sha256
+          if-no-files-found: error
+          retention-days: 7
