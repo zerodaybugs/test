@@ -1,0 +1,196 @@
+name: Temporary Superhuman OAuth update and error boundary gate
+
+on:
+  push:
+    branches: [research/superhuman-index-attachment-20260811]
+    paths: [.github/workflows/superhuman-oauth-error-boundary-gate-20260811.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+
+      - name: Install exact stable runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf sh-oauth-gate
+          mkdir -p sh-oauth-gate/evidence public-intake-status
+          cd sh-oauth-gate
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund @codahq/packs-sdk@1.17.1 isolated-vm@6.0.2
+
+      - name: Run canonical isolate error-leak gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd sh-oauth-gate
+          cat > error_gate.js <<'NODE'
+          'use strict';
+          const assert = require('assert');
+          const fs = require('fs');
+          const net = require('net');
+          const os = require('os');
+          const path = require('path');
+          const sdkRoot = path.dirname(require.resolve('@codahq/packs-sdk/package.json'));
+          const bootstrap = require(path.join(sdkRoot, 'dist/runtime/bootstrap/index.js'));
+          const {AuthenticatingFetcher} = require(path.join(sdkRoot, 'dist/testing/fetcher.js'));
+
+          const QUERY_SECRET = 'LAB_QUERY_SECRET_20260811';
+          const OAUTH_SECRET = 'LAB_OAUTH_ACCESS_TOKEN_20260811';
+          const logger = {trace(){},debug(){},info(){},warn(){},error(){}};
+          const blob = {async storeUrl(){throw new Error('unused')},async storeBlob(){throw new Error('unused')}};
+
+          async function unusedPort() {
+            const server = net.createServer();
+            await new Promise((resolve, reject) => server.listen(0, '127.0.0.1', resolve).once('error', reject));
+            const port = server.address().port;
+            await new Promise(resolve => server.close(resolve));
+            return port;
+          }
+
+          async function runCase(label, authDef, credentials, secret) {
+            const port = await unusedPort();
+            const work = fs.mkdtempSync(path.join(os.tmpdir(), 'sh-error-gate-'));
+            const packPath = path.join(work, 'pack.js');
+            const mapPath = path.join(work, 'pack.js.map');
+            fs.writeFileSync(packPath, `module.exports={pack:{defaultAuthentication:${JSON.stringify(authDef)},networkDomains:['127.0.0.1:${port}'],formulas:[{name:'Probe',description:'probe',parameters:[],resultType:'object',connectionRequirement:'required',execute:async(_p,context)=>{try{await context.fetcher.fetch({method:'GET',url:'https://127.0.0.1:${port}/closed'});return{unexpectedSuccess:true}}catch(e){return{constructor:e&&e.constructor&&e.constructor.name,name:e&&e.name,message:e&&e.message,stack:e&&e.stack,keys:e?Object.keys(e):[],json:(()=>{try{return JSON.stringify(e)}catch(_){return 'UNSERIALIZABLE'}})(),options:e&&e.options,response:e&&e.response}}}}]}};`);
+            fs.writeFileSync(mapPath, '{"version":3,"file":"pack.js","sources":["pack-source.js"],"names":[],"mappings":""}\n');
+            const isolate = bootstrap.createIsolate({memoryLimit:64});
+            const context = await bootstrap.createIsolateContext(isolate);
+            await bootstrap.registerBundles(isolate, context, packPath, bootstrap.getThunkPath(), true);
+            const fetcher = new AuthenticatingFetcher(()=>{}, authDef, [`127.0.0.1:${port}`], credentials, `LAB_INVOCATION_${label}`);
+            await bootstrap.injectExecutionContext({context,fetcher,temporaryBlobStorage:blob,syncStateService:undefined,logger,endpoint:undefined,invocationLocation:{protocolAndHost:'https://coda.io'},timezone:'UTC',invocationToken:`LAB_INVOCATION_${label}`,sync:undefined,authenticationName:'defaultUserAuthentication',executionId:`LAB_EXECUTION_${label}`,previousAttemptError:undefined});
+            const result = await bootstrap.executeThunk(context,{params:[],formulaSpec:{type:'Standard',formulaName:'Probe'}},packPath,mapPath);
+            isolate.dispose();
+            fs.rmSync(work,{recursive:true,force:true});
+            const serialized = JSON.stringify(result);
+            return {label,secret,secretVisible:serialized.includes(secret),result};
+          }
+
+          (async()=>{
+            const query = await runCase('QUERY',{type:'QueryParamToken',paramName:'api_key'},{paramValue:QUERY_SECRET},QUERY_SECRET);
+            const oauth = await runCase('OAUTH',{type:'OAuth2',authorizationUrl:'https://auth.example/authorize',tokenUrl:'https://auth.example/token',scopes:[]},{clientId:'LAB_CLIENT',clientSecret:'LAB_CLIENT_SECRET',accessToken:OAUTH_SECRET,refreshToken:'LAB_REFRESH',scopes:[]},OAUTH_SECRET);
+            const result={pass:true,sdkVersion:require(path.join(sdkRoot,'package.json')).version,isolatedVmVersion:require('isolated-vm/package.json').version,nodeVersion:process.version,query,oauth,anySecretVisible:query.secretVisible||oauth.secretVisible,syntheticOnly:true,productionRequestCount:0};
+            fs.writeFileSync('evidence/ERROR_BOUNDARY_RESULT.json',JSON.stringify(result,null,2)+'\n');
+            console.log(JSON.stringify(result,null,2));
+          })().catch(e=>{console.error(e&&e.stack||e);process.exit(1)});
+          NODE
+          node error_gate.js | tee evidence/ERROR_BOUNDARY_OUTPUT.txt
+          jq -e '.pass == true' evidence/ERROR_BOUNDARY_RESULT.json >/dev/null
+
+      - name: Run OAuth v1-to-v2 refresh-token routing gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd sh-oauth-gate
+          cat > oauth_update_gate.js <<'NODE'
+          'use strict';
+          const assert = require('assert');
+          const fs = require('fs');
+          const http = require('http');
+          const path = require('path');
+          const sdk = require('@codahq/packs-sdk');
+          const sdkRoot = path.dirname(require.resolve('@codahq/packs-sdk/package.json'));
+          const {AuthenticatingFetcher} = require(path.join(sdkRoot,'dist/testing/fetcher.js'));
+          const {compilePackMetadata} = require(path.join(sdkRoot,'dist/helpers/metadata.js'));
+          const {validatePackVersionMetadata} = require(path.join(sdkRoot,'dist/testing/upload_validation.js'));
+
+          const CLIENT_ID='LAB_OAUTH_CLIENT_ID_20260811';
+          const CLIENT_SECRET='LAB_OAUTH_CLIENT_SECRET_20260811';
+          const OLD_ACCESS='LAB_EXPIRED_ACCESS_20260811';
+          const REFRESH='LAB_REFRESH_TOKEN_20260811';
+          const NEW_ACCESS='LAB_NEW_ACCESS_20260811';
+          const captures=[];
+          function listen(server){return new Promise((resolve,reject)=>server.listen(0,'127.0.0.1',()=>resolve(server.address().port)).once('error',reject))}
+          function close(server){return new Promise(resolve=>server.close(resolve))}
+
+          (async()=>{
+            const tokenServer=http.createServer((req,res)=>{let body='';req.on('data',c=>body+=c);req.on('end',()=>{captures.push({server:'v2-token',method:req.method,url:req.url,headers:req.headers,body});res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({access_token:NEW_ACCESS,refresh_token:REFRESH,expires_in:3600,token_type:'Bearer'}))})});
+            const apiServer=http.createServer((req,res)=>{captures.push({server:'api',method:req.method,url:req.url,headers:req.headers});if((req.headers.authorization||'').includes(OLD_ACCESS)){res.writeHead(401,{'content-type':'application/json'});res.end(JSON.stringify({error:'expired'}))}else{res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({ok:true}))}});
+            const tokenPort=await listen(tokenServer); const apiPort=await listen(apiServer);
+            const tokenUrl=`http://127.0.0.1:${tokenPort}/oauth/token`;
+            const apiUrl=`http://127.0.0.1:${apiPort}/resource`;
+
+            const v2Pack=sdk.newPack(); v2Pack.setVersion('2.0.0'); v2Pack.addNetworkDomain(`127.0.0.1:${apiPort}`); v2Pack.setUserAuthentication({type:sdk.AuthenticationType.OAuth2,authorizationUrl:`http://127.0.0.1:${tokenPort}/oauth/authorize`,tokenUrl,scopes:[]});
+            v2Pack.addFormula({name:'Read',description:'read',parameters:[],resultType:sdk.ValueType.String,connectionRequirement:sdk.ConnectionRequirement.Required,execute:async()=>''});
+            const v2Metadata=compilePackMetadata(v2Pack);
+            const validated=await validatePackVersionMetadata(v2Metadata,'1.17.1');
+            assert.equal(validated.defaultAuthentication.tokenUrl,tokenUrl);
+
+            const storedV1Credentials={clientId:CLIENT_ID,clientSecret:CLIENT_SECRET,accessToken:OLD_ACCESS,refreshToken:REFRESH,scopes:[]};
+            let updatedCredentials;
+            const v2AuthDef={type:'OAuth2',authorizationUrl:`http://127.0.0.1:${tokenPort}/oauth/authorize`,tokenUrl,scopes:[]};
+            const fetcher=new AuthenticatingFetcher(c=>{updatedCredentials=c},v2AuthDef,[`127.0.0.1:${apiPort}`],storedV1Credentials,'LAB_INVOCATION_OAUTH_UPDATE');
+            const response=await fetcher.fetch({method:'GET',url:apiUrl});
+            assert.equal(response.status,200);
+            const tokenCapture=captures.find(x=>x.server==='v2-token');
+            assert(tokenCapture,'v2 token endpoint was not contacted');
+            assert(tokenCapture.body.includes(`refresh_token=${REFRESH}`));
+            const secretInBody=tokenCapture.body.includes(`client_secret=${CLIENT_SECRET}`);
+            const secretInBasic=(tokenCapture.headers.authorization||'').includes(Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64'));
+            assert(secretInBody||secretInBasic);
+            assert(updatedCredentials.accessToken===NEW_ACCESS);
+
+            const result={pass:true,sdkVersion:require(path.join(sdkRoot,'package.json')).version,officialV2UploadValidatorAccepted:true,v2TokenUrl:tokenUrl,storedV1CredentialsUsedWithV2AuthDefinition:true,refreshTokenDeliveredToV2TokenUrl:true,clientSecretDeliveredToV2TokenUrl:secretInBody||secretInBasic,newAccessTokenPersisted:true,captures,syntheticOnly:true,productionRequestCount:0};
+            fs.writeFileSync('evidence/OAUTH_UPDATE_RESULT.json',JSON.stringify(result,null,2)+'\n');
+            console.log(JSON.stringify(result,null,2));
+            await close(tokenServer); await close(apiServer);
+          })().catch(e=>{console.error(e&&e.stack||e);process.exit(1)});
+          NODE
+          node oauth_update_gate.js | tee evidence/OAUTH_UPDATE_OUTPUT.txt
+          jq -e '.pass == true and .refreshTokenDeliveredToV2TokenUrl == true and .clientSecretDeliveredToV2TokenUrl == true' evidence/OAUTH_UPDATE_RESULT.json >/dev/null
+
+      - name: Produce compact decision and hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd sh-oauth-gate
+          python3 - <<'PY'
+          import json, os, pathlib
+          ev=pathlib.Path('evidence')
+          error=json.loads((ev/'ERROR_BOUNDARY_RESULT.json').read_text())
+          update=json.loads((ev/'OAUTH_UPDATE_RESULT.json').read_text())
+          decision={
+            'pass': bool(error['pass'] and update['pass']),
+            'workflowRunId': int(os.environ['GITHUB_RUN_ID']),
+            'sourceCommit': os.environ['GITHUB_SHA'],
+            'errorBoundarySecretVisible': error['anySecretVisible'],
+            'oauthUpdateRefreshTokenRerouted': update['refreshTokenDeliveredToV2TokenUrl'],
+            'oauthUpdateClientSecretRerouted': update['clientSecretDeliveredToV2TokenUrl'],
+            'technicalDecision': 'OAUTH_UPDATE_CREDENTIAL_REROUTING_CONFIRMED_LOCAL',
+            'submissionReady': False,
+            'submissionDecision': 'HOLD_PENDING_HOSTED_CONNECTION_PERSISTENCE_AND_RELEASE_INVALIDATION',
+            'syntheticOnly': True,
+            'productionRequestCount': 0,
+          }
+          (ev/'RESULT.json').write_text(json.dumps(decision,indent=2)+'\n')
+          pathlib.Path('../public-intake-status/superhuman-oauth-error-boundary-result.json').write_text(json.dumps(decision,indent=2)+'\n')
+          print(json.dumps(decision,indent=2))
+          PY
+          find evidence -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-oauth-update-error-boundary-gate
+          path: sh-oauth-gate/evidence/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Commit compact result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-oauth-error-boundary-result.json
+          git commit -m 'chore: record Superhuman OAuth update boundary gate'
+          git push
