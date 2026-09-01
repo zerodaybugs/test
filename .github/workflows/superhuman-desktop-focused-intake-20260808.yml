@@ -1,0 +1,120 @@
+name: Temporary Superhuman desktop focused intake
+
+on:
+  push:
+    branches: [research/superhuman-desktop-20260808]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  intake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+
+      - name: Download and verify official 1041.0.29 macOS package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf desktop-focused
+          mkdir -p desktop-focused/raw desktop-focused/focused
+          URL='https://storage.googleapis.com/download.superhuman.com/supertron-update/Superhuman-1041.0.29-latest-mac.zip'
+          curl --fail --show-error --silent --location --retry 3 --retry-all-errors "$URL" -o desktop-focused/raw/release.zip
+          echo '5b753f4c31dd0e5732f0e555bbd76e595c573445bf93b91fd25320e29bf2f014  desktop-focused/raw/release.zip' | sha256sum -c -
+          unzip -q desktop-focused/raw/release.zip -d desktop-focused/raw/unpacked
+          APP="$(find desktop-focused/raw/unpacked -name 'Superhuman.app' -type d | head -1)"
+          test -n "$APP"
+          ASAR="$APP/Contents/Resources/app.asar"
+          test -f "$ASAR"
+          cp "$ASAR" desktop-focused/raw/app.asar
+          cp "$APP/Contents/Info.plist" desktop-focused/focused/Info.plist
+
+      - name: Extract ASAR and retain privileged-boundary files only
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --silent --no-progress install --global @electron/asar@3.4.1
+          asar extract desktop-focused/raw/app.asar desktop-focused/raw/source
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,re,hashlib,os,shutil
+          root=Path('desktop-focused')
+          src=root/'raw/source'; out=root/'focused'
+          package=src/'package.json'
+          if not package.exists(): raise SystemExit('missing package.json')
+          shutil.copy2(package,out/'package.json')
+          pkg=json.loads(package.read_text())
+          main=pkg.get('main')
+          patterns={
+            'electron_main':re.compile(r'BrowserWindow|app\.on\(|app\.whenReady|ipcMain|protocol\.|setAsDefaultProtocolClient|open-url|second-instance|webContents|shell\.openExternal',re.I),
+            'preload_bridge':re.compile(r'contextBridge|ipcRenderer|exposeInMainWorld|NativeApi|FileDownloads|openExternalURL|setLoginUuid|setPendingAuthProvider',re.I),
+            'navigation_security':re.compile(r'will-navigate|will-redirect|setWindowOpenHandler|new-window|webSecurity|nodeIntegration|contextIsolation|sandbox\s*:|allowRunningInsecureContent',re.I),
+            'custom_protocol':re.compile(r'superhuman:|native-login:|oauth|loginUuid|pendingAuthProvider|url\.parse|new URL\(',re.I),
+            'dangerous_sink':re.compile(r'executeJavaScript|child_process|execFile|spawn\(|exec\(|openPath|showItemInFolder|loadURL|loadFile|registerFileProtocol|registerHttpProtocol',re.I),
+          }
+          hits=[]; selected=set()
+          if main:
+            for candidate in [src/main,src/(main+'.js')]:
+              if candidate.exists(): selected.add(candidate)
+          for p in src.rglob('*'):
+            if not p.is_file() or p.stat().st_size>15_000_000 or p.suffix.lower() not in {'.js','.cjs','.mjs','.json','.html'}: continue
+            try: text=p.read_text(errors='ignore')
+            except Exception: continue
+            local=[]
+            for kind,rx in patterns.items():
+              for m in list(rx.finditer(text))[:250]:
+                local.append({'kind':kind,'offset':m.start(),'context':text[max(0,m.start()-320):m.start()+900].replace('\n',' ')})
+            if local:
+              selected.add(p)
+              for h in local: hits.append({'path':str(p.relative_to(src)),**h})
+          copied=[]
+          for p in sorted(selected):
+            rel=p.relative_to(src)
+            dest=out/'source'/rel
+            dest.parent.mkdir(parents=True,exist_ok=True)
+            shutil.copy2(p,dest); copied.append(str(rel))
+          status={
+            'workflow_run_id':int(os.environ['GITHUB_RUN_ID']),
+            'source_commit':os.environ['GITHUB_SHA'],
+            'desktop_version':'1041.0.29',
+            'release_zip_sha256':hashlib.sha256((root/'raw/release.zip').read_bytes()).hexdigest(),
+            'asar_sha256':hashlib.sha256((root/'raw/app.asar').read_bytes()).hexdigest(),
+            'package_main':main,
+            'total_source_files':sum(1 for p in src.rglob('*') if p.is_file()),
+            'selected_files':copied,
+            'hit_count':len(hits),
+          }
+          (out/'status.json').write_text(json.dumps(status,indent=2)+'\n')
+          (out/'privileged_boundary_hits.json').write_text(json.dumps(hits,indent=2)+'\n')
+          PY
+          find desktop-focused/focused -type f -print0 | sort -z | xargs -0 sha256sum > desktop-focused/focused/SHA256SUMS.txt
+          rm -rf desktop-focused/raw
+
+      - name: Upload focused evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-desktop-1041.0.29-focused
+          path: desktop-focused/focused/
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 9
+
+      - name: Commit status for polling
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p public-intake-status
+          cp desktop-focused/focused/status.json public-intake-status/superhuman-desktop-1041.0.29-focused.json
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-desktop-1041.0.29-focused.json
+          git commit -m 'chore: record focused Superhuman desktop intake status'
+          git push
