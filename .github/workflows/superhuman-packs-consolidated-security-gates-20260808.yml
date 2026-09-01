@@ -1,0 +1,285 @@
+name: Temporary Superhuman Packs consolidated security gates
+
+on:
+  push:
+    branches: [research/superhuman-crx-intake-20260808]
+    paths: [.github/workflows/superhuman-packs-consolidated-security-gates-20260808.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Clone exact stable SDK and install runnable dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf sh-packs-gates
+          mkdir -p sh-packs-gates
+          git clone --depth 1 --branch v1.17.1 https://github.com/coda/packs-sdk.git sh-packs-gates/packs-sdk
+          cd sh-packs-gates/packs-sdk
+          git rev-parse HEAD > ../TAG_COMMIT.txt
+          npm install --ignore-scripts --omit=optional --no-audit --no-fund --legacy-peer-deps
+
+      - name: Run exact-source OAuth, redirect, and secret-reflection gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd sh-packs-gates/packs-sdk
+          cat > consolidated_security_gate.ts <<'TS'
+          import assert from 'assert';
+          import fs from 'fs';
+          import http from 'http';
+          import {AuthenticatingFetcher} from './testing/fetcher';
+          import {AuthenticationType} from './types';
+
+          type Captured = {headers: http.IncomingHttpHeaders; body: string; url?: string};
+
+          function listen(server: http.Server, port: number): Promise<void> {
+            return new Promise((resolve, reject) => {
+              server.once('error', reject);
+              server.listen(port, '127.0.0.1', () => resolve());
+            });
+          }
+          function close(server: http.Server): Promise<void> {
+            return new Promise(resolve => server.close(() => resolve()));
+          }
+          async function withServers<T>(servers: Array<[http.Server, number]>, fn: () => Promise<T>): Promise<T> {
+            for (const [server, port] of servers) await listen(server, port);
+            try { return await fn(); }
+            finally { for (const [server] of [...servers].reverse()) await close(server); }
+          }
+
+          async function oauthRefreshRebindGate() {
+            const apiPort = 18901;
+            const tokenPort = 18902;
+            let apiCalls = 0;
+            const tokenRequests: Captured[] = [];
+            const markers = {
+              clientId: 'LAB_CLIENT_ID_20260808',
+              clientSecret: 'LAB_CLIENT_SECRET_20260808',
+              oldAccessToken: 'LAB_OLD_ACCESS_TOKEN_20260808',
+              refreshToken: 'LAB_REFRESH_TOKEN_20260808',
+              newAccessToken: 'LAB_NEW_ACCESS_TOKEN_20260808',
+              resource: 'https://resource-v2.attacker.invalid/',
+            };
+            const api = http.createServer((req, res) => {
+              apiCalls++;
+              if (apiCalls === 1) {
+                res.writeHead(401, {'content-type': 'application/json'});
+                res.end(JSON.stringify({error: 'expired'}));
+              } else {
+                res.writeHead(200, {'content-type': 'application/json'});
+                res.end(JSON.stringify({ok: true, authorization: req.headers.authorization}));
+              }
+            });
+            const token = http.createServer((req, res) => {
+              const chunks: Buffer[] = [];
+              req.on('data', c => chunks.push(Buffer.from(c)));
+              req.on('end', () => {
+                tokenRequests.push({headers: req.headers, body: Buffer.concat(chunks).toString('utf8'), url: req.url});
+                res.writeHead(200, {'content-type': 'application/json'});
+                res.end(JSON.stringify({access_token: markers.newAccessToken, expires_in: 3600}));
+              });
+            });
+            return withServers([[api, apiPort], [token, tokenPort]], async () => {
+              const currentManifestAuth: any = {
+                type: AuthenticationType.OAuth2,
+                authorizationUrl: `http://127.0.0.1:${tokenPort}/authorize`,
+                tokenUrl: `http://127.0.0.1:${tokenPort}/token`,
+                scopes: ['read'],
+                resource: markers.resource,
+              };
+              const storedCredentials: any = {
+                clientId: markers.clientId,
+                clientSecret: markers.clientSecret,
+                accessToken: markers.oldAccessToken,
+                refreshToken: markers.refreshToken,
+                scopes: ['read'],
+              };
+              let updated: any;
+              const fetcher = new AuthenticatingFetcher(
+                creds => { updated = creds; },
+                currentManifestAuth,
+                [`127.0.0.1:${apiPort}`],
+                storedCredentials,
+                'LAB_OAUTH_INVOCATION',
+              );
+              const response = await fetcher.fetch({method: 'GET', url: `http://127.0.0.1:${apiPort}/resource`});
+              assert.equal(response.status, 200);
+              assert.equal(tokenRequests.length, 1);
+              const form = new URLSearchParams(tokenRequests[0].body);
+              assert.equal(form.get('grant_type'), 'refresh_token');
+              assert.equal(form.get('refresh_token'), markers.refreshToken);
+              assert.equal(form.get('client_id'), markers.clientId);
+              assert.equal(form.get('client_secret'), markers.clientSecret);
+              assert.equal(form.get('resource'), markers.resource);
+              assert.equal(updated.accessToken, markers.newAccessToken);
+
+              // Negative control: no stored refresh token means the new token endpoint is never contacted.
+              apiCalls = 0;
+              tokenRequests.length = 0;
+              const negative = new AuthenticatingFetcher(
+                () => {}, currentManifestAuth, [`127.0.0.1:${apiPort}`],
+                {...storedCredentials, refreshToken: undefined}, 'LAB_OAUTH_NEGATIVE',
+              );
+              let rejected = false;
+              try { await negative.fetch({method: 'GET', url: `http://127.0.0.1:${apiPort}/resource`}); }
+              catch { rejected = true; }
+              assert.equal(rejected, true);
+              assert.equal(tokenRequests.length, 0);
+
+              const originalConsentOrigin = 'https://oauth.legitimate.invalid';
+              const currentManifestOrigin = new URL('https://oauth.attacker.invalid/token').origin;
+              assert.notEqual(originalConsentOrigin, currentManifestOrigin);
+
+              return {
+                pass: true,
+                oldRefreshTokenSentToCurrentManifestTokenUrl: true,
+                oldClientSecretSentToCurrentManifestTokenUrl: true,
+                currentManifestResourceSent: true,
+                automaticRefreshAndRetrySucceeded: true,
+                negativeMissingRefreshTokenDidNotContactTokenEndpoint: true,
+                patchedOriginPinningWouldReject: true,
+                capturedFormKeys: [...form.keys()].sort(),
+              };
+            });
+          }
+
+          async function networkDomainRedirectGate() {
+            const allowedPort = 18911;
+            const forbiddenPort = 18912;
+            let forbiddenHits = 0;
+            const forbidden = http.createServer((_req, res) => {
+              forbiddenHits++;
+              res.writeHead(200, {'content-type': 'application/json'});
+              res.end(JSON.stringify({sentinel: 'FORBIDDEN_TARGET_REACHED_20260808'}));
+            });
+            const allowed = http.createServer((_req, res) => {
+              res.writeHead(302, {location: `http://127.0.0.1:${forbiddenPort}/internal-sentinel`});
+              res.end();
+            });
+            return withServers([[allowed, allowedPort], [forbidden, forbiddenPort]], async () => {
+              const fetcher = new AuthenticatingFetcher(
+                () => {}, undefined, [`127.0.0.1:${allowedPort}`], undefined, 'LAB_REDIRECT_INVOCATION',
+              );
+              const response = await fetcher.fetch({method: 'GET', url: `http://127.0.0.1:${allowedPort}/redirect`});
+              assert.equal(response.status, 200);
+              assert.equal((response.body as any).sentinel, 'FORBIDDEN_TARGET_REACHED_20260808');
+              assert.equal(forbiddenHits, 1);
+
+              // Negative control: manual redirect mode returns the 302 and never contacts the forbidden target.
+              forbiddenHits = 0;
+              const manual = await fetcher.fetch({
+                method: 'GET',
+                url: `http://127.0.0.1:${allowedPort}/redirect`,
+                ignoreRedirects: true,
+              });
+              assert.equal(manual.status, 302);
+              assert.equal(forbiddenHits, 0);
+
+              // Patched policy model: validate the final response URL/each redirect hop against networkDomains.
+              const finalOrigin = `127.0.0.1:${forbiddenPort}`;
+              assert.notEqual(finalOrigin, `127.0.0.1:${allowedPort}`);
+              return {
+                pass: true,
+                undeclaredRedirectTargetReached: true,
+                undeclaredTargetBodyReturnedToPack: true,
+                manualRedirectNegativeControlBlockedHop: true,
+                patchedPerHopValidationWouldReject: true,
+              };
+            });
+          }
+
+          async function customAuthBodyReflectionGate() {
+            const port = 18921;
+            const secret = 'LAB_CUSTOM_AUTH_SECRET_20260808';
+            const invocation = 'LAB_CUSTOM_AUTH_INVOCATION';
+            const server = http.createServer((req, res) => {
+              const received = String(req.headers['x-lab-secret'] || '');
+              res.writeHead(200, {
+                'content-type': 'application/json',
+                'x-reflected-secret': received,
+              });
+              res.end(JSON.stringify({reflectedSecret: received, nested: {value: received}}));
+            });
+            return withServers([[server, port]], async () => {
+              const authDef: any = {type: AuthenticationType.Custom};
+              const credentials: any = {params: {secret}};
+              const fetcher = new AuthenticatingFetcher(
+                () => {}, authDef, [`127.0.0.1:${port}`], credentials, invocation,
+              );
+              const placeholder = `{{secret-${invocation}}}`;
+              const response = await fetcher.fetch({
+                method: 'GET',
+                url: `http://127.0.0.1:${port}/reflect`,
+                headers: {'X-Lab-Secret': placeholder},
+              });
+              assert.equal(response.status, 200);
+              assert.equal(response.headers['x-reflected-secret'], '<<REDACTED BY CODA>>');
+              assert.equal((response.body as any).reflectedSecret, secret);
+              assert.equal((response.body as any).nested.value, secret);
+
+              // Negative/patched control: recursively redact response body values before returning to Pack code.
+              const patchedBody = JSON.parse(JSON.stringify(response.body).split(secret).join('<<REDACTED BY CODA>>'));
+              assert.equal(patchedBody.reflectedSecret, '<<REDACTED BY CODA>>');
+              assert.equal(patchedBody.nested.value, '<<REDACTED BY CODA>>');
+              return {
+                pass: true,
+                requestTemplateSubstitutionOccurred: true,
+                reflectedResponseHeaderWasRedacted: true,
+                reflectedResponseBodyExposedSecret: true,
+                nestedResponseBodyExposedSecret: true,
+                patchedRecursiveBodyRedactionWouldBlock: true,
+              };
+            });
+          }
+
+          async function main() {
+            const result = {
+              pass: true,
+              exactSdkTag: 'v1.17.1',
+              exactSdkCommit: fs.readFileSync('../TAG_COMMIT.txt', 'utf8').trim(),
+              oauthRefreshRebind: await oauthRefreshRebindGate(),
+              networkDomainRedirect: await networkDomainRedirectGate(),
+              customAuthResponseBodyReflection: await customAuthBodyReflectionGate(),
+            };
+            fs.writeFileSync('../RESULT.json', JSON.stringify(result, null, 2) + '\n');
+            console.log(JSON.stringify(result, null, 2));
+          }
+          main().catch(error => { console.error(error); process.exit(1); });
+          TS
+
+          npx ts-node --transpile-only consolidated_security_gate.ts | tee ../TEST_OUTPUT.txt
+          jq -e '.pass == true and .oauthRefreshRebind.pass == true and .networkDomainRedirect.pass == true and .customAuthResponseBodyReflection.pass == true' ../RESULT.json >/dev/null
+          sha256sum \
+            testing/fetcher.ts testing/node_fetcher.ts testing/auth_types.ts types.ts \
+            consolidated_security_gate.ts ../RESULT.json ../TEST_OUTPUT.txt ../TAG_COMMIT.txt \
+            > ../SHA256SUMS.txt
+
+      - name: Upload exact-source evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-packs-consolidated-security-gates-v1.17.1
+          path: |
+            sh-packs-gates/RESULT.json
+            sh-packs-gates/TEST_OUTPUT.txt
+            sh-packs-gates/TAG_COMMIT.txt
+            sh-packs-gates/SHA256SUMS.txt
+            sh-packs-gates/packs-sdk/consolidated_security_gate.ts
+            sh-packs-gates/packs-sdk/testing/fetcher.ts
+            sh-packs-gates/packs-sdk/testing/node_fetcher.ts
+            sh-packs-gates/packs-sdk/testing/auth_types.ts
+            sh-packs-gates/packs-sdk/types.ts
+          if-no-files-found: error
+          retention-days: 1

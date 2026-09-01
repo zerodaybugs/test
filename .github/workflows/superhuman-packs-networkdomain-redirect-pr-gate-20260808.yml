@@ -1,0 +1,165 @@
+name: Temporary Superhuman Packs network-domain redirect PR gate
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+
+      - name: Clone exact stable SDK and install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf gate
+          git clone --depth 1 --branch v1.17.1 https://github.com/coda/packs-sdk.git gate
+          cd gate
+          git rev-parse HEAD > TAG_COMMIT.txt
+          npm ci --ignore-scripts --omit=optional --no-audit --no-fund
+
+      - name: Run exact-source redirect network-domain gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd gate
+          cat > redirect_networkdomain_gate.ts <<'TS'
+          import http from 'http';
+          import assert from 'assert';
+          import fs from 'fs';
+          import {AuthenticatingFetcher} from './testing/fetcher';
+
+          const ALLOWED_PORT = 18831;
+          const FORBIDDEN_PORT = 18832;
+          const SENTINEL = 'LAB_FORBIDDEN_DESTINATION_SENTINEL_20260808';
+          let allowedHits = 0;
+          let forbiddenHits = 0;
+
+          const listen = (server: http.Server, port: number) =>
+            new Promise<void>((resolve, reject) => {
+              server.once('error', reject);
+              server.listen(port, '127.0.0.1', () => resolve());
+            });
+          const close = (server: http.Server) => new Promise<void>(resolve => server.close(() => resolve()));
+
+          const forbidden = http.createServer((_req, res) => {
+            forbiddenHits++;
+            res.writeHead(200, {'content-type': 'application/json'});
+            res.end(JSON.stringify({sentinel: SENTINEL, destination: 'undeclared'}));
+          });
+          const allowed = http.createServer((_req, res) => {
+            allowedHits++;
+            res.writeHead(302, {Location: `http://127.0.0.1:${FORBIDDEN_PORT}/private`});
+            res.end();
+          });
+
+          async function main() {
+            await listen(forbidden, FORBIDDEN_PORT);
+            await listen(allowed, ALLOWED_PORT);
+            try {
+              const fetcher = new AuthenticatingFetcher(
+                () => {},
+                undefined,
+                [`127.0.0.1:${ALLOWED_PORT}`],
+                undefined,
+                'LAB_INVOCATION_TOKEN',
+              );
+
+              // Negative control: the undeclared destination is rejected when requested directly.
+              let directRejected = false;
+              let directError = '';
+              try {
+                await fetcher.fetch({method: 'GET', url: `http://127.0.0.1:${FORBIDDEN_PORT}/private`});
+              } catch (error: any) {
+                directRejected = true;
+                directError = String(error?.message || error);
+              }
+              assert.equal(directRejected, true);
+              assert.match(directError, /undeclared host/i);
+              assert.equal(forbiddenHits, 0);
+
+              // Vulnerable control: validate allowed origin, then follow 302 without re-validating destination.
+              const followed = await fetcher.fetch({method: 'GET', url: `http://127.0.0.1:${ALLOWED_PORT}/redirect`});
+              assert.equal(followed.status, 200);
+              assert.equal((followed.body as any).sentinel, SENTINEL);
+              assert.equal(allowedHits, 1);
+              assert.equal(forbiddenHits, 1);
+
+              // Built-in fail-closed control: ignoreRedirects prevents the destination request.
+              const beforeManual = forbiddenHits;
+              const manual = await fetcher.fetch({
+                method: 'GET',
+                url: `http://127.0.0.1:${ALLOWED_PORT}/redirect`,
+                ignoreRedirects: true,
+              });
+              assert.equal(manual.status, 302);
+              assert.equal(forbiddenHits, beforeManual);
+              assert.equal(String(manual.headers.location), `http://127.0.0.1:${FORBIDDEN_PORT}/private`);
+
+              // Patched policy model: every Location destination is passed through the same allowlist.
+              const patchedDestination = new URL(String(manual.headers.location));
+              const allowedDomains = [`127.0.0.1:${ALLOWED_PORT}`];
+              const patchedAllows = allowedDomains.some(
+                domain => patchedDestination.host === domain || patchedDestination.host.endsWith(`.${domain}`),
+              );
+              assert.equal(patchedAllows, false);
+
+              fs.writeFileSync(
+                'RESULT.json',
+                JSON.stringify({
+                  pass: true,
+                  exactSdkTag: 'v1.17.1',
+                  rootCause: 'initial URL host is validated once; node-fetch follows redirects without destination revalidation',
+                  vulnerableGate: {
+                    directUndeclaredDestinationRejected: true,
+                    allowedOriginRedirectReachedUndeclaredDestination: true,
+                    forbiddenResponseReturnedToPackCode: true,
+                    finalResponseUrl: `http://127.0.0.1:${FORBIDDEN_PORT}/private`,
+                  },
+                  negativeControl: {
+                    ignoreRedirectsPreventedDestinationRequest: true,
+                    directForbiddenHitCount: 0,
+                  },
+                  patchedControl: {perHopNetworkDomainValidationRejectedDestination: true},
+                  counters: {allowedHits, forbiddenHits},
+                  syntheticOnly: true,
+                }, null, 2) + '\n',
+              );
+            } finally {
+              await close(allowed);
+              await close(forbidden);
+            }
+          }
+          main().catch(error => { console.error(error); process.exit(1); });
+          TS
+          npx ts-node --transpile-only redirect_networkdomain_gate.ts | tee TEST_OUTPUT.txt
+          jq -e '.pass == true' RESULT.json >/dev/null
+          sha256sum \
+            testing/fetcher.ts testing/node_fetcher.ts testing/constants.ts types.ts \
+            redirect_networkdomain_gate.ts RESULT.json TEST_OUTPUT.txt TAG_COMMIT.txt \
+            > SHA256SUMS.txt
+
+      - name: Upload exact-source evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-packs-networkdomain-redirect-pr-gate
+          path: |
+            gate/RESULT.json
+            gate/TEST_OUTPUT.txt
+            gate/TAG_COMMIT.txt
+            gate/SHA256SUMS.txt
+            gate/redirect_networkdomain_gate.ts
+            gate/testing/fetcher.ts
+            gate/testing/node_fetcher.ts
+            gate/testing/constants.ts
+            gate/types.ts
+          retention-days: 1
+          if-no-files-found: error

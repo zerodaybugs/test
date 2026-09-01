@@ -1,0 +1,136 @@
+name: Temporary Superhuman web source-map trust-boundary scan
+
+on:
+  push:
+    branches: [research/superhuman-crx-intake-20260808]
+    paths: [.github/workflows/superhuman-web-sourcemap-trust-scan-20260808.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+      - name: Fetch exact build and maps
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf web-map-scan
+          mkdir -p web-map-scan/maps web-map-scan/bundles web-map-scan/sources web-map-scan/evidence
+          base='https://mail.superhuman.com/~backend/build'
+          files=('31a82a8bcd38240c8180.page.js' '31a82a8bcd38240c8180.background.js' '31a82a8bcd38240c8180.oauth2redirect.js' '31a82a8bcd38240c8180.loader.js')
+          for f in "${files[@]}"; do
+            curl -fsSL --retry 3 --retry-all-errors "$base/$f" -o "web-map-scan/bundles/$f"
+            curl -fsSL --retry 3 --retry-all-errors "$base/$f.map" -o "web-map-scan/maps/$f.map"
+          done
+          sha256sum web-map-scan/bundles/* web-map-scan/maps/* | sort > web-map-scan/evidence/SHA256SUMS_INPUT.txt
+      - name: Extract and rank original sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > web-map-scan/scan.py <<'PY'
+          from __future__ import annotations
+          import hashlib,json,pathlib,re
+          R=pathlib.Path('web-map-scan'); S=R/'sources'; E=R/'evidence'; S.mkdir(exist_ok=True)
+          maps=[]; extracted=[]; parse_errors=[]
+          for p in sorted((R/'maps').glob('*.map')):
+              raw=p.read_bytes()
+              try:m=json.loads(raw)
+              except Exception as e:
+                  parse_errors.append({'file':p.name,'error':repr(e),'prefix':raw[:200].decode(errors='replace')});continue
+              maps.append({'file':p.name,'version':m.get('version'),'sourceCount':len(m.get('sources') or []),'hasSourcesContent':bool(m.get('sourcesContent'))})
+              for i,name in enumerate(m.get('sources') or []):
+                  content=(m.get('sourcesContent') or [])[i] if i < len(m.get('sourcesContent') or []) else None
+                  if content is None:continue
+                  safe=re.sub(r'[^A-Za-z0-9._/-]+','_',name).lstrip('/').replace('../','__up__/')
+                  if len(safe)>220:safe=safe[:180]+'_'+hashlib.sha256(name.encode()).hexdigest()[:16]
+                  out=S/p.stem/safe; out.parent.mkdir(parents=True,exist_ok=True); out.write_text(content,errors='ignore')
+                  extracted.append({'map':p.name,'source':name,'path':str(out),'bytes':len(content.encode(errors='ignore'))})
+          rules={
+            'message_listener':r'addEventListener\s*\(\s*["\']message["\']|onmessage\s*=',
+            'postmessage_wildcard':r'postMessage\s*\([^\)]*,\s*["\']\*["\']','postmessage':r'\.postMessage\s*\(',
+            'broadcastchannel':r'new\s+BroadcastChannel\s*\(','window_opener':r'window\.opener|\bopener\b',
+            'location_input':r'location\.(search|hash|href)|URLSearchParams\s*\(\s*(?:window\.)?location',
+            'navigation_sink':r'location\.(assign|replace)|window\.open\s*\(|openExternal|shell\.openExternal',
+            'html_sink':r'innerHTML\s*=|outerHTML\s*=|insertAdjacentHTML|dangerouslySetInnerHTML|document\.write\s*\(',
+            'script_sink':r'\beval\s*\(|new\s+Function\s*\(|evaluateJavascript',
+            'storage_token':r'(localStorage|sessionStorage|indexedDB).{0,160}(token|credential|session|authorization)|(?:token|credential|session|authorization).{0,160}(localStorage|sessionStorage|indexedDB)',
+            'auth_terms':r'access[_-]?token|refresh[_-]?token|authorization_code|code_verifier|code_challenge|redirect_uri|oauth2?\.authenticate',
+            'identity_selectors':r'x-superhuman-user|external[_-]?id|accountId|userId|workspaceId|organizationId|tenantId|defaultAccount|fromAddress',
+            'object_selectors':r'threadId|messageId|draftId|documentId|containerId|guestToken|shareToken',
+            'prototype_merge':r'__proto__|prototype|constructor|Object\.assign|merge\s*\(','url_protocol':r'superhuman://|superhuman-app://|intent://|file://|javascript:',
+            'csrf_state':r'\bstate\b.{0,120}(oauth|authorize)|(?:oauth|authorize).{0,120}\bstate\b','origin_check':r'\.origin\s*[!=]==?|event\.origin|j\.origin|sender\.origin','source_check':r'event\.source|\.source\s*[!=]==?',
+          }
+          compiled={k:re.compile(v,re.I|re.S) for k,v in rules.items()}; rows=[]
+          for item in extracted:
+              p=pathlib.Path(item['path']); text=p.read_text(errors='ignore'); hits={k:len(rx.findall(text)) for k,rx in compiled.items()}; hits={k:v for k,v in hits.items() if v}
+              if not hits:continue
+              score=8*bool(hits.get('message_listener'))+8*bool(hits.get('broadcastchannel'))+7*bool(hits.get('postmessage_wildcard'))+5*bool(hits.get('window_opener'))+4*bool(hits.get('location_input'))+5*bool(hits.get('navigation_sink'))+7*bool(hits.get('html_sink'))+9*bool(hits.get('script_sink'))+7*bool(hits.get('storage_token'))+5*bool(hits.get('auth_terms'))+5*bool(hits.get('identity_selectors'))+4*bool(hits.get('object_selectors'))+4*bool(hits.get('url_protocol'))+4*bool(hits.get('csrf_state'))
+              if hits.get('message_listener') and not hits.get('origin_check'):score+=12
+              if hits.get('message_listener') and not hits.get('source_check'):score+=4
+              if hits.get('location_input') and hits.get('html_sink'):score+=12
+              if hits.get('location_input') and hits.get('navigation_sink'):score+=8
+              if hits.get('auth_terms') and hits.get('broadcastchannel'):score+=12
+              if hits.get('auth_terms') and hits.get('window_opener'):score+=8
+              if hits.get('identity_selectors') and hits.get('object_selectors'):score+=6
+              snippets=[]
+              for k,rx in compiled.items():
+                  m=rx.search(text)
+                  if m:snippets.append({'rule':k,'offset':m.start(),'snippet':re.sub(r'\s+',' ',text[max(0,m.start()-350):m.start()+1000])[:1500]})
+              rows.append({'score':score,'source':item['source'],'map':item['map'],'path':str(p),'bytes':item['bytes'],'hits':hits,'snippets':snippets})
+          rows.sort(key=lambda x:(-x['score'],x['source']))
+          result={'maps':maps,'parseErrors':parse_errors,'extractedSourceCount':len(extracted),'ranked':rows[:500]}
+          (E/'SOURCE_MAP_TRUST_SCAN.json').write_text(json.dumps(result,indent=2)+'\n')
+          md=['# Superhuman exact web-build source-map trust scan','',f'- Parsed maps: **{len(maps)}**',f'- Embedded original sources: **{len(extracted)}**',f'- Ranked source files: **{len(rows)}**','','A regex hit is not a vulnerability. Every candidate remains HOLD until a concrete untrusted source, privileged sink, production reachability, and matched negative control are proven.','']
+          for row in rows[:80]:
+              md += [f"## Score {row['score']} — `{row['source']}`",'',f"Hits: `{json.dumps(row['hits'],sort_keys=True)}`",'']
+              for sn in row['snippets'][:8]:md += [f"**{sn['rule']}**",'```text',sn['snippet'],'```','']
+          (E/'SOURCE_MAP_TRUST_SCAN.md').write_text('\n'.join(md))
+          PY
+          python3 web-map-scan/scan.py
+          jq -e '.extractedSourceCount >= 0' web-map-scan/evidence/SOURCE_MAP_TRUST_SCAN.json >/dev/null
+      - name: Build message-bus inventory and status
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib,re,os
+          R=pathlib.Path('web-map-scan'); E=R/'evidence'; data=json.loads((E/'SOURCE_MAP_TRUST_SCAN.json').read_text()); rows=[]
+          for row in data['ranked']:
+              if not any(k in row['hits'] for k in ['message_listener','broadcastchannel','window_opener','postmessage','auth_terms']):continue
+              p=pathlib.Path(row['path']);t=p.read_text(errors='ignore')
+              rows.append({'score':row['score'],'source':row['source'],'channels':sorted(set(re.findall(r'BroadcastChannel\s*\(\s*["\']([^"\']+)',t))),
+                           'origins':sorted(set(re.findall(r'https?://[A-Za-z0-9._:-]+',t)))[:100],'hits':row['hits']})
+          (E/'MESSAGE_BUS_INVENTORY.json').write_text(json.dumps(rows,indent=2)+'\n')
+          top=data['ranked'][:25]
+          status={'workflowRunId':int(os.environ['GITHUB_RUN_ID']),'sourceCommit':os.environ['GITHUB_SHA'],'buildId':'31a82a8bcd38240c8180','parsedMaps':len(data['maps']),'embeddedSources':data['extractedSourceCount'],'topCandidates':[{'score':x['score'],'source':x['source'],'hits':x['hits']} for x in top],'messageBusCandidateCount':len(rows),'submissionReady':False,'decision':'HOLD_STATIC_ONLY'}
+          (R/'STATUS.json').write_text(json.dumps(status,indent=2)+'\n')
+          PY
+          find web-map-scan/evidence web-map-scan/STATUS.json -type f -print0 | sort -z | xargs -0 sha256sum > web-map-scan/SHA256SUMS.txt
+      - name: Upload bounded evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-web-sourcemap-trust-scan
+          path: |
+            web-map-scan/STATUS.json
+            web-map-scan/SHA256SUMS.txt
+            web-map-scan/evidence/
+          if-no-files-found: error
+          retention-days: 1
+      - name: Commit non-binary status
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p public-intake-status
+          cp web-map-scan/STATUS.json public-intake-status/superhuman-web-sourcemap-trust-scan.json
+          cp web-map-scan/evidence/SOURCE_MAP_TRUST_SCAN.md public-intake-status/superhuman-web-sourcemap-trust-scan.md
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add public-intake-status/superhuman-web-sourcemap-trust-scan.json public-intake-status/superhuman-web-sourcemap-trust-scan.md
+          git commit -m 'chore: record temporary Superhuman web source-map trust scan'
+          git push
