@@ -1,0 +1,258 @@
+name: Superhuman Android dual-source provenance intake
+
+on:
+  push:
+    branches: [research/superhuman-android-intake-20260810]
+    paths: [.github/workflows/superhuman-android-dual-source-intake.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  intake:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+
+      - name: Install metadata and parsing dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf android-intake
+          mkdir -p android-intake/raw android-intake/downloads android-intake/extracted android-intake/evidence public-intake-status
+          npm install --no-save google-play-scraper@10.1.2
+          python -m pip install --disable-pip-version-check --quiet beautifulsoup4 requests
+
+      - name: Capture current Google Play metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('fs');
+          const gplay = require('google-play-scraper');
+          (async () => {
+            const app = await gplay.app({appId:'com.superhuman.mail', country:'us', lang:'en'});
+            const out = {
+              appId: app.appId,
+              title: app.title,
+              developer: app.developer,
+              developerId: app.developerId,
+              version: app.version,
+              updated: app.updated,
+              released: app.released,
+              url: app.url,
+              installs: app.installs,
+              minInstalls: app.minInstalls,
+              maxInstalls: app.maxInstalls,
+              score: app.score,
+              androidVersion: app.androidVersion,
+              androidVersionText: app.androidVersionText,
+              contentRating: app.contentRating,
+              privacyPolicy: app.privacyPolicy,
+            };
+            fs.writeFileSync('android-intake/evidence/GOOGLE_PLAY_METADATA.json', JSON.stringify(out,null,2)+'\n');
+          })().catch(e => { console.error(e); process.exit(1); });
+          NODE
+
+      - name: Scrape APKCombo and APKPure public download surfaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          python <<'PY'
+          import html, json, os, pathlib, re, urllib.parse
+          import requests
+          from bs4 import BeautifulSoup
+
+          root = pathlib.Path('android-intake')
+          raw = root/'raw'; downloads=root/'downloads'; evidence=root/'evidence'
+          ua='curl/8.0.1'
+          session=requests.Session(); session.headers.update({'User-Agent':ua,'Accept':'*/*','Connection':'keep-alive'})
+          results={'sources':{},'candidateUrls':[]}
+
+          def save(name, response):
+              (raw/f'{name}.body').write_bytes(response.content)
+              (raw/f'{name}.headers.json').write_text(json.dumps(dict(response.headers),indent=2)+'\n')
+              return {'status':response.status_code,'url':response.url,'size':len(response.content)}
+
+          combo_candidates=[
+              'https://apkcombo.com/superhuman-mail/com.superhuman.mail/',
+              'https://apkcombo.com/superhuman/com.superhuman.mail/',
+          ]
+          combo_base=None
+          for i,url in enumerate(combo_candidates):
+              r=session.get(url,timeout=40,allow_redirects=True)
+              results['sources'][f'apkcombo_page_{i}']=save(f'apkcombo-page-{i}',r)
+              if r.status_code==200 and 'com.superhuman.mail' in r.text:
+                  combo_base=r.url.rstrip('/')
+                  break
+          if combo_base:
+              r=session.get(combo_base+'/download/apk',timeout=40,allow_redirects=True)
+              results['sources']['apkcombo_download']=save('apkcombo-download',r)
+              if r.status_code==200:
+                  soup=BeautifulSoup(r.text,'html.parser')
+                  for li in soup.select('#variants-tab > div > ul > li'):
+                      arch=(li.select_one('code').get_text(' ',strip=True) if li.select_one('code') else 'unknown')
+                      for a in li.select('a[href]'):
+                          href=a.get('href')
+                          if not href: continue
+                          parsed=urllib.parse.urlparse(href)
+                          query=urllib.parse.parse_qs(parsed.query)
+                          if parsed.path=='/r2' and query.get('u'):
+                              href=query['u'][0]
+                          elif href.startswith('/'):
+                              href=urllib.parse.urljoin(combo_base+'/',href)
+                          path=urllib.parse.urlparse(href).path.lower()
+                          if path.endswith(('.apk','.xapk','.apks','.zip')):
+                              results['candidateUrls'].append({'source':'apkcombo','arch':arch,'url':href})
+                              break
+
+          # APKPure provides a stable latest-build endpoint; request both APK and XAPK forms.
+          pure_urls={
+              'apkpure_apk':'https://d.apkpure.com/b/APK/com.superhuman.mail?version=latest',
+              'apkpure_xapk':'https://d.apkpure.com/b/XAPK/com.superhuman.mail?version=latest',
+              'apkpure_page':'https://apkpure.com/superhuman-mail/com.superhuman.mail',
+          }
+          for name,url in pure_urls.items():
+              r=session.get(url,timeout=60,allow_redirects=True)
+              results['sources'][name]=save(name.replace('_','-'),r)
+              ctype=(r.headers.get('content-type') or '').lower()
+              if r.status_code==200 and (len(r.content)>100000 or 'application' in ctype):
+                  suffix='.xapk' if ('xapk' in name or r.content[:2]==b'PK') else '.apk'
+                  dest=downloads/f'{name}{suffix}'
+                  dest.write_bytes(r.content)
+                  results['candidateUrls'].append({'source':'apkpure','arch':'latest','url':r.url,'local':str(dest)})
+
+          # Download current APKCombo candidates (bounded to eight).
+          seen=set(); n=0
+          for row in list(results['candidateUrls']):
+              if row['source']!='apkcombo' or row['url'] in seen or n>=8: continue
+              seen.add(row['url']); n+=1
+              try:
+                  r=session.get(row['url'],timeout=90,allow_redirects=True)
+                  row['downloadStatus']=r.status_code; row['downloadSize']=len(r.content); row['finalUrl']=r.url
+                  if r.status_code==200 and len(r.content)>100000:
+                      ext=pathlib.Path(urllib.parse.urlparse(r.url).path).suffix.lower()
+                      if ext not in {'.apk','.xapk','.apks','.zip'}: ext='.apk'
+                      safe=re.sub(r'[^A-Za-z0-9_.-]+','_',row['arch'])[:80]
+                      dest=downloads/f'apkcombo_{n:02d}_{safe}{ext}'
+                      dest.write_bytes(r.content); row['local']=str(dest)
+              except Exception as e:
+                  row['downloadError']=repr(e)
+
+          (evidence/'DOWNLOAD_INDEX.json').write_text(json.dumps(results,indent=2)+'\n')
+          PY
+
+      - name: Extract containers and inspect package signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n1)"
+          AAPT="$BUILD_TOOLS/aapt"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+          test -x "$AAPT"
+          test -x "$APKSIGNER"
+
+          python <<'PY'
+          import pathlib, zipfile, shutil
+          root=pathlib.Path('android-intake')
+          for p in list((root/'downloads').iterdir()):
+              if not p.is_file(): continue
+              if p.suffix.lower() in {'.xapk','.apks','.zip'} or p.read_bytes()[:2]==b'PK' and p.suffix.lower()!='.apk':
+                  out=root/'extracted'/p.stem
+                  out.mkdir(parents=True,exist_ok=True)
+                  try:
+                      with zipfile.ZipFile(p) as z:
+                          for info in z.infolist():
+                              target=(out/info.filename).resolve()
+                              if not str(target).startswith(str(out.resolve())+str(pathlib.os.sep)):
+                                  continue
+                              z.extract(info,out)
+                  except zipfile.BadZipFile:
+                      pass
+          PY
+
+          find android-intake/downloads android-intake/extracted -type f -name '*.apk' -print0 | sort -z | while IFS= read -r -d '' apk; do
+            safe="$(printf '%s' "$apk" | sed 's#[^A-Za-z0-9_.-]#_#g')"
+            "$AAPT" dump badging "$apk" > "android-intake/evidence/${safe}.badging.txt" 2>&1 || true
+            "$APKSIGNER" verify --verbose --print-certs "$apk" > "android-intake/evidence/${safe}.apksigner.txt" 2>&1 || true
+            sha256sum "$apk" >> android-intake/evidence/APK_SHA256SUMS.txt
+          done
+
+          python <<'PY'
+          import hashlib, json, pathlib, re
+          root=pathlib.Path('android-intake'); ev=root/'evidence'
+          rows=[]
+          for badging in sorted(ev.glob('*.badging.txt')):
+              text=badging.read_text(errors='replace')
+              m=re.search(r"package: name='([^']+)' versionCode='([^']+)' versionName='([^']*)'",text)
+              apk_key=badging.name[:-len('.badging.txt')]
+              sig=ev/f'{apk_key}.apksigner.txt'
+              sigtext=sig.read_text(errors='replace') if sig.exists() else ''
+              cert_sha256=re.search(r"Signer #1 certificate SHA-256 digest: ([0-9a-fA-F:]+)",sigtext)
+              cert_sha1=re.search(r"Signer #1 certificate SHA-1 digest: ([0-9a-fA-F:]+)",sigtext)
+              rows.append({
+                  'artifactKey':apk_key,
+                  'packageName':m.group(1) if m else None,
+                  'versionCode':m.group(2) if m else None,
+                  'versionName':m.group(3) if m else None,
+                  'certSha256':cert_sha256.group(1).lower().replace(':','') if cert_sha256 else None,
+                  'certSha1':cert_sha1.group(1).lower().replace(':','') if cert_sha1 else None,
+                  'signatureVerified':'DOES NOT VERIFY' not in sigtext and 'Verifies' in sigtext,
+              })
+          target=[r for r in rows if r['packageName']=='com.superhuman.mail' and r['signatureVerified']]
+          groups={}
+          for r in target:
+              key=(r['versionCode'],r['certSha256'])
+              groups.setdefault(str(key),[]).append(r['artifactKey'])
+          matching=[{'key':k,'artifacts':v} for k,v in groups.items() if len(v)>=2 and k not in {"(None, None)"}]
+          result={
+              'package':'com.superhuman.mail',
+              'inspectedApkCount':len(rows),
+              'validTargetApkCount':len(target),
+              'rows':rows,
+              'matchingVersionAndCertificateGroups':matching,
+              'dualSourceProvenancePass':False,
+              'decision':'REVIEW_SOURCE_INDEPENDENCE',
+          }
+          # Confirm source independence by artifact key naming, not merely duplicate APKs inside one XAPK.
+          for group in matching:
+              names=group['artifacts']
+              if any('apkcombo' in n for n in names) and any('apkpure' in n for n in names):
+                  result['dualSourceProvenancePass']=True
+                  result['decision']='DUAL_SOURCE_PROVENANCE_PASS'
+          (ev/'APK_PROVENANCE_RESULT.json').write_text(json.dumps(result,indent=2)+'\n')
+          PY
+
+          find android-intake/evidence -type f -print0 | sort -z | xargs -0 sha256sum > android-intake/evidence/EVIDENCE_SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: superhuman-android-dual-source-intake
+          path: |
+            android-intake/downloads/
+            android-intake/extracted/
+            android-intake/evidence/
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: Commit compact intake status
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp android-intake/evidence/APK_PROVENANCE_RESULT.json public-intake-status/superhuman-android-provenance-result.json
+          cp android-intake/evidence/GOOGLE_PLAY_METADATA.json public-intake-status/superhuman-android-play-metadata.json
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-android-provenance-result.json public-intake-status/superhuman-android-play-metadata.json
+          git commit -m 'chore: record Superhuman Android provenance intake'
+          git push
