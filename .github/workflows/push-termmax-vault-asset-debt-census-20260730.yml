@@ -1,0 +1,490 @@
+name: Push TermMax vault settlement state census 20260731
+
+on:
+  push:
+    branches: [termmax-vault-asset-debt-census-20260730]
+    paths:
+      - '.github/workflows/push-termmax-vault-asset-debt-census-20260730.yml'
+      - 'monitor/TRIGGER_VAULT_ASSET_DEBT_PUSH.txt'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: push-termmax-vault-settlement-state-20260731
+  cancel-in-progress: true
+
+jobs:
+  settlement-state:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: termmax-vault-asset-debt-census-20260730
+          persist-credentials: true
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: python -m pip install --disable-pip-version-check --no-input web3==7.13.0 requests==2.32.4
+
+      - name: Run public read-only settlement census
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE/public-results/termmax-vault-settlement-state"
+          rm -rf "$root"
+          mkdir -p "$root"
+          cat > /tmp/termmax_vault_settlement_state.py <<'PY'
+          from __future__ import annotations
+
+          import json
+          import time
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from web3 import Web3
+
+          OUT = Path('public-results/termmax-vault-settlement-state')
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          VAULT = Web3.to_checksum_address('0xF488ccdf04079cC03183cDB6A147d12Cf97F9317')
+          START_BLOCK = 23_490_000
+          ROUTESCAN = 'https://api.routescan.io/v2/network/mainnet/evm/1/etherscan/api'
+          RPCS = [
+              'https://ethereum-rpc.publicnode.com',
+              'https://rpc.mevblocker.io',
+              'https://eth.drpc.org',
+              'https://1rpc.io/eth',
+          ]
+          ZERO = '0x0000000000000000000000000000000000000000'
+
+          NEW_ORDER_TOPIC = Web3.keccak(text='NewOrderCreated(address,address,address)').hex()
+          REDEEM_ORDER_TOPIC = Web3.keccak(text='RedeemOrder(address,address,uint256,uint256)').hex()
+          DEAL_BAD_DEBT_TOPIC = Web3.keccak(text='DealBadDebt(address,address,address,uint256,uint256,uint256)').hex()
+          TRANSFER_TOPIC = Web3.keccak(text='Transfer(address,address,uint256)').hex()
+
+          VAULT_ABI = [
+              {'type':'function','name':'ORDER_MANAGER_SINGLETON','stateMutability':'view','inputs':[],'outputs':[{'type':'address'}]},
+              {'type':'function','name':'name','stateMutability':'view','inputs':[],'outputs':[{'type':'string'}]},
+              {'type':'function','name':'symbol','stateMutability':'view','inputs':[],'outputs':[{'type':'string'}]},
+              {'type':'function','name':'asset','stateMutability':'view','inputs':[],'outputs':[{'type':'address'}]},
+              {'type':'function','name':'totalAssets','stateMutability':'view','inputs':[],'outputs':[{'type':'uint256'}]},
+              {'type':'function','name':'totalSupply','stateMutability':'view','inputs':[],'outputs':[{'type':'uint256'}]},
+              {'type':'function','name':'accretingPrincipal','stateMutability':'view','inputs':[],'outputs':[{'type':'uint256'}]},
+              {'type':'function','name':'totalFt','stateMutability':'view','inputs':[],'outputs':[{'type':'uint256'}]},
+              {'type':'function','name':'performanceFee','stateMutability':'view','inputs':[],'outputs':[{'type':'uint256'}]},
+              {'type':'function','name':'paused','stateMutability':'view','inputs':[],'outputs':[{'type':'bool'}]},
+              {'type':'function','name':'pool','stateMutability':'view','inputs':[],'outputs':[{'type':'address'}]},
+              {'type':'function','name':'curator','stateMutability':'view','inputs':[],'outputs':[{'type':'address'}]},
+              {'type':'function','name':'owner','stateMutability':'view','inputs':[],'outputs':[{'type':'address'}]},
+              {'type':'function','name':'badDebtMapping','stateMutability':'view','inputs':[{'type':'address'}],'outputs':[{'type':'uint256'}]},
+              {'type':'function','name':'orderMaturity','stateMutability':'view','inputs':[{'type':'address'}],'outputs':[{'type':'uint256'}]},
+          ]
+          ORDER_ABI = [
+              {'type':'function','name':'market','stateMutability':'view','inputs':[],'outputs':[{'type':'address'}]},
+              {'type':'function','name':'tokenReserves','stateMutability':'view','inputs':[],'outputs':[{'type':'uint128'},{'type':'uint128'}]},
+          ]
+          MARKET_ABI = [
+              {'type':'function','name':'tokens','stateMutability':'view','inputs':[],'outputs':[
+                  {'type':'address'},{'type':'address'},{'type':'address'},{'type':'address'},{'type':'address'}
+              ]},
+              {'type':'function','name':'config','stateMutability':'view','inputs':[],'outputs':[{'type':'tuple','components':[
+                  {'type':'address'},{'type':'uint64'},{'type':'tuple','components':[
+                      {'type':'uint32'},{'type':'uint32'},{'type':'uint32'},{'type':'uint32'},{'type':'uint32'},{'type':'uint32'}
+                  ]}
+              ]}]},
+          ]
+          ERC20_ABI = [
+              {'type':'function','name':'balanceOf','stateMutability':'view','inputs':[{'type':'address'}],'outputs':[{'type':'uint256'}]},
+              {'type':'function','name':'totalSupply','stateMutability':'view','inputs':[],'outputs':[{'type':'uint256'}]},
+              {'type':'function','name':'symbol','stateMutability':'view','inputs':[],'outputs':[{'type':'string'}]},
+              {'type':'function','name':'decimals','stateMutability':'view','inputs':[],'outputs':[{'type':'uint8'}]},
+          ]
+          POOL_ABI = [
+              {'type':'function','name':'balanceOf','stateMutability':'view','inputs':[{'type':'address'}],'outputs':[{'type':'uint256'}]},
+              {'type':'function','name':'convertToAssets','stateMutability':'view','inputs':[{'type':'uint256'}],'outputs':[{'type':'uint256'}]},
+          ]
+
+          def safe(fn, *args, **kwargs):
+              try:
+                  value = fn(*args, **kwargs)
+                  if isinstance(value, tuple):
+                      value = list(value)
+                  return {'ok': True, 'value': value}
+              except Exception as exc:
+                  return {'ok': False, 'error': f'{type(exc).__name__}: {exc}'}
+
+          def val(result, default=None):
+              return result.get('value', default) if result.get('ok') else default
+
+          def parse_int(value: Any) -> int:
+              if isinstance(value, int):
+                  return value
+              text = str(value or '0')
+              return int(text, 16) if text.lower().startswith('0x') else int(text)
+
+          def topic_address(topic: Any) -> str:
+              text = topic.hex() if hasattr(topic, 'hex') else str(topic)
+              if not text.startswith('0x'):
+                  text = '0x' + text
+              return Web3.to_checksum_address('0x' + text[-40:])
+
+          def words(data: str) -> list[int]:
+              raw = bytes.fromhex((data or '0x')[2:])
+              if len(raw) % 32:
+                  raise ValueError(f'non-word data length {len(raw)}')
+              return [int.from_bytes(raw[i:i+32], 'big') for i in range(0, len(raw), 32)]
+
+          def connect():
+              attempts = []
+              for url in RPCS:
+                  try:
+                      w3 = Web3(Web3.HTTPProvider(url, request_kwargs={'timeout': 35}))
+                      block = w3.eth.get_block('latest')
+                      if w3.eth.chain_id != 1:
+                          raise RuntimeError(f'unexpected chain id {w3.eth.chain_id}')
+                      attempts.append({'url': url, 'ok': True, 'block': block.number, 'hash': block.hash.hex()})
+                      return w3, url, attempts
+                  except Exception as exc:
+                      attempts.append({'url': url, 'ok': False, 'error': f'{type(exc).__name__}: {exc}'})
+              raise RuntimeError(json.dumps(attempts))
+
+          def indexed_logs(topic0: str, latest: int) -> list[dict[str, Any]]:
+              rows_all = []
+              page = 1
+              while True:
+                  params = {
+                      'module': 'logs', 'action': 'getLogs',
+                      'fromBlock': START_BLOCK, 'toBlock': latest,
+                      'address': VAULT, 'topic0': topic0,
+                      'page': page, 'offset': 1000,
+                  }
+                  payload = None
+                  last_error = None
+                  for attempt in range(7):
+                      try:
+                          response = requests.get(
+                              ROUTESCAN, params=params, timeout=60,
+                              headers={'User-Agent': 'ZeroDayBugs-TermMax-Readonly/4'},
+                          )
+                          if response.status_code == 429:
+                              time.sleep(1.5 * (attempt + 1))
+                              continue
+                          response.raise_for_status()
+                          payload = response.json()
+                          break
+                      except Exception as exc:
+                          last_error = exc
+                          time.sleep(1.25 * (attempt + 1))
+                  if payload is None:
+                      raise RuntimeError(f'Routescan failed: {last_error}')
+                  rows = payload.get('result', []) if isinstance(payload, dict) else []
+                  if isinstance(rows, str):
+                      if 'No' in rows or 'not found' in rows.lower():
+                          break
+                      raise RuntimeError(f'unexpected Routescan response: {payload}')
+                  if not rows:
+                      break
+                  rows_all.extend(rows)
+                  if len(rows) < 1000:
+                      break
+                  page += 1
+                  time.sleep(0.25)
+              return rows_all
+
+          w3, rpc, rpc_attempts = connect()
+          latest = w3.eth.block_number
+          block = w3.eth.get_block(latest)
+          timestamp = int(block.timestamp)
+          vault = w3.eth.contract(address=VAULT, abi=VAULT_ABI)
+
+          singleton = Web3.to_checksum_address(vault.functions.ORDER_MANAGER_SINGLETON().call(block_identifier=latest))
+          singleton_code = bytes(w3.eth.get_code(singleton, block_identifier=latest))
+          asset_address = Web3.to_checksum_address(vault.functions.asset().call(block_identifier=latest))
+          asset = w3.eth.contract(address=asset_address, abi=ERC20_ABI)
+          asset_decimals = int(asset.functions.decimals().call(block_identifier=latest))
+          pool_address = Web3.to_checksum_address(vault.functions.pool().call(block_identifier=latest))
+          pool = w3.eth.contract(address=pool_address, abi=POOL_ABI)
+          pool_shares = safe(pool.functions.balanceOf(VAULT).call, block_identifier=latest)
+          pool_assets = (
+              safe(pool.functions.convertToAssets(int(val(pool_shares, 0) or 0)).call, block_identifier=latest)
+              if val(pool_shares) is not None else {'ok': False, 'error': 'pool balance unavailable'}
+          )
+
+          new_order_logs = indexed_logs(NEW_ORDER_TOPIC, latest)
+          redeem_logs = indexed_logs(REDEEM_ORDER_TOPIC, latest)
+          deal_logs = indexed_logs(DEAL_BAD_DEBT_TOPIC, latest)
+          transfer_logs = indexed_logs(TRANSFER_TOPIC, latest)
+
+          orders: dict[str, dict[str, Any]] = {}
+          collateral_addresses: set[str] = set()
+          for raw in new_order_logs:
+              topics = raw.get('topics') or []
+              if len(topics) < 4:
+                  continue
+              market_address = topic_address(topics[2])
+              order_address = topic_address(topics[3])
+              order = w3.eth.contract(address=order_address, abi=ORDER_ABI)
+              market = w3.eth.contract(address=market_address, abi=MARKET_ABI)
+              tokens_r = safe(market.functions.tokens().call, block_identifier=latest)
+              config_r = safe(market.functions.config().call, block_identifier=latest)
+              tokens = val(tokens_r)
+              config = val(config_r)
+              collateral = Web3.to_checksum_address(tokens[3]) if tokens and len(tokens) == 5 else None
+              ft = Web3.to_checksum_address(tokens[0]) if tokens and len(tokens) == 5 else None
+              if collateral:
+                  collateral_addresses.add(collateral)
+              maturity = int(config[1]) if config else 0
+              vault_maturity_r = safe(vault.functions.orderMaturity(order_address).call, block_identifier=latest)
+              reserves_r = safe(order.functions.tokenReserves().call, block_identifier=latest)
+              ft_balance_r = {'ok': False, 'error': 'FT unavailable'}
+              ft_supply_r = {'ok': False, 'error': 'FT unavailable'}
+              if ft:
+                  ft_token = w3.eth.contract(address=ft, abi=ERC20_ABI)
+                  ft_balance_r = safe(ft_token.functions.balanceOf(order_address).call, block_identifier=latest)
+                  ft_supply_r = safe(ft_token.functions.totalSupply().call, block_identifier=latest)
+              orders[order_address.lower()] = {
+                  'order': order_address,
+                  'market': market_address,
+                  'createdBlock': parse_int(raw.get('blockNumber')),
+                  'createdTx': raw.get('transactionHash'),
+                  'tokens': tokens_r,
+                  'marketConfig': config_r,
+                  'marketMaturity': maturity,
+                  'marketMatured': bool(maturity and timestamp >= maturity),
+                  'vaultOrderMaturity': vault_maturity_r,
+                  'activeInVault': bool(int(val(vault_maturity_r, 0) or 0) != 0),
+                  'maturedAndStillActive': bool(maturity and timestamp >= maturity and int(val(vault_maturity_r, 0) or 0) != 0),
+                  'tokenReserves': reserves_r,
+                  'ftBalanceAtOrder': ft_balance_r,
+                  'ftTotalSupply': ft_supply_r,
+                  'collateral': collateral,
+              }
+
+          redeem_events = []
+          positive_redeem_events = []
+          redeemed_by_collateral: dict[str, int] = defaultdict(int)
+          for raw in redeem_logs:
+              topics = raw.get('topics') or []
+              data = words(raw.get('data') or '0x')
+              if len(topics) < 3 or len(data) < 2:
+                  continue
+              order_address = topic_address(topics[2])
+              row = orders.get(order_address.lower(), {'order': order_address})
+              collateral = row.get('collateral')
+              bad_debt, delivery_amount = data[0], data[1]
+              event = {
+                  'caller': topic_address(topics[1]),
+                  'order': order_address,
+                  'market': row.get('market'),
+                  'collateral': collateral,
+                  'badDebt': bad_debt,
+                  'deliveryAmount': delivery_amount,
+                  'blockNumber': parse_int(raw.get('blockNumber')),
+                  'transactionHash': raw.get('transactionHash'),
+              }
+              redeem_events.append(event)
+              if bad_debt:
+                  positive_redeem_events.append(event)
+                  if collateral:
+                      redeemed_by_collateral[collateral] += bad_debt
+
+          deal_events = []
+          dealt_by_collateral: dict[str, int] = defaultdict(int)
+          for raw in deal_logs:
+              topics = raw.get('topics') or []
+              data = words(raw.get('data') or '0x')
+              if len(topics) < 4 or len(data) < 3:
+                  continue
+              collateral = topic_address(topics[3])
+              collateral_addresses.add(collateral)
+              event = {
+                  'caller': topic_address(topics[1]),
+                  'recipient': topic_address(topics[2]),
+                  'collateral': collateral,
+                  'badDebt': data[0],
+                  'shares': data[1],
+                  'collateralOut': data[2],
+                  'blockNumber': parse_int(raw.get('blockNumber')),
+                  'transactionHash': raw.get('transactionHash'),
+              }
+              deal_events.append(event)
+              dealt_by_collateral[collateral] += data[0]
+
+          bad_debt_state = []
+          for collateral in sorted(collateral_addresses):
+              token = w3.eth.contract(address=collateral, abi=ERC20_ABI)
+              current_r = safe(vault.functions.badDebtMapping(collateral).call, block_identifier=latest)
+              bad_debt_state.append({
+                  'collateral': collateral,
+                  'symbol': safe(token.functions.symbol().call, block_identifier=latest),
+                  'decimals': safe(token.functions.decimals().call, block_identifier=latest),
+                  'historicalRedeemedBadDebt': redeemed_by_collateral.get(collateral, 0),
+                  'historicalDealtBadDebt': dealt_by_collateral.get(collateral, 0),
+                  'eventNetBadDebt': redeemed_by_collateral.get(collateral, 0) - dealt_by_collateral.get(collateral, 0),
+                  'currentBadDebtMapping': current_r,
+              })
+
+          balances: dict[str, int] = defaultdict(int)
+          for raw in transfer_logs:
+              topics = raw.get('topics') or []
+              data = words(raw.get('data') or '0x')
+              if len(topics) < 3 or not data:
+                  continue
+              sender = topic_address(topics[1])
+              recipient = topic_address(topics[2])
+              amount = data[0]
+              if sender.lower() != ZERO.lower():
+                  balances[sender] -= amount
+              if recipient.lower() != ZERO.lower():
+                  balances[recipient] += amount
+          positive_holders = [
+              {'holder': address, 'shares': amount}
+              for address, amount in balances.items() if amount > 0
+          ]
+          positive_holders.sort(key=lambda row: row['shares'], reverse=True)
+
+          matured_active = [row for row in orders.values() if row.get('maturedAndStillActive')]
+          current_bad_debt_total = sum(int(val(row['currentBadDebtMapping'], 0) or 0) for row in bad_debt_state)
+          direct_assets = int(asset.functions.balanceOf(VAULT).call(block_identifier=latest))
+          total_assets = int(vault.functions.totalAssets().call(block_identifier=latest))
+          total_supply = int(vault.functions.totalSupply().call(block_identifier=latest))
+          liquid_assets = direct_assets + int(val(pool_assets, 0) or 0)
+
+          result = {
+              'schema': 'termmax-vault-settlement-state/v1',
+              'generatedAtUtc': datetime.now(timezone.utc).isoformat(),
+              'safety': {'privateKeys': 0, 'signedTransactions': 0, 'broadcastTransactions': 0, 'stateChanges': 0},
+              'rpc': rpc,
+              'rpcAttempts': rpc_attempts,
+              'block': {
+                  'number': latest,
+                  'hash': block.hash.hex(),
+                  'timestamp': timestamp,
+                  'timestampUtc': datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat(),
+              },
+              'vault': {
+                  'address': VAULT,
+                  'name': vault.functions.name().call(block_identifier=latest),
+                  'symbol': vault.functions.symbol().call(block_identifier=latest),
+                  'asset': asset_address,
+                  'assetSymbol': asset.functions.symbol().call(block_identifier=latest),
+                  'assetDecimals': asset_decimals,
+                  'totalAssets': total_assets,
+                  'totalSupply': total_supply,
+                  'directAssetBalance': direct_assets,
+                  'pool': pool_address,
+                  'poolShareBalance': pool_shares,
+                  'poolRedeemableAssets': pool_assets,
+                  'liquidAssetEstimate': liquid_assets,
+                  'accretingPrincipal': vault.functions.accretingPrincipal().call(block_identifier=latest),
+                  'totalFt': vault.functions.totalFt().call(block_identifier=latest),
+                  'performanceFee': vault.functions.performanceFee().call(block_identifier=latest),
+                  'paused': vault.functions.paused().call(block_identifier=latest),
+                  'curator': vault.functions.curator().call(block_identifier=latest),
+                  'owner': vault.functions.owner().call(block_identifier=latest),
+              },
+              'orderManagerSingleton': {
+                  'address': singleton,
+                  'codeBytes': len(singleton_code),
+                  'runtimeKeccak256': Web3.keccak(singleton_code).hex(),
+                  'redeemOrderSelectorPresent': bytes(Web3.keccak(text='redeemOrder(address)')[:4]) in singleton_code,
+                  'dealBadDebtSelectorPresent': bytes(Web3.keccak(text='dealBadDebt(address,address,uint256)')[:4]) in singleton_code,
+              },
+              'eventCounts': {
+                  'newOrders': len(new_order_logs),
+                  'redeemOrders': len(redeem_events),
+                  'positiveBadDebtRedeemOrders': len(positive_redeem_events),
+                  'dealBadDebtEvents': len(deal_events),
+                  'shareTransfers': len(transfer_logs),
+              },
+              'orders': list(orders.values()),
+              'maturedAndStillActiveOrders': matured_active,
+              'redeemOrderEvents': redeem_events,
+              'positiveBadDebtRedeemOrderEvents': positive_redeem_events,
+              'dealBadDebtEvents': deal_events,
+              'badDebtState': bad_debt_state,
+              'holders': {
+                  'positiveHolderCount': len(positive_holders),
+                  'reconstructedShareSum': sum(row['shares'] for row in positive_holders),
+                  'topHolders': positive_holders[:50],
+              },
+              'verdict': {
+                  'materialVaultAssets': total_assets,
+                  'materialVaultAssetsHuman': total_assets / (10 ** asset_decimals),
+                  'multipleCurrentShareholders': len(positive_holders) >= 2,
+                  'currentBadDebtTotal': current_bad_debt_total,
+                  'currentBadDebtExists': current_bad_debt_total > 0,
+                  'historicalPositiveBadDebtEvents': len(positive_redeem_events),
+                  'historicalBadDebtOccurred': bool(positive_redeem_events),
+                  'maturedAndStillActiveOrderCount': len(matured_active),
+                  'liquidAssetsBelowReportedTotalAssets': liquid_assets < total_assets,
+                  'reportedMinusLiquidAssets': total_assets - liquid_assets,
+              },
+          }
+          (OUT / 'VAULT_SETTLEMENT_STATE_FULL.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
+          compact = {
+              'generatedAtUtc': result['generatedAtUtc'],
+              'block': result['block'],
+              'vault': result['vault'],
+              'orderManagerSingleton': result['orderManagerSingleton'],
+              'eventCounts': result['eventCounts'],
+              'positiveBadDebtRedeemOrderEvents': positive_redeem_events,
+              'dealBadDebtEvents': deal_events,
+              'badDebtState': bad_debt_state,
+              'maturedAndStillActiveOrders': matured_active,
+              'holders': result['holders'],
+              'verdict': result['verdict'],
+          }
+          (OUT / 'VAULT_SETTLEMENT_STATE_COMPACT.json').write_text(json.dumps(compact, indent=2), encoding='utf-8')
+          (OUT / 'VERDICT.json').write_text(json.dumps(result['verdict'], indent=2), encoding='utf-8')
+          print(json.dumps(compact, indent=2))
+          PY
+
+          set +e
+          python /tmp/termmax_vault_settlement_state.py \
+            > >(tee "$root/stdout.log") \
+            2> >(tee "$root/stderr.log" >&2)
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > "$root/exit_code.txt"
+          {
+            python --version
+            python -m pip freeze | sort
+            uname -a
+            sha256sum /tmp/termmax_vault_settlement_state.py
+          } > "$root/environment.txt"
+          find "$root" -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > "$root/SHA256SUMS.txt"
+          test "$rc" = 0
+
+      - name: Upload read-only evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: termmax-vault-settlement-state-${{ github.run_id }}
+          path: public-results/termmax-vault-settlement-state/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
+
+      - name: Commit public read-only result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'zerodaybugs-public-research-bot'
+          git config user.email 'research-bot@users.noreply.github.com'
+          git add public-results/termmax-vault-settlement-state/
+          if git diff --cached --quiet; then
+            echo 'Result unchanged'
+          else
+            git commit -m "Add TermMax vault settlement state run ${GITHUB_RUN_ID}"
+            git push origin HEAD:termmax-vault-asset-debt-census-20260730
+          fi
