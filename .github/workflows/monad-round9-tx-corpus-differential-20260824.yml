@@ -1,0 +1,275 @@
+name: Monad v0.16.0 transaction corpus differential Round 9
+
+on:
+  push:
+    branches:
+      - tooling/monad-round9-tx-corpus-differential-20260824
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tx-corpus:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone exact Monad BFT and public transaction corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global submodule.fetchJobs "$(nproc)"
+          git clone --filter=blob:none --no-recurse-submodules https://github.com/category-labs/monad-bft.git bft
+          git -C bft checkout c616743d1358186605e1c1b74a3d6c4fdd9dd48c
+          git -C bft submodule update --init monad-execution
+          test "$(git -C bft rev-parse HEAD)" = c616743d1358186605e1c1b74a3d6c4fdd9dd48c
+          test "$(git -C bft/monad-execution rev-parse HEAD)" = e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+          test -z "$(git -C bft status --porcelain=v1)"
+          git clone --depth 1 https://github.com/ethereum/tests.git ethereum-tests
+          mkdir -p out/raw out/meta out/candidates out/repro
+          git -C ethereum-tests rev-parse HEAD > out/meta/ETHEREUM_TESTS_COMMIT.txt
+          printf '%s\n' c616743d1358186605e1c1b74a3d6c4fdd9dd48c > out/meta/BFT_COMMIT.txt
+
+      - name: Extract decodable transaction corpus metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib,re,hashlib
+          root=pathlib.Path('ethereum-tests')
+          rows=[]
+          fork_priority=('Osaka','Prague','Cancun','Shanghai','Paris','London','Berlin')
+          for p in root.rglob('*.json'):
+              if 'TransactionTests' not in str(p): continue
+              try:d=json.loads(p.read_text(errors='replace'))
+              except Exception:continue
+              if not isinstance(d,dict):continue
+              for name,obj in d.items():
+                  if not isinstance(obj,dict):continue
+                  rlp=obj.get('rlp') or obj.get('txbytes') or obj.get('raw')
+                  if not isinstance(rlp,str):continue
+                  rlp=rlp.removeprefix('0x')
+                  if not re.fullmatch(r'[0-9a-fA-F]*',rlp) or len(rlp)%2:continue
+                  verdict=None;fork=None;exception=None
+                  for f in fork_priority:
+                      if f not in obj:continue
+                      fork=f;v=obj[f]
+                      if v is None:
+                          verdict='invalid';exception='null'
+                      elif isinstance(v,dict):
+                          exc=v.get('exception') or v.get('error')
+                          if exc:
+                              verdict='invalid';exception=str(exc)
+                          elif any(k in v for k in ('hash','sender','intrinsicGas','intrinsic_gas')):
+                              verdict='valid'
+                      break
+                  if verdict is None:
+                      # Generic exception markers outside fork subobject.
+                      exc=obj.get('exception') or obj.get('expectException')
+                      if exc:verdict='invalid';exception=str(exc)
+                  if verdict is None:continue
+                  rows.append({
+                      'fixture':str(p.relative_to(root)),'name':name,'fork':fork,
+                      'expected':verdict,'exception':exception,'rlp':rlp,
+                      'bytes':len(rlp)//2,'sha256':hashlib.sha256(bytes.fromhex(rlp)).hexdigest(),
+                  })
+          # Bound but keep diverse exception classes and paths.
+          invalid=[];valid=[];seen=set()
+          for r in sorted(rows,key=lambda x:(x['expected'],x.get('exception') or '',x['fixture'],x['name'])):
+              key=(r['expected'],r.get('exception'),r['sha256'])
+              if key in seen:continue
+              seen.add(key)
+              (invalid if r['expected']=='invalid' else valid).append(r)
+          selected=invalid[:2500]+valid[:300]
+          pathlib.Path('out/raw/TX_CORPUS.json').write_text(json.dumps(selected,indent=2,sort_keys=True)+'\n')
+          pathlib.Path('out/raw/TX_CORPUS_SUMMARY.json').write_text(json.dumps({
+              'all_rows':len(rows),'invalid_unique':len(invalid),'valid_unique':len(valid),
+              'selected_invalid':min(2500,len(invalid)),'selected_valid':min(300,len(valid)),
+          },indent=2,sort_keys=True)+'\n')
+          print('selected',len(selected))
+          PY
+
+      - name: Synthesize an in-crate admission probe from an exact existing test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,json
+          crate=Path('bft/monad-eth-block-validator')
+          candidates=[]
+
+          def extract_functions(text):
+              out=[]
+              for m in re.finditer(r'(?m)^\s*(?:#\[[^\n]+\]\s*)*(?:pub(?:\([^)]*\))?\s+)?fn\s+([A-Za-z0-9_]+)\s*\(',text):
+                  b=text.find('{',m.end())
+                  if b<0:continue
+                  depth=0;i=b;instr=False;esc=False
+                  while i<len(text):
+                      c=text[i]
+                      if instr:
+                          if esc:esc=False
+                          elif c=='\\':esc=True
+                          elif c=='"':instr=False
+                      else:
+                          if c=='"':instr=True
+                          elif c=='{':depth+=1
+                          elif c=='}':
+                              depth-=1
+                              if depth==0:
+                                  out.append((m.group(1),m.start(),i+1,text[m.start():i+1]));break
+                      i+=1
+              return out
+
+          for p in crate.rglob('*.rs'):
+              text=p.read_text(errors='replace')
+              for name,a,b,fn in extract_functions(text):
+                  low=fn.lower()
+                  if 'validate_block_body' in low and 'transactions' in low and ('#[test]' in fn or 'assert' in low):
+                      candidates.append((len(fn),p,name,a,b,fn))
+          candidates.sort(key=lambda x:x[0])
+          if not candidates:
+              raise SystemExit('no exact validate_block_body seed test found')
+          _,p,name,a,b,fn=candidates[0]
+          original=fn
+          # Rename test.
+          fn=re.sub(r'\bfn\s+'+re.escape(name)+r'\s*\(', 'fn corpus_admission_probe(', fn, count=1)
+          # Replace the first transaction vector with a type-inferred decoded envelope.
+          marker=re.search(r'transactions\s*:\s*vec!\s*\[',fn)
+          if not marker:
+              raise SystemExit('seed has no transactions vec')
+          start=marker.end();depth=1;i=start
+          while i<len(fn) and depth:
+              if fn[i]=='[':depth+=1
+              elif fn[i]==']':depth-=1
+              i+=1
+          if depth:raise SystemExit('transaction vector bracket mismatch')
+          fn=fn[:start]+'__corpus_tx'+fn[i-1:]
+          # Find direct validate call and retain setup through that statement.
+          call=re.search(r'(?s)(?:let\s+(\w+)\s*=\s*)?([^;\n]*validate_block_body\s*\([^;]+\);)',fn)
+          if not call:
+              # Multiline result assignment fallback.
+              call=re.search(r'(?s)let\s+(\w+)\s*=\s*([^;]*validate_block_body\s*\([^;]+\));',fn)
+          if not call:
+              raise SystemExit('cannot locate validate_block_body call')
+          # Infer result variable or replace expression with one.
+          stmt=call.group(0)
+          result_var=call.group(1) if call.lastindex and call.group(1) else '__corpus_result'
+          if not (call.lastindex and call.group(1)):
+              expr=stmt.rstrip(';').strip()
+              if expr.startswith('assert'):
+                  # Extract the method call before .is_ok/.is_err.
+                  m=re.search(r'([A-Za-z0-9_\.]+\.validate_block_body\s*\([^)]*\))',expr)
+                  if not m:raise SystemExit('assert call extraction failed')
+                  stmt=f'let {result_var} = {m.group(1)};'
+              else:
+                  stmt=f'let {result_var} = {expr};'
+          prefix=fn[:call.start()]
+          # Inject corpus transaction at function body start after opening brace.
+          brace=prefix.find('{')
+          injection='''\n    let __corpus_hex = std::env::var("MONAD_TX_RLP_HEX").expect("MONAD_TX_RLP_HEX");
+    let __corpus_raw = hex::decode(__corpus_hex).expect("valid hex");
+    let __corpus_tx = alloy_rlp::decode_exact(&__corpus_raw).expect("decodable TxEnvelope");
+'''
+          generated=prefix[:brace+1]+injection+prefix[brace+1:]+stmt+f'''\n    println!("MONAD_CORPUS_ACCEPT={{}}", {result_var}.is_ok());\n}}'''
+          text=p.read_text()
+          # Insert immediately after seed function, inside the same module/scope.
+          text=text[:b]+'\n\n'+generated+'\n'+text[b:]
+          p.write_text(text)
+          # Ensure dev dependencies used by fully qualified paths.
+          cargo=crate/'Cargo.toml';ct=cargo.read_text()
+          if 'hex = { workspace = true }' not in ct:
+              ct+='\n[dev-dependencies]\nhex = { workspace = true }\nalloy-rlp = { workspace = true }\n'
+              cargo.write_text(ct)
+          Path('out/meta/PROBE_SYNTHESIS.json').write_text(json.dumps({
+              'seed_file':str(p),'seed_function':name,'generated_function':'corpus_admission_probe',
+              'seed_bytes':len(original),'probe_bytes':len(generated),
+          },indent=2,sort_keys=True)+'\n')
+          Path('out/meta/CORPUS_PROBE.patch').write_text(generated+'\n')
+          PY
+          cd bft
+          cargo test -p monad-eth-block-validator corpus_admission_probe --no-run \
+            2>&1 | tee ../out/raw/PROBE_BUILD.log
+          rustc --version --verbose > ../out/meta/RUSTC_VERSION.txt
+          cargo --version --verbose > ../out/meta/CARGO_VERSION.txt
+
+      - name: Run corpus through exact Rust admission
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib,subprocess,os,re,time
+          corpus=json.loads(pathlib.Path('out/raw/TX_CORPUS.json').read_text())
+          results=[]
+          for idx,row in enumerate(corpus):
+              env=os.environ.copy();env['MONAD_TX_RLP_HEX']=row['rlp'];env['RUST_BACKTRACE']='0'
+              try:
+                  p=subprocess.run(
+                      ['cargo','test','-p','monad-eth-block-validator','corpus_admission_probe','--','--exact','corpus_admission_probe','--nocapture','--test-threads=1'],
+                      cwd='bft',env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=35,
+                  )
+                  m=re.search(r'MONAD_CORPUS_ACCEPT=(true|false)',p.stdout)
+                  if m: outcome='accept' if m.group(1)=='true' else 'reject'
+                  elif 'decodable TxEnvelope' in p.stdout or 'valid hex' in p.stdout: outcome='decode_fail'
+                  else: outcome='probe_error'
+                  rec={k:v for k,v in row.items() if k!='rlp'}
+                  rec.update({'probe_outcome':outcome,'return_code':p.returncode})
+                  if outcome in ('probe_error','decode_fail'):
+                      rec['log_tail']='\n'.join(p.stdout.splitlines()[-25:])
+                  results.append(rec)
+              except subprocess.TimeoutExpired:
+                  rec={k:v for k,v in row.items() if k!='rlp'};rec.update({'probe_outcome':'timeout','return_code':124});results.append(rec)
+          pathlib.Path('out/raw/TX_CORPUS_RESULTS.json').write_text(json.dumps(results,indent=2,sort_keys=True)+'\n')
+          PY
+
+      - name: Adjudicate and reproduce candidate mismatches
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib,subprocess,os,re
+          out=pathlib.Path('out')
+          corpus=json.loads((out/'raw/TX_CORPUS.json').read_text())
+          bysha={r['sha256']:r for r in corpus}
+          results=json.loads((out/'raw/TX_CORPUS_RESULTS.json').read_text())
+          candidates=[r for r in results if r['expected']=='invalid' and r['probe_outcome']=='accept']
+          controls=[r for r in results if r['expected']=='valid']
+          valid_control_accepts=sum(r['probe_outcome']=='accept' for r in controls)
+          repro=[]
+          for c in candidates[:100]:
+              row=bysha[c['sha256']]
+              rcs=[];outs=[]
+              for rep in range(1,4):
+                  env=os.environ.copy();env['MONAD_TX_RLP_HEX']=row['rlp'];env['RUST_BACKTRACE']='0'
+                  p=subprocess.run(['cargo','test','-p','monad-eth-block-validator','corpus_admission_probe','--','--exact','corpus_admission_probe','--nocapture','--test-threads=1'],cwd='bft',env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=40)
+                  m=re.search(r'MONAD_CORPUS_ACCEPT=(true|false)',p.stdout)
+                  outs.append(m.group(1) if m else 'missing');rcs.append(p.returncode)
+                  (out/'repro'/f"{c['sha256']}__rep{rep}.log").write_text(p.stdout)
+              repro.append({'candidate':c,'outputs':outs,'return_codes':rcs,'stable_accept':outs==['true','true','true']})
+          stable=[r for r in repro if r['stable_accept']]
+          d={
+              'source_commit':'c616743d1358186605e1c1b74a3d6c4fdd9dd48c',
+              'corpus_rows':len(results),'valid_controls':len(controls),'valid_control_accepts':valid_control_accepts,
+              'oracle_invalid_rust_accepts':len(candidates),'stable_candidates':stable,
+              'candidate_signal':bool(stable),'submission_ready':False,
+              'decision':'STABLE_ORACLE_MISMATCH_REQUIRES_EXACT_EXECUTION_AND_FULLNODE_PROMOTION' if stable else 'NO_STABLE_TX_ADMISSION_MISMATCH',
+              'mandatory_next_gate':'Exact execution must reject the same decodable transaction; then construct a validly signed malicious proposal and prove 3/3 finality impact plus matched fix.',
+          }
+          (out/'TX_CORPUS_ADJUDICATION.json').write_text(json.dumps(d,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({'decision':d['decision'],'candidates':len(candidates),'stable':len(stable),'submission_ready':False}))
+          PY
+          sha256sum out/raw/* out/meta/* out/TX_CORPUS_ADJUDICATION.json > out/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: monad-round9-tx-corpus-differential
+          path: |
+            out
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
