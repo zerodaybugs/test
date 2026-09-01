@@ -1,0 +1,186 @@
+name: Monad v0.16.0 execution validation fuzz Round 8
+
+on:
+  push:
+    branches:
+      - tooling/monad-round8-validation-fuzz-20260824
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  campaign:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    steps:
+      - name: Checkout tooling
+        uses: actions/checkout@v4
+
+      - name: Clone exact scoped execution source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global submodule.fetchJobs "$(nproc)"
+          git clone --recurse-submodules https://github.com/category-labs/monad.git monad
+          git -C monad checkout e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+          git -C monad submodule update --init --recursive
+          test "$(git -C monad rev-parse HEAD)" = "e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0"
+          test -z "$(git -C monad status --porcelain=v1)"
+          mkdir -p out/meta out/logs out/results out/crashes out/corpora
+          git -C monad submodule status --recursive > out/meta/SUBMODULES.txt
+
+      - name: Build official dependency image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --target base -t monad-round8-base -f monad/docker/Dockerfile monad \
+            > out/logs/docker-build.log 2>&1
+
+      - name: Configure and build exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --name monad-round8 \
+            -v "$PWD/monad:/src" \
+            -v "$PWD/out:/out" \
+            monad-round8-base bash -lc '
+              set -euo pipefail
+              cd /src
+              rm -rf build-round8
+              CC=clang-19 CXX=clang++-19 cmake -S . -B build-round8 -GNinja \
+                -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DCMAKE_TOOLCHAIN_FILE=category/core/toolchains/gcc-avx2.cmake \
+                -DMONAD_COMPILER_TESTING=On \
+                > /out/logs/configure.log 2>&1
+              ninja -C build-round8 -t targets all > /out/meta/NINJA_TARGETS.txt
+              cmake --build build-round8 --parallel "$(nproc)" \
+                > /out/logs/build.log 2>&1
+              ctest --test-dir build-round8 -N > /out/meta/CTEST_INVENTORY.txt
+              find build-round8 -type f -perm -111 -printf "%p\n" | sort \
+                > /out/meta/EXECUTABLES.txt
+              clang-19 --version > /out/meta/CLANG_VERSION.txt
+              cmake --version > /out/meta/CMAKE_VERSION.txt
+              ninja --version > /out/meta/NINJA_VERSION.txt
+            '
+
+      - name: Run consensus-relevant validation suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker start monad-round8 >/dev/null
+          docker exec monad-round8 bash -lc '
+            set -euo pipefail
+            cd /src
+            set +e
+            timeout --signal=TERM --kill-after=30s 2400s \
+              ctest --test-dir build-round8 --output-on-failure --no-tests=error \
+                -R "(validat|transaction|block|precompile|ecrecover|signature|state|trie|mpt|receipt|witness|parallel|conflict|system.transaction)" \
+                > /out/logs/targeted-ctest.log 2>&1
+            rc=$?
+            set -e
+            printf "%s\n" "$rc" > /out/results/targeted-ctest.rc
+          '
+
+      - name: Discover and run native fuzz executables
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker start monad-round8 >/dev/null
+          docker exec monad-round8 bash -lc '
+            set -euo pipefail
+            cd /src
+            python3 - <<"PY"
+          import pathlib, subprocess, json, re
+          build=pathlib.Path("build-round8")
+          candidates=[]
+          for p in build.rglob("*"):
+              if not p.is_file() or not p.stat().st_mode & 0o111:
+                  continue
+              n=p.name.lower()
+              if any(k in n for k in ("fuzz", "fuzzer")):
+                  candidates.append(str(p))
+          pathlib.Path("/out/meta/FUZZ_CANDIDATES.json").write_text(json.dumps(sorted(candidates),indent=2)+"\n")
+          PY
+            mkdir -p /out/corpora /out/crashes
+            python3 - <<"PY"
+          import json, pathlib, subprocess, os, time
+          candidates=json.loads(pathlib.Path("/out/meta/FUZZ_CANDIDATES.json").read_text())
+          records=[]
+          focus=("transaction","block","valid","precompile","state","trie","mpt","receipt","witness","execution","compiler")
+          selected=[p for p in candidates if any(k in pathlib.Path(p).name.lower() for k in focus)]
+          selected=selected[:16]
+          for idx,p in enumerate(selected):
+              name=pathlib.Path(p).name
+              corpus=pathlib.Path("/out/corpora")/f"{idx:02d}_{name}"
+              crash=pathlib.Path("/out/crashes")/f"{idx:02d}_{name}"
+              corpus.mkdir(parents=True,exist_ok=True); crash.mkdir(parents=True,exist_ok=True)
+              log=pathlib.Path("/out/logs")/f"fuzz_{idx:02d}_{name}.log"
+              cmd=[p,str(corpus),"-max_total_time=300","-timeout=15","-rss_limit_mb=4096",f"-artifact_prefix={crash}/","-print_final_stats=1"]
+              started=time.time()
+              try:
+                  proc=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=340,env={**os.environ,"ASAN_OPTIONS":"abort_on_error=1:detect_leaks=0","UBSAN_OPTIONS":"halt_on_error=1"})
+                  rc=proc.returncode; output=proc.stdout
+              except subprocess.TimeoutExpired as e:
+                  rc=124; output=(e.stdout or "") if isinstance(e.stdout,str) else ""
+              log.write_text(output,errors="replace")
+              artifacts=[str(x) for x in crash.iterdir() if x.is_file()]
+              records.append({"path":p,"name":name,"return_code":rc,"seconds":round(time.time()-started,3),"artifacts":artifacts,"log":str(log)})
+          pathlib.Path("/out/results/FUZZ_RESULTS.json").write_text(json.dumps(records,indent=2,sort_keys=True)+"\n")
+          PY
+          '
+
+      - name: Reproduce and classify all signals
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib, re, hashlib
+          out=pathlib.Path('out')
+          fuzz_path=out/'results/FUZZ_RESULTS.json'
+          fuzz=json.loads(fuzz_path.read_text()) if fuzz_path.exists() else []
+          ctest_rc=int((out/'results/targeted-ctest.rc').read_text().strip()) if (out/'results/targeted-ctest.rc').exists() else None
+          signals=[]
+          for rec in fuzz:
+              text=pathlib.Path(rec['log']).read_text(errors='replace') if pathlib.Path(rec['log']).exists() else ''
+              markers=sorted({m for m in ('AddressSanitizer','UndefinedBehaviorSanitizer','runtime error:','Segmentation fault','Assertion','MONAD_ASSERT','mismatch','state root') if m in text})
+              if rec['artifacts'] or markers or rec['return_code'] not in (0,124):
+                  signals.append({**rec,'markers':markers})
+          ctest_log=(out/'logs/targeted-ctest.log').read_text(errors='replace') if (out/'logs/targeted-ctest.log').exists() else ''
+          ctest_failed=ctest_rc not in (0,124) or bool(re.search(r'\b[1-9][0-9]* tests failed\b',ctest_log))
+          result={
+            'source_commit':'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0',
+            'targeted_ctest_return_code':ctest_rc,
+            'targeted_ctest_failed':ctest_failed,
+            'fuzz_executables_run':len(fuzz),
+            'raw_signal_count':len(signals),
+            'signals':signals,
+            'production_ingress_proven':False,
+            'consensus_impact_proven':False,
+            'submission_ready':False,
+            'decision':'RAW_SIGNALS_REQUIRE_MINIMIZATION' if signals or ctest_failed else 'NO_EXECUTION_VALIDATION_SIGNAL_IN_CAMPAIGN'
+          }
+          (out/'results/CAMPAIGN_ADJUDICATION.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(result,indent=2))
+          PY
+          (cd out && find meta logs results crashes -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) > out/SHA256SUMS
+          tar --sort=name --mtime='UTC 2026-08-24' --owner=0 --group=0 --numeric-owner \
+            -C out -czf monad-round8-validation-fuzz-20260824.tar.gz \
+            SHA256SUMS meta logs results crashes
+          sha256sum monad-round8-validation-fuzz-20260824.tar.gz > monad-round8-validation-fuzz-20260824.tar.gz.sha256
+
+      - name: Upload campaign evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-round8-validation-fuzz-20260824
+          path: |
+            monad-round8-validation-fuzz-20260824.tar.gz
+            monad-round8-validation-fuzz-20260824.tar.gz.sha256
+            out/results/CAMPAIGN_ADJUDICATION.json
+            out/results/FUZZ_RESULTS.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0

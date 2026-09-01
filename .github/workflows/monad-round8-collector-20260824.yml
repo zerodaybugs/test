@@ -1,0 +1,150 @@
+name: Monad Round 8 fail-closed collector
+
+on:
+  push:
+    branches:
+      - tooling/monad-round8-validation-fuzz-20260824
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+  statuses: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BRANCH: tooling/monad-round8-validation-fuzz-20260824
+      TARGET_WORKFLOW: monad-round8-validation-fuzz-20260824.yml
+      TARGET_ARTIFACT: monad-round8-validation-fuzz-20260824
+    steps:
+      - name: Checkout exact branch head
+        uses: actions/checkout@v4
+        with:
+          ref: tooling/monad-round8-validation-fuzz-20260824
+          fetch-depth: 1
+
+      - name: Wait for matching campaign run
+        id: wait
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_sha='${{ github.sha }}'
+          run_id=''
+          for _ in $(seq 1 220); do
+            runs=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/${TARGET_WORKFLOW}/runs?branch=${BRANCH}&per_page=30")
+            run_id=$(jq -r --arg sha "$target_sha" '
+              [.workflow_runs[] | select(.head_sha == $sha)]
+              | sort_by(.run_number) | reverse | .[0].id // empty
+            ' <<<"$runs")
+            status=$(jq -r --arg sha "$target_sha" '
+              [.workflow_runs[] | select(.head_sha == $sha)]
+              | sort_by(.run_number) | reverse | .[0].status // empty
+            ' <<<"$runs")
+            conclusion=$(jq -r --arg sha "$target_sha" '
+              [.workflow_runs[] | select(.head_sha == $sha)]
+              | sort_by(.run_number) | reverse | .[0].conclusion // empty
+            ' <<<"$runs")
+            if [[ -n "$run_id" && "$status" == completed ]]; then
+              printf 'run_id=%s\n' "$run_id" >> "$GITHUB_OUTPUT"
+              printf 'conclusion=%s\n' "$conclusion" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo 'matching campaign did not complete in collector timebox' >&2
+          exit 1
+
+      - name: Download and adjudicate artifact
+        id: adjudicate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p collected decision
+          gh run download '${{ steps.wait.outputs.run_id }}' \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$TARGET_ARTIFACT" \
+            --dir collected
+          adjudication=$(find collected -type f -name CAMPAIGN_ADJUDICATION.json -print -quit)
+          test -n "$adjudication"
+          cp "$adjudication" decision/CAMPAIGN_ADJUDICATION.json
+          python3 - <<'PY'
+          import json, pathlib, os
+          p=pathlib.Path('decision/CAMPAIGN_ADJUDICATION.json')
+          d=json.loads(p.read_text())
+          decision=d.get('decision','MISSING_DECISION')
+          if decision == 'NO_EXECUTION_VALIDATION_SIGNAL_IN_CAMPAIGN':
+              state='success'
+          elif decision == 'RAW_SIGNALS_REQUIRE_MINIMIZATION':
+              state='error'
+          else:
+              state='failure'
+          record={
+              'branch':os.environ['BRANCH'],
+              'head_sha':os.environ['GITHUB_SHA'],
+              'campaign_run_id':int(os.environ['CAMPAIGN_RUN_ID']),
+              'campaign_conclusion':os.environ['CAMPAIGN_CONCLUSION'],
+              'decision':decision,
+              'status_state':state,
+              'adjudication':d,
+              'submission_ready':False,
+          }
+          pathlib.Path('decision/MONAD_ROUND8_EXECUTION_DECISION.json').write_text(
+              json.dumps(record,indent=2,sort_keys=True)+'\n'
+          )
+          pathlib.Path('decision/STATUS_STATE.txt').write_text(state+'\n')
+          pathlib.Path('decision/STATUS_DESCRIPTION.txt').write_text(
+              (decision[:130] or 'MISSING_DECISION')+'\n'
+          )
+          print(json.dumps(record,indent=2))
+          PY
+        env:
+          CAMPAIGN_RUN_ID: ${{ steps.wait.outputs.run_id }}
+          CAMPAIGN_CONCLUSION: ${{ steps.wait.outputs.conclusion }}
+
+      - name: Publish machine decision to branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p research-results
+          cp decision/MONAD_ROUND8_EXECUTION_DECISION.json \
+            research-results/MONAD_ROUND8_EXECUTION_DECISION.json
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add research-results/MONAD_ROUND8_EXECUTION_DECISION.json
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m 'chore: publish Monad Round 8 machine decision [skip ci]'
+          git push origin HEAD:"${BRANCH}"
+
+      - name: Publish commit status
+        shell: bash
+        run: |
+          set -euo pipefail
+          state=$(cat decision/STATUS_STATE.txt)
+          description=$(cat decision/STATUS_DESCRIPTION.txt)
+          jq -n \
+            --arg state "$state" \
+            --arg context 'monad-round8/decision' \
+            --arg description "$description" \
+            --arg target_url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${{ steps.wait.outputs.run_id }}" \
+            '{state:$state,context:$context,description:$description,target_url:$target_url}' \
+            > decision/status-payload.json
+          gh api --method POST "/repos/${GITHUB_REPOSITORY}/statuses/${{ github.sha }}" \
+            --input decision/status-payload.json
+
+      - name: Upload collector record
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-round8-machine-decision
+          path: |
+            decision/MONAD_ROUND8_EXECUTION_DECISION.json
+            decision/CAMPAIGN_ADJUDICATION.json
+            decision/status-payload.json
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
