@@ -1,0 +1,169 @@
+name: Monad v0.16.0 BlockSync StateSync integrity Round 9
+
+on:
+  push:
+    branches:
+      - tooling/monad-round9-sync-integrity-20260824
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync-integrity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global submodule.fetchJobs "$(nproc)"
+          git clone --filter=blob:none --no-recurse-submodules https://github.com/category-labs/monad-bft.git bft
+          git -C bft checkout c616743d1358186605e1c1b74a3d6c4fdd9dd48c
+          git -C bft submodule update --init monad-execution
+          test "$(git -C bft rev-parse HEAD)" = c616743d1358186605e1c1b74a3d6c4fdd9dd48c
+          test "$(git -C bft/monad-execution rev-parse HEAD)" = e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+          test -z "$(git -C bft status --porcelain=v1)"
+          mkdir -p out/raw out/meta out/artifacts out/repro
+          printf '%s\n' c616743d1358186605e1c1b74a3d6c4fdd9dd48c > out/meta/BFT_COMMIT.txt
+
+      - name: Run exact sync baseline suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd bft
+          packages=()
+          for p in monad-blocksync monad-blocktree monad-state monad-state-backend monad-state-sync monad-statesync monad-execution-state monad-execution-state-read; do
+            if cargo metadata --no-deps --format-version 1 2>/dev/null | grep -q '"name":"'"$p"'"'; then packages+=("$p"); fi
+          done
+          : > ../out/raw/BASELINE_RESULTS.tsv
+          for p in "${packages[@]}"; do
+            set +e
+            timeout --signal=TERM --kill-after=15s 1800s \
+              cargo test -p "$p" --all-features -- --nocapture --test-threads=1 \
+              > "../out/raw/baseline_${p}.log" 2>&1
+            rc=$?
+            set -e
+            printf '%s\t%s\n' "$p" "$rc" >> ../out/raw/BASELINE_RESULTS.tsv
+          done
+          rustc --version --verbose > ../out/meta/RUSTC_VERSION.txt
+          cargo --version --verbose > ../out/meta/CARGO_VERSION.txt
+
+      - name: Run sync/proof fuzz targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-fuzz --locked
+          cd bft/monad-fuzz
+          cargo fuzz list > ../../out/raw/FUZZ_ALL.txt
+          grep -Ei '(blocksync|state.?sync|proof|block.?header|block.?body|payload|merkle|trie|state)' \
+            ../../out/raw/FUZZ_ALL.txt | head -n 14 > ../../out/raw/FUZZ_SELECTED.txt || true
+          : > ../../out/raw/FUZZ_RESULTS.tsv
+          while IFS= read -r target; do
+            [ -n "$target" ] || continue
+            mkdir -p "../../out/artifacts/$target"
+            set +e
+            RUST_BACKTRACE=1 timeout --signal=TERM --kill-after=20s 600s \
+              cargo fuzz run "$target" --artifact-prefix "../../out/artifacts/$target/" -- \
+                -max_total_time=560 -timeout=20 -rss_limit_mb=6000 -print_final_stats=1 \
+              > "../../out/raw/fuzz_${target}.log" 2>&1
+            rc=$?
+            set -e
+            printf '%s\t%s\n' "$target" "$rc" >> ../../out/raw/FUZZ_RESULTS.tsv
+          done < ../../out/raw/FUZZ_SELECTED.txt
+
+      - name: Reproduce fuzz artifacts three times
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd bft/monad-fuzz
+          : > ../../out/raw/REPRO_RESULTS.tsv
+          shopt -s nullglob
+          for td in ../../out/artifacts/*; do
+            target="$(basename "$td")"
+            for artifact in "$td"/*; do
+              [ -f "$artifact" ] || continue
+              for rep in 1 2 3; do
+                set +e
+                RUST_BACKTRACE=1 timeout --signal=TERM --kill-after=10s 90s \
+                  cargo fuzz run "$target" "$artifact" \
+                  > "../../out/repro/${target}__$(basename "$artifact")__rep${rep}.log" 2>&1
+                rc=$?
+                set -e
+                printf '%s\t%s\t%s\t%s\n' "$target" "$(basename "$artifact")" "$rep" "$rc" \
+                  >> ../../out/raw/REPRO_RESULTS.tsv
+              done
+            done
+          done
+
+      - name: Build public-fix and proof-binding inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C bft fetch --no-tags origin master
+          git -C bft log --format='%H%x09%aI%x09%s' \
+            c616743d1358186605e1c1b74a3d6c4fdd9dd48c..origin/master -- \
+            monad-blocksync monad-blocktree monad-state monad-statesync monad-state-sync \
+            > out/raw/POST_PIN_SYNC_COMMITS.tsv || true
+          rg -n --hidden --glob '!target/**' \
+            '(state.?root|proof|merkle|block_body_id|payload_id|receipt.?root|transaction.?root|verify|validate|expect\(|unwrap\(|assert!)' \
+            bft/monad-blocksync bft/monad-blocktree bft/monad-state \
+            > out/raw/SYNC_BINDING_INDEX.txt || true
+
+      - name: Adjudicate fail-closed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib,hashlib,re
+          out=pathlib.Path('out')
+          baselines=[]
+          p=out/'raw/BASELINE_RESULTS.tsv'
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  if line.strip():
+                      name,rc=line.split('\t');baselines.append({'package':name,'return_code':int(rc)})
+          artifacts=[]
+          for p in sorted((out/'artifacts').rglob('*')):
+              if p.is_file():artifacts.append({'path':str(p.relative_to(out)),'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()})
+          repro=[]
+          p=out/'raw/REPRO_RESULTS.tsv'
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  if line.strip():
+                      t,a,r,rc=line.split('\t');repro.append({'target':t,'artifact':a,'rep':int(r),'return_code':int(rc)})
+          groups={}
+          for r in repro:groups.setdefault((r['target'],r['artifact']),[]).append(r['return_code'])
+          stable=[{'target':k[0],'artifact':k[1],'return_codes':v} for k,v in groups.items() if len(v)==3 and all(x!=0 for x in v)]
+          baseline_ok=bool(baselines) and all(x['return_code']==0 for x in baselines)
+          d={
+              'source_commit':'c616743d1358186605e1c1b74a3d6c4fdd9dd48c',
+              'baseline_results':baselines,'baseline_ok':baseline_ok,
+              'artifacts':artifacts,'stable_reproductions':stable,
+              'candidate_signal':baseline_ok and bool(stable),'submission_ready':False,
+              'decision':(
+                  'STABLE_SYNC_CRASH_REQUIRES_VALID_PEER_MESSAGE_AND_STATE_ACCEPTANCE_ADJUDICATION'
+                  if baseline_ok and stable else
+                  'INFRASTRUCTURE_OR_BASELINE_FAILURE' if not baseline_ok else
+                  'NO_STABLE_SYNC_INTEGRITY_SIGNAL'
+              ),
+              'mandatory_next_gate':'A crash is not sufficient. Prove one authenticated malicious peer can make the node accept a header/body or proof/state-root mismatch, then show 3/3 divergent finalized state or sustained finality loss and a matched fix.',
+          }
+          (out/'SYNC_INTEGRITY_ADJUDICATION.json').write_text(json.dumps(d,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({'decision':d['decision'],'stable':len(stable),'submission_ready':False}))
+          PY
+          sha256sum out/raw/* out/meta/* out/SYNC_INTEGRITY_ADJUDICATION.json > out/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: monad-round9-sync-integrity
+          path: |
+            out
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
