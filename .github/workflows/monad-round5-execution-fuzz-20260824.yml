@@ -1,0 +1,179 @@
+name: Monad v0.16.0 Round 5 execution fuzz 20260824
+
+on:
+  push:
+    branches:
+      - tooling/monad-round5-execution-fuzz-20260824
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  execution-fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone exact scoped execution source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global submodule.fetchJobs "$(nproc)"
+          git clone --recurse-submodules https://github.com/category-labs/monad.git monad-execution
+          cd monad-execution
+          git checkout e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+          git submodule update --init --recursive
+          test "$(git rev-parse HEAD)" = "e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0"
+          git status --porcelain=v1 > ../SOURCE_STATUS.txt
+          test ! -s ../SOURCE_STATUS.txt
+          git submodule status --recursive > ../SUBMODULES.txt
+
+      - name: Build official dependency image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --target base -t monad-v0160-base -f monad-execution/docker/Dockerfile monad-execution
+
+      - name: Configure and inventory execution fuzz targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/meta out/logs out/rc out/artifacts out/bin
+          docker run --name monad-v0160-r5-exec \
+            -v "$PWD/monad-execution:/src" \
+            -v "$PWD/out:/out" \
+            monad-v0160-base bash -lc '
+              set -euo pipefail
+              cd /src
+              rm -rf build-r5-exec
+              CC=clang-19 CXX=clang++-19 cmake -S . -B build-r5-exec -GNinja \
+                -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DCMAKE_TOOLCHAIN_FILE=category/core/toolchains/gcc-avx2.cmake \
+                -DMONAD_COMPILER_TESTING=On
+              ninja -C build-r5-exec -t targets all > /out/meta/NINJA_TARGETS.txt
+              clang-19 --version > /out/meta/CLANG_VERSION.txt
+              clang++-19 --version > /out/meta/CLANGXX_VERSION.txt
+              cmake --version > /out/meta/CMAKE_VERSION.txt
+              ninja --version > /out/meta/NINJA_VERSION.txt
+            '
+          cp SOURCE_STATUS.txt SUBMODULES.txt out/meta/
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,json
+          text=Path('out/meta/NINJA_TARGETS.txt').read_text(errors='replace')
+          names=[]
+          for line in text.splitlines():
+              name=line.split(':',1)[0].strip()
+              low=name.lower()
+              if 'fuzz' not in low: continue
+              if 'compiler' in low and 'staking' not in low: continue
+              score=sum(w for token,w in {
+                'execution':12,'parallel':12,'state':10,'trie':10,'triedb':10,
+                'block':9,'transaction':8,'tx':7,'staking':9,'rlp':7,
+                'receipt':6,'account':5,'storage':8,'mip':10,'scheduler':8
+              }.items() if token in low)
+              if name not in [x['target'] for x in names]: names.append({'target':name,'score':score})
+          names.sort(key=lambda x:(-x['score'],x['target']))
+          Path('out/TARGET_INVENTORY.json').write_text(json.dumps({'all':names,'selected':names[:12]},indent=2)+'\n')
+          Path('out/SELECTED.txt').write_text('\n'.join(x['target'] for x in names[:12])+'\n')
+          PY
+
+      - name: Build selected targets without hiding failures
+        shell: bash
+        run: |
+          set -u
+          docker start monad-v0160-r5-exec >/dev/null
+          while IFS= read -r target; do
+            [[ -n "$target" ]] || continue
+            slug=$(printf '%s' "$target" | sed 's#[^A-Za-z0-9_.-]#_#g')
+            set +e
+            docker exec monad-v0160-r5-exec bash -lc "cd /src && timeout --signal=TERM --kill-after=20s 1500s cmake --build build-r5-exec --target '$target' --parallel \"\$(nproc)\"" >"out/logs/${slug}.build.log" 2>&1
+            rc=$?
+            set -e
+            printf '%s\n' "$rc" >"out/rc/${slug}.build.rc"
+          done < out/SELECTED.txt
+          docker exec monad-v0160-r5-exec bash -lc '
+            set -euo pipefail
+            find /src/build-r5-exec -type f -perm -111 \( -iname "*fuzz*" -o -iname "*fuzzer*" \) -print > /out/meta/BUILT_FUZZ_BINARIES.txt
+            while IFS= read -r p; do
+              [[ -f "$p" ]] || continue
+              b=$(basename "$p")
+              cp "$p" "/out/bin/${b}-$(printf %s "$p" | sha256sum | cut -c1-12)"
+            done < /out/meta/BUILT_FUZZ_BINARIES.txt
+          '
+
+      - name: Run top built execution fuzzers
+        shell: bash
+        run: |
+          set -u
+          docker start monad-v0160-r5-exec >/dev/null
+          mapfile -t bins < <(find out/bin -maxdepth 1 -type f -perm -111 | sort | head -n 8)
+          for hostbin in "${bins[@]}"; do
+            bn=$(basename "$hostbin")
+            mkdir -p "out/artifacts/$bn" "out/corpus/$bn"
+            dockerbin="/out/bin/$bn"
+            set +e
+            docker exec monad-v0160-r5-exec bash -lc "'$dockerbin' -help=1" >"out/logs/${bn}.help.log" 2>&1
+            hrc=$?
+            if grep -qiE 'libFuzzer|max_total_time|artifact_prefix' "out/logs/${bn}.help.log"; then
+              docker exec monad-v0160-r5-exec bash -lc "timeout --signal=TERM --kill-after=20s 360s '$dockerbin' '/out/corpus/$bn' -max_total_time=300 -timeout=20 -rss_limit_mb=4096 -artifact_prefix='/out/artifacts/$bn/'" >"out/logs/${bn}.run.log" 2>&1 &
+            else
+              docker exec monad-v0160-r5-exec bash -lc "timeout --signal=TERM --kill-after=20s 360s '$dockerbin'" >"out/logs/${bn}.run.log" 2>&1 &
+            fi
+            echo $! >"out/rc/${bn}.pid"
+            printf '%s\n' "$hrc" >"out/rc/${bn}.help.rc"
+            set -e
+          done
+          for p in out/rc/*.pid; do
+            [[ -f "$p" ]] || continue
+            bn=$(basename "$p" .pid)
+            pid=$(cat "$p")
+            set +e
+            wait "$pid"; rc=$?
+            set -e
+            printf '%s\n' "$rc" >"out/rc/${bn}.run.rc"
+          done
+          exit 0
+
+      - name: Analyze execution fuzz evidence fail closed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,hashlib
+          root=Path('out'); inv=json.loads((root/'TARGET_INVENTORY.json').read_text())
+          rows=[]; candidates=[]
+          for rcfile in sorted((root/'rc').glob('*.run.rc')):
+              bn=rcfile.name[:-7]; rc=int(rcfile.read_text().strip())
+              log=root/'logs'/f'{bn}.run.log'; text=log.read_text(errors='replace') if log.exists() else ''
+              arts=[p for p in (root/'artifacts'/bn).rglob('*') if p.is_file()]
+              terms=[x for x in ['ERROR: AddressSanitizer','runtime error:','Assertion failed','MONAD_ASSERT','Segmentation fault','Aborted','stack-overflow','deadly signal','mismatch'] if x in text]
+              signal=bool(arts) or bool(terms) or rc not in (0,124,137,143)
+              row={'binary':bn,'run_rc':rc,'artifact_count':len(arts),'anomaly_terms':terms,'candidate_signal':signal,'log_sha256':hashlib.sha256(log.read_bytes()).hexdigest() if log.exists() else None,'artifacts':[{'path':str(p.relative_to(root)),'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'bytes':p.stat().st_size} for p in arts]}
+              rows.append(row)
+              if signal:candidates.append(row)
+          result={'source_commit':'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0','inventory':inv,'runs':rows,'candidate_count':len(candidates),'candidates':candidates,'decision':'EXECUTION_CRASH_OR_DIFFERENTIAL_CANDIDATES_REQUIRE_MINIMIZATION' if candidates else 'NO_EXECUTION_FUZZ_SIGNAL_IN_CAMPAIGN','submission_ready':False,'high_proven':False,'critical_proven':False}
+          (root/'EXECUTION_FUZZ_RESULT.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(result,indent=2))
+          PY
+          find out -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > out/SHA256SUMS
+          tar --sort=name --mtime='UTC 2026-08-24' --owner=0 --group=0 --numeric-owner -C out -czf monad-v0160-r5-execution-fuzz.tar.gz .
+          sha256sum monad-v0160-r5-execution-fuzz.tar.gz > monad-v0160-r5-execution-fuzz.tar.gz.sha256
+
+      - name: Upload execution fuzz evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: monad-v0160-r5-execution-fuzz
+          path: |
+            monad-v0160-r5-execution-fuzz.tar.gz
+            monad-v0160-r5-execution-fuzz.tar.gz.sha256
+            out/EXECUTION_FUZZ_RESULT.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
