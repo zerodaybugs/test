@@ -1,0 +1,241 @@
+name: Temporary Pyth Core encrypted historical-fork runner
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-pyth-core-secure-fork-run.yml'
+      - 'tmp-secure/pyth-core-payload.enc.b64'
+      - 'tmp-secure/pyth-core-keyinfo.enc.b64'
+      - 'tmp-secure/pyth-core-payload.sha256'
+      - 'tmp-secure/pyth-core-output-public.pem'
+      - 'tmp-secure/pyth-core-run.trigger'
+      - 'tools/pyth_core_evm_live_binding.py'
+      - 'tools/pyth_core_evm_live_state.py'
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout ciphertext only
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Restore Pyth-specific cached input key
+        id: restore-key-primary
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/katana-secure-private.pem
+          key: pyth-core-secure-input-key-v1
+          fail-on-cache-miss: true
+
+      - name: Restore original encrypted-runner input key
+        id: restore-key-original
+        if: steps.restore-key-primary.outcome != 'success'
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/katana-secure-private.pem
+          key: katana-secure-poc-key-56fe0ca7762997ce47d5ae1706bf8af29cbc71202b28c498
+          fail-on-cache-miss: true
+
+      - name: Restore input key by cache-prefix fallback
+        id: restore-key-prefix
+        if: steps.restore-key-primary.outcome != 'success' && steps.restore-key-original.outcome != 'success'
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/katana-secure-private.pem
+          key: pyth-core-secure-input-key-probe-${{ github.run_id }}
+          restore-keys: |
+            pyth-core-secure-input-key-
+            katana-secure-poc-key-
+          fail-on-cache-miss: true
+
+      - name: Validate restored input key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s /tmp/katana-secure-private.pem
+          chmod 0600 /tmp/katana-secure-private.pem
+          openssl pkey -in /tmp/katana-secure-private.pem -check -noout
+          sha256sum /tmp/katana-secure-private.pem | awk '{print $1}' > /tmp/restored-input-key.sha256
+
+      - name: Stabilize input key under Pyth-specific cache key
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/katana-secure-private.pem
+          key: pyth-core-secure-input-key-v1
+
+      - name: Install pinned Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Install exact Solidity compiler for live binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 5 \
+            https://github.com/ethereum/solidity/releases/download/v0.8.4/solc-static-linux \
+            -o /tmp/solc-0.8.4
+          chmod 0755 /tmp/solc-0.8.4
+          /tmp/solc-0.8.4 --version
+
+      - name: Decrypt and verify private Pyth Core payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s /tmp/katana-secure-private.pem
+          umask 077
+          base64 -d tmp-secure/pyth-core-payload.enc.b64 > /tmp/pyth-core-payload.enc
+          base64 -d tmp-secure/pyth-core-keyinfo.enc.b64 > /tmp/pyth-core-keyinfo.enc
+          openssl pkeyutl -decrypt \
+            -inkey /tmp/katana-secure-private.pem \
+            -in /tmp/pyth-core-keyinfo.enc \
+            -out /tmp/pyth-core-keyinfo.bin \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          python3 - <<'PY'
+          from pathlib import Path
+          keyinfo = Path('/tmp/pyth-core-keyinfo.bin').read_bytes()
+          if len(keyinfo) != 48:
+              raise SystemExit(f'invalid key material length: {len(keyinfo)}')
+          Path('/tmp/pyth-core-key.hex').write_text(keyinfo[:32].hex())
+          Path('/tmp/pyth-core-iv.hex').write_text(keyinfo[32:].hex())
+          PY
+          KEY=$(cat /tmp/pyth-core-key.hex)
+          IV=$(cat /tmp/pyth-core-iv.hex)
+          openssl enc -d -aes-256-cbc \
+            -K "$KEY" -iv "$IV" \
+            -in /tmp/pyth-core-payload.enc \
+            -out /tmp/pyth-core-payload.tar.gz
+          EXPECTED=$(tr -d '[:space:]' < tmp-secure/pyth-core-payload.sha256)
+          printf '%s  %s\n' "$EXPECTED" /tmp/pyth-core-payload.tar.gz | sha256sum -c -
+          tar -xzf /tmp/pyth-core-payload.tar.gz
+          test -f pyth_core_secure_payload/run.sh
+          mv pyth_core_secure_payload payload
+          chmod +x payload/run.sh
+
+      - name: Execute isolated historical-fork proof
+        id: execute
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          START=$(date +%s)
+          set +e
+          timeout 2100 bash payload/run.sh > evidence/runner-console.log 2>&1
+          STATUS=$?
+          set -e
+          END=$(date +%s)
+          printf '%s\n' "$STATUS" > evidence/runner-exit-code.txt
+          printf '%s\n' "$((END - START))" > evidence/runner-duration-seconds.txt
+          printf '%s\n' "${GITHUB_RUN_ID}" > evidence/github-run-id.txt
+          printf '%s\n' "${GITHUB_SHA}" > evidence/github-sha.txt
+          cp /tmp/restored-input-key.sha256 evidence/restored-input-key.sha256
+          if [ -d payload/evidence ]; then
+            cp -a payload/evidence evidence/payload-evidence
+          fi
+          if [ -f /tmp/pyth-core-payload.tar.gz ]; then
+            cp /tmp/pyth-core-payload.tar.gz evidence/reproducer-payload.tar.gz
+            sha256sum evidence/reproducer-payload.tar.gz > evidence/reproducer-payload.sha256
+          fi
+          exit 0
+
+      - name: Capture live source binding and governance state diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p evidence/live-binding
+          cp tools/pyth_core_evm_live_binding.py tools/pyth_core_evm_live_state.py evidence/live-binding/ 2>/dev/null
+          python tools/pyth_core_evm_live_binding.py \
+            --proxy 0x4D7E825f80bDf85e913E0DD2A2D54927e9dE1594 \
+            --solc /tmp/solc-0.8.4 \
+            --out evidence/live-binding \
+            > evidence/live-binding/binding-driver-console.log 2>&1
+          BINDING_STATUS=$?
+          python tools/pyth_core_evm_live_state.py \
+            --proxy 0x4D7E825f80bDf85e913E0DD2A2D54927e9dE1594 \
+            --out evidence/live-binding \
+            > evidence/live-binding/live-state-driver-console.log 2>&1
+          STATE_STATUS=$?
+          printf '%s\n' "$BINDING_STATUS" > evidence/live-binding/binding-driver-exit-code.txt
+          printf '%s\n' "$STATE_STATUS" > evidence/live-binding/live-state-driver-exit-code.txt
+          find evidence/live-binding -type f ! -name LIVE_BINDING_SHA256SUMS -print0 \
+            | LC_ALL=C sort -z | xargs -0 sha256sum > evidence/live-binding/LIVE_BINDING_SHA256SUMS
+          exit 0
+
+      - name: Encrypt all evidence before upload
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted-output evidence
+          if [ ! -f evidence/runner-exit-code.txt ]; then
+            printf '%s\n' '125' > evidence/runner-exit-code.txt
+            printf '%s\n' 'Execution step did not create an exit-code record.' > evidence/runner-bootstrap-error.txt
+          fi
+          cp evidence/runner-exit-code.txt encrypted-output/runner-exit-code.txt
+          if [ "$(cat evidence/runner-exit-code.txt)" = '0' ]; then
+            printf '%s\n' 'PYTH_CORE_EXACT_FORK_EXECUTION_PASS' > encrypted-output/POC_EXECUTION_PASS.txt
+          fi
+          tar --sort=name --mtime='UTC 2026-07-25' --owner=0 --group=0 --numeric-owner \
+            -czf /tmp/pyth-core-evidence.tar.gz evidence
+          sha256sum /tmp/pyth-core-evidence.tar.gz | awk '{print $1}' \
+            > encrypted-output/evidence-plaintext.sha256
+          openssl rand 32 > /tmp/output-key.bin
+          openssl rand 16 > /tmp/output-iv.bin
+          cat /tmp/output-key.bin /tmp/output-iv.bin > /tmp/output-keyinfo.bin
+          KEY=$(python3 -c "from pathlib import Path; print(Path('/tmp/output-key.bin').read_bytes().hex())")
+          IV=$(python3 -c "from pathlib import Path; print(Path('/tmp/output-iv.bin').read_bytes().hex())")
+          openssl enc -aes-256-cbc \
+            -K "$KEY" -iv "$IV" \
+            -in /tmp/pyth-core-evidence.tar.gz \
+            -out encrypted-output/evidence.tar.gz.enc
+          openssl pkeyutl -encrypt \
+            -pubin -inkey tmp-secure/pyth-core-output-public.pem \
+            -in /tmp/output-keyinfo.bin \
+            -out encrypted-output/evidence-keyinfo.enc \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          sha256sum encrypted-output/evidence.tar.gz.enc encrypted-output/evidence-keyinfo.enc \
+            encrypted-output/runner-exit-code.txt > encrypted-output/SHA256SUMS
+          rm -rf evidence payload pyth_core_secure_payload out cache broadcast
+          rm -f /tmp/pyth-core-payload* /tmp/pyth-core-keyinfo* /tmp/pyth-core-key.hex /tmp/pyth-core-iv.hex
+          rm -f /tmp/pyth-core-evidence.tar.gz /tmp/output-key.bin /tmp/output-iv.bin /tmp/output-keyinfo.bin
+          rm -f /tmp/katana-secure-private.pem /tmp/solc-0.8.4 /tmp/restored-input-key.sha256
+
+      - name: Upload encrypted evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyth-core-encrypted-historical-fork-evidence-${{ github.run_id }}
+          path: encrypted-output/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Enforce PoC result and encrypted-output boundary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s encrypted-output/evidence.tar.gz.enc
+          test -s encrypted-output/evidence-keyinfo.enc
+          test -s encrypted-output/evidence-plaintext.sha256
+          test -s encrypted-output/SHA256SUMS
+          test -s encrypted-output/runner-exit-code.txt
+          test "$(cat encrypted-output/runner-exit-code.txt)" = '0'
+          grep -Fx 'PYTH_CORE_EXACT_FORK_EXECUTION_PASS' encrypted-output/POC_EXECUTION_PASS.txt
+          test ! -e payload
+          test ! -e evidence
