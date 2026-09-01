@@ -1,0 +1,235 @@
+name: Monad v0.16.0 Round 6 final collector 20260823
+
+on:
+  push:
+    branches:
+      - tooling/monad-v0160-round6-final-collector-20260823
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 140
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: zerodaybugs/test
+      RUN_OSAKA: '32661049895'
+      RUN_NATIVE: '32661386526'
+    steps:
+      - name: Checkout final collector branch
+        uses: actions/checkout@v4
+        with:
+          ref: tooling/monad-v0160-round6-final-collector-20260823
+          fetch-depth: 0
+
+      - name: Resolve dynamic runs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p round6/download round6/extracted
+          resolve_latest() {
+            local branch="$1" workflow="$2"
+            for _ in $(seq 1 100); do
+              id=$(gh api "repos/${REPO}/actions/runs?branch=${branch}&per_page=100" \
+                --jq ".workflow_runs | map(select(.name == \"${workflow}\")) | sort_by(.created_at) | reverse | .[0].id // empty")
+              if [[ -n "$id" ]]; then printf '%s\n' "$id"; return 0; fi
+              sleep 10
+            done
+            return 1
+          }
+          RUN_SANITIZER=$(resolve_latest tooling/monad-v0160-vm-sanitizer-campaign-20260823 'Monad v0.16.0 VM sanitizer campaign 20260823')
+          RUN_MIP8=$(resolve_latest tooling/monad-v0160-mip8-statesync-differential-20260823 'Monad v0.16.0 MIP-8 statesync differential 20260823')
+          RUN_DUP=$(resolve_latest tooling/monad-v0160-execution-duplicate-ledger-20260823 'Monad v0.16.0 execution duplicate ledger 20260823')
+          RUN_CROSS=$(resolve_latest tooling/monad-v0160-cross-build-differential-20260823 'Monad v0.16.0 cross-build differential 20260823')
+          cat > round6/RUNS.json <<JSON
+          {
+            "osaka": ${RUN_OSAKA},
+            "native": ${RUN_NATIVE},
+            "sanitizer": ${RUN_SANITIZER},
+            "mip8": ${RUN_MIP8},
+            "duplicate_scan": ${RUN_DUP},
+            "cross_build": ${RUN_CROSS}
+          }
+          JSON
+
+      - name: Wait for every workflow and collect failures
+        shell: bash
+        run: |
+          set -euo pipefail
+          wait_run() {
+            local id="$1" label="$2"
+            for _ in $(seq 1 240); do
+              status=$(gh api "repos/${REPO}/actions/runs/${id}" --jq .status)
+              if [[ "$status" == completed ]]; then
+                conclusion=$(gh api "repos/${REPO}/actions/runs/${id}" --jq .conclusion)
+                printf '%s\n' "$conclusion" > "round6/${label}.conclusion"
+                if [[ "$conclusion" != success ]]; then
+                  gh run view "$id" --repo "$REPO" --log-failed > "round6/${label}.failed.log" 2>&1 || true
+                  return 1
+                fi
+                return 0
+              fi
+              sleep 30
+            done
+            echo timeout > "round6/${label}.conclusion"
+            return 1
+          }
+          read_id() { python3 -c "import json; print(json.load(open('round6/RUNS.json'))['$1'])"; }
+          failure=0
+          for label in osaka native sanitizer mip8 duplicate_scan cross_build; do
+            wait_run "$(read_id "$label")" "$label" || failure=1
+          done
+          printf '%s\n' "$failure" > round6/CAMPAIGN_FAILURE_FLAG.txt
+
+      - name: Download successful artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$(cat round6/CAMPAIGN_FAILURE_FLAG.txt)" != 0 ]]; then
+            echo 'At least one workflow did not finish successfully.' > round6/CAMPAIGN_FAILURE.txt
+            exit 0
+          fi
+          read_id() { python3 -c "import json; print(json.load(open('round6/RUNS.json'))['$1'])"; }
+          download_named() {
+            local label="$1" name="$2" run_id artifact_id
+            run_id=$(read_id "$label")
+            artifact_id=$(gh api "repos/${REPO}/actions/runs/${run_id}/artifacts?per_page=100" \
+              --jq ".artifacts[] | select(.name == \"${name}\") | .id" | head -n1)
+            [[ -n "$artifact_id" ]]
+            gh api "repos/${REPO}/actions/artifacts/${artifact_id}/zip" > "round6/download/${label}.zip"
+            unzip -t "round6/download/${label}.zip" >/dev/null
+            mkdir -p "round6/extracted/${label}"
+            unzip -q "round6/download/${label}.zip" -d "round6/extracted/${label}"
+          }
+          download_named osaka monad-v0160-vm-differential-campaign-20260823
+          download_named native monad-v0160-native-revision-differential-20260823
+          download_named sanitizer monad-v0160-vm-sanitizer-campaign-20260823
+          download_named mip8 monad-v0160-mip8-statesync-differential-20260823
+          download_named duplicate_scan monad-v0160-execution-duplicate-ledger-20260823
+          download_named cross_build monad-v0160-cross-build-differential-20260823
+
+      - name: Build fail-closed master decision
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json
+          root=Path('round6')
+          failure=(root/'CAMPAIGN_FAILURE_FLAG.txt').read_text().strip()!='0'
+          names={
+            'osaka':'CAMPAIGN_RESULT.json',
+            'native':'NATIVE_REVISION_RESULT.json',
+            'sanitizer':'SANITIZER_RESULT.json',
+            'mip8':'MIP8_STATESYNC_RESULT.json',
+            'duplicate_scan':'MONAD_V0160_EXECUTION_PUBLIC_DUPLICATE_LEDGER_2026-08-23.json',
+            'cross_build':'CROSS_BUILD_RESULT.json',
+          }
+          data={}; errors=[]
+          for label,name in names.items():
+            base=root/'extracted'/label
+            hits=list(base.rglob(name)) if base.exists() else []
+            if len(hits)!=1:
+              errors.append(f'{label}:{name}:found_{len(hits)}'); continue
+            try: data[label]=json.loads(hits[0].read_text())
+            except Exception as exc: errors.append(f'{label}:parse:{exc}')
+
+          candidates=[]
+          for label in ['osaka','native','sanitizer']:
+            for lane in data.get(label,{}).get('lanes',[]):
+              if lane.get('candidate_signal'):
+                candidates.append({
+                  'source':label,'name':lane.get('name'),
+                  'return_code':lane.get('return_code'),
+                  'signals':lane.get('anomaly_terms',lane.get('sanitizer_hits',[])),
+                  'first_seed':lane.get('first_seed'),'last_seed':lane.get('last_seed'),
+                  'log_sha256':lane.get('log_sha256'),
+                  'next_gate':'exact seed replay; one-input minimization; matched negative/fixed controls; normal product admission; repeated accepted state-root or finality impact',
+                })
+          for pair in data.get('mip8',{}).get('matched_pairs',[]):
+            if pair.get('differential_signal'):
+              candidates.append({'source':'mip8','name':pair.get('target'),'signals':['slot_page_differential'],'slot':pair.get('slot'),'page':pair.get('page'),'next_gate':'artifact minimization; valid state transition; accepted root/statesync divergence; three vulnerable and three fixed runs'})
+          for family in data.get('cross_build',{}).get('matched_families',[]):
+            if family.get('differential_signal'):
+              candidates.append({'source':'cross_build','name':family.get('family'),'signals':['gcc_clang_or_optimization_differential'],'members':family.get('members'),'next_gate':'same-seed build replay; one valid transaction; isolate UB/miscompile; product admission and impact'})
+
+          complete=(not failure and not errors and len(data)==6)
+          duplicate=data.get('duplicate_scan',{})
+          if not complete:
+            decision='HOLD_INFRASTRUCTURE_OR_PARSE_FAILURE'
+          elif candidates:
+            decision='HOLD_MACHINE_CANDIDATES_REQUIRE_MINIMIZATION_IMPACT_AND_DUPLICATE_ADJUDICATION'
+          else:
+            decision='NO_NEW_SUBMIT_READY_HIGH_OR_CRITICAL_IN_ROUND6'
+          result={
+            'date':'2026-08-23',
+            'scope':{
+              'program':'Monad Consensus & Execution Bug Bounty',
+              'monad_bft_tag':'v0.16.0',
+              'monad_bft_commit':'c616743d1358186605e1c1b74a3d6c4fdd9dd48c',
+              'execution_commit':'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0',
+            },
+            'submitted_do_not_duplicate':[{'root_cause':'epoch-boundary TC relay filtered after role transition','severity':'High','status':'SUBMITTED_DO_NOT_DUPLICATE'}],
+            'campaign_complete':complete,'campaign_failure':failure,'parse_errors':errors,
+            'campaign_decisions':{k:v.get('decision') for k,v in data.items()},
+            'candidate_count':len(candidates),'candidates':candidates,
+            'public_duplicate_gate':{
+              'decision':duplicate.get('decision'),
+              'automatic_exact_duplicate_proven':duplicate.get('automatic_exact_duplicate_proven'),
+              'manual_review_required':duplicate.get('manual_review_required'),
+              'rule':duplicate.get('rule'),
+            },
+            'proof_card':{
+              'wedge_1':'Native MONAD_NINE/MONAD_TEN interpreter/compiler equivalence including page-encoded state.',
+              'wedge_2':'Scoped-release slot/page statesync equivalence using later public test coverage only as a harness.',
+              'wedge_3':'Matched-seed GCC/Clang O1/O2 differential for optimization-specific UB or compiler miscompilation.',
+            },
+            'submission_ready':False,'high_proven':False,'critical_proven':False,'decision':decision,
+            'release_gate':[
+              'exact current scope and source binding','distinct root cause from submitted ledger','permitted local unauthorized attacker trigger','three independent vulnerable reproductions','matched negative and narrow fixed controls','normal monad-bft or statesync entrypoint','direct accepted state-root divergence or sustained finality impact','current public issue/PR/audit comparison by root cause and natural fix','one root cause per report','clean-room verifier, deterministic ZIP, checksum and residue scan'
+            ],
+          }
+          (root/'MONAD_V0160_ROUND6_MASTER_DECISION_2026-08-23.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          md=['# Monad v0.16.0 Round 6 master decision','',f"**Decision:** `{decision}`",'',f"- Campaign complete: **{str(complete).lower()}**",f"- Candidate inputs: **{len(candidates)}**",'- New submit-ready High: **no**','- New submit-ready Critical: **no**','']
+          if candidates:
+            md+=['## Machine candidates — not findings','']
+            for c in candidates: md.append(f"- `{c['source']} / {c['name']}` — signals `{c.get('signals')}` — next gate: {c['next_gate']}")
+            md+=['']
+          elif complete:
+            md+=['No signal crossed the differential, native-revision, sanitizer, MIP-8 slot/page, or cross-build machine gates.','']
+          else:
+            md+=[f"Failures/errors: `{errors}`; failure flag `{failure}`.",'']
+          md+=['## Public duplicate gate','',f"- Decision: `{duplicate.get('decision')}`",f"- Automatic exact duplicate proven: `{duplicate.get('automatic_exact_duplicate_proven')}`",f"- Manual review required: `{duplicate.get('manual_review_required')}`",'', '## Release boundary','', 'No archive may be labelled submit-ready until every item in the JSON release gate is independently PASS.','']
+          (root/'MONAD_V0160_ROUND6_MASTER_DECISION_2026-08-23.md').write_text('\n'.join(md))
+          sums=[]
+          for p in sorted(root.rglob('*')):
+            if p.is_file() and p.name!='SHA256SUMS': sums.append(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(root)}")
+          (root/'SHA256SUMS').write_text('\n'.join(sums)+'\n')
+          print(json.dumps({'decision':decision,'candidate_count':len(candidates),'complete':complete}))
+          PY
+
+      - name: Commit compact result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add round6/MONAD_V0160_ROUND6_MASTER_DECISION_2026-08-23.json \
+                  round6/MONAD_V0160_ROUND6_MASTER_DECISION_2026-08-23.md \
+                  round6/SHA256SUMS round6/RUNS.json round6/*.conclusion \
+                  round6/CAMPAIGN_FAILURE_FLAG.txt round6/*.failed.log round6/CAMPAIGN_FAILURE.txt 2>/dev/null || true
+          git commit -m 'research: collect Monad Round 6 final result [skip ci]'
+          git push origin HEAD:tooling/monad-v0160-round6-final-collector-20260823
+
+      - name: Upload full Round 6 collection
+        uses: actions/upload-artifact@v7
+        with:
+          name: monad-v0160-round6-final-collector-20260823
+          path: round6
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
