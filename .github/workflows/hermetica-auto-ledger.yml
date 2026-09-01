@@ -1,0 +1,212 @@
+name: Hermetica auto mint ledger
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-auto-ledger.yml'
+      - 'public-data/hermetica-auto-ledger-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ledger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconstruct complete mint and redeem ledger
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT=/tmp/hermetica-auto-ledger
+          mkdir -p "$OUT"
+          python3 - <<'PY'
+          import datetime as dt
+          import json
+          import pathlib
+          import re
+          import time
+          import urllib.parse
+          import urllib.request
+
+          OUT = pathlib.Path('/tmp/hermetica-auto-ledger')
+          API = 'https://api.hiro.so'
+          CONTRACT = 'SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG.minting-auto-v1-2'
+          MINT_LIMIT = 50_000_000_000_000
+          RESET_WINDOW = 600
+          INITIAL_LAST_RESET = 1_757_221_858
+          TOKEN_BASE = {
+              'SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token': 100_000_000,
+              'SP120SBRBQJ00MCWS7TM5R8WJNTTKD5K0HFRC2CNE.usdcx': 1_000_000,
+          }
+
+          def get_json(url, attempts=12):
+              last = None
+              for i in range(attempts):
+                  try:
+                      req = urllib.request.Request(url, headers={
+                          'User-Agent': 'read-only-security-research/1.0',
+                          'Accept': 'application/json',
+                      })
+                      with urllib.request.urlopen(req, timeout=45) as r:
+                          return json.loads(r.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(15, 1.5 * (i + 1)))
+              raise RuntimeError(f'{url}: {last}')
+
+          def paged(url, max_rows=10000):
+              rows, offset, limit = [], 0, 50
+              while True:
+                  sep = '&' if '?' in url else '?'
+                  body = get_json(f'{url}{sep}{urllib.parse.urlencode({"limit":limit,"offset":offset})}')
+                  page = body.get('results') or []
+                  rows.extend(page)
+                  total = int(body.get('total') or len(rows))
+                  if not page or len(rows) >= total:
+                      return rows
+                  offset += len(page)
+                  if offset > max_rows:
+                      raise RuntimeError(f'row cap exceeded for {url}')
+                  time.sleep(0.08)
+
+          def parse_uint(repr_text, key):
+              m = re.search(rf'\({re.escape(key)} u(\d+)\)', repr_text or '')
+              return int(m.group(1)) if m else None
+
+          def parse_principal(repr_text, key):
+              m = re.search(rf'\({re.escape(key)} \'([^\s\)]+)\)', repr_text or '')
+              return m.group(1) if m else None
+
+          txs = paged(f'{API}/extended/v1/address/{urllib.parse.quote(CONTRACT, safe="")}/transactions')
+          events = paged(f'{API}/extended/v1/contract/{urllib.parse.quote(CONTRACT, safe="")}/events')
+          tx_by_id = {t.get('tx_id'): t for t in txs}
+          logs = []
+          for ev in events:
+              log = ev.get('contract_log') or {}
+              if ev.get('event_type') != 'smart_contract_log' or log.get('contract_id') != CONTRACT:
+                  continue
+              rep = ((log.get('value') or {}).get('repr') or '')
+              asset = parse_principal(rep, 'minting-asset')
+              direction = 'mint'
+              if not asset:
+                  asset = parse_principal(rep, 'redeeming-asset')
+                  direction = 'redeem'
+              if not asset:
+                  continue
+              tx = tx_by_id.get(ev.get('tx_id')) or {}
+              cc = tx.get('contract_call') or {}
+              row = {
+                  'tx_id': ev.get('tx_id'),
+                  'event_index': ev.get('event_index'),
+                  'block_height': int(tx.get('block_height') or ev.get('block_height') or 0),
+                  'tx_index': int(tx.get('tx_index') or 0),
+                  'block_time': int(tx.get('block_time') or ev.get('block_time') or 0),
+                  'sender': tx.get('sender_address'),
+                  'status': tx.get('tx_status'),
+                  'function_name': cc.get('function_name'),
+                  'direction': direction,
+                  'asset': asset,
+                  'amount_usdh': parse_uint(rep, 'amount-usdh-requested'),
+                  'amount_asset': parse_uint(rep, 'amount-asset-required'),
+                  'price': parse_uint(rep, 'price'),
+                  'price_conf': parse_uint(rep, 'price-conf'),
+                  'oracle_timestamp': parse_uint(rep, 'oracle-timestamp'),
+                  'slippage_in_price': parse_uint(rep, 'slippage-in-price'),
+                  'fee_amount': parse_uint(rep, 'fee-amount'),
+                  'repr': rep,
+              }
+              logs.append(row)
+
+          logs.sort(key=lambda x: (x['block_height'], x['tx_index'], x['event_index']))
+          current = MINT_LIMIT
+          last_reset = INITIAL_LAST_RESET
+          reset_epochs = []
+          violations = []
+          oracle_timestamp_reuse = {}
+          economic = []
+          epoch = None
+
+          for row in logs:
+              if row['direction'] == 'mint':
+                  ts = row['oracle_timestamp']
+                  amount = row['amount_usdh']
+                  if ts is None or amount is None:
+                      violations.append({'type':'missing_mint_fields','row':row})
+                      continue
+                  if ts >= last_reset + RESET_WINDOW:
+                      if epoch is not None:
+                          reset_epochs.append(epoch)
+                      last_reset = ts
+                      current = MINT_LIMIT
+                      epoch = {'reset_timestamp':ts,'minted':0,'transactions':[]}
+                  elif epoch is None:
+                      epoch = {'reset_timestamp':last_reset,'minted':0,'transactions':[]}
+                  before = current
+                  if amount > current:
+                      violations.append({'type':'mint_limit_exceeded_but_succeeded','before':before,'row':row})
+                  current -= amount
+                  epoch['minted'] += amount
+                  epoch['transactions'].append(row['tx_id'])
+                  if epoch['minted'] > MINT_LIMIT:
+                      violations.append({'type':'epoch_mint_above_limit','epoch':epoch.copy(),'row':row})
+                  oracle_timestamp_reuse.setdefault(str(ts), []).append(row['tx_id'])
+
+              base = TOKEN_BASE.get(row['asset'])
+              if base and row['price'] and row['amount_usdh'] is not None and row['amount_asset'] is not None:
+                  # Asset value in USDh base units at the decoded oracle price.
+                  collateral_value = row['amount_asset'] * row['price'] * 100_000_000 // (base * 100_000_000)
+                  delta = collateral_value - row['amount_usdh']
+                  economic.append({
+                      'tx_id':row['tx_id'],'direction':row['direction'],'asset':row['asset'],
+                      'amount_usdh':row['amount_usdh'],'amount_asset':row['amount_asset'],
+                      'price':row['price'],'oracle_collateral_value_usdh_base':collateral_value,
+                      'collateral_minus_usdh_base':delta,
+                  })
+
+          if epoch is not None:
+              reset_epochs.append(epoch)
+
+          reused = {k:v for k,v in oracle_timestamp_reuse.items() if len(v)>1}
+          mint_econ = [x for x in economic if x['direction']=='mint']
+          redeem_econ = [x for x in economic if x['direction']=='redeem']
+          summary = {
+              'generated_at':dt.datetime.now(dt.timezone.utc).isoformat(),
+              'source':'Hiro public read-only APIs',
+              'contract':CONTRACT,
+              'transaction_count':len(txs),
+              'event_count':len(events),
+              'parsed_log_count':len(logs),
+              'mint_count':sum(x['direction']=='mint' for x in logs),
+              'redeem_count':sum(x['direction']=='redeem' for x in logs),
+              'simulated_current_mint_limit':current,
+              'simulated_last_reset':last_reset,
+              'reset_epoch_count':len(reset_epochs),
+              'maximum_minted_in_one_reset_epoch':max((x['minted'] for x in reset_epochs), default=0),
+              'oracle_timestamp_reuse':reused,
+              'violation_count':len(violations),
+              'violations':violations,
+              'minimum_mint_collateral_delta_base':min((x['collateral_minus_usdh_base'] for x in mint_econ), default=None),
+              'maximum_mint_collateral_delta_base':max((x['collateral_minus_usdh_base'] for x in mint_econ), default=None),
+              'minimum_redeem_collateral_delta_base':min((x['collateral_minus_usdh_base'] for x in redeem_econ), default=None),
+              'maximum_redeem_collateral_delta_base':max((x['collateral_minus_usdh_base'] for x in redeem_econ), default=None),
+          }
+          (OUT/'transactions.json').write_text(json.dumps(txs,indent=2))
+          (OUT/'events.json').write_text(json.dumps(events,indent=2))
+          (OUT/'ledger.json').write_text(json.dumps(logs,indent=2))
+          (OUT/'reset-epochs.json').write_text(json.dumps(reset_epochs,indent=2))
+          (OUT/'economic-checks.json').write_text(json.dumps(economic,indent=2))
+          (OUT/'summary.json').write_text(json.dumps(summary,indent=2))
+          print(json.dumps(summary,indent=2))
+          PY
+          (cd "$OUT" && find . -type f -not -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-auto-ledger
+          path: /tmp/hermetica-auto-ledger
+          retention-days: 2
+          if-no-files-found: error
+          compression-level: 0
