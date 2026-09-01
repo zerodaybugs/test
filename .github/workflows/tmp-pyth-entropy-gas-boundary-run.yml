@@ -1,0 +1,161 @@
+name: Temporary encrypted Pyth Entropy gas-boundary runner
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-pyth-entropy-gas-boundary-run.yml'
+      - 'tmp-secure/pyth-entropy-gas-payload.enc.b64'
+      - 'tmp-secure/pyth-entropy-gas-keyinfo.enc.b64'
+      - 'tmp-secure/pyth-entropy-gas-payload.sha256'
+      - 'tmp-secure/pyth-entropy-gas-output-public.pem'
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout ciphertext only
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Restore cached input decryption key
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/katana-secure-private.pem
+          key: katana-secure-poc-key-56fe0ca7762997ce47d5ae1706bf8af29cbc71202b28c498
+          fail-on-cache-miss: true
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.0.0'
+
+      - name: Install pinned Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Decrypt and verify private Entropy payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s /tmp/katana-secure-private.pem
+          umask 077
+          base64 -d tmp-secure/pyth-entropy-gas-payload.enc.b64 > /tmp/entropy-payload.enc
+          base64 -d tmp-secure/pyth-entropy-gas-keyinfo.enc.b64 > /tmp/entropy-keyinfo.enc
+          openssl pkeyutl -decrypt \
+            -inkey /tmp/katana-secure-private.pem \
+            -in /tmp/entropy-keyinfo.enc \
+            -out /tmp/entropy-keyinfo.bin \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          python3 - <<'PY'
+          from pathlib import Path
+          data = Path('/tmp/entropy-keyinfo.bin').read_bytes()
+          if len(data) != 48:
+              raise SystemExit(f'invalid keyinfo length: {len(data)}')
+          Path('/tmp/entropy-key.hex').write_text(data[:32].hex())
+          Path('/tmp/entropy-iv.hex').write_text(data[32:].hex())
+          PY
+          KEY=$(cat /tmp/entropy-key.hex)
+          IV=$(cat /tmp/entropy-iv.hex)
+          openssl enc -d -aes-256-cbc \
+            -K "$KEY" -iv "$IV" \
+            -in /tmp/entropy-payload.enc \
+            -out /tmp/entropy-payload.tar.gz
+          EXPECTED=$(tr -d '[:space:]' < tmp-secure/pyth-entropy-gas-payload.sha256)
+          printf '%s  %s\n' "$EXPECTED" /tmp/entropy-payload.tar.gz | sha256sum -c -
+          tar -xzf /tmp/entropy-payload.tar.gz
+          test -x pyth_entropy_secure_payload/run.sh
+          mv pyth_entropy_secure_payload payload
+
+      - name: Execute exact-source local proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          START=$(date +%s)
+          set +e
+          timeout 5100 bash payload/run.sh > evidence/runner-console.log 2>&1
+          STATUS=$?
+          set -e
+          END=$(date +%s)
+          printf '%s\n' "$STATUS" > evidence/runner-exit-code.txt
+          printf '%s\n' "$((END - START))" > evidence/runner-duration-seconds.txt
+          printf '%s\n' "$GITHUB_RUN_ID" > evidence/github-run-id.txt
+          printf '%s\n' "$GITHUB_SHA" > evidence/github-sha.txt
+          if [ -d payload/evidence ]; then
+            cp -a payload/evidence evidence/payload-evidence
+          fi
+          if [ -f /tmp/entropy-payload.tar.gz ]; then
+            cp /tmp/entropy-payload.tar.gz evidence/reproducer-payload.tar.gz
+            sha256sum evidence/reproducer-payload.tar.gz > evidence/reproducer-payload.sha256
+          fi
+          exit 0
+
+      - name: Encrypt all evidence before upload
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted-output evidence
+          if [ ! -f evidence/runner-exit-code.txt ]; then
+            printf '%s\n' '125' > evidence/runner-exit-code.txt
+            printf '%s\n' 'Execution did not create an exit record.' > evidence/bootstrap-error.txt
+          fi
+          cp evidence/runner-exit-code.txt encrypted-output/runner-exit-code.txt
+          tar --sort=name --mtime='UTC 2026-07-26' --owner=0 --group=0 --numeric-owner \
+            -czf /tmp/entropy-evidence.tar.gz evidence
+          sha256sum /tmp/entropy-evidence.tar.gz | awk '{print $1}' \
+            > encrypted-output/evidence-plaintext.sha256
+          openssl rand 32 > /tmp/output-key.bin
+          openssl rand 16 > /tmp/output-iv.bin
+          cat /tmp/output-key.bin /tmp/output-iv.bin > /tmp/output-keyinfo.bin
+          KEY=$(od -An -tx1 -v /tmp/output-key.bin | tr -d ' \n')
+          IV=$(od -An -tx1 -v /tmp/output-iv.bin | tr -d ' \n')
+          openssl enc -aes-256-cbc \
+            -K "$KEY" -iv "$IV" \
+            -in /tmp/entropy-evidence.tar.gz \
+            -out encrypted-output/evidence.tar.gz.enc
+          openssl pkeyutl -encrypt \
+            -pubin -inkey tmp-secure/pyth-entropy-gas-output-public.pem \
+            -in /tmp/output-keyinfo.bin \
+            -out encrypted-output/evidence-keyinfo.enc \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          sha256sum encrypted-output/evidence.tar.gz.enc \
+            encrypted-output/evidence-keyinfo.enc \
+            encrypted-output/runner-exit-code.txt \
+            > encrypted-output/SHA256SUMS
+          rm -rf payload evidence pyth_entropy_secure_payload work out cache broadcast
+          rm -f /tmp/entropy-* /tmp/output-key.bin /tmp/output-iv.bin /tmp/output-keyinfo.bin
+          rm -f /tmp/katana-secure-private.pem
+
+      - name: Upload encrypted evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyth-entropy-encrypted-gas-boundary-${{ github.run_id }}
+          path: encrypted-output/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Enforce encrypted-output boundary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s encrypted-output/evidence.tar.gz.enc
+          test -s encrypted-output/evidence-keyinfo.enc
+          test -s encrypted-output/evidence-plaintext.sha256
+          test -s encrypted-output/runner-exit-code.txt
+          test -s encrypted-output/SHA256SUMS
+          test ! -e payload
+          test ! -e evidence

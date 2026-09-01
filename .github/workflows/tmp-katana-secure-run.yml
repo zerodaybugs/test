@@ -1,0 +1,149 @@
+name: Temporary Katana encrypted PoC runner
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-katana-secure-run.yml'
+      - 'tmp-secure/katana-payload.enc.b64'
+      - 'tmp-secure/katana-keyinfo.enc.b64'
+      - 'tmp-secure/katana-payload.sha256'
+      - 'tmp-secure/output-public.pem'
+
+concurrency:
+  group: katana-secure-poc-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout ciphertext only
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Restore frozen Katana Critical decryption key
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/katana-critical-input-private.pem
+          key: katana-critical-vote-erasure-key-20260726-ec91f657
+          fail-on-cache-miss: true
+
+      - name: Install pinned Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Decrypt and verify private PoC payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s /tmp/katana-critical-input-private.pem
+          umask 077
+          base64 -d tmp-secure/katana-payload.enc.b64 > /tmp/katana-payload.enc
+          base64 -d tmp-secure/katana-keyinfo.enc.b64 > /tmp/katana-keyinfo.enc
+          openssl pkeyutl -decrypt \
+            -inkey /tmp/katana-critical-input-private.pem \
+            -in /tmp/katana-keyinfo.enc \
+            -out /tmp/katana-keyinfo.bin \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          python3 - <<'PY'
+          from pathlib import Path
+          keyinfo = Path('/tmp/katana-keyinfo.bin').read_bytes()
+          if len(keyinfo) != 48:
+              raise SystemExit(f'invalid key material length: {len(keyinfo)}')
+          Path('/tmp/katana-key.hex').write_text(keyinfo[:32].hex())
+          Path('/tmp/katana-iv.hex').write_text(keyinfo[32:].hex())
+          PY
+          KEY=$(cat /tmp/katana-key.hex)
+          IV=$(cat /tmp/katana-iv.hex)
+          openssl enc -d -aes-256-cbc \
+            -K "$KEY" -iv "$IV" \
+            -in /tmp/katana-payload.enc \
+            -out /tmp/katana-payload.tar.gz
+          EXPECTED=$(tr -d '[:space:]' < tmp-secure/katana-payload.sha256)
+          printf '%s  %s\n' "$EXPECTED" /tmp/katana-payload.tar.gz | sha256sum -c -
+          tar -xzf /tmp/katana-payload.tar.gz
+          test -f katana_secure_payload/run.sh
+          mv katana_secure_payload payload
+          chmod +x payload/run.sh
+
+      - name: Execute local-fork proof without publishing plaintext logs
+        id: execute
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          set +e
+          FOUNDRY_VIA_IR=true bash payload/run.sh > evidence/runner-console.log 2>&1
+          STATUS=$?
+          set -e
+          printf '%s\n' "$STATUS" > evidence/runner-exit-code.txt
+          printf '%s\n' "$STATUS" > /tmp/katana-runner-status
+          printf '%s\n' "${GITHUB_RUN_ID}" > evidence/github-run-id.txt
+          printf '%s\n' "${GITHUB_SHA}" > evidence/github-sha.txt
+          if [ -d payload/evidence ]; then
+            cp -a payload/evidence evidence/payload-evidence
+          fi
+          cp -a payload evidence/payload-source
+          exit 0
+
+      - name: Encrypt all PoC evidence before upload
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted-output evidence
+          if [ ! -f evidence/runner-exit-code.txt ]; then
+            printf '%s\n' '125' > evidence/runner-exit-code.txt
+            printf '%s\n' '125' > /tmp/katana-runner-status
+            printf '%s\n' 'PoC execution step did not create an exit-code record.' > evidence/runner-bootstrap-error.txt
+          fi
+          tar --sort=name --mtime='UTC 2026-07-26' --owner=0 --group=0 --numeric-owner \
+            -czf /tmp/katana-evidence.tar.gz evidence
+          sha256sum /tmp/katana-evidence.tar.gz | awk '{print $1}' > encrypted-output/evidence-plaintext.sha256
+          openssl rand 32 > /tmp/output-key.bin
+          openssl rand 16 > /tmp/output-iv.bin
+          cat /tmp/output-key.bin /tmp/output-iv.bin > /tmp/output-keyinfo.bin
+          KEY=$(xxd -p -c 256 /tmp/output-key.bin)
+          IV=$(xxd -p -c 256 /tmp/output-iv.bin)
+          openssl enc -aes-256-cbc \
+            -K "$KEY" -iv "$IV" \
+            -in /tmp/katana-evidence.tar.gz \
+            -out encrypted-output/evidence.tar.gz.enc
+          openssl pkeyutl -encrypt \
+            -pubin -inkey tmp-secure/output-public.pem \
+            -in /tmp/output-keyinfo.bin \
+            -out encrypted-output/evidence-keyinfo.enc \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          sha256sum encrypted-output/evidence.tar.gz.enc encrypted-output/evidence-keyinfo.enc \
+            > encrypted-output/SHA256SUMS
+          rm -rf evidence payload target katana_secure_payload
+          rm -f /tmp/katana-payload* /tmp/katana-keyinfo* /tmp/katana-key.hex /tmp/katana-iv.hex
+          rm -f /tmp/katana-evidence.tar.gz /tmp/output-key.bin /tmp/output-iv.bin /tmp/output-keyinfo.bin
+
+      - name: Upload encrypted evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-encrypted-poc-evidence-${{ github.run_id }}
+          path: encrypted-output/
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Enforce PoC result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f encrypted-output/evidence.tar.gz.enc
+          test -f /tmp/katana-runner-status
+          test "$(cat /tmp/katana-runner-status)" = '0'
