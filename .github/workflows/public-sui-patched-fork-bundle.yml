@@ -1,0 +1,161 @@
+name: Public patched sui-fork bundle
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/public-sui-patched-fork-bundle.yml
+      - public-toolchain-trigger.txt
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-patched-sui-fork-bundle
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
+          df -h | tee disk-before.txt
+
+      - name: Install Sui CLI 1.72.2
+        run: |
+          set -euo pipefail
+          API="https://api.github.com/repos/MystenLabs/sui/releases/tags/mainnet-v1.72.2"
+          curl -fsSL "$API" -o release-cli.json
+          URL="$(jq -r '.assets[] | select(.name == "sui-mainnet-v1.72.2-ubuntu-x86_64.tgz") | .browser_download_url' release-cli.json)"
+          test -n "$URL"
+          curl -fsSL -o sui-cli.tgz "$URL"
+          mkdir cli-release
+          tar -xzf sui-cli.tgz -C cli-release
+          SUI_BIN="$(find cli-release -type f -name sui | head -n 1)"
+          test -n "$SUI_BIN"
+          chmod +x "$SUI_BIN"
+          sudo cp "$SUI_BIN" /usr/local/bin/sui
+          sui --version | tee SUI_VERSION.txt
+          sha256sum /usr/local/bin/sui > SUI_CLI_SHA256.txt
+
+      - name: Build checkpoint-free sui-fork 1.72.5
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/MystenLabs/sui.git sui-source
+          git -C sui-source checkout mainnet-v1.72.5
+          git -C sui-source rev-parse HEAD | tee SUI_FORK_SOURCE_COMMIT.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('sui-source/crates/sui-fork/src/rpc/executor.rs')
+          text = p.read_text()
+          start = text.index('        // Execute under the serialized checkpoint path, then seal the')
+          end_marker = '        let digest = *effects.transaction_digest();\n'
+          end = text.index(end_marker, start)
+          replacement = '''        // Generic local-research plumbing patch: execute and persist the
+                  // transaction without synthetic full-checkpoint assembly. This does
+                  // not alter Sui VM execution, transaction validation, or Move code.
+                  let (effects, exec_error) = {
+                      let mut sim = self.context.simulacrum().write().await;
+                      sim.execute_transaction_impersonating(transaction)
+                          .map_err(into_submission_error)?
+                  };
+                  let checkpoint_seq = {
+                      let sim = self.context.simulacrum().read().await;
+                      sim.store()
+                          .get_highest_checkpint()
+                          .map(|checkpoint| checkpoint.data().sequence_number)
+                          .unwrap_or(0)
+                  };
+
+          '''
+          p.write_text(text[:start] + replacement + text[end:])
+          PY
+          git -C sui-source diff -- crates/sui-fork/src/rpc/executor.rs | tee SUI_FORK_PATCH.diff
+          grep -q 'Generic local-research plumbing patch' sui-source/crates/sui-fork/src/rpc/executor.rs
+          cd sui-source
+          cargo build --locked -p sui-fork 2>&1 | tee "$GITHUB_WORKSPACE/SUI_FORK_BUILD_OUTPUT.txt"
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p patched-fork-binary
+          cp sui-source/target/debug/sui-fork patched-fork-binary/sui-fork
+          chmod +x patched-fork-binary/sui-fork
+          cp SUI_FORK_SOURCE_COMMIT.txt SUI_FORK_PATCH.diff patched-fork-binary/
+          sha256sum patched-fork-binary/* > patched-fork-binary/SHA256SUMS
+          ls -lh patched-fork-binary
+          df -h | tee disk-after-build.txt
+
+      - name: Create generic offline fork snapshot
+        run: |
+          set -euo pipefail
+          sudo cp patched-fork-binary/sui-fork /usr/local/bin/sui-fork
+          CHECKPOINT=280268295
+          SENDER=0xe9ca39d84ead6a433860a7a3e283d75e53f01ab237f29cc78dbb05da1c93252d
+          GAS=0x161b07eb7b9ac7162ec1766443604bc969f291543116b4f0c2e67f78af2496bc
+          mkdir -p generic-fork-evidence
+          sui-fork start \
+            --network mainnet \
+            --checkpoint "$CHECKPOINT" \
+            --data-dir "$GITHUB_WORKSPACE/generic-fork-data" \
+            --address "$SENDER" \
+            --object "$GAS" \
+            --object 0x1 \
+            --object 0x2 \
+            --object 0x6 \
+            --rpc-addr 127.0.0.1:9000 \
+            > generic-fork-evidence/sui-fork.log 2>&1 &
+          PID=$!
+          trap 'kill $PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 240); do
+            if sui-fork --json status --rpc-addr http://127.0.0.1:9000 > generic-fork-evidence/status.json 2> generic-fork-evidence/status.err; then break; fi
+            kill -0 "$PID"
+            sleep 2
+          done
+          sui-fork --json status --rpc-addr http://127.0.0.1:9000 | tee generic-fork-evidence/status.json
+          kill "$PID"
+          wait "$PID" || true
+          trap - EXIT
+          printf '%s\n' "$CHECKPOINT" > generic-fork-evidence/FORK_CHECKPOINT.txt
+          printf '%s\n' "$SENDER" > generic-fork-evidence/SEEDED_SENDER.txt
+          printf '%s\n' "$GAS" > generic-fork-evidence/SEEDED_GAS_OBJECT.txt
+          printf '%s\n' 0x1 0x2 0x6 > generic-fork-evidence/SEEDED_SYSTEM_OBJECTS.txt
+          cat generic-fork-data/mainnet/forked_at_${CHECKPOINT}/seed_manifest.json | tee generic-fork-evidence/seed_manifest.json
+          tar -czf generic-fork-snapshot.tar.gz generic-fork-data generic-fork-evidence
+          sha256sum generic-fork-snapshot.tar.gz > GENERIC_FORK_SNAPSHOT_SHA256.txt
+          ls -lh generic-fork-snapshot.tar.gz
+
+      - name: Upload patched fork binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-patched-sui-fork-1.72.5
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
+          path: |
+            patched-fork-binary/
+            SUI_VERSION.txt
+            SUI_CLI_SHA256.txt
+            SUI_FORK_BUILD_OUTPUT.txt
+            disk-before.txt
+            disk-after-build.txt
+
+      - name: Upload generic offline snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-generic-sui-mainnet-fork-snapshot
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
+          path: |
+            generic-fork-snapshot.tar.gz
+            GENERIC_FORK_SNAPSHOT_SHA256.txt
