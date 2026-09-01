@@ -1,0 +1,78 @@
+name: Hermetica Granite relay state capture
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-granite-relay-state.yml'
+      - 'public-data/hermetica-granite-relay-state-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install read-only decoder
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/hermetica-granite-relay
+          cd /tmp/hermetica-granite-relay
+          npm init -y >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund @stacks/transactions@7.2.0
+      - name: Capture public Granite relay state
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/hermetica-granite-relay
+          cat > capture.cjs <<'NODE'
+          const fs=require('fs');
+          const {principalCV,cvToHex,hexToCV,cvToJSON}=require('@stacks/transactions');
+          const API='https://api.hiro.so';
+          const GRAN='SP26NGV9AFZBX7XBDBS2C7EC7FCPSAV9PKREQNMVS';
+          const LIQ='SP1A4X1ZFXGE4J28ZQ9QG3JNRCQ4AK6R10PECHVVP.liquidator';
+          const FLASH=`${GRAN}.flash-loan-v1`;
+          const HERM='SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG';
+          const RESERVE=`${HERM}.redeeming-reserve-v1-2`;
+          const ASSET='SP3Y2ZSH8P7D50B0VBTSX11S7XSG24M1VB9YFQA4K.token-aeusdc::aeUSDC';
+
+          async function fetchRetry(url,options={},attempts=8){let last;for(let i=0;i<attempts;i++){try{const r=await fetch(url,options);if(r.ok)return r;const t=await r.text();last=new Error(`${r.status} ${r.statusText}: ${t}`);if(r.status<500&&r.status!==429)throw last;}catch(e){last=e;}await new Promise(r=>setTimeout(r,900*(i+1)));}throw last;}
+          async function callRead(deployer,name,fn,args=[]){const r=await fetchRetry(`${API}/v2/contracts/call-read/${deployer}/${name}/${fn}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({sender:deployer,arguments:args.map(cvToHex)})});const b=await r.json();let decoded=null;if(b.result){try{decoded=cvToJSON(hexToCV(b.result));}catch(e){decoded={error:String(e),raw:b.result};}}return {okay:b.okay,cause:b.cause,result_raw:b.result,decoded};}
+          async function history(principal,max=500){const all=[];for(let o=0;o<max;o+=50){const r=await fetchRetry(`${API}/extended/v1/address/${encodeURIComponent(principal)}/transactions?limit=50&offset=${o}`);const b=await r.json();const rows=b.results||[];all.push(...rows);if(rows.length<50||all.length>=(b.total||max))break;}return all.slice(0,max);}
+          async function balances(p){const r=await fetchRetry(`${API}/extended/v1/address/${encodeURIComponent(p)}/balances`);return await r.json();}
+          async function source(deployer,name){const r=await fetchRetry(`${API}/v2/contracts/source/${deployer}/${name}?proof=0`);return await r.json();}
+          function direct(txs,cid){return txs.filter(t=>t.tx_type==='contract_call'&&t.contract_call?.contract_id===cid).map(t=>({tx_id:t.tx_id,status:t.tx_status,time:t.burn_block_time_iso,height:t.block_height,sender:t.sender_address,function:t.contract_call.function_name,args:Object.fromEntries((t.contract_call.function_args||[]).map((a,i)=>[a.name||`arg${i}`,a.repr])),result:t.tx_result?.repr,events:t.events}));}
+
+          (async()=>{
+            const flashTx=await history(FLASH,500);
+            const liqTx=await history(LIQ,500);
+            const allowed=await callRead(GRAN,'flash-loan-v1','is-contract-allowed',[principalCV(LIQ)]);
+            const fee=await callRead(GRAN,'flash-loan-v1','get-fee');
+            const info=await callRead('SP1A4X1ZFXGE4J28ZQ9QG3JNRCQ4AK6R10PECHVVP','liquidator','get-info');
+            const whitelist=await callRead(HERM,'minting-auto-state-v1','get-whitelist',[principalCV(LIQ),principalCV('SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token')]);
+            const supported=await callRead(HERM,'minting-auto-state-v1','get-supported-asset',[principalCV('SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token')]);
+            const out={generated_at:new Date().toISOString(),source:'Hiro public read-only APIs',principals:{flash_loan:FLASH,liquidator:LIQ,redeeming_reserve:RESERVE},read_only:{liquidator_allowed_callback:allowed,flash_fee:fee,liquidator_info:info,hermetica_whitelist:whitelist,sbtc_supported_asset:supported},balances:{flash_loan:await balances(FLASH),liquidator:await balances(LIQ),redeeming_reserve:await balances(RESERVE)},transactions:{flash_loan:direct(flashTx,FLASH),liquidator:direct(liqTx,LIQ)},sources:{flash_loan:await source(GRAN,'flash-loan-v1'),liquidator:await source('SP1A4X1ZFXGE4J28ZQ9QG3JNRCQ4AK6R10PECHVVP','liquidator')}};
+            fs.writeFileSync('granite-relay-state.json',JSON.stringify(out,null,2));
+            const reserveBal=out.balances.redeeming_reserve.fungible_tokens?.[ASSET]?.balance||'0';
+            const liqBal=out.balances.liquidator.fungible_tokens||{};
+            fs.writeFileSync('summary.json',JSON.stringify({allowed,fee,info,whitelist,supported,redeeming_reserve_aeusdc:reserveBal,liquidator_fungible_balances:liqBal,flash_direct_calls:out.transactions.flash_loan.length,liquidator_direct_calls:out.transactions.liquidator.length},null,2));
+            console.log(fs.readFileSync('summary.json','utf8'));
+          })().catch(e=>{console.error(e);process.exit(1);});
+          NODE
+          node capture.cjs
+          sha256sum granite-relay-state.json summary.json > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-granite-relay-state
+          path: |
+            /tmp/hermetica-granite-relay/granite-relay-state.json
+            /tmp/hermetica-granite-relay/summary.json
+            /tmp/hermetica-granite-relay/SHA256SUMS
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0

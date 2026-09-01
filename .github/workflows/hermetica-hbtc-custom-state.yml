@@ -1,0 +1,210 @@
+name: Hermetica hBTC custom state capture
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-hbtc-custom-state.yml'
+      - 'public-data/hermetica-hbtc-custom-state-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install read-only client
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/hermetica-hbtc-custom
+          cd /tmp/hermetica-hbtc-custom
+          npm init -y >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund @stacks/transactions@7.2.0
+
+      - name: Capture public state and configured principals
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/hermetica-hbtc-custom
+          cat > capture.cjs <<'NODE'
+          const fs = require('fs');
+          const {
+            principalCV,
+            trueCV,
+            falseCV,
+            cvToHex,
+            hexToCV,
+            cvToJSON,
+          } = require('@stacks/transactions');
+
+          const API = 'https://api.hiro.so';
+          const DEPLOYER = 'SP1S1HSFH0SQQGWKB69EYFNY0B1MHRMGXR3J1FH4D';
+          const STATE = `${DEPLOYER}.state-hbtc-v1`;
+          const HQ = `${DEPLOYER}.hq-hbtc-v1`;
+
+          async function fetchRetry(url, options = {}, attempts = 7) {
+            let last;
+            for (let i = 0; i < attempts; i++) {
+              try {
+                const res = await fetch(url, options);
+                if (res.ok) return res;
+                const text = await res.text();
+                last = new Error(`${res.status} ${res.statusText}: ${text}`);
+                if (res.status < 500 && res.status !== 429) throw last;
+              } catch (e) { last = e; }
+              await new Promise(r => setTimeout(r, 1200 * (i + 1)));
+            }
+            throw last;
+          }
+
+          async function txHistory(principal, max = 3000) {
+            const all = [];
+            for (let offset = 0; offset < max; offset += 50) {
+              const res = await fetchRetry(`${API}/extended/v1/address/${encodeURIComponent(principal)}/transactions?limit=50&offset=${offset}`);
+              const body = await res.json();
+              const rows = body.results || [];
+              all.push(...rows);
+              if (rows.length < 50 || all.length >= (body.total || max)) break;
+            }
+            return all.slice(0, max);
+          }
+
+          function directCalls(txs, contractId) {
+            return txs.filter(tx => tx.tx_type === 'contract_call' && tx.contract_call?.contract_id === contractId);
+          }
+
+          function argsObject(tx) {
+            const out = {};
+            for (const a of tx.contract_call?.function_args || []) out[a.name || `arg${Object.keys(out).length}`] = a.repr;
+            return out;
+          }
+
+          function principalsFrom(value) {
+            const text = typeof value === 'string' ? value : JSON.stringify(value);
+            const found = new Set();
+            const re = /'?((?:SP|SM)[0-9A-HJKMNP-TV-Z]{20,50}(?:\.[a-zA-Z0-9-]{1,50})?)/g;
+            let m;
+            while ((m = re.exec(text))) found.add(m[1]);
+            return [...found];
+          }
+
+          async function callRead(contract, fn, args = []) {
+            const res = await fetchRetry(`${API}/v2/contracts/call-read/${DEPLOYER}/${contract}/${fn}`, {
+              method: 'POST',
+              headers: {'content-type':'application/json'},
+              body: JSON.stringify({sender: DEPLOYER, arguments: args.map(cvToHex)}),
+            });
+            const body = await res.json();
+            let decoded = null;
+            if (body.result) {
+              try { decoded = cvToJSON(hexToCV(body.result)); }
+              catch (e) { decoded = {decode_error:String(e), raw:body.result}; }
+            }
+            return {okay:body.okay, cause:body.cause, result_raw:body.result, decoded};
+          }
+
+          async function sourceMeta(principal) {
+            if (!principal.includes('.')) return {type:'standard'};
+            const [addr, ...parts] = principal.split('.');
+            const name = parts.join('.');
+            const res = await fetch(`${API}/v2/contracts/source/${addr}/${name}?proof=0`);
+            if (!res.ok) return {type:'contract', exists:false, status:res.status};
+            const body = await res.json();
+            return {type:'contract', exists:true, source_length:(body.source||'').length, publish_height:body.publish_height};
+          }
+
+          (async () => {
+            const stateTxs = await txHistory(STATE);
+            const hqTxs = await txHistory(HQ);
+            const stateCalls = directCalls(stateTxs, STATE).map(tx => ({
+              tx_id:tx.tx_id,
+              status:tx.tx_status,
+              height:tx.block_height,
+              time:tx.burn_block_time_iso,
+              sender:tx.sender_address,
+              fn:tx.contract_call.function_name,
+              args:argsObject(tx),
+              result:tx.tx_result?.repr,
+            }));
+            const hqCalls = directCalls(hqTxs, HQ).map(tx => ({
+              tx_id:tx.tx_id,
+              status:tx.tx_status,
+              height:tx.block_height,
+              time:tx.burn_block_time_iso,
+              sender:tx.sender_address,
+              fn:tx.contract_call.function_name,
+              args:argsObject(tx),
+              result:tx.tx_result?.repr,
+            }));
+
+            const relevantFns = new Set([
+              'set-custom-exit-fee','remove-custom-exit-fee','set-custom-exit-fee-many','remove-custom-exit-fee-many',
+              'set-custom-cooldown','remove-custom-cooldown',
+              'request-external-update','cancel-external-request','confirm-external-request',
+              'request-asset-update','cancel-asset-request','confirm-asset-request',
+              'set-fee-address','set-express-enabled','set-express-limit-enabled',
+            ]);
+            const relevantStateCalls = stateCalls.filter(x => relevantFns.has(x.fn));
+
+            const principals = new Set([DEPLOYER, STATE, HQ]);
+            for (const call of [...relevantStateCalls, ...hqCalls]) {
+              for (const p of principalsFrom(call)) principals.add(p);
+              if (call.sender) principals.add(call.sender);
+            }
+            const sorted = [...principals].sort();
+
+            const current = {};
+            for (const p of sorted) {
+              const row = {source: await sourceMeta(p)};
+              try { row.custom_cooldown_standard = await callRead('state-hbtc-v1','get-custom-cooldown',[principalCV(p), falseCV()]); } catch(e) { row.custom_cooldown_standard={error:String(e)}; }
+              try { row.custom_exit_fee_standard = await callRead('state-hbtc-v1','get-custom-exit-fee',[principalCV(p), falseCV()]); } catch(e) { row.custom_exit_fee_standard={error:String(e)}; }
+              try { row.custom_cooldown_express = await callRead('state-hbtc-v1','get-custom-cooldown',[principalCV(p), trueCV()]); } catch(e) { row.custom_cooldown_express={error:String(e)}; }
+              try { row.custom_exit_fee_express = await callRead('state-hbtc-v1','get-custom-exit-fee',[principalCV(p), trueCV()]); } catch(e) { row.custom_exit_fee_express={error:String(e)}; }
+              row.roles = {};
+              for (const fn of ['get-guardian','get-trader','get-rewarder','get-manager','get-fee-setter','get-protocol']) {
+                try { row.roles[fn] = await callRead('hq-hbtc-v1',fn,[principalCV(p)]); }
+                catch(e) { row.roles[fn]={error:String(e)}; }
+              }
+              try { row.external = await callRead('state-hbtc-v1','get-external',[principalCV(p)]); } catch(e) { row.external={error:String(e)}; }
+              current[p] = row;
+            }
+
+            const globals = {};
+            for (const fn of ['get-cooldown','get-express-cooldown','get-exit-fee','get-express-fee','get-express-enabled','get-express-limit-enabled','get-request-redeem-enabled','get-redeem-enabled','get-vault-enabled','get-transfer-enabled','get-deposit-enabled']) {
+              try { globals[fn] = await callRead('state-hbtc-v1',fn); }
+              catch(e) { globals[fn]={error:String(e)}; }
+            }
+
+            const out = {
+              generated_at:new Date().toISOString(),
+              source:'Hiro public read-only APIs',
+              counts:{state_address_txs:stateTxs.length,state_direct_calls:stateCalls.length,hq_address_txs:hqTxs.length,hq_direct_calls:hqCalls.length,candidate_principals:sorted.length},
+              globals,
+              relevant_state_calls:relevantStateCalls,
+              hq_calls:hqCalls,
+              current,
+            };
+            fs.writeFileSync('hermetica-hbtc-custom-state.json', JSON.stringify(out,null,2));
+            fs.writeFileSync('summary.json', JSON.stringify({counts:out.counts, globals},null,2));
+            console.log(JSON.stringify(out.counts,null,2));
+          })().catch(e => { console.error(e); process.exit(1); });
+          NODE
+          node capture.cjs
+          sha256sum hermetica-hbtc-custom-state.json summary.json > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-hbtc-custom-state
+          path: |
+            /tmp/hermetica-hbtc-custom/hermetica-hbtc-custom-state.json
+            /tmp/hermetica-hbtc-custom/summary.json
+            /tmp/hermetica-hbtc-custom/SHA256SUMS
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
