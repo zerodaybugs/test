@@ -1,0 +1,251 @@
+name: Bucket CDP Live Invariant Reconciliation R29
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-cdp-invariants-r29-20260811]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconcile production CDP transitions and response settlement
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-cdp-live-invariants-r29
+          mkdir -p bucket-cdp-live-invariants-r29/raw
+          cat > bucket-cdp-live-invariants-r29/reconcile.py <<'PY'
+          import json, pathlib, time, urllib.request
+
+          OUT=pathlib.Path('bucket-cdp-live-invariants-r29'); RAW=OUT/'raw'
+          RPCS=['https://fullnode.mainnet.sui.io:443','https://sui-mainnet-endpoint.blockvision.org']
+          GQL='https://graphql.mainnet.sui.io/graphql'
+          VAULT_TYPE='0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e::vault::Vault'
+          FRAMEWORK_PACKAGES=[
+            '0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc',
+            '0xe2d49d67ff42dc500275f2d84841bf35632aa6c1abdb70af66a10e1de93a4400',
+          ]
+
+          def post(url,payload,retries=6,timeout=150):
+              data=json.dumps(payload).encode(); last=None
+              for n in range(retries):
+                  try:
+                      req=urllib.request.Request(url,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-cdp-live-invariants-r29/1'})
+                      with urllib.request.urlopen(req,timeout=timeout) as r: return json.loads(r.read().decode())
+                  except Exception as e:
+                      last=e; time.sleep(2**n)
+              raise RuntimeError(f'{url}: {last}')
+
+          def rpc(method,params):
+              errors=[]
+              for ep in RPCS:
+                  try:
+                      body=post(ep,{'jsonrpc':'2.0','id':1,'method':method,'params':params})
+                      if body.get('error'): raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint':ep,'result':body.get('result')}
+                  except Exception as e: errors.append({'endpoint':ep,'error':str(e)})
+              return {'failures':errors}
+
+          def gql(query,variables=None):
+              body=post(GQL,{'query':query,'variables':variables or {}})
+              if body.get('errors'): raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          def result(w): return w.get('result') if isinstance(w,dict) else None
+          def dump(name,value): (RAW/name).write_text(json.dumps(value,indent=2,sort_keys=True)+'\n')
+          def integer(v):
+              if isinstance(v,bool) or v is None: return None
+              if isinstance(v,int): return v
+              if isinstance(v,str):
+                  try: return int(v)
+                  except Exception: return None
+              if isinstance(v,dict):
+                  for key in ('value','magnitude'):
+                      if key in v:
+                          q=integer(v[key])
+                          if q is not None: return q
+                  if isinstance(v.get('fields'),dict): return integer(v['fields'])
+              return None
+          def find_key(value,key):
+              if isinstance(value,dict):
+                  if key in value: return value[key]
+                  for child in value.values():
+                      got=find_key(child,key)
+                      if got is not None: return got
+              elif isinstance(value,list):
+                  for child in value:
+                      got=find_key(child,key)
+                      if got is not None: return got
+              return None
+          def snapshot(obj):
+              if not isinstance(obj,dict): return None
+              data=obj.get('data') or obj
+              content=data.get('content') or {}
+              fields=content.get('fields') or {}
+              limited=fields.get('limited_supply') or {}
+              return {
+                  'version':data.get('version'),
+                  'digest':data.get('digest'),
+                  'totalDebt':integer(fields.get('total_debt_amount')),
+                  'totalCollateral':integer(fields.get('total_coll_amount')),
+                  'balance':integer(fields.get('balance')),
+                  'limitedSupply':integer(limited.get('supply')) if isinstance(limited,dict) else None,
+                  'limitedLimit':integer(limited.get('limit')) if isinstance(limited,dict) else None,
+                  'positionCount':integer((fields.get('position_table') or {}).get('size')) if isinstance(fields.get('position_table'),dict) else None,
+                  'interestUnit':integer(fields.get('interest_unit')),
+                  'timestamp':integer(fields.get('timestamp')),
+                  'requestChecklist':fields.get('request_checklist'),
+                  'responseChecklist':fields.get('response_checklist'),
+              }
+
+          checkpoint=gql('query { checkpoint { sequenceNumber timestamp } }')['checkpoint']
+          q='''query V($after:String){objects(first:50,after:$after,filter:{type:"'''+VAULT_TYPE+'''"}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename}previousTransaction{digest sender{address}}asMoveObject{contents{type{repr}json bcs}}}}}'''
+          vaults=[]; cursor=None
+          while True:
+              conn=gql(q,{'after':cursor})['objects']; vaults.extend(conn.get('nodes') or [])
+              page=conn.get('pageInfo') or {}
+              if not page.get('hasNextPage'): break
+              cursor=page.get('endCursor')
+          dump('vaults.json',vaults)
+
+          opts={'showInput':True,'showRawInput':False,'showEffects':True,'showEvents':True,'showObjectChanges':True,'showBalanceChanges':True}
+          transactions={}; transitions=[]; call_packages=set()
+          relevant_names={'update_position','liquidate','collect_interest','destroy_response','new_checker','destroy_checker','debtor_request','donor_request','beneficiary_request'}
+          for vault in vaults:
+              vid=vault['address']; txs=[]; cursor=None
+              for _ in range(12):
+                  wrapper=rpc('suix_queryTransactionBlocks',[{'filter':{'InputObject':vid},'options':opts},cursor,50,True]); page=result(wrapper)
+                  if not isinstance(page,dict): break
+                  txs.extend(page.get('data') or [])
+                  if not page.get('hasNextPage'): break
+                  cursor=page.get('nextCursor')
+              transactions[vid]=txs
+              for tx in txs:
+                  status=((tx.get('effects') or {}).get('status') or {}).get('status')
+                  if status!='success': continue
+                  try: commands=tx['transaction']['data']['transaction']['transactions']
+                  except Exception: commands=[]
+                  calls=[]
+                  for index,cmd in enumerate(commands or []):
+                      mc=cmd.get('MoveCall') if isinstance(cmd,dict) else None
+                      if mc:
+                          call_packages.add(str(mc.get('package')))
+                          calls.append({'index':index,'package':mc.get('package'),'module':mc.get('module'),'function':mc.get('function'),'type_arguments':mc.get('type_arguments')})
+                  names={c['function'] for c in calls}
+                  if not names.intersection(relevant_names): continue
+                  shared_ref=None
+                  for ref in (tx.get('effects') or {}).get('sharedObjects') or []:
+                      if str(ref.get('objectId')).lower()==vid.lower(): shared_ref=ref; break
+                  pre_version=integer((shared_ref or {}).get('version'))
+                  post_version=None
+                  for ch in tx.get('objectChanges') or []:
+                      if str(ch.get('objectId')).lower()==vid.lower() and ch.get('type')=='mutated':
+                          post_version=integer(ch.get('version')); break
+                  pre_obj=result(rpc('sui_tryGetPastObject',[vid,str(pre_version),{'showType':True,'showOwner':True,'showPreviousTransaction':True,'showDisplay':False,'showContent':True,'showBcs':True}])) if pre_version is not None else None
+                  post_obj=result(rpc('sui_tryGetPastObject',[vid,str(post_version),{'showType':True,'showOwner':True,'showPreviousTransaction':True,'showDisplay':False,'showContent':True,'showBcs':True}])) if post_version is not None else None
+                  pre_details=(pre_obj or {}).get('details') if isinstance(pre_obj,dict) else None
+                  post_details=(post_obj or {}).get('details') if isinstance(post_obj,dict) else None
+                  pre_data=(pre_details or {}).get('data') if isinstance(pre_details,dict) else pre_details
+                  post_data=(post_details or {}).get('data') if isinstance(post_details,dict) else post_details
+                  before=snapshot(pre_data); after=snapshot(post_data)
+                  delta={}
+                  if before and after:
+                      for key in ('totalDebt','totalCollateral','balance','limitedSupply','positionCount','interestUnit'):
+                          a=before.get(key); b=after.get(key); delta[key]=(b-a) if isinstance(a,int) and isinstance(b,int) else None
+                  event_rows=[]
+                  for ev in tx.get('events') or []:
+                      typ=str(ev.get('type') or '')
+                      if any(term in typ.lower() for term in ('position','liquidat','interest','borrow','repay','collateral','update')):
+                          event_rows.append({'type':typ,'json':ev.get('parsedJson'),'packageId':ev.get('packageId'),'module':ev.get('transactionModule')})
+                  transitions.append({
+                      'vault':vid,'digest':tx.get('digest'),'timestampMs':tx.get('timestampMs'),
+                      'sender':((tx.get('transaction') or {}).get('data') or {}).get('sender'),
+                      'calls':calls,'callNames':sorted(names),'before':before,'after':after,'delta':delta,
+                      'events':event_rows,'balanceChanges':tx.get('balanceChanges'),'objectChanges':tx.get('objectChanges'),
+                  })
+          dump('transactions.json',transactions); dump('transitions.json',transitions)
+
+          normalized={}; structs=[]; exposed=[]
+          for pid in sorted(p for p in call_packages if p and p.startswith('0x')):
+              wrapper=rpc('sui_getNormalizedMoveModulesByPackage',[pid]); normalized[pid]=wrapper
+              mods=result(wrapper)
+              if not isinstance(mods,dict): continue
+              for module_name,module in mods.items():
+                  for struct_name,struct in (module.get('structs') or {}).items():
+                      if any(x in struct_name.lower() for x in ('response','request','sheet','checker','receipt')):
+                          structs.append({'package':pid,'module':module_name,'name':struct_name,'abilities':struct.get('abilities'),'fields':struct.get('fields')})
+                  for fn_name,fn in (module.get('exposedFunctions') or {}).items():
+                      if any(x in fn_name.lower() for x in ('response','request','check','destroy','update_position','liquidat','collect')):
+                          exposed.append({'package':pid,'module':module_name,'name':fn_name,'visibility':fn.get('visibility'),'isEntry':fn.get('isEntry'),'parameters':fn.get('parameters'),'return':fn.get('return')})
+          dump('normalized.json',normalized); dump('response_structs.json',structs); dump('exposed_functions.json',exposed)
+
+          framework=[]
+          for pid in FRAMEWORK_PACKAGES:
+              wrapper=rpc('sui_getNormalizedMoveModulesByPackage',[pid]); mods=result(wrapper)
+              account=(mods or {}).get('account') if isinstance(mods,dict) else None
+              if not isinstance(account,dict): continue
+              for fn_name,fn in (account.get('exposedFunctions') or {}).items():
+                  params=fn.get('parameters') or []
+                  raw=any(p=='Address' or (isinstance(p,dict) and 'Address' in json.dumps(p)) or 'object::ID' in json.dumps(p) for p in params)
+                  framework.append({'package':pid,'name':fn_name,'visibility':fn.get('visibility'),'isEntry':fn.get('isEntry'),'parameters':params,'return':fn.get('return'),'rawAddressOrId':raw})
+          dump('framework_account_functions.json',framework)
+
+          droppable=[s for s in structs if any(str(a).lower()=='drop' for a in (s.get('abilities') or []))]
+          update_without_settlement=[]
+          aggregate_suspicious=[]
+          for row in transitions:
+              names=set(row['callNames'])
+              if 'update_position' in names and not ({'destroy_response','destroy_checker'} & names): update_without_settlement.append(row['digest'])
+              d=row.get('delta') or {}
+              if d.get('totalDebt') is not None and d.get('limitedSupply') is not None:
+                  # Debt and module/vault limited supply need not always move together during pure repayment/interest;
+                  # flag only absolute disagreement for manual review, never auto-promote.
+                  if d['totalDebt']!=d['limitedSupply']:
+                      aggregate_suspicious.append({'digest':row['digest'],'vault':row['vault'],'debtDelta':d['totalDebt'],'supplyDelta':d['limitedSupply'],'calls':row['callNames']})
+          raw_constructor=any(r['rawAddressOrId'] and 'request' in r['name'].lower() for r in framework)
+          summary={
+              'schema':'bucket-cdp-live-invariants-r29/v1','network':'sui-mainnet','checkpoint':checkpoint,'readOnly':True,
+              'vaultCount':len(vaults),'relevantTransitionCount':len(transitions),
+              'updateWithoutResponseSettlementCount':len(update_without_settlement),'updateWithoutResponseSettlementDigests':update_without_settlement,
+              'droppableResponseLikeStructCount':len(droppable),'droppableResponseLikeStructs':droppable,
+              'debtSupplyDeltaReviewCount':len(aggregate_suspicious),'debtSupplyDeltaReview':aggregate_suspicious,
+              'frameworkRawAddressRequestConstructorFound':raw_constructor,'frameworkAccountFunctions':framework,
+              'exactPermissionlessMaterialPoC':False,
+              'highCriticalCandidate':False,
+              'writes':0,'transactionsConstructed':0,'generatedUnix':int(time.time()),
+          }
+          (OUT/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(summary,indent=2))
+          PY
+          python3 bucket-cdp-live-invariants-r29/reconcile.py | tee bucket-cdp-live-invariants-r29/run.log
+          find bucket-cdp-live-invariants-r29 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-cdp-live-invariants-r29/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-cdp-live-invariants-r29 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          s=json.load(open('bucket-cdp-live-invariants-r29/SUMMARY.json'))
+          assert s['readOnly'] is True and s['writes']==0 and s['transactionsConstructed']==0
+          assert s['vaultCount']>0
+          print('BUCKET_CDP_LIVE_INVARIANTS_R29_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-cdp-live-invariants-r29
+          path: bucket-cdp-live-invariants-r29
+          if-no-files-found: error
+          retention-days: 3
