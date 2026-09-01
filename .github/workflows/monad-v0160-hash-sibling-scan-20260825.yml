@@ -1,0 +1,261 @@
+name: Monad v0.16.0 deterministic hash sibling scan 20260825
+
+on:
+  push:
+    branches:
+      - tooling/monad-v0160-hash-sibling-scan-20260825
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout tooling
+        uses: actions/checkout@v4
+
+      - name: Clone exact public execution source and public fix history
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/category-labs/monad.git monad
+          git -C monad fetch --no-tags origin \
+            e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0 \
+            50c57bbcbfc9ef2285b1a1c207f7efaa43bb3cdc \
+            7fc140eef12fa03e8d96e64150d4e4dc7270f67b
+          git -C monad checkout --detach e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+          test "$(git -C monad rev-parse HEAD)" = "e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0"
+          test -z "$(git -C monad status --porcelain=v1)"
+          mkdir -p out/meta out/context
+          git -C monad show -s --format=fuller HEAD > out/meta/SCOPED_COMMIT.txt
+          git -C monad show -s --format=fuller 50c57bbcbfc9ef2285b1a1c207f7efaa43bb3cdc > out/meta/PUBLIC_FIX_COMMIT.txt
+          git -C monad diff-tree --no-commit-id --name-status -r 50c57bbcbfc9ef2285b1a1c207f7efaa43bb3cdc > out/meta/PUBLIC_FIX_FILES.tsv
+          git -C monad diff 50c57bbcbfc9ef2285b1a1c207f7efaa43bb3cdc^..50c57bbcbfc9ef2285b1a1c207f7efaa43bb3cdc > out/meta/PUBLIC_FIX.patch
+
+      - name: Scan custom hashers and unordered-container call sites
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import re
+          from collections import defaultdict
+
+          root = pathlib.Path('monad')
+          out = pathlib.Path('out')
+          excluded_parts = {
+              '.git', 'build', 'build-native', 'third_party', 'vendor',
+              'test', 'tests', 'bench', 'benches', 'fuzz', 'fuzzer',
+              'examples', 'docker', '.github'
+          }
+          exts = {'.h', '.hh', '.hpp', '.hxx', '.c', '.cc', '.cpp', '.cxx', '.ipp', '.rs'}
+
+          files = []
+          for p in root.rglob('*'):
+              if not p.is_file() or p.suffix.lower() not in exts:
+                  continue
+              rel = p.relative_to(root)
+              if any(part in excluded_parts for part in rel.parts):
+                  continue
+              try:
+                  text = p.read_text(errors='replace')
+              except Exception:
+                  continue
+              files.append((rel.as_posix(), text))
+
+          fixed_hash_patterns = [
+              ('wyhash', re.compile(r'wyhash(?:::\w+)*\s*\([^;\n]*\)|wyhash::hash\s*\(', re.I)),
+              ('komihash', re.compile(r'komihash\s*\(', re.I)),
+              ('xxhash', re.compile(r'(?:xxh3?|xxhash)\w*\s*\(', re.I)),
+              ('murmur', re.compile(r'murmur\w*\s*\(', re.I)),
+              ('fnv', re.compile(r'fnv\w*|FNV_OFFSET|FNV_PRIME', re.I)),
+              ('fixed_seed', re.compile(r'(?:hash|wyhash|komihash|xxh\w*)[^\n;]{0,140}(?:seed[^\n;]{0,40})?[,=(]\s*(?:0|1|143|0x[0-9a-fA-F]+)\s*[,)]', re.I)),
+              ('manual_mix', re.compile(r'(?:\^=|\*=|\+=)\s*(?:0x9e3779b9|0x517cc1b7|0xc6a4a793|1099511628211|16777619)', re.I)),
+          ]
+          generic_hash_patterns = [
+              re.compile(r'struct\s+hash\s*<', re.I),
+              re.compile(r'std::hash\s*<', re.I),
+              re.compile(r'operator\s*\(\s*\)\s*\([^)]*\)\s*const[^\n{]*\{', re.I),
+              re.compile(r'\bhash\s*\([^;]{0,200}\)\s*(?:const)?\s*\{', re.I),
+          ]
+          container_re = re.compile(
+              r'(?:std::)?unordered_(?:map|set|multimap|multiset)\s*<|'
+              r'ankerl::unordered_dense::(?:map|set)\s*<|'
+              r'phmap::(?:flat_hash_map|flat_hash_set)\s*<|'
+              r'absl::(?:flat_hash_map|flat_hash_set)\s*<|'
+              r'folly::F14\w*Map\s*<',
+              re.I,
+          )
+
+          changed_files = set()
+          for line in (out/'meta'/'PUBLIC_FIX_FILES.tsv').read_text(errors='replace').splitlines():
+              parts = line.split('\t')
+              if parts:
+                  changed_files.add(parts[-1])
+
+          hash_sites = []
+          container_sites = []
+          contexts = []
+
+          def window(lines, index, before=10, after=18):
+              start = max(0, index-before)
+              end = min(len(lines), index+after+1)
+              return start, end, '\n'.join(f'{n+1:05d}: {lines[n]}' for n in range(start, end))
+
+          for path, text in files:
+              lines = text.splitlines()
+              for idx, line in enumerate(lines):
+                  kinds = [name for name, pat in fixed_hash_patterns if pat.search(line)]
+                  generic = any(p.search(line) for p in generic_hash_patterns)
+                  if kinds or generic:
+                      start, end, ctx = window(lines, idx)
+                      context_lower = ctx.lower()
+                      test_only = any(part in {'test','tests','bench','benches','fuzz','fuzzer','examples'} for part in pathlib.PurePosixPath(path).parts)
+                      candidate = bool(kinds) and not test_only
+                      likely_seeded = bool(re.search(r'random_device|seeded_fast_hash|random_seed|process_seed|siphash', ctx, re.I))
+                      site = {
+                          'path': path,
+                          'line': idx+1,
+                          'kinds': kinds,
+                          'generic_hasher_surface': generic,
+                          'likely_seeded_in_context': likely_seeded,
+                          'covered_by_public_fix_file': path in changed_files,
+                          'candidate_unseeded_distinct_file': candidate and not likely_seeded and path not in changed_files,
+                          'line_text': line.strip(),
+                          'context_sha256': hashlib.sha256(ctx.encode()).hexdigest(),
+                      }
+                      hash_sites.append(site)
+                      if site['candidate_unseeded_distinct_file']:
+                          contexts.append(f'===== HASH {path}:{idx+1} =====\n{ctx}\n')
+                  if container_re.search(line):
+                      start, end, ctx = window(lines, idx, 6, 12)
+                      container_sites.append({
+                          'path': path,
+                          'line': idx+1,
+                          'line_text': line.strip(),
+                          'covered_by_public_fix_file': path in changed_files,
+                          'context_sha256': hashlib.sha256(ctx.encode()).hexdigest(),
+                      })
+
+          # Link candidate hasher definitions to production container users by token proximity.
+          candidate_tokens = set()
+          for site in hash_sites:
+              if not site['candidate_unseeded_distinct_file']:
+                  continue
+              m = re.search(r'(?:struct|class)\s+([A-Za-z_][A-Za-z0-9_]*)', site['line_text'])
+              if m:
+                  candidate_tokens.add(m.group(1))
+              for token in re.findall(r'([A-Za-z_][A-Za-z0-9_]*(?:Hash|Hasher|HashCompare))', site['line_text']):
+                  candidate_tokens.add(token)
+
+          token_users = defaultdict(list)
+          for path, text in files:
+              lines = text.splitlines()
+              for token in sorted(candidate_tokens):
+                  for idx, line in enumerate(lines):
+                      if token in line:
+                          token_users[token].append({'path': path, 'line': idx+1, 'line_text': line.strip()})
+
+          shortlist = [s for s in hash_sites if s['candidate_unseeded_distinct_file']]
+          # De-duplicate adjacent hits from the same context.
+          compact = []
+          last = None
+          for s in sorted(shortlist, key=lambda x:(x['path'], x['line'])):
+              key = (s['path'], s['context_sha256'])
+              if key == last:
+                  continue
+              compact.append(s)
+              last = key
+
+          result = {
+              'exact_source_commit': 'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0',
+              'public_prior_art_commit': '50c57bbcbfc9ef2285b1a1c207f7efaa43bb3cdc',
+              'current_main_reference': '7fc140eef12fa03e8d96e64150d4e4dc7270f67b',
+              'production_source_files_scanned': len(files),
+              'hash_surface_hits': len(hash_sites),
+              'unordered_container_hits': len(container_sites),
+              'candidate_unseeded_distinct_file_hits': len(compact),
+              'public_fix_changed_files': sorted(changed_files),
+              'candidate_tokens': sorted(candidate_tokens),
+              'shortlist': compact,
+              'token_users': dict(token_users),
+              'release_semantics': {
+                  'direct_public_fix_root_cause_is_prior_art': True,
+                  'shortlist_is_not_a_finding': True,
+                  'required_next_gate': 'distinct hasher/key type, protocol-valid collision corpus, bounded valid block, repeated full-node execution/finality impact, matched fix, current scope and duplicate clearance',
+              },
+          }
+          (out/'HASH_SIBLING_SCAN.json').write_text(json.dumps(result, indent=2, sort_keys=True)+'\n')
+          (out/'HASH_SURFACES.json').write_text(json.dumps(hash_sites, indent=2, sort_keys=True)+'\n')
+          (out/'UNORDERED_CONTAINER_SITES.json').write_text(json.dumps(container_sites, indent=2, sort_keys=True)+'\n')
+          (out/'context'/'SHORTLIST_CONTEXT.txt').write_text('\n'.join(contexts))
+
+          with (out/'UNSEEDED_HASH_SHORTLIST.tsv').open('w') as f:
+              f.write('path\tline\tkinds\tline_text\tcovered_by_public_fix_file\n')
+              for s in compact:
+                  f.write(f"{s['path']}\t{s['line']}\t{','.join(s['kinds'])}\t{s['line_text'].replace(chr(9),' ')}\t{s['covered_by_public_fix_file']}\n")
+
+          print(json.dumps({
+              'production_source_files_scanned': len(files),
+              'hash_surface_hits': len(hash_sites),
+              'unordered_container_hits': len(container_sites),
+              'candidate_unseeded_distinct_file_hits': len(compact),
+              'candidate_tokens': sorted(candidate_tokens),
+          }, indent=2))
+          PY
+
+      - name: Search later public history for each shortlisted file
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib, subprocess
+          out = pathlib.Path('out')
+          data = json.loads((out/'HASH_SIBLING_SCAN.json').read_text())
+          files = sorted({x['path'] for x in data['shortlist']})
+          rows = []
+          for path in files:
+              proc = subprocess.run(
+                  ['git','-C','monad','log','--format=%H%x09%aI%x09%s',
+                   'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0..7fc140eef12fa03e8d96e64150d4e4dc7270f67b',
+                   '--',path],
+                  text=True, capture_output=True, check=True,
+              )
+              commits = []
+              for line in proc.stdout.splitlines():
+                  parts = line.split('\t',2)
+                  if len(parts) == 3:
+                      commits.append({'sha':parts[0],'date':parts[1],'subject':parts[2]})
+              rows.append({'path':path,'later_commits':commits})
+          (out/'SHORTLIST_PUBLIC_HISTORY.json').write_text(json.dumps(rows,indent=2,sort_keys=True)+'\n')
+          PY
+
+      - name: Package deterministic evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          find out -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > out/SHA256SUMS
+          tar --sort=name --mtime='UTC 2026-08-25' --owner=0 --group=0 --numeric-owner \
+            -C out -czf monad-v0160-hash-sibling-scan-20260825.tar.gz .
+          sha256sum monad-v0160-hash-sibling-scan-20260825.tar.gz > monad-v0160-hash-sibling-scan-20260825.tar.gz.sha256
+
+      - name: Upload scan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0160-hash-sibling-scan-20260825
+          path: |
+            monad-v0160-hash-sibling-scan-20260825.tar.gz
+            monad-v0160-hash-sibling-scan-20260825.tar.gz.sha256
+            out/HASH_SIBLING_SCAN.json
+            out/UNSEEDED_HASH_SHORTLIST.tsv
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
