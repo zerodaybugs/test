@@ -1,0 +1,152 @@
+name: Temporary encrypted Pyth governance caps-order inventory
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-pyth-governance-caps-order-scan.yml'
+      - 'tmp-research/pyth-governance-caps/payload.enc.b64'
+      - 'tmp-research/pyth-governance-caps/keyinfo.enc.b64'
+      - 'tmp-research/pyth-governance-caps/payload.sha256'
+      - 'tmp-research/pyth-governance-caps/output-public.pem'
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout ciphertext only
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Restore cached input decryption key
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/pyth-governance-caps-private.pem
+          key: pyth-governance-caps-input-key-v1
+          fail-on-cache-miss: true
+
+      - name: Decrypt and verify private research payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s /tmp/pyth-governance-caps-private.pem
+          umask 077
+          base64 -d tmp-research/pyth-governance-caps/payload.enc.b64 > /tmp/payload.enc
+          base64 -d tmp-research/pyth-governance-caps/keyinfo.enc.b64 > /tmp/keyinfo.enc
+          openssl pkeyutl -decrypt \
+            -inkey /tmp/pyth-governance-caps-private.pem \
+            -in /tmp/keyinfo.enc \
+            -out /tmp/keyinfo.bin \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          python3 - <<'PY'
+          from pathlib import Path
+          data = Path('/tmp/keyinfo.bin').read_bytes()
+          if len(data) != 48:
+              raise SystemExit(f'invalid keyinfo length: {len(data)}')
+          Path('/tmp/key.hex').write_text(data[:32].hex())
+          Path('/tmp/iv.hex').write_text(data[32:].hex())
+          PY
+          KEY=$(cat /tmp/key.hex)
+          IV=$(cat /tmp/iv.hex)
+          openssl enc -d -aes-256-cbc \
+            -K "$KEY" -iv "$IV" \
+            -in /tmp/payload.enc \
+            -out /tmp/payload.tar.gz
+          EXPECTED=$(tr -d '[:space:]' < tmp-research/pyth-governance-caps/payload.sha256)
+          printf '%s  %s\n' "$EXPECTED" /tmp/payload.tar.gz | sha256sum -c -
+          tar -xzf /tmp/payload.tar.gz
+          test -x payload/run.sh
+          test -x payload/scan.py
+
+      - name: Execute read-only production inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p collected
+          START=$(date +%s)
+          set +e
+          timeout 5100 bash payload/run.sh > collected/runner-console.log 2>&1
+          STATUS=$?
+          set -e
+          END=$(date +%s)
+          printf '%s\n' "$STATUS" > collected/runner-exit-code.txt
+          printf '%s\n' "$((END - START))" > collected/runner-duration-seconds.txt
+          printf '%s\n' "$GITHUB_RUN_ID" > collected/github-run-id.txt
+          printf '%s\n' "$GITHUB_SHA" > collected/github-sha.txt
+          if [ -d payload/evidence ]; then
+            cp -a payload/evidence collected/evidence
+          fi
+          cp /tmp/payload.tar.gz collected/reproducer-payload.tar.gz
+          sha256sum collected/reproducer-payload.tar.gz > collected/reproducer-payload.sha256
+          exit 0
+
+      - name: Encrypt all evidence before upload
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted-output collected
+          if [ ! -f collected/runner-exit-code.txt ]; then
+            printf '%s\n' '125' > collected/runner-exit-code.txt
+            printf '%s\n' 'Execution did not create an exit record.' > collected/bootstrap-error.txt
+          fi
+          cp collected/runner-exit-code.txt encrypted-output/runner-exit-code.txt
+          tar --sort=name --mtime='UTC 2026-07-26' --owner=0 --group=0 --numeric-owner \
+            -czf /tmp/evidence.tar.gz collected
+          sha256sum /tmp/evidence.tar.gz | awk '{print $1}' \
+            > encrypted-output/evidence-plaintext.sha256
+          openssl rand 32 > /tmp/output-key.bin
+          openssl rand 16 > /tmp/output-iv.bin
+          cat /tmp/output-key.bin /tmp/output-iv.bin > /tmp/output-keyinfo.bin
+          KEY=$(od -An -tx1 -v /tmp/output-key.bin | tr -d ' \n')
+          IV=$(od -An -tx1 -v /tmp/output-iv.bin | tr -d ' \n')
+          openssl enc -aes-256-cbc \
+            -K "$KEY" -iv "$IV" \
+            -in /tmp/evidence.tar.gz \
+            -out encrypted-output/evidence.tar.gz.enc
+          openssl pkeyutl -encrypt \
+            -pubin -inkey tmp-research/pyth-governance-caps/output-public.pem \
+            -in /tmp/output-keyinfo.bin \
+            -out encrypted-output/evidence-keyinfo.enc \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          sha256sum encrypted-output/evidence.tar.gz.enc \
+            encrypted-output/evidence-keyinfo.enc \
+            encrypted-output/evidence-plaintext.sha256 \
+            encrypted-output/runner-exit-code.txt \
+            > encrypted-output/SHA256SUMS
+          rm -rf payload collected
+          rm -f /tmp/payload* /tmp/key* /tmp/iv.hex \
+            /tmp/output-key.bin /tmp/output-iv.bin /tmp/output-keyinfo.bin \
+            /tmp/evidence.tar.gz /tmp/pyth-governance-caps-private.pem
+
+      - name: Upload encrypted evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyth-governance-caps-order-encrypted-${{ github.run_id }}
+          path: encrypted-output/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Enforce encrypted-output and successful scan
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s encrypted-output/evidence.tar.gz.enc
+          test -s encrypted-output/evidence-keyinfo.enc
+          test -s encrypted-output/evidence-plaintext.sha256
+          test -s encrypted-output/runner-exit-code.txt
+          test -s encrypted-output/SHA256SUMS
+          test ! -e payload
+          test ! -e collected
+          test "$(cat encrypted-output/runner-exit-code.txt)" = '0'

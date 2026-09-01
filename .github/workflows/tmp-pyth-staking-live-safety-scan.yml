@@ -1,0 +1,184 @@
+name: Temporary read-only Pyth staking live safety scan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-pyth-staking-live-safety-scan.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Query public Solana state only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > /tmp/scan.py <<'PY'
+          import base64, hashlib, json, struct, time, urllib.request
+          from pathlib import Path
+
+          ALPH='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+          RPCS=[
+            'https://api.mainnet-beta.solana.com',
+            'https://solana-rpc.publicnode.com',
+            'https://solana-mainnet.g.alchemy.com/v2/demo',
+          ]
+          STAKING='pytS9TjG1qyAZypk7n8rw8gfW9sUaqqYyMhJQ4E7JCQ'
+          LOADER='BPFLoaderUpgradeab1e11111111111111111111111'
+          MARKER=b'MOCK_CLOCK_ENABLED'
+          P=2**255-19
+          D=(-121665*pow(121666,P-2,P))%P
+          I=pow(2,(P-1)//4,P)
+
+          def b58d(s):
+            n=0
+            for c in s: n=n*58+ALPH.index(c)
+            raw=n.to_bytes((n.bit_length()+7)//8,'big') if n else b''
+            return b'\0'*(len(s)-len(s.lstrip('1')))+raw
+          def b58e(b):
+            n=int.from_bytes(b,'big'); out=''
+            while n: n,r=divmod(n,58); out=ALPH[r]+out
+            return '1'*(len(b)-len(b.lstrip(b'\0')))+(out or '')
+          def on_curve(s):
+            y=int.from_bytes(s,'little')&((1<<255)-1)
+            if y>=P:return False
+            sign=s[31]>>7; y2=y*y%P; u=(y2-1)%P; v=(D*y2+1)%P
+            x2=u*pow(v,P-2,P)%P; x=pow(x2,(P+3)//8,P)
+            if (x*x-x2)%P:x=x*I%P
+            if (x*x-x2)%P:return False
+            if x==0 and sign:return False
+            return True
+          def pda(seeds,program):
+            for bump in range(255,-1,-1):
+              h=hashlib.sha256(b''.join(seeds)+bytes([bump])+program+b'ProgramDerivedAddress').digest()
+              if not on_curve(h):return h,bump
+            raise RuntimeError('pda')
+          def rpc(url,method,params,reqid=1):
+            body=json.dumps({'jsonrpc':'2.0','id':reqid,'method':method,'params':params}).encode()
+            req=urllib.request.Request(url,data=body,headers={'content-type':'application/json','user-agent':'pyth-staking-readonly-safety-scan/1.0'})
+            errs=[]
+            for i in range(4):
+              try:
+                with urllib.request.urlopen(req,timeout=45) as r: obj=json.load(r)
+                if 'error' in obj: raise RuntimeError(obj['error'])
+                return obj['result']
+              except Exception as e:
+                errs.append(repr(e)); time.sleep(i+1)
+            raise RuntimeError({'url':url,'method':method,'errors':errs})
+          def acct(url,key,reqid):
+            r=rpc(url,'getAccountInfo',[key,{'encoding':'base64','commitment':'finalized'}],reqid)
+            v=r['value']
+            if not v:return None,r.get('context',{})
+            return {'lamports':v['lamports'],'owner':v['owner'],'executable':v['executable'],'data':base64.b64decode(v['data'][0])},r.get('context',{})
+          def read_pk(raw,off):return b58e(raw[off:off+32]),off+32
+          def parse_config(raw):
+            off=8; bump=raw[off];off+=1
+            governance_authority,off=read_pk(raw,off)
+            mint,off=read_pk(raw,off)
+            realm,off=read_pk(raw,off)
+            removed=raw[off];off+=1
+            epoch=struct.unpack_from('<Q',raw,off)[0];off+=8
+            freeze=bool(raw[off]);off+=1
+            pda_auth,off=read_pk(raw,off)
+            gov_program,off=read_pk(raw,off)
+            tag=raw[off];off+=1
+            token_list=None
+            if tag:
+              token_list=struct.unpack_from('<q',raw,off)[0];off+=8
+            agreement=raw[off:off+32].hex();off+=32
+            mock=struct.unpack_from('<q',raw,off)[0];off+=8
+            pool_auth,off=read_pk(raw,off)
+            return {'bump':bump,'governance_authority':governance_authority,'pyth_token_mint':mint,'realm':realm,'removed_unlocking_duration':removed,'epoch_duration':epoch,'freeze':freeze,'pda_authority':pda_auth,'governance_program':gov_program,'token_list_time':token_list,'agreement_hash':agreement,'mock_clock_time':mock,'pool_authority':pool_auth}
+          def parse_target(raw):
+            off=8; bump=raw[off];off+=1
+            last,prev,locked=struct.unpack_from('<QQQ',raw,off);off+=24
+            delta=struct.unpack_from('<q',raw,off)[0]
+            return {'bump':bump,'last_update_at':last,'prev_epoch_locked':prev,'locked':locked,'delta_locked':delta}
+
+          program_raw=b58d(STAKING)
+          config_key,b1=pda([b'config'],program_raw)
+          target_key,b2=pda([b'target',b'voting'],program_raw)
+          max_key,b3=pda([b'max_voter'],program_raw)
+          keys={'program':STAKING,'config':b58e(config_key),'target':b58e(target_key),'max_voter':b58e(max_key)}
+          out={'keys':keys,'pda_bumps':{'config':b1,'target':b2,'max_voter':b3},'providers':[],'signed_or_broadcast_transactions':0}
+          for idx,url in enumerate(RPCS):
+            row={'rpc':url}
+            try:
+              prog,ctx=acct(url,STAKING,100+idx*20)
+              if not prog:raise RuntimeError('missing program')
+              row['slot']=ctx.get('slot');row['program_owner']=prog['owner'];row['program_executable']=prog['executable'];row['program_account_sha256']=hashlib.sha256(prog['data']).hexdigest()
+              if prog['owner']!=LOADER:raise RuntimeError({'wrong_loader':prog['owner']})
+              if len(prog['data'])<36 or struct.unpack_from('<I',prog['data'],0)[0]!=2:raise RuntimeError('not upgradeable Program state')
+              pd=b58e(prog['data'][4:36]);row['programdata']=pd
+              pda_acc,_=acct(url,pd,101+idx*20)
+              if not pda_acc:raise RuntimeError('missing programdata')
+              row['programdata_sha256']=hashlib.sha256(pda_acc['data']).hexdigest();row['programdata_len']=len(pda_acc['data'])
+              tag=struct.unpack_from('<I',pda_acc['data'],0)[0];row['programdata_tag']=tag
+              row['deployment_slot']=struct.unpack_from('<Q',pda_acc['data'],4)[0]
+              opt=pda_acc['data'][12];row['upgrade_authority']=b58e(pda_acc['data'][13:45]) if opt else None
+              header=45 if opt else 13;binary=pda_acc['data'][header:]
+              row['binary_sha256']=hashlib.sha256(binary).hexdigest();row['binary_len']=len(binary);row['mock_clock_marker_present']=MARKER in binary
+              cfg,_=acct(url,keys['config'],102+idx*20);tgt,_=acct(url,keys['target'],103+idx*20);mx,_=acct(url,keys['max_voter'],104+idx*20)
+              if not cfg or not tgt or not mx:raise RuntimeError('missing canonical PDA')
+              row['config_owner']=cfg['owner'];row['config_sha256']=hashlib.sha256(cfg['data']).hexdigest();row['config']=parse_config(cfg['data'])
+              row['target_owner']=tgt['owner'];row['target_sha256']=hashlib.sha256(tgt['data']).hexdigest();row['target']=parse_target(tgt['data'])
+              row['max_voter_owner']=mx['owner'];row['max_voter_sha256']=hashlib.sha256(mx['data']).hexdigest();row['ok']=True
+            except Exception as e:
+              row['ok']=False;row['error']=repr(e)
+            out['providers'].append(row)
+          good=[r for r in out['providers'] if r.get('ok')]
+          out['successful_provider_count']=len(good)
+          fields=['programdata','upgrade_authority','binary_sha256','mock_clock_marker_present','config_sha256','target_sha256','max_voter_sha256']
+          out['providers_identical']=len(good)>=2 and all(len({json.dumps(r.get(f),sort_keys=True) for r in good})==1 for f in fields)
+          out['mainnet_mock_clock_disabled']=len(good)>=2 and all(not r['mock_clock_marker_present'] for r in good)
+          out['nonzero_authorities']=len(good)>=2 and all(r['config']['governance_authority']!='11111111111111111111111111111111' and r['config']['pda_authority']!='11111111111111111111111111111111' for r in good)
+          out['verdict']='PASS' if out['successful_provider_count']>=2 and out['providers_identical'] and out['mainnet_mock_clock_disabled'] and out['nonzero_authorities'] else 'FAIL'
+          Path('evidence/live-staking-safety.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print('PYTH_STAKING_LIVE_SAFETY_'+out['verdict'])
+          print('SUCCESSFUL_PROVIDER_COUNT='+str(out['successful_provider_count']))
+          print('PROVIDERS_IDENTICAL='+str(out['providers_identical']).lower())
+          print('MAINNET_MOCK_CLOCK_DISABLED='+str(out['mainnet_mock_clock_disabled']).lower())
+          print('NONZERO_AUTHORITIES='+str(out['nonzero_authorities']).lower())
+          if good:
+            c=good[0]['config'];t=good[0]['target']
+            print('UPGRADE_AUTHORITY='+str(good[0]['upgrade_authority']))
+            print('GOVERNANCE_AUTHORITY='+c['governance_authority'])
+            print('PDA_AUTHORITY='+c['pda_authority'])
+            print('POOL_AUTHORITY='+c['pool_authority'])
+            print('EPOCH_DURATION='+str(c['epoch_duration']))
+            print('FREEZE='+str(c['freeze']).lower())
+            print('MOCK_CLOCK_TIME='+str(c['mock_clock_time']))
+            print('TARGET_LAST_UPDATE_EPOCH='+str(t['last_update_at']))
+            print('TARGET_LOCKED='+str(t['locked']))
+            print('TARGET_DELTA_LOCKED='+str(t['delta_locked']))
+          if out['verdict']!='PASS':raise SystemExit(1)
+          PY
+          python3 /tmp/scan.py | tee evidence/summary.txt
+          sha256sum evidence/live-staking-safety.json evidence/summary.txt > evidence/SHA256SUMS
+
+      - name: Upload public-chain evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyth-staking-live-safety-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Enforce read-only result
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -qx 'PYTH_STAKING_LIVE_SAFETY_PASS' evidence/summary.txt
+          grep -qx 'MAINNET_MOCK_CLOCK_DISABLED=true' evidence/summary.txt
+          grep -qx 'NONZERO_AUTHORITIES=true' evidence/summary.txt

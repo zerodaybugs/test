@@ -1,0 +1,272 @@
+name: Temporary encrypted Pyth staking outer slash-vote PoC
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-pyth-staking-outer-slash-vote-poc.yml'
+      - 'tmp-research/pyth-staking-slash-vote/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pyth-staking-outer-slash-vote-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  poc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout encrypted inputs only
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Restore isolated input decryption key
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/pyth-staking-slash-vote-private.pem
+          key: pyth-staking-slash-vote-input-key-v1
+          fail-on-cache-miss: true
+
+      - name: Install build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev protobuf-compiler
+          sh -c "$(curl -sSfL https://release.anza.xyz/v1.18.16/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Decrypt and construct exact outer-path proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s /tmp/pyth-staking-slash-vote-private.pem
+          umask 077
+          test "$(find tmp-research/pyth-staking-slash-vote -maxdepth 1 -type f -name 'payload.part.*' | wc -l)" -eq 8
+          cat tmp-research/pyth-staking-slash-vote/payload.part.* \
+            | tr -d '[:space:]' \
+            | base64 -d > /tmp/payload.enc
+          base64 -d tmp-research/pyth-staking-slash-vote/keyinfo.enc.b64 > /tmp/keyinfo.enc
+          openssl pkeyutl -decrypt \
+            -inkey /tmp/pyth-staking-slash-vote-private.pem \
+            -in /tmp/keyinfo.enc \
+            -out /tmp/keyinfo.bin \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          python3 - <<'PY'
+          from pathlib import Path
+          data = Path('/tmp/keyinfo.bin').read_bytes()
+          if len(data) != 48:
+              raise SystemExit(f'invalid keyinfo length: {len(data)}')
+          Path('/tmp/key.hex').write_text(data[:32].hex())
+          Path('/tmp/iv.hex').write_text(data[32:].hex())
+          PY
+          KEY=$(cat /tmp/key.hex)
+          IV=$(cat /tmp/iv.hex)
+          openssl enc -d -aes-256-cbc \
+            -K "$KEY" -iv "$IV" \
+            -in /tmp/payload.enc \
+            -out /tmp/payload.tar.gz
+          EXPECTED=$(tr -d '[:space:]' < tmp-research/pyth-staking-slash-vote/payload.sha256)
+          printf '%s  %s\n' "$EXPECTED" /tmp/payload.tar.gz | sha256sum -c -
+          tar -xzf /tmp/payload.tar.gz
+          test -x payload/run.sh
+
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('payload/slash_vote_order.rs')
+          text = path.read_text()
+
+          def one(old: str, new: str) -> None:
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'unexpected replacement count {count}: {old[:100]!r}')
+              text = text.replace(old, new)
+
+          one(
+              '        setup::{setup, SetupProps, SetupResult},',
+              '        integrity_pool::{\n            helper_functions::get_default_slash_custody,\n            instructions::{advance, advance_delegation_record, create_slash_event, delegate, slash, update_y},\n            pda::get_delegation_record_address,\n        },\n        publisher_caps::helper_functions::post_dummy_publisher_caps,\n        setup::{setup, SetupProps, SetupResult},'
+          )
+          one(
+              '                create_position, create_voter_record, slash_staking, update_pool_authority,',
+              '                create_position, create_voter_record,'
+          )
+          one('const SLASH_RATIO: u64 = 500_000;', 'const SLASH_RATIO: u64 = 50_000;')
+          one(
+              '        pool_data_pubkey: _,\n        reward_program_authority: _,\n        maybe_publisher_index: _,',
+              '        pool_data_pubkey,\n        reward_program_authority,\n        maybe_publisher_index,'
+          )
+          one('        init_publishers: false,', '        init_publishers: true,')
+          one(
+              '    let pool_authority = Keypair::new();\n    svm.airdrop(&attacker.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();\n    svm.airdrop(&honest.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();\n\n    update_pool_authority(\n        &mut svm,\n        &governance_authority,\n        pool_authority.pubkey(),\n    );',
+              '    let slash_relayer = Keypair::new();\n    svm.airdrop(&attacker.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();\n    svm.airdrop(&honest.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();\n    svm.airdrop(&slash_relayer.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();\n    assert!(maybe_publisher_index.is_some());\n    update_y(&mut svm, &governance_authority, &reward_program_authority, 0).unwrap();'
+          )
+          one(
+              '    create_position(\n        &mut svm,\n        &attacker,\n        attacker_positions,\n        TargetWithParameters::IntegrityPool {\n            publisher: publisher_keypair.pubkey(),\n        },\n        Some(&pool_authority),\n        attacker_amount,\n    )\n    .unwrap();',
+              '    delegate(\n        &mut svm,\n        &attacker,\n        publisher_keypair.pubkey(),\n        pool_data_pubkey,\n        attacker_positions,\n        attacker_amount,\n    )\n    .unwrap();'
+          )
+          one(
+              '    advance_production_epochs(&mut svm, 1);',
+              '    advance_production_epochs(&mut svm, 1);\n    let caps_epoch_one = post_dummy_publisher_caps(\n        &mut svm,\n        &governance_authority,\n        publisher_keypair.pubkey(),\n        100,\n    );\n    advance(&mut svm, &governance_authority, caps_epoch_one).unwrap();\n    advance_delegation_record(\n        &mut svm,\n        &governance_authority,\n        publisher_keypair.pubkey(),\n        attacker_positions,\n        pyth_token_mint.pubkey(),\n        pool_data_pubkey,\n        None,\n    )\n    .unwrap();\n    advance_production_epochs(&mut svm, 1);\n    let caps_epoch_two = post_dummy_publisher_caps(\n        &mut svm,\n        &governance_authority,\n        publisher_keypair.pubkey(),\n        100,\n    );\n    advance(&mut svm, &governance_authority, caps_epoch_two).unwrap();\n    advance_delegation_record(\n        &mut svm,\n        &governance_authority,\n        publisher_keypair.pubkey(),\n        attacker_positions,\n        pyth_token_mint.pubkey(),\n        pool_data_pubkey,\n        None,\n    )\n    .unwrap();'
+          )
+          one(
+              '    let slash_destination =\n        create_token_account(&mut svm, &governance_authority, &pyth_token_mint.pubkey());\n\n    if vote_before_slash {',
+              '    let slash_custody = get_default_slash_custody(\n        &reward_program_authority.pubkey(),\n        &pyth_token_mint.pubkey(),\n    );\n    create_slash_event(\n        &mut svm,\n        &governance_authority,\n        &reward_program_authority,\n        0,\n        SLASH_RATIO,\n        slash_custody,\n        publisher_keypair.pubkey(),\n        pool_data_pubkey,\n    )\n    .unwrap();\n    assert_ne!(slash_relayer.pubkey(), attacker.pubkey());\n    assert_ne!(slash_relayer.pubkey(), governance_authority.pubkey());\n    assert_ne!(slash_relayer.pubkey(), reward_program_authority.pubkey());\n    assert_ne!(slash_relayer.pubkey(), publisher_keypair.pubkey());\n\n    if vote_before_slash {'
+          )
+
+          direct_call = (
+              '        slash_staking(\n'
+              '            &mut svm,\n'
+              '            &governance_authority,\n'
+              '            attacker_positions,\n'
+              '            &pool_authority,\n'
+              '            SLASH_RATIO,\n'
+              '            publisher_keypair.pubkey(),\n'
+              '            slash_destination.pubkey(),\n'
+              '        )\n'
+              '        .unwrap();'
+          )
+          outer_call = (
+              '        slash(\n'
+              '            &mut svm,\n'
+              '            &slash_relayer,\n'
+              '            attacker_positions,\n'
+              '            0,\n'
+              '            slash_custody,\n'
+              '            publisher_keypair.pubkey(),\n'
+              '            pool_data_pubkey,\n'
+              '        )\n'
+              '        .unwrap();'
+          )
+          count = text.count(direct_call)
+          if count != 2:
+              raise SystemExit(f'unexpected direct slash call count: {count}')
+          text = text.replace(direct_call, outer_call)
+
+          one(
+              '    let custody_data: anchor_spl::token::TokenAccount = fetch_account_data(&mut svm, &custody);',
+              '    let custody_data: anchor_spl::token::TokenAccount = fetch_account_data(&mut svm, &custody);\n    let slash_custody_data: anchor_spl::token::TokenAccount =\n        fetch_account_data(&mut svm, &slash_custody);\n    let delegation_record: integrity_pool::state::delegation_record::DelegationRecord =\n        fetch_account_data(\n            &mut svm,\n            &get_delegation_record_address(publisher_keypair.pubkey(), attacker_positions),\n        );'
+          )
+          one(
+              '    assert_eq!(attacker_voting_after, attacker_amount / 2);\n    assert_eq!(attacker_integrity_after, attacker_amount / 2);\n    assert_eq!(custody_data.amount, attacker_amount / 2);\n    assert_eq!(target_after.locked, attacker_amount / 2 + honest_amount);',
+              '    let expected_after = ((u128::from(attacker_amount)\n        * u128::from(1_000_000 - SLASH_RATIO))\n        / 1_000_000u128) as u64;\n    let expected_slashed = attacker_amount - expected_after;\n    assert_eq!(attacker_voting_after, expected_after);\n    assert_eq!(attacker_integrity_after, expected_after);\n    assert_eq!(custody_data.amount, expected_after);\n    assert_eq!(target_after.locked, expected_after + honest_amount);\n    assert_eq!(slash_custody_data.amount, expected_slashed);\n    assert_eq!(delegation_record.next_slash_event_index, 1);'
+          )
+          one(
+              '        * 3;\n    let denominator = u128::from(threshold_pct) * 4;',
+              '        * 39;\n    let denominator = u128::from(threshold_pct) * 40;'
+          )
+          one(
+              '    println!("COMMUNITY_THRESHOLD_PERCENT={}", control.threshold_pct);',
+              '    println!("SLASH_RATIO_PPM={SLASH_RATIO}");\n    println!("SLASH_RATIO_PERCENT=5");\n    println!("OUTER_INTEGRITY_POOL_SLASH_PATH=true");\n    println!("SLASH_EVENT_CREATED_BEFORE_ORDERING_WINDOW=true");\n    println!("DISTINCT_UNPRIVILEGED_SLASH_RELAYER=true");\n    println!("COMMUNITY_THRESHOLD_PERCENT={}", control.threshold_pct);'
+          )
+          path.write_text(text)
+          PY
+          sha256sum payload/slash_vote_order.rs > /tmp/outer-harness.sha256
+
+      - name: Execute exact live-release outer-path proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p collected
+          START=$(date +%s)
+          set +e
+          timeout 6900 bash payload/run.sh > collected/runner-console.log 2>&1
+          STATUS=$?
+          set -e
+          END=$(date +%s)
+          printf '%s\n' "$STATUS" > collected/runner-exit-code.txt
+          printf '%s\n' "$((END - START))" > collected/runner-duration-seconds.txt
+          printf '%s\n' "$GITHUB_RUN_ID" > collected/github-run-id.txt
+          printf '%s\n' "$GITHUB_SHA" > collected/github-sha.txt
+          cp /tmp/outer-harness.sha256 collected/outer-harness.sha256
+          cp payload/slash_vote_order.rs collected/outer-slash_vote_order.rs
+          cp /tmp/payload.tar.gz collected/original-reproducer-payload.tar.gz
+          if [ -d payload/evidence ]; then cp -a payload/evidence collected/evidence; fi
+
+          CLASS=UNKNOWN_FAILURE
+          if [ "$STATUS" -eq 0 ]; then CLASS=PASS
+          elif grep -qE 'error: could not compile|could not compile .+ due to' collected/runner-console.log; then CLASS=RUST_BUILD_FAILURE
+          elif grep -qE 'test result: FAILED|thread .+ panicked at|panicked at' collected/runner-console.log; then CLASS=RUST_TEST_FAILURE
+          elif [ "$STATUS" -eq 124 ]; then CLASS=TIMEOUT
+          fi
+          {
+            printf 'RUNNER_EXIT_CODE=%s\n' "$STATUS"
+            printf 'EXECUTION_CLASS=%s\n' "$CLASS"
+            printf 'RUNNER_DURATION_SECONDS=%s\n' "$((END - START))"
+            printf 'EXACT_OUTER_INTEGRITY_POOL_PATH=true\n'
+            cat /tmp/outer-harness.sha256
+            printf 'SAFE_DIAGNOSTIC_LINES_BEGIN\n'
+            grep -E '^(error(\[[A-Z0-9]+\])?:|error:|warning:|running [0-9]+ test|test result:|failures:|thread .+ panicked at|[A-Z0-9_]+=(true|false|PASS|FAIL|[0-9]+)|PYTH_[A-Z0-9_]+)' collected/runner-console.log \
+              | tail -n 240 | sed -E 's#/home/runner/work/[^ :]+#<WORKSPACE>#g' || true
+            printf 'SAFE_DIAGNOSTIC_LINES_END\n'
+            printf 'SANITIZED_TAIL_BEGIN\n'
+            tail -n 200 collected/runner-console.log \
+              | sed -E 's#/home/runner/work/[^ :]+#<WORKSPACE>#g; s#/home/runner/\.cargo/[^ :]+#<CARGO_CACHE>#g; s#/tmp/[^ :]+#<TMP_PATH>#g'
+            printf 'SANITIZED_TAIL_END\n'
+          } > collected/public-safe-status.txt
+          exit 0
+
+      - name: Encrypt complete evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted-output collected
+          if [ ! -f collected/runner-exit-code.txt ]; then printf '125\n' > collected/runner-exit-code.txt; fi
+          if [ ! -f collected/public-safe-status.txt ]; then printf 'EXECUTION_CLASS=BOOTSTRAP_FAILURE\n' > collected/public-safe-status.txt; fi
+          cp collected/runner-exit-code.txt encrypted-output/runner-exit-code.txt
+          cp collected/public-safe-status.txt encrypted-output/public-safe-status.txt
+          tar --sort=name --mtime='UTC 2026-07-27' --owner=0 --group=0 --numeric-owner -czf /tmp/evidence.tar.gz collected
+          sha256sum /tmp/evidence.tar.gz | awk '{print $1}' > encrypted-output/evidence-plaintext.sha256
+          openssl rand 32 > /tmp/output-key.bin
+          openssl rand 16 > /tmp/output-iv.bin
+          cat /tmp/output-key.bin /tmp/output-iv.bin > /tmp/output-keyinfo.bin
+          KEY=$(od -An -tx1 -v /tmp/output-key.bin | tr -d ' \n')
+          IV=$(od -An -tx1 -v /tmp/output-iv.bin | tr -d ' \n')
+          openssl enc -aes-256-cbc -K "$KEY" -iv "$IV" -in /tmp/evidence.tar.gz -out encrypted-output/evidence.tar.gz.enc
+          openssl pkeyutl -encrypt -pubin -inkey tmp-research/pyth-staking-slash-vote/output-public.pem \
+            -in /tmp/output-keyinfo.bin -out encrypted-output/evidence-keyinfo.enc \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          sha256sum encrypted-output/evidence.tar.gz.enc encrypted-output/evidence-keyinfo.enc \
+            encrypted-output/evidence-plaintext.sha256 encrypted-output/runner-exit-code.txt \
+            encrypted-output/public-safe-status.txt > encrypted-output/SHA256SUMS
+          rm -rf payload collected
+          rm -f /tmp/payload* /tmp/key* /tmp/iv.hex /tmp/outer-harness.sha256 \
+            /tmp/output-key.bin /tmp/output-iv.bin /tmp/output-keyinfo.bin /tmp/evidence.tar.gz \
+            /tmp/pyth-staking-slash-vote-private.pem
+
+      - name: Upload encrypted evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyth-staking-outer-slash-vote-poc-${{ github.run_id }}
+          path: encrypted-output/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Enforce exact outer-path result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s encrypted-output/evidence.tar.gz.enc
+          test -s encrypted-output/evidence-keyinfo.enc
+          test -s encrypted-output/evidence-plaintext.sha256
+          test -s encrypted-output/runner-exit-code.txt
+          test -s encrypted-output/public-safe-status.txt
+          grep -qx '0' encrypted-output/runner-exit-code.txt
+          grep -qx 'EXECUTION_CLASS=PASS' encrypted-output/public-safe-status.txt
+          grep -q '^SLASH_RATIO_PPM=50000$' encrypted-output/public-safe-status.txt
+          grep -q '^OUTER_INTEGRITY_POOL_SLASH_PATH=true$' encrypted-output/public-safe-status.txt
+          grep -q '^DISTINCT_UNPRIVILEGED_SLASH_RELAYER=true$' encrypted-output/public-safe-status.txt
+          grep -q '^CONTROL_WEIGHT_BELOW_THRESHOLD=true$' encrypted-output/public-safe-status.txt
+          grep -q '^ATTACK_WEIGHT_AT_OR_ABOVE_THRESHOLD=true$' encrypted-output/public-safe-status.txt
+          test ! -e payload
+          test ! -e collected

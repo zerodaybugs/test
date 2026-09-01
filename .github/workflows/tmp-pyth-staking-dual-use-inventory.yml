@@ -1,0 +1,298 @@
+name: Temporary encrypted Pyth staking dual-use inventory
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-pyth-staking-dual-use-inventory.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pyth-staking-dual-use-inventory-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout public encryption key only
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Run read-only mainnet dual-use inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p collected encrypted-output
+          cat > /tmp/dual_use_inventory.py <<'PY'
+          import base64, hashlib, json, math, struct, time, urllib.request
+          from pathlib import Path
+
+          ALPH='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+          RPCS=[
+            'https://solana-rpc.publicnode.com',
+            'https://api.mainnet-beta.solana.com',
+            'https://solana-mainnet.g.alchemy.com/v2/demo',
+          ]
+          STAKING='pytS9TjG1qyAZypk7n8rw8gfW9sUaqqYyMhJQ4E7JCQ'
+          POSITION_DISC=hashlib.sha256(b'account:PositionData').digest()[:8]
+          MAX_VOTER_WEIGHT=10_000_000_000_000_000
+          SLASH_PPM=50_000
+          POSITION_BUFFER_SIZE=200
+          POSITION_HEADER=40
+          P=2**255-19
+          D=(-121665*pow(121666,P-2,P))%P
+          I=pow(2,(P-1)//4,P)
+
+          def b58d(s):
+            n=0
+            for c in s:n=n*58+ALPH.index(c)
+            raw=n.to_bytes((n.bit_length()+7)//8,'big') if n else b''
+            return b'\0'*(len(s)-len(s.lstrip('1')))+raw
+          def b58e(b):
+            n=int.from_bytes(b,'big');out=''
+            while n:n,r=divmod(n,58);out=ALPH[r]+out
+            return '1'*(len(b)-len(b.lstrip(b'\0')))+(out or '')
+          def on_curve(s):
+            y=int.from_bytes(s,'little')&((1<<255)-1)
+            if y>=P:return False
+            sign=s[31]>>7;y2=y*y%P;u=(y2-1)%P;v=(D*y2+1)%P
+            x2=u*pow(v,P-2,P)%P;x=pow(x2,(P+3)//8,P)
+            if (x*x-x2)%P:x=x*I%P
+            if (x*x-x2)%P:return False
+            return not (x==0 and sign)
+          def pda(seeds,program):
+            for bump in range(255,-1,-1):
+              h=hashlib.sha256(b''.join(seeds)+bytes([bump])+program+b'ProgramDerivedAddress').digest()
+              if not on_curve(h):return h,bump
+            raise RuntimeError('pda failure')
+          def rpc(url,method,params,reqid=1,timeout=120,retries=5):
+            body=json.dumps({'jsonrpc':'2.0','id':reqid,'method':method,'params':params},separators=(',',':')).encode()
+            errs=[]
+            for i in range(retries):
+              try:
+                req=urllib.request.Request(url,data=body,headers={'content-type':'application/json','user-agent':'pyth-staking-dual-use-readonly/1.0'})
+                with urllib.request.urlopen(req,timeout=timeout) as r:obj=json.load(r)
+                if 'error' in obj:raise RuntimeError(obj['error'])
+                return obj['result']
+              except Exception as e:
+                errs.append(repr(e));time.sleep(min(8,i+1))
+            raise RuntimeError({'url':url,'method':method,'errors':errs})
+          def account(url,key,reqid=1):
+            r=rpc(url,'getAccountInfo',[key,{'encoding':'base64','commitment':'finalized'}],reqid)
+            v=r['value']
+            if v is None:return None
+            return {'owner':v['owner'],'lamports':v['lamports'],'data':base64.b64decode(v['data'][0])}
+          def parse_config(raw):
+            off=8+1+32+32+32+1
+            epoch_duration=struct.unpack_from('<Q',raw,off)[0]
+            return {'epoch_duration':epoch_duration}
+          def parse_target(raw):
+            off=8
+            bump=raw[off];off+=1
+            last,prev,locked=struct.unpack_from('<QQQ',raw,off);off+=24
+            delta=struct.unpack_from('<q',raw,off)[0]
+            return {'bump':bump,'last_update_at':last,'prev_epoch_locked':prev,'locked':locked,'delta_locked':delta}
+          def target_amount(t,epoch):
+            diff=int(epoch)-int(t['last_update_at'])
+            if diff==-1:return t['prev_epoch_locked']
+            if diff==0:return t['locked']
+            if diff>=1:
+              x=int(t['locked'])+int(t['delta_locked'])
+              if x<0:raise ValueError('negative target')
+              return x
+            raise ValueError('snapshot too old')
+          def position_state(p,epoch):
+            if epoch<p['activation_epoch']:return 'LOCKING'
+            u=p['unlocking_start']
+            if u is None:return 'LOCKED'
+            if u>epoch:return 'PREUNLOCKING'
+            if u+1>epoch:return 'UNLOCKING'
+            return 'UNLOCKED'
+          def parse_positions(raw):
+            if len(raw)<POSITION_HEADER or raw[:8]!=POSITION_DISC:raise ValueError('bad position discriminator')
+            owner=b58e(raw[8:40]);out=[]
+            capacity=(len(raw)-POSITION_HEADER)//POSITION_BUFFER_SIZE
+            for idx in range(capacity):
+              slot=raw[POSITION_HEADER+idx*POSITION_BUFFER_SIZE:POSITION_HEADER+(idx+1)*POSITION_BUFFER_SIZE]
+              if not slot or slot[0]==0:continue
+              if slot[0]!=1:raise ValueError(f'bad option tag {slot[0]} at {idx}')
+              amount=struct.unpack_from('<Q',slot,1)[0]
+              activation=struct.unpack_from('<Q',slot,9)[0]
+              unlock_tag=slot[17]
+              cursor=18
+              if unlock_tag==0:unlock=None
+              elif unlock_tag==1:
+                unlock=struct.unpack_from('<Q',slot,cursor)[0];cursor+=8
+              else:raise ValueError(f'bad unlock tag {unlock_tag} at {idx}')
+              target_tag=slot[cursor];cursor+=1
+              if target_tag==0:
+                target='Voting';publisher=None
+              elif target_tag==1:
+                target='IntegrityPool';publisher=b58e(slot[cursor:cursor+32])
+              else:raise ValueError(f'bad target tag {target_tag} at {idx}')
+              out.append({'index':idx,'amount':amount,'activation_epoch':activation,'unlocking_start':unlock,'target':target,'publisher':publisher})
+            return owner,out
+          def get_program_accounts(url,reqid):
+            params=[STAKING,{'encoding':'base64','commitment':'finalized','filters':[{'memcmp':{'offset':0,'bytes':b58e(POSITION_DISC)}}]}]
+            rows=rpc(url,'getProgramAccounts',params,reqid,timeout=240,retries=4)
+            parsed=[]
+            for row in rows:
+              parsed.append({'pubkey':row['pubkey'],'owner':row['account']['owner'],'data':base64.b64decode(row['account']['data'][0])})
+            parsed.sort(key=lambda x:x['pubkey'])
+            return parsed
+          def get_multiple(url,keys,baseid):
+            out={}
+            for start in range(0,len(keys),100):
+              batch=keys[start:start+100]
+              r=rpc(url,'getMultipleAccounts',[batch,{'encoding':'base64','commitment':'finalized'}],baseid+start//100,timeout=120,retries=5)
+              for k,v in zip(batch,r['value']):
+                out[k]=None if v is None else base64.b64decode(v['data'][0])
+            return out
+          def weight(raw,total):
+            if total<=0:return 0
+            return (int(raw)*MAX_VOTER_WEIGHT)//int(total)
+
+          program_raw=b58d(STAKING)
+          cfg_key=b58e(pda([b'config'],program_raw)[0])
+          target_key=b58e(pda([b'target',b'voting'],program_raw)[0])
+
+          provider_attempts=[];full=[]
+          for idx,url in enumerate(RPCS):
+            row={'rpc':url}
+            try:
+              slot=rpc(url,'getSlot',[{'commitment':'finalized'}],10+idx)
+              ts=rpc(url,'getBlockTime',[slot],20+idx)
+              cfg=account(url,cfg_key,30+idx)
+              tgt=account(url,target_key,40+idx)
+              if not cfg or not tgt:raise RuntimeError('missing config/target')
+              accounts=get_program_accounts(url,100+idx)
+              digest=hashlib.sha256()
+              for a in accounts:
+                digest.update(a['pubkey'].encode()+b'\0'+hashlib.sha256(a['data']).digest())
+              row.update({'ok':True,'slot':slot,'block_time':ts,'config_sha256':hashlib.sha256(cfg['data']).hexdigest(),'target_sha256':hashlib.sha256(tgt['data']).hexdigest(),'account_count':len(accounts),'account_set_sha256':digest.hexdigest()})
+              full.append((url,accounts,cfg['data'],tgt['data'],slot,ts,row))
+            except Exception as e:
+              row.update({'ok':False,'error':repr(e)})
+            provider_attempts.append(row)
+
+          if not full:raise SystemExit('no full provider succeeded')
+          url,accounts,cfg_raw,tgt_raw,slot,ts,selected=full[0]
+          config=parse_config(cfg_raw);target=parse_target(tgt_raw)
+          current_epoch=int(ts)//int(config['epoch_duration'])
+          previous_epoch=current_epoch-1
+
+          position_records=[];custody_keys=[]
+          for a in accounts:
+            owner,positions=parse_positions(a['data'])
+            custody=b58e(pda([b'custody',b58d(a['pubkey'])],program_raw)[0])
+            custody_keys.append(custody)
+            position_records.append({'positions_account':a['pubkey'],'owner':owner,'custody':custody,'positions':positions,'data_sha256':hashlib.sha256(a['data']).hexdigest()})
+          custody_map=get_multiple(url,custody_keys,1000)
+
+          dual=[]
+          for rec in position_records:
+            cdata=custody_map.get(rec['custody'])
+            if cdata is None or len(cdata)<72:continue
+            custody_amount=struct.unpack_from('<Q',cdata,64)[0]
+            gov_current=0;gov_prev=0;vote_eligible_current=0;vote_eligible_prev=0
+            ois_by_publisher={}
+            for p in rec['positions']:
+              s_cur=position_state(p,current_epoch);s_prev=position_state(p,previous_epoch)
+              if p['target']=='Voting':
+                if s_cur!='UNLOCKED':gov_current+=p['amount']
+                if s_prev!='UNLOCKED':gov_prev+=p['amount']
+                if s_cur in ('LOCKED','PREUNLOCKING'):vote_eligible_current+=p['amount']
+                if s_prev in ('LOCKED','PREUNLOCKING'):vote_eligible_prev+=p['amount']
+              elif p['target']=='IntegrityPool' and s_prev in ('LOCKED','PREUNLOCKING'):
+                ois_by_publisher[p['publisher']]=ois_by_publisher.get(p['publisher'],0)+p['amount']
+            if not ois_by_publisher or vote_eligible_current==0:continue
+            per_pub=[]
+            for publisher,ois_prev in sorted(ois_by_publisher.items()):
+              slash=(ois_prev*SLASH_PPM)//1_000_000
+              voting_reduction=max(0,gov_current+slash-custody_amount)
+              voting_reduction=min(voting_reduction,gov_current)
+              raw_pre=vote_eligible_current
+              raw_post=max(0,raw_pre-voting_reduction)
+              total_pre=target_amount(target,current_epoch)
+              total_post=max(0,total_pre-voting_reduction)
+              w_pre=weight(raw_pre,total_pre);w_post=weight(raw_post,total_post)
+              per_pub.append({'publisher':publisher,'ois_prev':ois_prev,'slash_5pct':slash,'voting_reduction':voting_reduction,'raw_vote_pre':raw_pre,'raw_vote_post':raw_post,'global_locked_pre':total_pre,'global_locked_post':total_post,'normalized_weight_pre':w_pre,'normalized_weight_post':w_post,'normalized_weight_delta':w_pre-w_post})
+            if any(x['voting_reduction']>0 for x in per_pub):
+              dual.append({'positions_account':rec['positions_account'],'owner':rec['owner'],'custody':rec['custody'],'custody_amount':custody_amount,'governance_exposure_current':gov_current,'governance_exposure_previous':gov_prev,'vote_eligible_current':vote_eligible_current,'vote_eligible_previous':vote_eligible_prev,'publishers':per_pub})
+
+          impacts=[p for d in dual for p in d['publishers'] if p['voting_reduction']>0]
+          impacts.sort(key=lambda x:(x['normalized_weight_delta'],x['voting_reduction']),reverse=True)
+          top=impacts[0] if impacts else None
+          providers_identical=False
+          if len(full)>=2:
+            providers_identical=len({(x[6]['account_count'],x[6]['account_set_sha256'],x[6]['config_sha256'],x[6]['target_sha256']) for x in full})==1
+
+          details={'staking_program':STAKING,'config':cfg_key,'target':target_key,'selected_rpc':url,'provider_attempts':provider_attempts,'full_provider_count':len(full),'providers_identical':providers_identical,'slot':slot,'block_time':ts,'epoch_duration':config['epoch_duration'],'current_epoch':current_epoch,'previous_epoch':previous_epoch,'target':target,'position_account_count':len(position_records),'dual_use_impacted_accounts':dual,'impact_count':len(impacts),'top_impact':top,'signed_or_broadcast_transactions':0}
+          Path('collected/dual-use-details.json').write_text(json.dumps(details,indent=2,sort_keys=True)+'\n')
+          summary={
+            'PYTH_STAKING_DUAL_USE_INVENTORY':'PASS',
+            'FULL_PROVIDER_COUNT':len(full),
+            'PROVIDERS_IDENTICAL':str(providers_identical).lower(),
+            'POSITION_ACCOUNT_COUNT':len(position_records),
+            'DUAL_USE_WITH_5PCT_VOTING_REDUCTION_ACCOUNT_COUNT':len(dual),
+            'IMPACT_COMBINATION_COUNT':len(impacts),
+            'MAX_RAW_VOTING_REDUCTION':0 if not top else top['voting_reduction'],
+            'MAX_NORMALIZED_WEIGHT_DELTA':0 if not top else top['normalized_weight_delta'],
+            'CURRENT_EPOCH':current_epoch,
+            'PUBLIC_CHAIN_TRANSACTIONS':0,
+          }
+          Path('collected/public-summary.txt').write_text('\n'.join(f'{k}={v}' for k,v in summary.items())+'\n')
+          print(Path('collected/public-summary.txt').read_text(),end='')
+          PY
+          python3 /tmp/dual_use_inventory.py
+          sha256sum collected/dual-use-details.json collected/public-summary.txt > collected/SHA256SUMS
+
+      - name: Encrypt sensitive account-level evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar --sort=name --mtime='UTC 2026-07-27' --owner=0 --group=0 --numeric-owner \
+            -czf /tmp/dual-use-details.tar.gz collected/dual-use-details.json collected/SHA256SUMS
+          openssl rand 32 > /tmp/output-key.bin
+          openssl rand 16 > /tmp/output-iv.bin
+          cat /tmp/output-key.bin /tmp/output-iv.bin > /tmp/output-keyinfo.bin
+          KEY=$(od -An -tx1 -v /tmp/output-key.bin | tr -d ' \n')
+          IV=$(od -An -tx1 -v /tmp/output-iv.bin | tr -d ' \n')
+          openssl enc -aes-256-cbc -K "$KEY" -iv "$IV" \
+            -in /tmp/dual-use-details.tar.gz -out encrypted-output/dual-use-details.tar.gz.enc
+          openssl pkeyutl -encrypt -pubin \
+            -inkey tmp-research/pyth-staking-slash-vote/output-public.pem \
+            -in /tmp/output-keyinfo.bin -out encrypted-output/dual-use-details-keyinfo.enc \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          cp collected/public-summary.txt encrypted-output/public-summary.txt
+          sha256sum encrypted-output/dual-use-details.tar.gz.enc \
+            encrypted-output/dual-use-details-keyinfo.enc \
+            encrypted-output/public-summary.txt > encrypted-output/SHA256SUMS
+          rm -f collected/dual-use-details.json /tmp/dual-use-details.tar.gz \
+            /tmp/output-key.bin /tmp/output-iv.bin /tmp/output-keyinfo.bin /tmp/dual_use_inventory.py
+
+      - name: Upload encrypted evidence and aggregate summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyth-staking-dual-use-inventory-${{ github.run_id }}
+          path: encrypted-output/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Enforce read-only inventory boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s encrypted-output/dual-use-details.tar.gz.enc
+          test -s encrypted-output/dual-use-details-keyinfo.enc
+          test -s encrypted-output/public-summary.txt
+          grep -qx 'PYTH_STAKING_DUAL_USE_INVENTORY=PASS' encrypted-output/public-summary.txt
+          grep -qx 'PUBLIC_CHAIN_TRANSACTIONS=0' encrypted-output/public-summary.txt
+          test ! -e collected/dual-use-details.json

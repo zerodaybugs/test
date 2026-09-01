@@ -1,0 +1,229 @@
+name: Temporary encrypted Pyth staking slash-vote snapshot PoC
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-pyth-staking-slash-vote-poc.yml'
+      - 'tmp-research/pyth-staking-slash-vote/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pyth-staking-slash-vote-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  poc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout ciphertext only
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Restore isolated input decryption key
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/pyth-staking-slash-vote-private.pem
+          key: pyth-staking-slash-vote-input-key-v1
+          fail-on-cache-miss: true
+
+      - name: Install build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev protobuf-compiler
+          sh -c "$(curl -sSfL https://release.anza.xyz/v1.18.16/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Decrypt and verify private PoC payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s /tmp/pyth-staking-slash-vote-private.pem
+          umask 077
+          test "$(find tmp-research/pyth-staking-slash-vote -maxdepth 1 -type f -name 'payload.part.*' | wc -l)" -eq 8
+          cat tmp-research/pyth-staking-slash-vote/payload.part.* \
+            | tr -d '[:space:]' \
+            | base64 -d > /tmp/payload.enc
+          base64 -d tmp-research/pyth-staking-slash-vote/keyinfo.enc.b64 > /tmp/keyinfo.enc
+          openssl pkeyutl -decrypt \
+            -inkey /tmp/pyth-staking-slash-vote-private.pem \
+            -in /tmp/keyinfo.enc \
+            -out /tmp/keyinfo.bin \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          python3 - <<'PY'
+          from pathlib import Path
+          data = Path('/tmp/keyinfo.bin').read_bytes()
+          if len(data) != 48:
+              raise SystemExit(f'invalid keyinfo length: {len(data)}')
+          Path('/tmp/key.hex').write_text(data[:32].hex())
+          Path('/tmp/iv.hex').write_text(data[32:].hex())
+          PY
+          KEY=$(cat /tmp/key.hex)
+          IV=$(cat /tmp/iv.hex)
+          openssl enc -d -aes-256-cbc \
+            -K "$KEY" -iv "$IV" \
+            -in /tmp/payload.enc \
+            -out /tmp/payload.tar.gz
+          EXPECTED=$(tr -d '[:space:]' < tmp-research/pyth-staking-slash-vote/payload.sha256)
+          printf '%s  %s\n' "$EXPECTED" /tmp/payload.tar.gz | sha256sum -c -
+          tar -xzf /tmp/payload.tar.gz
+          test -x payload/run.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('payload/slash_vote_order.rs')
+          text = path.read_text()
+          old = '    advance_production_epochs(&mut svm, 1);'
+          new = '    advance_production_epochs(&mut svm, 2);'
+          if text.count(old) != 1:
+              raise SystemExit(f'unexpected epoch-advance occurrence count: {text.count(old)}')
+          path.write_text(text.replace(old, new))
+          PY
+          sha256sum payload/slash_vote_order.rs > /tmp/patched-harness.sha256
+
+      - name: Execute exact live-release program proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p collected
+          START=$(date +%s)
+          set +e
+          timeout 6900 bash payload/run.sh > collected/runner-console.log 2>&1
+          STATUS=$?
+          set -e
+          END=$(date +%s)
+          printf '%s\n' "$STATUS" > collected/runner-exit-code.txt
+          printf '%s\n' "$((END - START))" > collected/runner-duration-seconds.txt
+          printf '%s\n' "$GITHUB_RUN_ID" > collected/github-run-id.txt
+          printf '%s\n' "$GITHUB_SHA" > collected/github-sha.txt
+          cp /tmp/patched-harness.sha256 collected/patched-harness.sha256
+          if [ -d payload/evidence ]; then
+            cp -a payload/evidence collected/evidence
+          fi
+          cp /tmp/payload.tar.gz collected/reproducer-payload.tar.gz
+          sha256sum collected/reproducer-payload.tar.gz > collected/reproducer-payload.sha256
+
+          CLASS=UNKNOWN_FAILURE
+          if [ "$STATUS" -eq 0 ]; then
+            CLASS=PASS
+          elif grep -qE 'error: could not compile|could not compile .+ due to' collected/runner-console.log; then
+            CLASS=RUST_BUILD_FAILURE
+          elif grep -qE 'test result: FAILED|thread .+ panicked at|panicked at' collected/runner-console.log; then
+            CLASS=RUST_TEST_FAILURE
+          elif [ "$STATUS" -eq 124 ]; then
+            CLASS=TIMEOUT
+          fi
+
+          TEST_FILE=$(find payload /tmp -type f -name slash_vote_order.rs 2>/dev/null | head -n 1 || true)
+          {
+            printf 'RUNNER_EXIT_CODE=%s\n' "$STATUS"
+            printf 'EXECUTION_CLASS=%s\n' "$CLASS"
+            printf 'RUNNER_DURATION_SECONDS=%s\n' "$((END - START))"
+            printf 'HARNESS_PATCH=ADVANCE_TWO_EPOCHS\n'
+            cat /tmp/patched-harness.sha256
+            printf 'SAFE_DIAGNOSTIC_LINES_BEGIN\n'
+            grep -E '^(error(\[[A-Z0-9]+\])?:|error:|warning:|running [0-9]+ test|test result:|failures:|thread .+ panicked at|[A-Z0-9_]+=(true|false|PASS|FAIL|[0-9]+)|PYTH_[A-Z0-9_]+)' collected/runner-console.log \
+              | tail -n 160 \
+              | sed -E 's#/home/runner/work/[^ :]+#<WORKSPACE>#g' || true
+            printf 'SAFE_DIAGNOSTIC_LINES_END\n'
+            printf 'SANITIZED_TAIL_BEGIN\n'
+            tail -n 140 collected/runner-console.log \
+              | sed -E 's#/home/runner/work/[^ :]+#<WORKSPACE>#g; s#/home/runner/\.cargo/[^ :]+#<CARGO_CACHE>#g; s#/tmp/[^ :]+#<TMP_PATH>#g'
+            printf 'SANITIZED_TAIL_END\n'
+            printf 'PAYLOAD_FILE_LIST_BEGIN\n'
+            find payload -maxdepth 5 -type f -printf '%P\n' | sort
+            printf 'PAYLOAD_FILE_LIST_END\n'
+            printf 'TEST_SOURCE_CONTEXT_BEGIN\n'
+            if [ -n "$TEST_FILE" ]; then
+              printf 'TEST_SOURCE_FILE=%s\n' "$(basename "$TEST_FILE")"
+              nl -ba "$TEST_FILE" | sed -n '1,380p'
+            else
+              printf 'TEST_SOURCE_FILE=NOT_FOUND\n'
+            fi
+            printf 'TEST_SOURCE_CONTEXT_END\n'
+          } > collected/public-safe-status.txt
+          exit 0
+
+      - name: Encrypt all evidence before upload
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted-output collected
+          if [ ! -f collected/runner-exit-code.txt ]; then
+            printf '%s\n' '125' > collected/runner-exit-code.txt
+            printf '%s\n' 'Execution did not create an exit record.' > collected/bootstrap-error.txt
+          fi
+          if [ ! -f collected/public-safe-status.txt ]; then
+            {
+              printf 'RUNNER_EXIT_CODE=%s\n' "$(cat collected/runner-exit-code.txt)"
+              printf 'EXECUTION_CLASS=BOOTSTRAP_FAILURE\n'
+              printf 'SAFE_DIAGNOSTIC_LINES_BEGIN\n'
+              printf 'Execution did not reach the proof step.\n'
+              printf 'SAFE_DIAGNOSTIC_LINES_END\n'
+            } > collected/public-safe-status.txt
+          fi
+          cp collected/runner-exit-code.txt encrypted-output/runner-exit-code.txt
+          cp collected/public-safe-status.txt encrypted-output/public-safe-status.txt
+          tar --sort=name --mtime='UTC 2026-07-26' --owner=0 --group=0 --numeric-owner \
+            -czf /tmp/evidence.tar.gz collected
+          sha256sum /tmp/evidence.tar.gz | awk '{print $1}' \
+            > encrypted-output/evidence-plaintext.sha256
+          openssl rand 32 > /tmp/output-key.bin
+          openssl rand 16 > /tmp/output-iv.bin
+          cat /tmp/output-key.bin /tmp/output-iv.bin > /tmp/output-keyinfo.bin
+          KEY=$(od -An -tx1 -v /tmp/output-key.bin | tr -d ' \n')
+          IV=$(od -An -tx1 -v /tmp/output-iv.bin | tr -d ' \n')
+          openssl enc -aes-256-cbc \
+            -K "$KEY" -iv "$IV" \
+            -in /tmp/evidence.tar.gz \
+            -out encrypted-output/evidence.tar.gz.enc
+          openssl pkeyutl -encrypt \
+            -pubin -inkey tmp-research/pyth-staking-slash-vote/output-public.pem \
+            -in /tmp/output-keyinfo.bin \
+            -out encrypted-output/evidence-keyinfo.enc \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          sha256sum encrypted-output/evidence.tar.gz.enc \
+            encrypted-output/evidence-keyinfo.enc \
+            encrypted-output/evidence-plaintext.sha256 \
+            encrypted-output/runner-exit-code.txt \
+            encrypted-output/public-safe-status.txt \
+            > encrypted-output/SHA256SUMS
+          rm -rf payload collected
+          rm -f /tmp/payload* /tmp/key* /tmp/iv.hex /tmp/patched-harness.sha256 \
+            /tmp/output-key.bin /tmp/output-iv.bin /tmp/output-keyinfo.bin \
+            /tmp/evidence.tar.gz /tmp/pyth-staking-slash-vote-private.pem
+
+      - name: Upload encrypted evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyth-staking-slash-vote-poc-${{ github.run_id }}
+          path: encrypted-output/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Enforce successful encrypted-only result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s encrypted-output/evidence.tar.gz.enc
+          test -s encrypted-output/evidence-keyinfo.enc
+          test -s encrypted-output/evidence-plaintext.sha256
+          test -s encrypted-output/runner-exit-code.txt
+          test -s encrypted-output/public-safe-status.txt
+          test -s encrypted-output/SHA256SUMS
+          grep -qx '0' encrypted-output/runner-exit-code.txt
+          grep -qx 'EXECUTION_CLASS=PASS' encrypted-output/public-safe-status.txt
+          test ! -e payload
+          test ! -e collected
