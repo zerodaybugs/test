@@ -1,0 +1,268 @@
+name: StackingDAO FOMO ownership liveness gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/stackingdao-fomo-owner-gate.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stackingdao-fomo-owner-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout workflow
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Query public FOMO state read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cd evidence
+          npm init -y >/dev/null 2>&1
+          npm install --no-save --package-lock=false @stacks/transactions@6.17.0 >/dev/null 2>&1
+
+          cat > query.mjs <<'NODE'
+          import {
+            contractPrincipalCV,
+            cvToHex,
+            cvToString,
+            hexToCV,
+            uintCV,
+          } from '@stacks/transactions';
+          import { writeFile } from 'node:fs/promises';
+
+          const address = 'SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG';
+          const api = 'https://api.mainnet.hiro.so';
+          const sender = address;
+          const games = [
+            { name: 'stacking-dao-fomo', nft: 'stacking-dao-fomo-nft', loserBps: 2500 },
+            { name: 'stacking-dao-fomo-v1', nft: 'stacking-dao-fomo-nft', loserBps: 2500 },
+            { name: 'stacking-dao-fomo-eoy-v1', nft: 'stacking-dao-fomo-eoy-nft', loserBps: 4500 },
+          ];
+
+          const out = {
+            captured_at: new Date().toISOString(),
+            api,
+            address,
+            games: {},
+            nft_contracts: {},
+            dao_flags: {},
+          };
+
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+          async function fetchJson(url, options = {}, attempts = 5) {
+            let last;
+            for (let i = 1; i <= attempts; i += 1) {
+              try {
+                const response = await fetch(url, options);
+                const text = await response.text();
+                if (!response.ok) throw new Error(`${response.status} ${response.statusText}: ${text}`);
+                return JSON.parse(text);
+              } catch (error) {
+                last = error;
+                if (i < attempts) await sleep(1200 * i);
+              }
+            }
+            throw last;
+          }
+
+          async function call(contract, fn, args = []) {
+            const body = JSON.stringify({ sender, arguments: args.map(cvToHex) });
+            const raw = await fetchJson(
+              `${api}/v2/contracts/call-read/${address}/${contract}/${fn}`,
+              { method: 'POST', headers: { 'content-type': 'application/json' }, body },
+            );
+            const decoded = raw.result ? cvToString(hexToCV(raw.result)) : null;
+            return { okay: Boolean(raw.okay), decoded, raw };
+          }
+
+          function firstUint(text) {
+            const match = String(text ?? '').match(/u(\d+)/);
+            return match ? Number(match[1]) : null;
+          }
+
+          function boolValue(text) {
+            if (text === 'true') return true;
+            if (text === 'false') return false;
+            return null;
+          }
+
+          async function daoFlag(name) {
+            const result = await call('dao', 'get-contract-active', [contractPrincipalCV(address, name)]);
+            out.dao_flags[name] = result;
+            return boolValue(result.decoded);
+          }
+
+          async function allTransactions(principal) {
+            const rows = [];
+            const limit = 50;
+            for (let offset = 0; offset < 5000; offset += limit) {
+              const page = await fetchJson(
+                `${api}/extended/v1/address/${principal}/transactions?limit=${limit}&offset=${offset}`,
+              );
+              rows.push(...(page.results ?? []));
+              if ((page.results ?? []).length < limit || rows.length >= (page.total ?? rows.length)) break;
+              await sleep(100);
+            }
+            return rows;
+          }
+
+          const nftNames = [...new Set(games.map(g => g.nft))];
+          for (const name of [...games.map(g => g.name), ...nftNames, 'ststx-token']) {
+            await daoFlag(name);
+          }
+
+          for (const nft of nftNames) {
+            const last = await call(nft, 'get-last-token-id');
+            const lastId = firstUint(last.decoded);
+            const owners = [];
+            const scanLimit = Math.min(lastId ?? 0, 2000);
+            for (let id = 0; id < scanLimit; id += 1) {
+              try {
+                const owner = await call(nft, 'get-owner', [uintCV(id)]);
+                if (owner.decoded && !owner.decoded.includes('none')) {
+                  owners.push({ id, owner: owner.decoded });
+                }
+              } catch (error) {
+                owners.push({ id, error: String(error) });
+              }
+              if (id > 0 && id % 100 === 0) await sleep(150);
+            }
+            out.nft_contracts[nft] = {
+              last,
+              last_id: lastId,
+              scan_limit: scanLimit,
+              scan_truncated: Number.isInteger(lastId) && lastId > scanLimit,
+              live_owner_count: owners.filter(x => x.owner).length,
+              live_owners: owners,
+            };
+          }
+
+          for (const game of games) {
+            const state = {};
+            for (const fn of [
+              'get-current-winner',
+              'get-claim-cost',
+              'get-increment',
+              'get-total-treasure',
+              'get-last-claim-burn-block-height',
+              'has-game-started',
+              'has-game-ended',
+            ]) {
+              try { state[fn] = await call(game.name, fn); }
+              catch (error) { state[fn] = { error: String(error) }; }
+            }
+
+            state.ststx_balance = await call(
+              'ststx-token',
+              'get-balance',
+              [contractPrincipalCV(address, game.name)],
+            );
+
+            const txs = await allTransactions(`${address}.${game.name}`);
+            const successfulCalls = txs.filter(tx =>
+              tx.tx_type === 'contract_call' && tx.tx_status === 'success'
+            );
+            const counts = {};
+            const recent = [];
+            for (const tx of successfulCalls) {
+              const fn = tx.contract_call?.function_name ?? 'unknown';
+              counts[fn] = (counts[fn] ?? 0) + 1;
+              if (recent.length < 100) {
+                recent.push({
+                  tx_id: tx.tx_id,
+                  function_name: fn,
+                  sender_address: tx.sender_address,
+                  burn_block_height: tx.burn_block_height,
+                  block_height: tx.block_height,
+                  block_time_iso: tx.block_time_iso,
+                });
+              }
+            }
+
+            const treasure = firstUint(state['get-total-treasure']?.decoded);
+            const balance = firstUint(state.ststx_balance?.decoded);
+            const minted = counts['buy-claim'] ?? 0;
+            const denominator = minted > 1 ? minted - 1 : null;
+            const computedLoserPool = Number.isInteger(treasure)
+              ? Math.floor(treasure * game.loserBps / 10000)
+              : null;
+            const computedAverage = Number.isInteger(computedLoserPool) && denominator
+              ? Math.floor(computedLoserPool / denominator)
+              : null;
+
+            out.games[game.name] = {
+              nft: game.nft,
+              loser_bps: game.loserBps,
+              state,
+              transaction_total: txs.length,
+              successful_call_counts: counts,
+              recent_successful_calls: recent,
+              inferred_minted_claims: minted,
+              inferred_loser_denominator: denominator,
+              computed_loser_pool_from_total_treasure: computedLoserPool,
+              computed_average_payout: computedAverage,
+              actual_ststx_balance: balance,
+              payout_funded_by_actual_balance: Number.isInteger(balance) && Number.isInteger(computedAverage)
+                ? balance >= computedAverage
+                : null,
+            };
+          }
+
+          await writeFile('snapshot.json', `${JSON.stringify(out, null, 2)}\n`);
+
+          const lines = [`captured_at=${out.captured_at}`];
+          for (const [name, flag] of Object.entries(out.dao_flags)) {
+            lines.push(`DAO ${name}=${flag.decoded}`);
+          }
+          for (const [name, nft] of Object.entries(out.nft_contracts)) {
+            lines.push(`NFT ${name} last_id=${nft.last_id} live_owner_count=${nft.live_owner_count} truncated=${nft.scan_truncated}`);
+            for (const item of nft.live_owners) {
+              lines.push(`NFT_OWNER ${name} id=${item.id} owner=${item.owner ?? item.error}`);
+            }
+          }
+          for (const [name, game] of Object.entries(out.games)) {
+            lines.push(`GAME ${name} started=${game.state['has-game-started']?.decoded} ended=${game.state['has-game-ended']?.decoded} total_treasure=${game.state['get-total-treasure']?.decoded} actual_ststx_balance=${game.state.ststx_balance?.decoded} buy_claims=${game.inferred_minted_claims} loser_avg=${game.computed_average_payout} funded=${game.payout_funded_by_actual_balance}`);
+            lines.push(`CALL_COUNTS ${name} ${JSON.stringify(game.successful_call_counts)}`);
+          }
+          await writeFile('snapshot.txt', `${lines.join('\n')}\n`);
+          console.log(lines.join('\n'));
+          NODE
+
+          node query.mjs
+          sha256sum snapshot.json snapshot.txt query.mjs > SHA256SUMS
+
+      - name: Upload read-only FOMO evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackingdao-fomo-owner-${{ github.run_id }}
+          path: |
+            evidence/snapshot.json
+            evidence/snapshot.txt
+            evidence/query.mjs
+            evidence/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Enforce evidence integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd evidence
+          sha256sum -c SHA256SUMS
+          grep -F 'GAME stacking-dao-fomo ' snapshot.txt
+          grep -F 'GAME stacking-dao-fomo-v1 ' snapshot.txt
+          grep -F 'GAME stacking-dao-fomo-eoy-v1 ' snapshot.txt
