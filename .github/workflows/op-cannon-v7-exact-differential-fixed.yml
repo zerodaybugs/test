@@ -1,0 +1,183 @@
+name: OP Cannon v7 exact Go-Solidity differential (fixed artifacts)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/op-cannon-v7-exact-differential-fixed.yml"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: op-cannon-v7-exact-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  differential:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      GOMAXPROCS: "2"
+      FOUNDRY_DISABLE_NIGHTLY_WARNING: "1"
+    steps:
+      - name: Checkout exact public source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ethereum-optimism/optimism
+          ref: op-contracts/v7.0.0
+          path: upstream
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Record immutable source lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          {
+            echo "source_tag=op-contracts/v7.0.0"
+            echo "source_commit=$(git -C upstream rev-parse HEAD)"
+            echo "source_tree=$(git -C upstream rev-parse HEAD^{tree})"
+          } | tee out/source-lock.txt
+
+      - name: Restore pinned Foundry and Solidity toolchains
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p tools/foundry tools/solc "$HOME/.svm"
+          touch "$HOME/.svm/.global-version"
+
+          curl --fail --location --retry 5 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/8724435663/zip" \
+            -o tools/foundry.zip
+          unzip -q tools/foundry.zip -d tools/foundry-wrapper
+          while IFS= read -r archive; do
+            tar -xzf "$archive" -C tools/foundry
+          done < <(find tools/foundry-wrapper -type f \( -name '*.tar.gz' -o -name '*.tgz' \) | sort)
+
+          curl --fail --location --retry 5 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/8724924958/zip" \
+            -o tools/solc.zip
+          unzip -q tools/solc.zip -d tools/solc-wrapper
+          while IFS= read -r archive; do
+            tar -xzf "$archive" -C tools/solc
+          done < <(find tools/solc-wrapper -type f \( -name '*.tar.gz' -o -name '*.tgz' \) | sort)
+
+          forge_bin="$(find tools/foundry -type f -name forge | head -n1)"
+          test -n "$forge_bin"
+          chmod +x "$forge_bin"
+          mkdir -p "$HOME/.local/bin"
+          cp "$forge_bin" "$HOME/.local/bin/forge"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+          found=0
+          while IFS= read -r solc_bin; do
+            version="$(basename "$solc_bin" | sed -E 's/^solc[-_]?//')"
+            case "$version" in
+              0.8.10|0.8.15|0.8.19|0.8.25)
+                mkdir -p "$HOME/.svm/$version"
+                cp "$solc_bin" "$HOME/.svm/$version/solc-$version"
+                chmod +x "$HOME/.svm/$version/solc-$version"
+                found=$((found + 1))
+                ;;
+            esac
+          done < <(find tools/solc -type f -name 'solc-*' | sort)
+          test "$found" -ge 4
+
+          forge --version | tee out/forge-version.txt
+          for version in 0.8.10 0.8.15 0.8.19 0.8.25; do
+            "$HOME/.svm/$version/solc-$version" --version | tee -a out/solc-versions.txt
+          done
+
+      - name: Prepare generated Superchain data
+        shell: bash
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          if [ ! -f op-core/superchain/superchain-configs.zip ]; then
+            ./op-core/superchain/sync-superchain.sh
+          fi
+          sha256sum op-core/superchain/superchain-configs.zip | tee ../out/superchain-configs.sha256
+
+      - name: Build exact Cannon contracts and assert artifact presence
+        shell: bash
+        working-directory: upstream/packages/contracts-bedrock
+        env:
+          FOUNDRY_OFFLINE: "true"
+        run: |
+          set -euo pipefail
+          forge build --offline src/cannon/MIPS64.sol src/cannon/PreimageOracle.sol \
+            2>&1 | tee ../../../out/forge-build.log
+          test -s forge-artifacts/MIPS64.sol/MIPS64.json
+          test -s forge-artifacts/PreimageOracle.sol/PreimageOracle.json
+          sha256sum \
+            forge-artifacts/MIPS64.sol/MIPS64.json \
+            forge-artifacts/PreimageOracle.sol/PreimageOracle.json \
+            | tee ../../../out/forge-artifacts.sha256
+
+      - name: Run exact Go-to-Solidity MIPS64 differential suite
+        shell: bash
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          go test ./cannon/mipsevm/tests \
+            -run '^TestEVM_' \
+            -count=1 \
+            -timeout=90m \
+            -v 2>&1 | tee ../out/mips64-go-solidity-differential.log
+
+      - name: Run deterministic MIPS state, memory, syscall, and concurrency suites
+        shell: bash
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          go test ./cannon/mipsevm/... \
+            -run '^(Test|Example)' \
+            -count=1 \
+            -timeout=90m \
+            2>&1 | tee ../out/mips64-deterministic.log
+
+      - name: Repeat high-risk differential subsets
+        shell: bash
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          go test ./cannon/mipsevm/tests \
+            -run '^(TestEVM_SingleStep_|TestEVM_MT64_|TestEVM_MT_StoreOpsClearMemReservation64|TestEVM_SysGetRandom|TestEVM_MT_SysRead_Preimage64|TestEVM_EmptyThreadStacks|TestEVM_SchedQuantumThreshold)' \
+            -count=100 \
+            -timeout=110m \
+            2>&1 | tee ../out/mips64-repeat-100.log
+
+      - name: Record evidence integrity
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "runner=$(uname -a)"
+            echo "go=$(go version)"
+            echo "source_commit=$(git -C upstream rev-parse HEAD 2>/dev/null || true)"
+          } | tee out/environment.txt
+          find out -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > out/SHA256SUMS
+
+      - name: Upload exact differential evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: op-cannon-v7-exact-differential-fixed
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
