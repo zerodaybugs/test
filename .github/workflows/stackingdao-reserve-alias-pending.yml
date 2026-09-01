@@ -1,0 +1,150 @@
+name: StackingDAO reserve alias pending snapshot
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/stackingdao-reserve-alias-pending.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout workflow
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Query reserve aliases read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cd evidence
+          npm init -y >/dev/null 2>&1
+          npm install --no-save --package-lock=false @stacks/transactions@6.17.0 >/dev/null 2>&1
+          cat > query.mjs <<'NODE'
+          import { contractPrincipalCV, cvToHex, cvToString, hexToCV } from '@stacks/transactions';
+          import { writeFile } from 'node:fs/promises';
+
+          const owner = 'SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG';
+          const tracking = `${owner}.ststxbtc-tracking-v2`;
+          const data = `${owner}.ststxbtc-tracking-data-v2`;
+          const token = `${owner}.ststxbtc-token-v2`;
+          const api = 'https://api.mainnet.hiro.so';
+          const positions = [
+            {
+              name: 'zest-v2',
+              helper: `${owner}.position-zest-v2`,
+              reserve: 'SP2VCQJGH7PHP2DJK7Z0V48AGBHQAW3R3ZW1QF4N.pool-vault',
+            },
+            {
+              name: 'zest-v6',
+              helper: `${owner}.position-zest-v6`,
+              reserve: 'SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-vault-ststxbtc',
+            },
+          ];
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+          function cvPrincipal(value) {
+            const clean = value.replace(/^'/, '');
+            const dot = clean.indexOf('.');
+            return contractPrincipalCV(clean.slice(0, dot), clean.slice(dot + 1));
+          }
+
+          async function request(url, options = {}, attempts = 8) {
+            let last;
+            for (let attempt = 1; attempt <= attempts; attempt += 1) {
+              try {
+                const response = await fetch(url, options);
+                const text = await response.text();
+                if (!response.ok) {
+                  const retryAfter = Number(response.headers.get('retry-after') ?? 0);
+                  if ((response.status === 429 || response.status >= 500) && attempt < attempts) {
+                    await sleep(Math.max(attempt * 1500, retryAfter * 1000));
+                    continue;
+                  }
+                  throw new Error(`${response.status}: ${text}`);
+                }
+                return JSON.parse(text);
+              } catch (error) {
+                last = error;
+                if (attempt < attempts) await sleep(attempt * 1500);
+              }
+            }
+            throw last;
+          }
+
+          function splitContract(id) {
+            const dot = id.indexOf('.');
+            return [id.slice(0, dot), id.slice(dot + 1)];
+          }
+
+          async function call(contractId, fn, args = []) {
+            const [address, name] = splitContract(contractId);
+            const body = JSON.stringify({ sender: owner, arguments: args.map(cvToHex) });
+            const json = await request(
+              `${api}/v2/contracts/call-read/${address}/${name}/${fn}`,
+              { method: 'POST', headers: { 'content-type': 'application/json' }, body },
+            );
+            if (!json.result) throw new Error(`${contractId}.${fn}: ${JSON.stringify(json)}`);
+            return { decoded: cvToString(hexToCV(json.result)), raw: json };
+          }
+
+          const output = { captured_at: new Date().toISOString(), rows: [] };
+          for (const entry of positions) {
+            const reserveCV = cvPrincipal(entry.reserve);
+            const helperCV = cvPrincipal(entry.helper);
+            output.rows.push({
+              ...entry,
+              helper_supported: await call(data, 'get-supported-positions', [helperCV]),
+              reserve_supported: await call(data, 'get-supported-positions', [reserveCV]),
+              reserve_record: await call(data, 'get-holder-position', [reserveCV, reserveCV]),
+              reserve_pending: await call(tracking, 'get-pending-rewards', [reserveCV, reserveCV]),
+              reserve_token_balance: await call(token, 'get-balance', [reserveCV]),
+              helper_record: await call(data, 'get-holder-position', [helperCV, helperCV]),
+              helper_pending: await call(tracking, 'get-pending-rewards', [helperCV, helperCV]),
+              helper_token_balance: await call(token, 'get-balance', [helperCV]),
+            });
+            await sleep(250);
+          }
+          await writeFile('snapshot.json', `${JSON.stringify(output, null, 2)}\n`);
+          const lines = [`captured_at=${output.captured_at}`];
+          for (const row of output.rows) {
+            lines.push(`POSITION ${row.name}`);
+            lines.push(`helper=${row.helper}`);
+            lines.push(`reserve=${row.reserve}`);
+            lines.push(`helper_supported=${row.helper_supported.decoded}`);
+            lines.push(`reserve_supported=${row.reserve_supported.decoded}`);
+            lines.push(`reserve_record=${row.reserve_record.decoded}`);
+            lines.push(`reserve_pending=${row.reserve_pending.decoded}`);
+            lines.push(`reserve_token_balance=${row.reserve_token_balance.decoded}`);
+            lines.push(`helper_record=${row.helper_record.decoded}`);
+            lines.push(`helper_pending=${row.helper_pending.decoded}`);
+            lines.push(`helper_token_balance=${row.helper_token_balance.decoded}`);
+          }
+          await writeFile('snapshot.txt', `${lines.join('\n')}\n`);
+          console.log(lines.join('\n'));
+          NODE
+          node query.mjs
+          sha256sum snapshot.json snapshot.txt query.mjs > SHA256SUMS
+
+      - name: Upload reserve alias evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackingdao-reserve-alias-pending-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Enforce snapshot integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s evidence/snapshot.json
+          grep -q '^reserve_pending=' evidence/snapshot.txt

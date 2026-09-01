@@ -1,0 +1,283 @@
+name: StackingDAO supported-position liveness snapshot
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/stackingdao-supported-position-liveness.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stackingdao-supported-positions-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout workflow
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Query supported positions and reward funding read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/sources
+          cd evidence
+          npm init -y >/dev/null 2>&1
+          npm install --no-save --package-lock=false @stacks/transactions@6.17.0 >/dev/null 2>&1
+
+          cat > query.mjs <<'NODE'
+          import {
+            contractPrincipalCV,
+            cvToHex,
+            cvToString,
+            hexToCV,
+            standardPrincipalCV,
+          } from '@stacks/transactions';
+          import { writeFile } from 'node:fs/promises';
+
+          const stackingAddress = 'SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG';
+          const tracking = `${stackingAddress}.ststxbtc-tracking-v2`;
+          const trackingData = `${stackingAddress}.ststxbtc-tracking-data-v2`;
+          const token = `${stackingAddress}.ststxbtc-token-v2`;
+          const sbtcAddress = 'SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4';
+          const sbtc = `${sbtcAddress}.sbtc-token`;
+          const api = 'https://api.mainnet.hiro.so';
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+          async function fetchJson(url, options = {}, attempts = 8) {
+            let last;
+            for (let attempt = 1; attempt <= attempts; attempt += 1) {
+              try {
+                const response = await fetch(url, options);
+                const text = await response.text();
+                if (!response.ok) {
+                  const retryAfter = Number(response.headers.get('retry-after') ?? 0);
+                  if ((response.status === 429 || response.status >= 500) && attempt < attempts) {
+                    await sleep(Math.max(retryAfter * 1000, attempt * 1800));
+                    continue;
+                  }
+                  throw new Error(`${response.status} ${response.statusText}: ${text}`);
+                }
+                return JSON.parse(text);
+              } catch (error) {
+                last = error;
+                if (attempt < attempts) await sleep(attempt * 1800);
+              }
+            }
+            throw last;
+          }
+
+          function splitContract(id) {
+            const dot = id.indexOf('.');
+            if (dot < 1) throw new Error(`Not a contract principal: ${id}`);
+            return [id.slice(0, dot), id.slice(dot + 1)];
+          }
+
+          function principalCV(repr) {
+            const clean = String(repr).replace(/^'/, '');
+            const dot = clean.indexOf('.');
+            return dot > 0
+              ? contractPrincipalCV(clean.slice(0, dot), clean.slice(dot + 1))
+              : standardPrincipalCV(clean);
+          }
+
+          async function callRead(contractId, fn, args = []) {
+            const [address, name] = splitContract(contractId);
+            const body = JSON.stringify({ sender: stackingAddress, arguments: args.map(cvToHex) });
+            const json = await fetchJson(
+              `${api}/v2/contracts/call-read/${address}/${name}/${fn}`,
+              { method: 'POST', headers: { 'content-type': 'application/json' }, body },
+            );
+            if (!json.result) throw new Error(`${contractId}.${fn}: ${JSON.stringify(json)}`);
+            return { decoded: cvToString(hexToCV(json.result)), raw: json };
+          }
+
+          async function fetchTransactions(principal, maxRows = 2500) {
+            const output = [];
+            const limit = 50;
+            let offset = 0;
+            let total = Infinity;
+            while (offset < total && output.length < maxRows) {
+              const page = await fetchJson(
+                `${api}/extended/v2/addresses/${principal}/transactions?limit=${limit}&offset=${offset}`,
+              );
+              const rows = page.results ?? [];
+              output.push(...rows);
+              total = Number(page.total ?? output.length);
+              if (rows.length === 0) break;
+              offset += rows.length;
+              await sleep(250);
+            }
+            return { output, total };
+          }
+
+          function coreTx(row) {
+            return row.tx ?? row;
+          }
+
+          function normalizedCall(row) {
+            const tx = coreTx(row);
+            return tx.contract_call ?? row.contract_call ?? null;
+          }
+
+          function txStatus(row) {
+            const tx = coreTx(row);
+            return tx.tx_status ?? row.tx_status ?? null;
+          }
+
+          function txId(row) {
+            const tx = coreTx(row);
+            return tx.tx_id ?? row.tx_id ?? null;
+          }
+
+          function blockTime(row) {
+            const tx = coreTx(row);
+            return tx.burn_block_time_iso ?? tx.block_time_iso ?? row.burn_block_time_iso ?? row.block_time_iso ?? null;
+          }
+
+          function argRepr(call, index) {
+            const arg = call?.function_args?.[index];
+            return arg?.repr ?? arg?.name ?? arg?.hex ?? null;
+          }
+
+          const txPage = await fetchTransactions(tracking);
+          const relevantCalls = [];
+          const positionPrincipals = new Set();
+          const activityCounts = {};
+
+          for (const row of txPage.output) {
+            const call = normalizedCall(row);
+            if (!call || call.contract_id !== tracking) continue;
+            const fn = call.function_name ?? 'unknown';
+            activityCounts[fn] = (activityCounts[fn] ?? 0) + 1;
+            const normalized = {
+              tx_id: txId(row),
+              status: txStatus(row),
+              block_time_iso: blockTime(row),
+              function_name: fn,
+              function_args: call.function_args ?? [],
+              sender_address: coreTx(row).sender_address ?? row.sender_address ?? null,
+            };
+            if (['set-supported-positions', 'refresh-position', 'add-rewards', 'claim-pending-rewards'].includes(fn)) {
+              relevantCalls.push(normalized);
+            }
+            if (fn === 'set-supported-positions') {
+              const position = argRepr(call, 0);
+              if (position) positionPrincipals.add(String(position).replace(/^'/, ''));
+            }
+            if (fn === 'refresh-position') {
+              const position = argRepr(call, 1);
+              if (position) positionPrincipals.add(String(position).replace(/^'/, ''));
+            }
+          }
+
+          const current = {
+            claims_enabled: await callRead(tracking, 'get-claims-enabled'),
+            tracked_total_supply: await callRead(trackingData, 'get-total-supply'),
+            cumulative_reward: await callRead(trackingData, 'get-cumm-reward'),
+            next_holder_index: await callRead(trackingData, 'get-next-holder-index'),
+            tracking_sbtc_balance: await callRead(sbtc, 'get-balance', [principalCV(tracking)]),
+            tracking_ststxbtc_balance: await callRead(token, 'get-balance', [principalCV(tracking)]),
+          };
+
+          const positions = [];
+          for (const principal of [...positionPrincipals].sort()) {
+            const item = { principal };
+            try {
+              item.current_supported_state = await callRead(
+                trackingData,
+                'get-supported-positions',
+                [principalCV(principal)],
+              );
+            } catch (error) {
+              item.current_supported_state_error = String(error);
+            }
+            try {
+              item.position_ststxbtc_balance = await callRead(
+                token,
+                'get-balance',
+                [principalCV(principal)],
+              );
+            } catch (error) {
+              item.position_ststxbtc_balance_error = String(error);
+            }
+            try {
+              const [address, name] = splitContract(principal);
+              const source = await fetchJson(`${api}/v2/contracts/source/${address}/${name}?proof=0`);
+              item.source_available = typeof source.source === 'string';
+              item.publish_height = source.publish_height ?? null;
+              item.clarity_version = source.clarity_version ?? null;
+              if (item.source_available) {
+                await writeFile(`sources/${address}.${name}.clar`, `${source.source}\n`);
+              }
+            } catch (error) {
+              item.source_available = false;
+              item.source_error = String(error);
+            }
+            positions.push(item);
+            await sleep(250);
+          }
+
+          const output = {
+            captured_at: new Date().toISOString(),
+            api,
+            tracking,
+            transaction_rows_fetched: txPage.output.length,
+            transaction_rows_reported_total: txPage.total,
+            activity_counts: activityCounts,
+            relevant_calls: relevantCalls,
+            current,
+            positions,
+          };
+          await writeFile('snapshot.json', `${JSON.stringify(output, null, 2)}\n`);
+
+          const lines = [
+            `captured_at=${output.captured_at}`,
+            `transaction_rows_fetched=${output.transaction_rows_fetched}`,
+            `transaction_rows_reported_total=${output.transaction_rows_reported_total}`,
+            `claims_enabled=${current.claims_enabled.decoded}`,
+            `tracked_total_supply=${current.tracked_total_supply.decoded}`,
+            `cumulative_reward=${current.cumulative_reward.decoded}`,
+            `next_holder_index=${current.next_holder_index.decoded}`,
+            `tracking_sbtc_balance=${current.tracking_sbtc_balance.decoded}`,
+            `tracking_ststxbtc_balance=${current.tracking_ststxbtc_balance.decoded}`,
+            ...Object.entries(activityCounts).sort().map(([fn, count]) => `activity_${fn}=${count}`),
+            ...positions.map(item =>
+              `POSITION ${item.principal} state=${item.current_supported_state?.decoded ?? item.current_supported_state_error} ` +
+              `token_balance=${item.position_ststxbtc_balance?.decoded ?? item.position_ststxbtc_balance_error} ` +
+              `source=${item.source_available ? 'yes' : 'no'}`,
+            ),
+          ];
+          await writeFile('snapshot.txt', `${lines.join('\n')}\n`);
+          console.log(lines.join('\n'));
+          NODE
+
+          node query.mjs
+          find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+
+      - name: Upload supported-position evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackingdao-supported-position-liveness-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          include-hidden-files: true
+          compression-level: 6
+          retention-days: 1
+
+      - name: Enforce snapshot integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s evidence/snapshot.json
+          test -s evidence/snapshot.txt
+          test -s evidence/SHA256SUMS
+          grep -Fx 'claims_enabled=true' evidence/snapshot.txt
