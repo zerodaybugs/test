@@ -1,0 +1,148 @@
+name: Export official .NET 10 source and toolchain 20260819
+
+on:
+  push:
+    branches:
+      - agent/dotnet10-source-toolchain-20260819-exec
+    paths:
+      - '.github/workflows/dotnet10-source-toolchain-20260819.yml'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dotnet10-source-toolchain-20260819-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve official release metadata
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p export/source export/toolchain export/metadata
+          curl --fail --location --retry 5 --retry-all-errors \
+            -o export/metadata/releases.json \
+            https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json
+          python3 - <<'PY'
+          import json, pathlib
+          root = pathlib.Path('export')
+          data = json.loads((root/'metadata/releases.json').read_text())
+          release = next(r for r in data['releases'] if r['release-version'] == data['latest-release'])
+          sdk = release['sdk']
+          sdk_file = next(f for f in sdk['files'] if f['rid'] == 'linux-x64' and f['name'] == 'dotnet-sdk-linux-x64.tar.gz')
+          runtime = release['runtime']
+          runtime_file = next(f for f in runtime['files'] if f['rid'] == 'linux-x64' and f['name'] == 'dotnet-runtime-linux-x64.tar.gz')
+          asp = release['aspnetcore-runtime']
+          asp_file = next(f for f in asp['files'] if f['rid'] == 'linux-x64' and f['name'] == 'aspnetcore-runtime-linux-x64.tar.gz')
+          resolved = {
+              'release_version': release['release-version'],
+              'release_date': release['release-date'],
+              'sdk': {'version': sdk['version'], **sdk_file},
+              'runtime': {'version': runtime['version'], **runtime_file},
+              'aspnetcore_runtime': {'version': asp['version'], **asp_file},
+          }
+          (root/'metadata/resolved.json').write_text(json.dumps(resolved, indent=2)+'\n')
+          for key in ('sdk','runtime','aspnetcore_runtime'):
+              item = resolved[key]
+              print(f"{key.upper()}_VERSION={item['version']}")
+              print(f"{key.upper()}_URL={item['url']}")
+              print(f"{key.upper()}_HASH={item['hash']}")
+          PY
+
+      - name: Download and verify official toolchain archives
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import hashlib, json, pathlib, urllib.request
+          root = pathlib.Path('export')
+          data = json.loads((root/'metadata/resolved.json').read_text())
+          for key in ('sdk','runtime','aspnetcore_runtime'):
+              item=data[key]
+              filename=item['url'].rsplit('/',1)[-1]
+              out=root/'toolchain'/filename
+              urllib.request.urlretrieve(item['url'], out)
+              got=hashlib.sha512(out.read_bytes()).hexdigest()
+              expected=item['hash'].lower()
+              if got != expected:
+                  raise SystemExit(f'SHA512 mismatch for {filename}: {got} != {expected}')
+              print(filename, out.stat().st_size, got)
+          PY
+
+      - name: Download exact ASP.NET Core source tags and current branch snapshot
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          curl --fail --location --retry 5 --retry-all-errors \
+            -o export/source/aspnetcore-v10.0.9.tar.gz \
+            https://codeload.github.com/dotnet/aspnetcore/tar.gz/refs/tags/v10.0.9
+          curl --fail --location --retry 5 --retry-all-errors \
+            -o export/source/aspnetcore-v10.0.10.tar.gz \
+            https://codeload.github.com/dotnet/aspnetcore/tar.gz/refs/tags/v10.0.10
+          curl --fail --location --retry 5 --retry-all-errors \
+            -o export/source/aspnetcore-main.tar.gz \
+            https://codeload.github.com/dotnet/aspnetcore/tar.gz/refs/heads/main
+          python3 - <<'PY'
+          import hashlib, json, pathlib, tarfile
+          root=pathlib.Path('export')
+          rows=[]
+          for p in sorted((root/'source').glob('*.tar.gz')):
+              with tarfile.open(p, 'r:gz') as tf:
+                  roots=sorted({m.name.split('/',1)[0] for m in tf.getmembers() if m.name})
+              rows.append({'name':p.name,'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'roots':roots})
+          (root/'metadata/source-manifest.json').write_text(json.dumps(rows, indent=2)+'\n')
+          PY
+
+      - name: Validate extracted SDK/runtime identity
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sdk_archive="$(find export/toolchain -maxdepth 1 -name 'dotnet-sdk-*-linux-x64.tar.gz' -print -quit)"
+          test -n "$sdk_archive"
+          mkdir -p export/sdk
+          tar -xzf "$sdk_archive" -C export/sdk
+          export DOTNET_ROOT="$PWD/export/sdk"
+          export PATH="$DOTNET_ROOT:$PATH"
+          expected_sdk="$(python3 -c "import json; print(json.load(open('export/metadata/resolved.json'))['sdk']['version'])")"
+          expected_runtime="$(python3 -c "import json; print(json.load(open('export/metadata/resolved.json'))['runtime']['version'])")"
+          dotnet --info | tee export/metadata/dotnet-info.txt
+          dotnet --list-sdks | tee export/metadata/dotnet-sdks.txt
+          dotnet --list-runtimes | tee export/metadata/dotnet-runtimes.txt
+          dotnet --version | grep -Fx "$expected_sdk"
+          dotnet --list-runtimes | grep -F "Microsoft.NETCore.App $expected_runtime"
+          dotnet --list-runtimes | grep -F "Microsoft.AspNetCore.App $expected_runtime"
+          rm -rf export/sdk
+
+      - name: Create integrity manifests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          (cd export && find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt)
+          python3 - <<'PY'
+          import hashlib, json, pathlib
+          root=pathlib.Path('export')
+          rows=[]
+          for p in sorted(root.rglob('*')):
+              if p.is_file() and p.name != 'MANIFEST.json':
+                  rows.append({'path':p.relative_to(root).as_posix(),'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()})
+          (root/'MANIFEST.json').write_text(json.dumps({'schema':'dotnet10-source-toolchain-export/v2','files':rows},indent=2)+'\n')
+          PY
+
+      - name: Upload export
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet10-source-toolchain-20260819
+          path: export
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
