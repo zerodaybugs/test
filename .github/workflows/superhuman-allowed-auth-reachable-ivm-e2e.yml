@@ -1,0 +1,157 @@
+name: Superhuman uploadable allowed-auth metadata isolated-vm gate
+
+on:
+  push:
+    branches: [research/superhuman-allowed-auth-e2e-20260809]
+    paths: [.github/workflows/superhuman-allowed-auth-reachable-ivm-e2e.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+
+      - name: Install exact stable SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf reachable-ivm
+          mkdir -p reachable-ivm/evidence public-intake-status
+          cd reachable-ivm
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund @codahq/packs-sdk@1.17.1
+
+      - name: Execute uploadable formula and sync metadata paths in the official isolate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd reachable-ivm
+          cat > pack-bundle.js <<'PACK'
+          const DEFAULT = 'defaultUserAuthentication';
+          module.exports = {pack: {
+            defaultAuthentication: {type:'HeaderBearerToken'},
+            systemConnectionAuthentication: {type:'HeaderBearerToken'},
+            adminAuthentications: [{
+              name:'LabAdmin', displayName:'Lab Admin', description:'Synthetic admin auth', isServiceAccount:true,
+              authentication:{type:'HeaderBearerToken', canSyncPermissions:true},
+            }],
+            formulas:[{
+              name:'RestrictedAction', description:'Restricted standard formula', resultType:'string',
+              connectionRequirement:'required', allowedAuthenticationNames:[DEFAULT],
+              parameters:[{
+                name:'target', type:'string', description:'Synthetic target',
+                autocomplete:{execute:async(_params,context)=>{
+                  const r=await context.fetcher.fetch({method:'GET',url:globalThis.__LAB_BASE_URL+'/formula-autocomplete'});
+                  return [{display:r.body.sentinel,value:r.body.sentinel}];
+                }},
+              }],
+              execute:async(_params,context)=>{
+                const r=await context.fetcher.fetch({method:'GET',url:globalThis.__LAB_BASE_URL+'/standard'});
+                return r.body.sentinel;
+              },
+            }],
+            syncTables:[{
+              name:'RestrictedItems', identityName:'RestrictedItem',
+              schema:{type:'object',id:'id',primary:'name',properties:{id:{type:'string',required:true},name:{type:'string',required:true}}},
+              getter:{
+                name:'SyncRestrictedItems', description:'Restricted sync formula', connectionRequirement:'required',
+                allowedAuthenticationNames:[DEFAULT],
+                parameters:[{
+                  name:'filter', type:'string', description:'Synthetic filter',
+                  autocomplete:{execute:async(_params,context)=>{
+                    const r=await context.fetcher.fetch({method:'GET',url:globalThis.__LAB_BASE_URL+'/sync-autocomplete'});
+                    return [{display:r.body.sentinel,value:r.body.sentinel}];
+                  }},
+                }],
+                validateParameters:{execute:async(_params,context)=>{
+                  const r=await context.fetcher.fetch({method:'GET',url:globalThis.__LAB_BASE_URL+'/sync-validate'});
+                  return {isValid:true,message:r.body.sentinel};
+                }},
+                execute:async(_params,context)=>{
+                  const r=await context.fetcher.fetch({method:'GET',url:globalThis.__LAB_BASE_URL+'/sync'});
+                  return {result:[],continuation:{sentinel:r.body.sentinel}};
+                },
+              },
+            }],
+          }};
+          PACK
+          printf '%s\n' '{"version":3,"file":"pack-bundle.js","sources":["pack-source.js"],"names":[],"mappings":""}' > pack-bundle.js.map
+          cat > gate.js <<'NODE'
+          'use strict';
+          const assert=require('assert'),crypto=require('crypto'),fs=require('fs'),http=require('http'),path=require('path');
+          const sdkRoot=path.dirname(require.resolve('@codahq/packs-sdk/package.json'));
+          const bootstrap=require(path.join(sdkRoot,'dist/runtime/bootstrap/index.js'));
+          const {AuthenticatingFetcher}=require(path.join(sdkRoot,'dist/testing/fetcher.js'));
+          const thunkPath=bootstrap.getThunkPath(),packPath=path.resolve('pack-bundle.js'),mapPath=path.resolve('pack-bundle.js.map');
+          const DEFAULT='defaultUserAuthentication',SYSTEM='systemAuthentication',ADMIN='LabAdmin';
+          const TOKENS={[DEFAULT]:'LAB_DEFAULT_BEARER_20260809',[SYSTEM]:'LAB_SYSTEM_BEARER_20260809',[ADMIN]:'LAB_ADMIN_BEARER_20260809'};
+          const SENTINELS={[DEFAULT]:'LAB_DEFAULT_PRIVATE_DATA_20260809',[SYSTEM]:'LAB_SYSTEM_PRIVATE_DATA_20260809',[ADMIN]:'LAB_ADMIN_PRIVATE_DATA_20260809'};
+          const captured=[];let server;
+          const logger={trace(){},debug(){},info(){},warn(){},error(){}};
+          const blob={async storeUrl(){throw new Error('unused')},async storeBlob(){throw new Error('unused')}};
+          const listen=s=>new Promise((ok,no)=>{s.once('error',no);s.listen(0,'127.0.0.1',()=>ok(s.address().port));});
+          const close=s=>new Promise(ok=>s.close(()=>ok()));
+          function principalFor(value){for(const [name,token] of Object.entries(TOKENS)){if(value===`Bearer ${token}`)return name;}return 'unknown';}
+          async function runtime(principal,baseUrl,port){
+            const isolate=bootstrap.createIsolate({memoryLimit:64});const context=await bootstrap.createIsolateContext(isolate);
+            await bootstrap.registerBundles(isolate,context,packPath,thunkPath,true);await context.global.set('__LAB_BASE_URL',baseUrl,{copy:true});
+            const fetcher=new AuthenticatingFetcher(()=>{}, {type:'HeaderBearerToken'}, [`127.0.0.1:${port}`], {token:TOKENS[principal]}, `LAB_INV_${principal}`);
+            await bootstrap.injectExecutionContext({context,fetcher,temporaryBlobStorage:blob,syncStateService:undefined,logger,endpoint:undefined,invocationLocation:{protocolAndHost:'https://coda.io'},timezone:'UTC',invocationToken:`LAB_INV_${principal}`,sync:undefined,authenticationName:principal,executionId:`LAB_EXEC_${principal}`,previousAttemptError:undefined});
+            return {isolate,context};
+          }
+          const invoke=(rt,spec)=>bootstrap.executeThunk(rt.context,{params:[],formulaSpec:spec},packPath,mapPath);
+          async function expectBlocked(rt,spec,principal,label){const before=captured.length;let error;try{await invoke(rt,spec)}catch(e){error=e}assert(error,`${label} unexpectedly succeeded for ${principal}`);assert.match(error.message,/not allowed for connection with authentication/);assert.equal(captured.length,before);return error.message;}
+          async function testDisallowed(rt,principal){
+            const standardError=await expectBlocked(rt,{type:'Standard',formulaName:'RestrictedAction'},principal,'standard');
+            const syncError=await expectBlocked(rt,{type:'Sync',formulaName:'RestrictedItems'},principal,'sync');
+            const start=captured.length,expected=SENTINELS[principal];
+            const formulaAutocomplete=await invoke(rt,{type:'Metadata',metadataFormulaType:'ParameterAutocomplete',parentFormulaName:'RestrictedAction',parentFormulaType:'Standard',parameterName:'target'});
+            const syncAutocomplete=await invoke(rt,{type:'Metadata',metadataFormulaType:'ParameterAutocomplete',parentFormulaName:'SyncRestrictedItems',parentFormulaType:'Sync',parameterName:'filter'});
+            const syncValidation=await invoke(rt,{type:'Metadata',metadataFormulaType:'ValidateParameters',parentFormulaName:'SyncRestrictedItems',parentFormulaType:'Sync'});
+            assert.equal(formulaAutocomplete[0].value,expected);assert.equal(syncAutocomplete[0].value,expected);assert.equal(syncValidation.message,expected);
+            const requests=captured.slice(start);assert.equal(requests.length,3);assert(requests.every(r=>r.principal===principal));
+            return {standardError,syncError,formulaAutocomplete,syncAutocomplete,syncValidation,requests};
+          }
+          async function main(){
+            server=http.createServer((req,res)=>{const authorization=req.headers.authorization||'',principal=principalFor(authorization);captured.push({method:req.method,url:req.url,authorization,principal});res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({principal,sentinel:SENTINELS[principal]||'UNKNOWN'}));});
+            const port=await listen(server),baseUrl=`http://127.0.0.1:${port}`;
+            const def=await runtime(DEFAULT,baseUrl,port),sys=await runtime(SYSTEM,baseUrl,port),adm=await runtime(ADMIN,baseUrl,port);
+            const defaultStandard=await invoke(def,{type:'Standard',formulaName:'RestrictedAction'});assert.equal(defaultStandard,SENTINELS[DEFAULT]);
+            const defaultSync=await invoke(def,{type:'Sync',formulaName:'RestrictedItems'});assert.equal(defaultSync.continuation.sentinel,SENTINELS[DEFAULT]);
+            const system=await testDisallowed(sys,SYSTEM),admin=await testDisallowed(adm,ADMIN);
+            const result={pass:true,sdkVersion:require(path.join(sdkRoot,'package.json')).version,isolatedVmVersion:require('isolated-vm/package.json').version,nodeVersion:process.version,thunkBundleSha256:crypto.createHash('sha256').update(fs.readFileSync(thunkPath)).digest('hex'),canonicalPath:'createIsolateContext -> registerBundles -> injectExecutionContext -> executeThunk -> findAndExecutePackFunction',uploadablePaths:['Standard parameter autocomplete','Sync parameter autocomplete','Sync validateParameters'],positiveControls:{defaultStandard,defaultSync},disallowedPrincipals:{systemAuthentication:system,LabAdmin:admin},capturedRequestCount:captured.length,captured,syntheticOnly:true,productionRequestCount:0};
+            fs.writeFileSync('evidence/RESULT.json',JSON.stringify(result,null,2)+'\n');def.isolate.dispose();sys.isolate.dispose();adm.isolate.dispose();
+          }
+          main().then(async()=>{await close(server);console.log(fs.readFileSync('evidence/RESULT.json','utf8'))}).catch(async e=>{try{if(server)await close(server)}catch(_){};console.error(e&&e.stack||e);process.exit(1)});
+          NODE
+          node gate.js | tee evidence/TEST_OUTPUT.txt
+          jq -e '.pass == true and .capturedRequestCount == 8 and .isolatedVmVersion == "6.0.2" and (.uploadablePaths|length) == 3' evidence/RESULT.json >/dev/null
+          sha256sum gate.js pack-bundle.js pack-bundle.js.map package.json package-lock.json node_modules/@codahq/packs-sdk/bundles/thunk_bundle.js evidence/RESULT.json evidence/TEST_OUTPUT.txt > evidence/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-allowed-auth-metadata-uploadable-ivm-e2e
+          path: reachable-ivm/evidence/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Commit compact result
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq '{pass,sdkVersion,isolatedVmVersion,nodeVersion,thunkBundleSha256,canonicalPath,uploadablePaths,positiveControls,capturedRequestCount,syntheticOnly,productionRequestCount,disallowedPrincipals:{systemAuthentication:{standardError:.disallowedPrincipals.systemAuthentication.standardError,syncError:.disallowedPrincipals.systemAuthentication.syncError,requestCount:(.disallowedPrincipals.systemAuthentication.requests|length)},LabAdmin:{standardError:.disallowedPrincipals.LabAdmin.standardError,syncError:.disallowedPrincipals.LabAdmin.syncError,requestCount:(.disallowedPrincipals.LabAdmin.requests|length)}}}' reachable-ivm/evidence/RESULT.json > public-intake-status/superhuman-allowed-auth-metadata-uploadable-ivm-e2e.json
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-allowed-auth-metadata-uploadable-ivm-e2e.json
+          git commit -m 'chore: record uploadable allowed-auth isolate gate'
+          git push

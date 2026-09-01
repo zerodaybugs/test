@@ -1,0 +1,177 @@
+name: Superhuman allowed-auth metadata upload-validation gate
+
+on:
+  push:
+    branches: [research/superhuman-allowed-auth-e2e-20260809]
+    paths: [.github/workflows/superhuman-allowed-auth-upload-validation.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+
+      - name: Install exact stable SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf allowed-auth-upload
+          mkdir -p allowed-auth-upload/evidence public-intake-status
+          cd allowed-auth-upload
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund @codahq/packs-sdk@1.17.1
+
+      - name: Compile and validate publicly constructible system-auth Pack paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd allowed-auth-upload
+          cat > validate.js <<'NODE'
+          'use strict';
+          const assert = require('assert');
+          const fs = require('fs');
+          const path = require('path');
+          const sdk = require('@codahq/packs-sdk');
+          const sdkRoot = path.dirname(require.resolve('@codahq/packs-sdk/package.json'));
+          const {ReservedAuthenticationNames} = require(path.join(sdkRoot, 'dist/types.js'));
+          const {compilePackMetadata} = require(path.join(sdkRoot, 'dist/helpers/metadata.js'));
+          const {validatePackVersionMetadata} = require(path.join(sdkRoot, 'dist/testing/upload_validation.js'));
+
+          async function main() {
+            const pack = sdk.newPack();
+            pack.setVersion('1.0.0');
+            pack.addNetworkDomain('api.example.com');
+            pack.setUserAuthentication({type: sdk.AuthenticationType.HeaderBearerToken});
+            pack.setSystemAuthentication({type: sdk.AuthenticationType.HeaderBearerToken});
+
+            // Publicly supported Standard formula with a dynamic autocomplete hook.
+            pack.addFormula({
+              name: 'RestrictedAction',
+              description: 'A formula restricted to a personal user connection.',
+              parameters: [sdk.makeParameter({
+                type: sdk.ParameterType.String,
+                name: 'target',
+                description: 'Synthetic target.',
+                autocomplete: async function(context, search) {
+                  const response = await context.fetcher.fetch({method: 'GET', url: 'https://api.example.com/options'});
+                  return sdk.simpleAutocomplete(search, response.body.values || []);
+                },
+              })],
+              resultType: sdk.ValueType.String,
+              connectionRequirement: sdk.ConnectionRequirement.Required,
+              allowedAuthenticationNames: [ReservedAuthenticationNames.Default],
+              execute: async function([target], context) {
+                const response = await context.fetcher.fetch({method: 'GET', url: 'https://api.example.com/action'});
+                return `${target}:${response.status}`;
+              },
+            });
+
+            // Publicly supported Sync formula with validateParameters and the same allowlist.
+            const ItemSchema = sdk.makeObjectSchema({
+              properties: {
+                id: {type: sdk.ValueType.String, required: true},
+                name: {type: sdk.ValueType.String, required: true},
+              },
+              displayProperty: 'name',
+              idProperty: 'id',
+            });
+            pack.addSyncTable({
+              name: 'RestrictedItems',
+              description: 'Synthetic restricted sync table.',
+              identityName: 'RestrictedItem',
+              schema: ItemSchema,
+              formula: {
+                name: 'SyncRestrictedItems',
+                description: 'Sync restricted items.',
+                parameters: [sdk.makeParameter({
+                  type: sdk.ParameterType.String,
+                  name: 'filter',
+                  description: 'Synthetic filter.',
+                  autocomplete: async function(context, search) {
+                    const response = await context.fetcher.fetch({method: 'GET', url: 'https://api.example.com/sync-options'});
+                    return sdk.simpleAutocomplete(search, response.body.values || []);
+                  },
+                })],
+                connectionRequirement: sdk.ConnectionRequirement.Required,
+                allowedAuthenticationNames: [ReservedAuthenticationNames.Default],
+                validateParameters: async function(context) {
+                  const response = await context.fetcher.fetch({method: 'GET', url: 'https://api.example.com/validate'});
+                  return {isValid: Boolean(response.body.ok)};
+                },
+                execute: async function() {
+                  return {result: []};
+                },
+              },
+            });
+
+            const metadata = compilePackMetadata(pack);
+            const validated = await validatePackVersionMetadata(metadata, '1.17.1');
+            assert.equal(validated.defaultAuthentication.type, sdk.AuthenticationType.HeaderBearerToken);
+            assert.equal(validated.systemConnectionAuthentication.type, sdk.AuthenticationType.HeaderBearerToken);
+            assert.deepEqual(validated.formulas[0].allowedAuthenticationNames, [ReservedAuthenticationNames.Default]);
+            assert(validated.formulas[0].parameters[0].autocomplete, 'formula autocomplete missing after compilation');
+            assert.deepEqual(validated.syncTables[0].getter.allowedAuthenticationNames, [ReservedAuthenticationNames.Default]);
+            assert(validated.syncTables[0].getter.parameters[0].autocomplete, 'sync autocomplete missing after compilation');
+            assert(validated.syncTables[0].getter.validateParameters, 'sync validateParameters missing after compilation');
+
+            const result = {
+              pass: true,
+              sdkVersion: require(path.join(sdkRoot, 'package.json')).version,
+              officialUploadValidationAccepted: true,
+              defaultAuthentication: validated.defaultAuthentication.type,
+              systemConnectionAuthentication: validated.systemConnectionAuthentication.type,
+              standardFormula: {
+                allowedAuthenticationNames: validated.formulas[0].allowedAuthenticationNames,
+                autocompletePresent: Boolean(validated.formulas[0].parameters[0].autocomplete),
+              },
+              syncFormula: {
+                allowedAuthenticationNames: validated.syncTables[0].getter.allowedAuthenticationNames,
+                autocompletePresent: Boolean(validated.syncTables[0].getter.parameters[0].autocomplete),
+                validateParametersPresent: Boolean(validated.syncTables[0].getter.validateParameters),
+              },
+              usesOnlyPublicBuilderMethods: [
+                'newPack', 'setUserAuthentication', 'setSystemAuthentication',
+                'addFormula', 'addSyncTable', 'makeParameter', 'makeObjectSchema'
+              ],
+              productionRequestCount: 0,
+              syntheticOnly: true,
+            };
+            fs.writeFileSync('evidence/RESULT.json', JSON.stringify(result, null, 2) + '\n');
+            fs.writeFileSync('evidence/COMPILED_METADATA.json', JSON.stringify(metadata, null, 2) + '\n');
+          }
+          main().then(() => console.log(fs.readFileSync('evidence/RESULT.json', 'utf8'))).catch(error => {
+            console.error(error && error.stack || error);
+            process.exit(1);
+          });
+          NODE
+          node validate.js | tee evidence/TEST_OUTPUT.txt
+          jq -e '.pass == true and .officialUploadValidationAccepted == true and .systemConnectionAuthentication == "HeaderBearerToken" and .standardFormula.autocompletePresent == true and .syncFormula.validateParametersPresent == true' evidence/RESULT.json >/dev/null
+          sha256sum validate.js package.json package-lock.json evidence/RESULT.json evidence/COMPILED_METADATA.json evidence/TEST_OUTPUT.txt > evidence/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-allowed-auth-metadata-upload-validation
+          path: allowed-auth-upload/evidence/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Commit compact result
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp allowed-auth-upload/evidence/RESULT.json public-intake-status/superhuman-allowed-auth-metadata-upload-validation.json
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-allowed-auth-metadata-upload-validation.json
+          git commit -m 'chore: record allowed-auth upload-validation gate'
+          git push

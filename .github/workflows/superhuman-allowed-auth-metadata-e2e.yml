@@ -1,0 +1,319 @@
+name: Superhuman allowed-auth metadata exact E2E gate
+
+on:
+  push:
+    branches: [research/superhuman-allowed-auth-e2e-20260809]
+    paths: [.github/workflows/superhuman-allowed-auth-metadata-e2e.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+
+      - name: Install exact stable Superhuman Packs SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf allowed-auth-e2e
+          mkdir -p allowed-auth-e2e/evidence public-intake-status
+          cd allowed-auth-e2e
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund @codahq/packs-sdk@1.17.1
+          node -e "const p=require('./node_modules/@codahq/packs-sdk/package.json'); if(p.version!=='1.17.1') process.exit(1); console.log(p.version)" > evidence/sdk-version.txt
+
+      - name: Run exact thunk plus AuthenticatingFetcher boundary gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd allowed-auth-e2e
+          cat > gate.js <<'NODE'
+          'use strict';
+          const assert = require('assert');
+          const crypto = require('crypto');
+          const fs = require('fs');
+          const http = require('http');
+          const path = require('path');
+
+          const sdkRoot = path.dirname(require.resolve('@codahq/packs-sdk/package.json'));
+          const thunkPath = path.join(sdkRoot, 'bundles', 'thunk_bundle.js');
+          const thunk = require(thunkPath);
+          const {AuthenticatingFetcher} = require(path.join(sdkRoot, 'dist', 'testing', 'fetcher.js'));
+
+          const DEFAULT = 'defaultUserAuthentication';
+          const SYSTEM = 'systemAuthentication';
+          const ADMIN = 'LabAdmin';
+          const TOKENS = {
+            [DEFAULT]: 'LAB_DEFAULT_BEARER_20260809',
+            [SYSTEM]: 'LAB_SYSTEM_BEARER_20260809',
+            [ADMIN]: 'LAB_ADMIN_BEARER_20260809',
+          };
+          const RESPONSE_SENTINELS = {
+            [DEFAULT]: 'LAB_DEFAULT_PRIVATE_DATA_20260809',
+            [SYSTEM]: 'LAB_SYSTEM_PRIVATE_DATA_20260809',
+            [ADMIN]: 'LAB_ADMIN_PRIVATE_DATA_20260809',
+          };
+
+          const captured = [];
+          let server;
+
+          function listen(server) {
+            return new Promise((resolve, reject) => {
+              server.once('error', reject);
+              server.listen(0, '127.0.0.1', () => resolve(server.address().port));
+            });
+          }
+          function close(server) {
+            return new Promise(resolve => server.close(() => resolve()));
+          }
+          function authLabel(value) {
+            for (const [label, token] of Object.entries(TOKENS)) {
+              if (value === `Bearer ${token}`) return label;
+            }
+            return 'unknown';
+          }
+
+          async function main() {
+            server = http.createServer((req, res) => {
+              const authorization = req.headers.authorization || '';
+              const principal = authLabel(authorization);
+              captured.push({
+                method: req.method,
+                url: req.url,
+                principal,
+                authorization,
+              });
+              res.writeHead(200, {'content-type': 'application/json'});
+              res.end(JSON.stringify({
+                principal,
+                sentinel: RESPONSE_SENTINELS[principal] || 'UNKNOWN',
+              }));
+            });
+            const port = await listen(server);
+            const baseUrl = `http://127.0.0.1:${port}`;
+            const networkDomains = [`127.0.0.1:${port}`];
+            const authDef = {type: 'HeaderBearerToken'};
+
+            function fetcherFor(principal) {
+              return new AuthenticatingFetcher(
+                () => {},
+                authDef,
+                networkDomains,
+                {token: TOKENS[principal]},
+                `LAB_INVOCATION_${principal}`,
+              );
+            }
+            function executionContext(principal) {
+              return {
+                authenticationName: principal,
+                fetcher: fetcherFor(principal),
+                invocationLocation: 'doc',
+                timezone: 'UTC',
+                invocationToken: `LAB_INVOCATION_${principal}`,
+              };
+            }
+            async function fetchPrivate(route, context) {
+              const response = await context.fetcher.fetch({method: 'GET', url: `${baseUrl}/${route}`});
+              return response.body;
+            }
+
+            const restrictedFormula = {
+              name: 'RestrictedAction',
+              description: 'Restricted to the default user authentication',
+              parameters: [{
+                name: 'target',
+                type: 'string',
+                description: 'Synthetic target',
+                autocomplete: {
+                  execute: async (_params, context) => {
+                    const body = await fetchPrivate('autocomplete', context);
+                    return [{display: body.sentinel, value: body.sentinel}];
+                  },
+                },
+              }],
+              resultType: 'string',
+              connectionRequirement: 'required',
+              allowedAuthenticationNames: [DEFAULT],
+              execute: async (_params, context) => (await fetchPrivate('standard', context)).sentinel,
+              validateParameters: {
+                execute: async (_params, context) => {
+                  const body = await fetchPrivate('validate', context);
+                  return {isValid: true, message: body.sentinel};
+                },
+              },
+            };
+
+            const restrictedSyncGetter = {
+              name: 'RestrictedSync',
+              description: 'Restricted sync getter',
+              parameters: [],
+              connectionRequirement: 'required',
+              allowedAuthenticationNames: [DEFAULT],
+              execute: async () => ({result: []}),
+            };
+
+            const manifest = {
+              defaultAuthentication: authDef,
+              systemConnectionAuthentication: authDef,
+              adminAuthentications: [{
+                name: ADMIN,
+                displayName: 'Lab Admin',
+                description: 'Synthetic service-account authentication',
+                isServiceAccount: true,
+                authentication: {...authDef, canSyncPermissions: true},
+              }],
+              formulas: [restrictedFormula],
+              syncTables: [{
+                name: 'RestrictedDynamicSyncTable',
+                isDynamic: true,
+                getter: restrictedSyncGetter,
+                listDynamicUrls: {
+                  execute: async (_params, context) => {
+                    const body = await fetchPrivate('dynamic-urls', context);
+                    return [{display: body.sentinel, value: body.sentinel}];
+                  },
+                },
+                searchDynamicUrls: {
+                  execute: async (_params, context) => {
+                    const body = await fetchPrivate('search-dynamic-urls', context);
+                    return [{display: body.sentinel, value: body.sentinel}];
+                  },
+                },
+                getDisplayUrl: {execute: async () => 'https://synthetic.invalid/'},
+                getName: {execute: async () => 'Synthetic'},
+                getSchema: {execute: async () => ({type: 'object', id: 'id', primary: 'name', properties: {id: {type: 'string'}, name: {type: 'string'}}})},
+                namedPropertyOptions: {
+                  sensitiveOptions: {
+                    execute: async (_params, context) => {
+                      const body = await fetchPrivate('property-options', context);
+                      return [{display: body.sentinel, value: body.sentinel}];
+                    },
+                  },
+                },
+              }],
+            };
+
+            async function invoke(spec, principal) {
+              return thunk.findAndExecutePackFunction({
+                shouldWrapError: false,
+                params: [],
+                formulaSpec: spec,
+                manifest,
+                executionContext: executionContext(principal),
+              });
+            }
+
+            async function expectBlocked(principal) {
+              const countBefore = captured.length;
+              let error;
+              try {
+                await invoke({type: 'Standard', formulaName: 'RestrictedAction'}, principal);
+              } catch (e) {
+                error = e;
+              }
+              assert(error, `standard invocation unexpectedly succeeded for ${principal}`);
+              assert.match(error.message, /not allowed for connection with authentication/);
+              assert.equal(captured.length, countBefore, 'blocked standard invocation reached the HTTP server');
+              return error.message;
+            }
+
+            async function runMetadata(principal) {
+              const expected = RESPONSE_SENTINELS[principal];
+              const start = captured.length;
+              const standardError = await expectBlocked(principal);
+              const autocomplete = await invoke({
+                type: 'Metadata', metadataFormulaType: 'ParameterAutocomplete',
+                parentFormulaName: 'RestrictedAction', parentFormulaType: 'Standard', parameterName: 'target',
+              }, principal);
+              const validation = await invoke({
+                type: 'Metadata', metadataFormulaType: 'ValidateParameters',
+                parentFormulaName: 'RestrictedAction', parentFormulaType: 'Standard',
+              }, principal);
+              const dynamicUrls = await invoke({
+                type: 'Metadata', metadataFormulaType: 'SyncListDynamicUrls',
+                syncTableName: 'RestrictedDynamicSyncTable',
+              }, principal);
+              const propertyOptions = await invoke({
+                type: 'Metadata', metadataFormulaType: 'PropertyOptions',
+                syncTableName: 'RestrictedDynamicSyncTable', optionsFormulaKey: 'sensitiveOptions',
+                propertyName: 'name', propertyValues: {}, propertySchema: {type: 'string'}, search: 'lab',
+              }, principal);
+
+              assert.equal(autocomplete[0].value, expected);
+              assert.equal(validation.message, expected);
+              assert.equal(dynamicUrls[0].value, expected);
+              assert.equal(propertyOptions.packResult.results[0].value, expected);
+              const requests = captured.slice(start);
+              assert.equal(requests.length, 4);
+              assert(requests.every(row => row.principal === principal));
+              assert(requests.every(row => row.authorization === `Bearer ${TOKENS[principal]}`));
+              return {standardError, autocomplete, validation, dynamicUrls, propertyOptions, requests};
+            }
+
+            // Positive control: the allowed principal can invoke the standard formula and receives its own data.
+            const defaultResult = await invoke({type: 'Standard', formulaName: 'RestrictedAction'}, DEFAULT);
+            assert.equal(defaultResult, RESPONSE_SENTINELS[DEFAULT]);
+            assert.equal(captured.at(-1).principal, DEFAULT);
+
+            const system = await runMetadata(SYSTEM);
+            const admin = await runMetadata(ADMIN);
+
+            const result = {
+              pass: true,
+              sdkVersion: require(path.join(sdkRoot, 'package.json')).version,
+              nodeVersion: process.version,
+              thunkBundleSha256: crypto.createHash('sha256').update(fs.readFileSync(thunkPath)).digest('hex'),
+              rootCause: 'Metadata dispatch paths execute credential-backed hooks without the allowedAuthenticationNames check used by Standard, Sync, SyncUpdate, and GetPermissions dispatch.',
+              positiveControl: {defaultStandardResult: defaultResult},
+              disallowedPrincipals: {
+                systemAuthentication: system,
+                LabAdmin: admin,
+              },
+              capturedRequestCount: captured.length,
+              captured,
+              syntheticOnly: true,
+              productionRequestCount: 0,
+            };
+            fs.writeFileSync('evidence/RESULT.json', JSON.stringify(result, null, 2) + '\n');
+          }
+
+          main().then(async () => {
+            await close(server);
+            console.log(fs.readFileSync('evidence/RESULT.json', 'utf8'));
+          }).catch(async error => {
+            try { if (server) await close(server); } catch (_) {}
+            console.error(error && error.stack || error);
+            process.exit(1);
+          });
+          NODE
+          node gate.js | tee evidence/TEST_OUTPUT.txt
+          jq -e '.pass == true and .capturedRequestCount == 9' evidence/RESULT.json >/dev/null
+          sha256sum gate.js package.json package-lock.json node_modules/@codahq/packs-sdk/bundles/thunk_bundle.js evidence/RESULT.json evidence/TEST_OUTPUT.txt evidence/sdk-version.txt > evidence/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: superhuman-allowed-auth-metadata-exact-e2e
+          path: allowed-auth-e2e/evidence/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Commit compact result for polling
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq '{pass,sdkVersion,nodeVersion,thunkBundleSha256,rootCause,positiveControl,capturedRequestCount,syntheticOnly,productionRequestCount,disallowedPrincipals: {systemAuthentication: {standardError: .disallowedPrincipals.systemAuthentication.standardError, requestCount: (.disallowedPrincipals.systemAuthentication.requests|length)}, LabAdmin: {standardError: .disallowedPrincipals.LabAdmin.standardError, requestCount: (.disallowedPrincipals.LabAdmin.requests|length)}}}' allowed-auth-e2e/evidence/RESULT.json > public-intake-status/superhuman-allowed-auth-metadata-exact-e2e.json
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-allowed-auth-metadata-exact-e2e.json
+          git commit -m 'chore: record exact allowed-auth metadata E2E gate'
+          git push
