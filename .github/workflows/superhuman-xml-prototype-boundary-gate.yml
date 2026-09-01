@@ -1,0 +1,204 @@
+name: Superhuman XML prototype-boundary exact gate
+
+on:
+  push:
+    branches: [research/superhuman-xml-proto-20260810]
+    paths: [.github/workflows/superhuman-xml-prototype-boundary-gate.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+
+      - name: Install exact stable SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf xml-proto-gate
+          mkdir -p xml-proto-gate/evidence public-intake-status
+          cd xml-proto-gate
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund @codahq/packs-sdk@1.17.1
+
+      - name: Run parser, fetcher, normalization, and validation gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd xml-proto-gate
+          cat > gate.js <<'NODE'
+          'use strict';
+          const assert = require('assert');
+          const fs = require('fs');
+          const http = require('http');
+          const path = require('path');
+          const xml2js = require('xml2js');
+
+          const sdkRoot = path.dirname(require.resolve('@codahq/packs-sdk/package.json'));
+          const {AuthenticatingFetcher} = require(path.join(sdkRoot, 'dist/testing/fetcher.js'));
+          const {transformBody} = require(path.join(sdkRoot, 'dist/handler_templates.js'));
+          const {validateResult} = require(path.join(sdkRoot, 'dist/testing/validation.js'));
+
+          const payloads = {
+            protoTag: '<root><__proto__><id>INHERITED_ID</id><name>INHERITED_NAME</name><sentinel>PROTO_SENTINEL</sentinel></__proto__><visible>ok</visible></root>',
+            ctorChain: '<root><constructor><prototype><sentinel>CTOR_SENTINEL</sentinel></prototype></constructor><visible>ok</visible></root>',
+            protoAttr: '<root __proto__="ATTR_SENTINEL"><visible>ok</visible></root>',
+          };
+
+          async function parse(xml) {
+            return xml2js.parseStringPromise(xml, {explicitRoot: false});
+          }
+          function describe(value) {
+            const proto = value && typeof value === 'object' ? Object.getPrototypeOf(value) : null;
+            return {
+              ownKeys: value && typeof value === 'object' ? Object.getOwnPropertyNames(value) : [],
+              prototypeOwnKeys: proto && typeof proto === 'object' ? Object.getOwnPropertyNames(proto) : [],
+              prototypeSnapshot: proto && typeof proto === 'object' ? {
+                id: proto.id,
+                name: proto.name,
+                sentinel: proto.sentinel,
+              } : null,
+              objectPrototypePolluted: {
+                id: Object.prototype.id,
+                name: Object.prototype.name,
+                sentinel: Object.prototype.sentinel,
+              },
+            };
+          }
+
+          async function main() {
+            delete Object.prototype.id;
+            delete Object.prototype.name;
+            delete Object.prototype.sentinel;
+
+            const parserResults = {};
+            for (const [name, xml] of Object.entries(payloads)) {
+              const parsed = await parse(xml);
+              parserResults[name] = {parsed, description: describe(parsed)};
+            }
+
+            let server;
+            const serverPort = await new Promise((resolve, reject) => {
+              server = http.createServer((req, res) => {
+                res.writeHead(200, {'content-type': 'application/xml'});
+                res.end(payloads.protoTag);
+              });
+              server.once('error', reject);
+              server.listen(0, '127.0.0.1', () => resolve(server.address().port));
+            });
+
+            const fetcher = new AuthenticatingFetcher(
+              () => {},
+              undefined,
+              [`127.0.0.1:${serverPort}`],
+              undefined,
+              'LAB_INVOCATION_XML_20260810',
+            );
+            const fetched = await fetcher.fetch({method: 'GET', url: `http://127.0.0.1:${serverPort}/xml`});
+            await new Promise(resolve => server.close(resolve));
+
+            const schema = {
+              type: 'object',
+              id: 'id',
+              primary: 'name',
+              includeUnknownProperties: true,
+              properties: {
+                id: {type: 'string', required: true},
+                name: {type: 'string', required: true},
+                visible: {type: 'string'},
+              },
+            };
+            const formula = {
+              name: 'XmlResult',
+              resultType: 'object',
+              parameters: [],
+              schema,
+              execute: async () => fetched.body,
+            };
+
+            const beforeNormalize = describe(fetched.body);
+            const normalized = transformBody(fetched.body, schema);
+            const afterNormalize = describe(normalized);
+            let validationAccepted = false;
+            let validationError = null;
+            try {
+              validateResult(formula, normalized);
+              validationAccepted = true;
+            } catch (error) {
+              validationError = String(error && error.stack || error);
+            }
+
+            const result = {
+              pass: true,
+              sdkVersion: require(path.join(sdkRoot, 'package.json')).version,
+              xml2jsVersion: require('xml2js/package.json').version,
+              nodeVersion: process.version,
+              parserResults,
+              fetcherBody: fetched.body,
+              beforeNormalize,
+              normalized,
+              afterNormalize,
+              validationAccepted,
+              validationError,
+              serializedNormalized: JSON.stringify(normalized),
+              directObjectPrototypePollutionObserved: Boolean(
+                Object.prototype.id || Object.prototype.name || Object.prototype.sentinel
+              ),
+              inheritedRequiredFieldsObserved: Boolean(
+                normalized && !Object.prototype.hasOwnProperty.call(normalized, 'id') && normalized.id === 'INHERITED_ID' &&
+                !Object.prototype.hasOwnProperty.call(normalized, 'name') && normalized.name === 'INHERITED_NAME'
+              ),
+              inheritedRequiredFieldsAcceptedByValidator: Boolean(
+                validationAccepted && normalized.id === 'INHERITED_ID' && normalized.name === 'INHERITED_NAME'
+              ),
+              inheritedFieldsOmittedFromJson: Boolean(
+                validationAccepted && !JSON.stringify(normalized).includes('INHERITED_ID') &&
+                !JSON.stringify(normalized).includes('INHERITED_NAME')
+              ),
+              productionRequestCount: 0,
+              syntheticOnly: true,
+            };
+            fs.writeFileSync('evidence/RESULT.json', JSON.stringify(result, null, 2) + '\n');
+            fs.writeFileSync('evidence/PAYLOADS.json', JSON.stringify(payloads, null, 2) + '\n');
+          }
+
+          main().then(() => {
+            console.log(fs.readFileSync('evidence/RESULT.json', 'utf8'));
+          }).catch(error => {
+            console.error(error && error.stack || error);
+            process.exit(1);
+          });
+          NODE
+
+          node gate.js | tee evidence/TEST_OUTPUT.txt
+          jq -e '.pass == true' evidence/RESULT.json >/dev/null
+          sha256sum gate.js package.json package-lock.json evidence/RESULT.json evidence/PAYLOADS.json evidence/TEST_OUTPUT.txt > evidence/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: superhuman-xml-prototype-boundary-exact-gate
+          path: xml-proto-gate/evidence/
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: Commit compact result
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq '{pass,sdkVersion,xml2jsVersion,nodeVersion,directObjectPrototypePollutionObserved,inheritedRequiredFieldsObserved,inheritedRequiredFieldsAcceptedByValidator,inheritedFieldsOmittedFromJson,validationAccepted,productionRequestCount,syntheticOnly}' xml-proto-gate/evidence/RESULT.json > public-intake-status/superhuman-xml-prototype-boundary-result.json
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-xml-prototype-boundary-result.json
+          git commit -m 'chore: record Superhuman XML prototype-boundary gate'
+          git push
