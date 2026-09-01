@@ -1,0 +1,156 @@
+name: Snapshot public TermMax frontend assets
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/snapshot-termmax-public-frontend.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Fetch current public frontend assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/frontend"
+          BASE='https://app.termmax.ts.finance'
+          mkdir -p "$OUT/pages" "$OUT/assets" "$OUT/meta"
+
+          python3 - "$OUT" "$BASE" <<'PY'
+          from __future__ import annotations
+          import hashlib, html, json, pathlib, re, ssl, sys, time
+          from urllib.parse import urljoin, urlparse
+          from urllib.request import Request, urlopen
+
+          out = pathlib.Path(sys.argv[1])
+          base = sys.argv[2].rstrip('/')
+          routes = [
+              '/', '/lend', '/borrow?chain=eth', '/leverage',
+              '/dashboard/positions', '/dashboard/orders?chain=eth',
+              '/earn/eth/0x18d91b5e3218ab16ef86fb7cb054cb48ba1e8b8e',
+              '/market/eth/0x02b34b833edc65fb9dd53546aee11179e1f43599?chain=eth',
+          ]
+          user_agent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          ctx = ssl.create_default_context()
+          inventory = []
+          fetched: dict[str, pathlib.Path] = {}
+
+          def request(url: str) -> tuple[bytes, dict[str, str], int]:
+              req = Request(url, headers={'User-Agent': user_agent, 'Accept': '*/*'})
+              with urlopen(req, timeout=45, context=ctx) as response:
+                  body = response.read()
+                  headers = {k.lower(): v for k, v in response.headers.items()}
+                  return body, headers, response.status
+
+          def safe_name(url: str) -> str:
+              p = urlparse(url)
+              raw = (p.path.strip('/') or 'root') + (('__q_' + p.query) if p.query else '')
+              name = re.sub(r'[^A-Za-z0-9._-]+', '_', raw)
+              digest = hashlib.sha256(url.encode()).hexdigest()[:12]
+              return f'{digest}__{name[:180]}'
+
+          def save_url(url: str, directory: pathlib.Path) -> pathlib.Path | None:
+              normalized = url.split('#', 1)[0]
+              if normalized in fetched:
+                  return fetched[normalized]
+              try:
+                  body, headers, status = request(normalized)
+              except Exception as exc:
+                  inventory.append({'url': normalized, 'error': repr(exc)})
+                  return None
+              suffix = pathlib.Path(urlparse(normalized).path).suffix
+              path = directory / (safe_name(normalized) + ('' if safe_name(normalized).endswith(suffix) else suffix))
+              path.write_bytes(body)
+              (path.with_suffix(path.suffix + '.headers.json')).write_text(json.dumps(headers, indent=2) + '\n')
+              entry = {
+                  'url': normalized,
+                  'path': path.relative_to(out).as_posix(),
+                  'status': status,
+                  'content_type': headers.get('content-type', ''),
+                  'bytes': len(body),
+                  'sha256': hashlib.sha256(body).hexdigest(),
+              }
+              inventory.append(entry)
+              fetched[normalized] = path
+              return path
+
+          page_texts = []
+          for index, route in enumerate(routes):
+              url = urljoin(base + '/', route.lstrip('/'))
+              path = save_url(url, out / 'pages')
+              if path:
+                  page_texts.append(path.read_text(errors='replace'))
+              time.sleep(0.25)
+
+          candidates = set()
+          attr_re = re.compile(r'''(?:src|href)=["']([^"']+)["']''', re.I)
+          raw_url_re = re.compile(r'''["']((?:https?:)?//app\.termmax\.ts\.finance/[^"']+|/_next/[^"']+)["']''')
+          for text in page_texts:
+              for value in attr_re.findall(text) + raw_url_re.findall(text):
+                  value = html.unescape(value).replace('\\u0026', '&')
+                  url = urljoin(base + '/', value)
+                  if urlparse(url).netloc == urlparse(base).netloc:
+                      candidates.add(url)
+
+          for special in ['/robots.txt', '/sitemap.xml', '/manifest.json', '/site.webmanifest', '/sw.js', '/service-worker.js']:
+              candidates.add(urljoin(base + '/', special.lstrip('/')))
+
+          rounds = 0
+          while candidates and rounds < 8:
+              rounds += 1
+              current = sorted(candidates)
+              candidates.clear()
+              for url in current:
+                  path = save_url(url, out / 'assets')
+                  if not path:
+                      continue
+                  if path.stat().st_size > 30_000_000:
+                      continue
+                  text = path.read_text(errors='replace')
+                  patterns = [
+                      re.compile(r'''["'](/_next/static/[^"'\\s)]+?\.js(?:\?[^"']*)?)["']'''),
+                      re.compile(r'''["'](/_next/static/[^"'\\s)]+?\.css(?:\?[^"']*)?)["']'''),
+                      re.compile(r'''sourceMappingURL=([^\s*]+)'''),
+                  ]
+                  for pattern in patterns:
+                      for value in pattern.findall(text):
+                          value = value.strip().strip('"\'')
+                          target = urljoin(url, value)
+                          if urlparse(target).netloc == urlparse(base).netloc and target not in fetched:
+                              candidates.add(target)
+                  if urlparse(url).path.endswith('.js'):
+                      map_url = url.split('?', 1)[0] + '.map'
+                      if map_url not in fetched:
+                          candidates.add(map_url)
+
+          (out / 'meta' / 'INVENTORY.json').write_text(json.dumps(inventory, indent=2) + '\n')
+          (out / 'meta' / 'URLS.txt').write_text('\n'.join(sorted(fetched)) + '\n')
+          with (out / 'meta' / 'SHA256SUMS.txt').open('w') as f:
+              for p in sorted(out.rglob('*')):
+                  if p.is_file() and p.name != 'SHA256SUMS.txt':
+                      f.write(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(out).as_posix()}\n')
+          summary = {
+              'base': base,
+              'routes_requested': routes,
+              'objects_fetched': len(fetched),
+              'errors': sum(1 for x in inventory if 'error' in x),
+              'total_bytes': sum(x.get('bytes', 0) for x in inventory),
+          }
+          (out / 'meta' / 'SUMMARY.json').write_text(json.dumps(summary, indent=2) + '\n')
+          print(json.dumps(summary, indent=2))
+          PY
+
+      - name: Upload public frontend snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: termmax-public-frontend-${{ github.run_id }}
+          path: frontend/
+          if-no-files-found: error
+          retention-days: 3
