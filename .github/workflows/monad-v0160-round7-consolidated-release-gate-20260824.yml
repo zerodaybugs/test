@@ -1,0 +1,249 @@
+name: Monad v0.16.0 Round 7 consolidated release gate 20260824
+
+on:
+  push:
+    branches:
+      - tooling/monad-v0160-frontier-source-dossier-20260824
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  consolidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout research tooling
+        uses: actions/checkout@v4
+
+      - name: Resolve and download adjudication artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/raw evidence/adjudications evidence/meta
+          cat > evidence/meta/EXPECTED_WORKFLOWS.tsv <<'EOF'
+          timeout_v4	Monad v0.16.0 selective timeout equivocation V4 20260824	monad-v0160-selective-timeout-equivocation-v4-20260824
+          timeout_promotion	Monad v0.16.0 timeout equivocation promotion gate 20260824	monad-v0160-timeout-equivocation-promotion-20260824
+          raptor_amplification	Monad v0.16.0 RaptorCast authenticated verification amplification 20260824	monad-v0160-raptorcast-authenticated-verification-amplification-20260824
+          raptor_starvation	Monad v0.16.0 RaptorCast global limiter starvation 20260824	monad-v0160-raptorcast-global-limiter-starvation-20260824
+          execution_frontier	Monad execution post-v0.16 frontier export 20260824	monad-execution-post-v0160-frontier-20260824
+          EOF
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('evidence/meta/EXPECTED_WORKFLOWS.tsv')
+          p.write_text('\n'.join(line.strip() for line in p.read_text().splitlines() if line.strip())+'\n')
+          PY
+
+          : > evidence/meta/RUNS.tsv
+          while IFS=$'\t' read -r key workflow artifact; do
+            run_id=""
+            for attempt in $(seq 1 180); do
+              run_id="$(gh run list --repo zerodaybugs/test --branch tooling/monad-v0160-frontier-source-dossier-20260824 \
+                --limit 100 --json databaseId,name,status,conclusion,createdAt \
+                --jq '[.[] | select(.name == '"$(printf '%q' "$workflow")"' and .status == "completed")] | sort_by(.createdAt) | last | .databaseId // empty' 2>/dev/null || true)"
+              if [ -n "$run_id" ]; then
+                break
+              fi
+              sleep 5
+            done
+            if [ -z "$run_id" ]; then
+              printf '%s\t%s\t%s\tMISSING\n' "$key" "$workflow" "$artifact" >> evidence/meta/RUNS.tsv
+              continue
+            fi
+            printf '%s\t%s\t%s\t%s\n' "$key" "$workflow" "$artifact" "$run_id" >> evidence/meta/RUNS.tsv
+            mkdir -p "evidence/raw/$key"
+            gh run download "$run_id" --repo zerodaybugs/test --name "$artifact" --dir "evidence/raw/$key" \
+              > "evidence/meta/download-$key.log" 2>&1 || true
+          done < evidence/meta/EXPECTED_WORKFLOWS.tsv
+
+          find evidence/raw -type f -printf '%P\n' | LC_ALL=C sort > evidence/meta/DOWNLOADED_FILE_LIST.txt
+
+      - name: Extract machine adjudications and enforce source pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib, shutil
+          root=pathlib.Path('evidence')
+          records=[]
+          for keydir in sorted((root/'raw').iterdir() if (root/'raw').exists() else []):
+              if not keydir.is_dir():
+                  continue
+              key=keydir.name
+              jsons=[]
+              for p in keydir.rglob('*.json'):
+                  try:
+                      d=json.loads(p.read_text())
+                  except Exception:
+                      continue
+                  jsons.append((p,d))
+              preferred=[]
+              for p,d in jsons:
+                  if p.name in ('PROMOTION_ADJUDICATION.json','ADJUDICATION.json','EXPORT_RESULT.json'):
+                      preferred.append((p,d))
+              selected=preferred or jsons
+              for idx,(p,d) in enumerate(selected):
+                  dst=root/'adjudications'/f'{key}-{idx:02d}-{p.name}'
+                  shutil.copy2(p,dst)
+                  records.append({
+                      'key':key,
+                      'source_path':str(p),
+                      'copied_path':str(dst),
+                      'data':d,
+                  })
+          (root/'meta'/'ADJUDICATION_INDEX.json').write_text(json.dumps(records,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(records,indent=2))
+          PY
+
+      - name: Consolidated fail-closed release decision
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib
+          root=pathlib.Path('evidence')
+          records=json.loads((root/'meta'/'ADJUDICATION_INDEX.json').read_text())
+          expected=['timeout_v4','timeout_promotion','raptor_amplification','raptor_starvation','execution_frontier']
+          present={r['key'] for r in records}
+          missing=[k for k in expected if k not in present]
+          submission_ready=[]
+          candidates=[]
+          holds=[]
+          kills=[]
+          pin_errors=[]
+          for r in records:
+              d=r['data'] if isinstance(r.get('data'),dict) else {}
+              decision=str(d.get('decision') or d.get('release_decision') or '')
+              if d.get('submission_ready') is True or 'SUBMIT_READY' in decision.upper():
+                  submission_ready.append(r)
+              if decision.upper().startswith('CANDIDATE'):
+                  candidates.append(r)
+              elif decision.upper().startswith('HOLD'):
+                  holds.append(r)
+              elif decision.upper().startswith('KILL') or decision.upper().startswith('NO_'):
+                  kills.append(r)
+              commit=d.get('source_commit')
+              if commit and commit != 'c616743d1358186605e1c1b74a3d6c4fdd9dd48c':
+                  pin_errors.append({'path':r['copied_path'],'source_commit':commit})
+          if pin_errors:
+              release='BLOCK_SOURCE_PIN_MISMATCH'
+          elif submission_ready:
+              release='BLOCK_REQUIRES_INDEPENDENT_FINAL_RELEASE_QA'
+          elif missing:
+              release='HOLD_MISSING_MACHINE_ADJUDICATIONS'
+          elif candidates:
+              release='HOLD_CANDIDATE_REQUIRES_MINIMIZATION_PRODUCTION_IMPACT_AND_DUPLICATE_CLEARANCE'
+          else:
+              release='HOLD_NOT_FOR_SUBMISSION'
+          decision={
+              'project':'Monad v0.16.0 continued hunt Round 7',
+              'monad_bft_commit':'c616743d1358186605e1c1b74a3d6c4fdd9dd48c',
+              'monad_execution_commit':'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0',
+              'release_decision':release,
+              'submission_ready':False,
+              'new_high_proven':False,
+              'new_critical_proven':False,
+              'expected_gates':expected,
+              'present_gates':sorted(present),
+              'missing_gates':missing,
+              'candidate_records':[r['copied_path'] for r in candidates],
+              'hold_records':[r['copied_path'] for r in holds],
+              'kill_records':[r['copied_path'] for r in kills],
+              'source_pin_errors':pin_errors,
+              'mandatory_remaining_gates':[
+                  'exact current program and file-level scope confirmation',
+                  'unmodified production-ingress reproduction',
+                  'unauthorized-but-permitted attacker trigger',
+                  'direct reproducible High/Critical impact with negative controls',
+                  'matched natural security fix',
+                  'public duplicate/prior-art/natural-fix clearance',
+                  'private-duplicate risk assessment',
+                  'one root cause per report',
+                  'independent final QA, AI-residue scan, manifest and checksum verification',
+              ],
+          }
+          (root/'ROUND7_MASTER_DECISION.json').write_text(json.dumps(decision,indent=2,sort_keys=True)+'\n')
+          md=[
+              '# Monad v0.16.0 — Round 7 consolidated release gate',
+              '',
+              f'**Release decision:** `{release}`',
+              '',
+              f'- Present gates: {", ".join(sorted(present)) or "none"}',
+              f'- Missing gates: {", ".join(missing) or "none"}',
+              f'- Candidate records: {len(candidates)}',
+              f'- Submission-ready records: {len(submission_ready)}',
+              '',
+              'No submission ZIP is released by this gate. Even an upstream candidate must pass unmodified production-ingress, direct-impact, scope and duplicate clearance plus independent final QA.',
+          ]
+          (root/'ROUND7_STATUS.md').write_text('\n'.join(md)+'\n')
+          print(json.dumps(decision,indent=2))
+          PY
+
+      - name: Integrity and AI-residue QA
+        shell: bash
+        run: |
+          set -euo pipefail
+          find evidence -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum \
+            > evidence/SHA256SUMS
+          python3 - <<'PY'
+          import json,pathlib,re
+          root=pathlib.Path('evidence')
+          suspicious=[]
+          patterns=[
+              re.compile(r'(?i)as an ai'),
+              re.compile(r'(?i)language model'),
+              re.compile(r'(?i)chatgpt'),
+              re.compile(r'(?i)claude'),
+              re.compile(r'(?i)todo\s*:\s*write'),
+              re.compile(r'(?i)placeholder'),
+          ]
+          for p in root.rglob('*'):
+              if not p.is_file() or p.name=='FINAL_QA.json':
+                  continue
+              if p.suffix.lower() not in {'.json','.md','.txt','.tsv','.log','.patch','.rs','.yml','.yaml'}:
+                  continue
+              text=p.read_text(errors='replace')
+              for pat in patterns:
+                  if pat.search(text):
+                      suspicious.append({'path':str(p),'pattern':pat.pattern})
+          master=json.loads((root/'ROUND7_MASTER_DECISION.json').read_text())
+          qa={
+              'qa_decision':'PASS_RESEARCH_CHECKPOINT' if not suspicious else 'BLOCK_AI_OR_PLACEHOLDER_RESIDUE',
+              'release_decision':master['release_decision'],
+              'submission_ready':False,
+              'suspicious_residue':suspicious,
+          }
+          (root/'FINAL_QA.json').write_text(json.dumps(qa,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(qa,indent=2))
+          if suspicious:
+              raise SystemExit(2)
+          PY
+          find evidence -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum \
+            > evidence/SHA256SUMS
+          tar --sort=name --mtime='UTC 2026-08-24' --owner=0 --group=0 --numeric-owner \
+            -C evidence -czf MONAD_V0160_ROUND7_RESEARCH_CHECKPOINT_NOT_FOR_SUBMISSION_20260824.tar.gz .
+          sha256sum MONAD_V0160_ROUND7_RESEARCH_CHECKPOINT_NOT_FOR_SUBMISSION_20260824.tar.gz \
+            > MONAD_V0160_ROUND7_RESEARCH_CHECKPOINT_NOT_FOR_SUBMISSION_20260824.tar.gz.sha256
+
+      - name: Upload consolidated research checkpoint
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0160-round7-consolidated-release-gate-20260824
+          path: |
+            MONAD_V0160_ROUND7_RESEARCH_CHECKPOINT_NOT_FOR_SUBMISSION_20260824.tar.gz
+            MONAD_V0160_ROUND7_RESEARCH_CHECKPOINT_NOT_FOR_SUBMISSION_20260824.tar.gz.sha256
+            evidence/ROUND7_MASTER_DECISION.json
+            evidence/ROUND7_STATUS.md
+            evidence/FINAL_QA.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0

@@ -1,0 +1,312 @@
+name: Monad v0.16.0 same-key Byzantine branch-switch campaign 20260824
+
+on:
+  push:
+    branches:
+      - tooling/monad-v0160-frontier-source-dossier-20260824
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  campaign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - name: Checkout tooling branch
+        uses: actions/checkout@v4
+
+      - name: Clone exact scoped source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global submodule.fetchJobs "$(nproc)"
+          git clone --filter=blob:none --no-recurse-submodules \
+            https://github.com/category-labs/monad-bft.git monad-bft
+          cd monad-bft
+          git checkout c616743d1358186605e1c1b74a3d6c4fdd9dd48c
+          git submodule update --init monad-execution
+          test "$(git rev-parse HEAD)" = "c616743d1358186605e1c1b74a3d6c4fdd9dd48c"
+          test "$(git -C monad-execution rev-parse HEAD)" = "e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0"
+          test -z "$(git status --porcelain=v1)"
+
+      - name: Generate constrained one-Byzantine scenarios
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd monad-bft
+          mkdir -p monad-twins/tests/generated_branch_switch ../out/cases ../out/raw ../out/meta
+          python3 - <<'PY'
+          import itertools, json, pathlib, random
+          root = pathlib.Path('monad-twins/tests/generated_branch_switch')
+          root.mkdir(parents=True, exist_ok=True)
+
+          scenarios = []
+          def add(name, modes, all_connected_rounds=frozenset()):
+              scenarios.append((name, tuple(modes), frozenset(all_connected_rounds)))
+
+          n = 10
+          add('control_original_only', [0] * n)
+          add('control_twin_only', [1] * n)
+          add('control_all_connected', [0] * n, range(n))
+          add('alternating_original_first', [i % 2 for i in range(n)])
+          add('alternating_twin_first', [(i + 1) % 2 for i in range(n)])
+          for width in range(2, 7):
+              add(f'burst_width_{width}_original_first', [(i // width) % 2 for i in range(24)])
+              add(f'burst_width_{width}_twin_first', [((i // width) + 1) % 2 for i in range(24)])
+
+          # Exhaustive branch switching over the first eight rounds.
+          for bits in itertools.product((0, 1), repeat=8):
+              add('exhaustive8_' + ''.join(map(str, bits)), bits)
+
+          # Deterministic longer schedules with occasional both-twins-connected rounds.
+          for seed in range(96):
+              rng = random.Random(seed)
+              modes = [rng.randrange(2) for _ in range(32)]
+              both = {i for i in range(32) if rng.random() < 0.125}
+              add(f'random32_seed_{seed:03d}', modes, both)
+
+          names = ['Alice', 'Bob', 'Carol', 'David', 'Alice_twin']
+          for idx, (name, modes, both) in enumerate(scenarios):
+              partition = []
+              for r, active in enumerate(modes):
+                  if r in both:
+                      partition.append([names])
+                  elif active == 0:
+                      partition.append([
+                          ['Alice', 'Bob', 'Carol', 'David'],
+                          ['Alice_twin'],
+                      ])
+                  else:
+                      partition.append([
+                          ['Alice'],
+                          ['Alice_twin', 'Bob', 'Carol', 'David'],
+                      ])
+              case = {
+                  'description': (
+                      '25 percent same-key Byzantine branch switch; honest-to-honest links always intact; '
+                      f'scenario={name}'
+                  ),
+                  'nodes': ['Alice', 'Bob', 'Carol', 'David'],
+                  'twins': ['Alice_twin'],
+                  'expected_block_default': 18,
+                  'timeout_ms': 45000,
+                  'delta_ms': 5,
+                  'allow_block_sync': True,
+                  'liveness': 8,
+                  'partition': partition,
+                  'default_partition': [names],
+              }
+              path = root / f'{idx:04d}_{name}.json'
+              path.write_text(json.dumps(case, indent=2) + '\n')
+
+          manifest = {
+              'scenario_count': len(scenarios),
+              'attacker_stake_fraction': '1/4',
+              'honest_nodes': ['Bob', 'Carol', 'David'],
+              'byzantine_identity': 'Alice / Alice_twin share exact signing keys',
+              'honest_to_honest_links_always_intact': True,
+              'message_class': 'production consensus messages generated and signed by exact state machines',
+          }
+          pathlib.Path('../out/SCENARIO_MANIFEST.json').write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + '\n'
+          )
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Install fail-closed matrix test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd monad-bft
+          cat > monad-twins/tests/branch_switch_matrix.rs <<'RS'
+          use std::{
+              any::Any,
+              fs,
+              panic::{catch_unwind, AssertUnwindSafe},
+              path::PathBuf,
+              time::Instant,
+          };
+
+          use monad_mock_swarm::swarm_relation::MonadMessageNoSerSwarm;
+          use monad_twins_utils::{run_twins_test, twin_reader::read_twins_test};
+
+          fn panic_text(payload: Box<dyn Any + Send>) -> String {
+              if let Some(s) = payload.downcast_ref::<String>() {
+                  return s.clone();
+              }
+              if let Some(s) = payload.downcast_ref::<&str>() {
+                  return (*s).to_string();
+              }
+              "non-string panic payload".to_string()
+          }
+
+          fn json_escape(s: &str) -> String {
+              let mut out = String::with_capacity(s.len() + 8);
+              for c in s.chars() {
+                  match c {
+                      '"' => out.push_str("\\\""),
+                      '\\' => out.push_str("\\\\"),
+                      '\n' => out.push_str("\\n"),
+                      '\r' => out.push_str("\\r"),
+                      '\t' => out.push_str("\\t"),
+                      c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+                      c => out.push(c),
+                  }
+              }
+              out
+          }
+
+          #[test]
+          fn branch_switch_matrix() {
+              let mut cases: Vec<PathBuf> = fs::read_dir("tests/generated_branch_switch")
+                  .expect("generated scenario directory missing")
+                  .map(|entry| entry.expect("scenario dir entry").path())
+                  .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                  .collect();
+              cases.sort();
+              assert!(cases.len() >= 300, "scenario coverage unexpectedly small");
+
+              let result_path = std::env::var("MONAD_BRANCH_SWITCH_RESULT")
+                  .expect("MONAD_BRANCH_SWITCH_RESULT is required");
+              let mut records = Vec::with_capacity(cases.len());
+              let mut failure_count = 0usize;
+
+              for path in cases {
+                  let display = path.display().to_string();
+                  let started = Instant::now();
+                  let result = catch_unwind(AssertUnwindSafe(|| {
+                      let case = read_twins_test::<MonadMessageNoSerSwarm>(&display);
+                      run_twins_test::<_, _, _, MonadMessageNoSerSwarm>(1, case);
+                  }));
+                  let elapsed_ms = started.elapsed().as_millis();
+                  let (pass, panic) = match result {
+                      Ok(()) => (true, String::new()),
+                      Err(payload) => {
+                          failure_count += 1;
+                          (false, panic_text(payload))
+                      }
+                  };
+                  records.push(format!(
+                      "{{\"case\":\"{}\",\"pass\":{},\"elapsed_ms\":{},\"panic\":\"{}\"}}",
+                      json_escape(&display),
+                      if pass { "true" } else { "false" },
+                      elapsed_ms,
+                      json_escape(&panic),
+                  ));
+              }
+
+              let document = format!(
+                  "{{\n  \"source_commit\": \"c616743d1358186605e1c1b74a3d6c4fdd9dd48c\",\n  \"scenario_count\": {},\n  \"failure_count\": {},\n  \"attacker_stake_fraction\": \"1/4\",\n  \"honest_to_honest_links_always_intact\": true,\n  \"records\": [\n    {}\n  ]\n}}\n",
+                  records.len(),
+                  failure_count,
+                  records.join(",\n    "),
+              );
+              fs::write(&result_path, document).expect("write campaign result");
+
+              assert_eq!(
+                  failure_count,
+                  0,
+                  "candidate signal: constrained same-key Byzantine branch-switch scenarios failed; inspect result JSON"
+              );
+          }
+          RS
+
+      - name: Compile exact campaign
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd monad-bft
+          cargo test -p monad-twins --test branch_switch_matrix --no-run \
+            2>&1 | tee ../out/raw/build.log
+          cargo metadata --no-deps --format-version 1 > ../out/meta/CARGO_METADATA.json
+          rustc --version --verbose > ../out/meta/RUSTC_VERSION.txt
+          cargo --version --verbose > ../out/meta/CARGO_VERSION.txt
+
+      - name: Execute constrained campaign
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd monad-bft
+          set +e
+          MONAD_BRANCH_SWITCH_RESULT="$PWD/../out/BRANCH_SWITCH_RESULT.json" \
+            RUST_BACKTRACE=1 \
+            timeout --signal=TERM --kill-after=20s 3600s \
+            cargo test -p monad-twins --test branch_switch_matrix \
+              -- --exact branch_switch_matrix --nocapture --test-threads=1 \
+              > ../out/raw/campaign.log 2>&1
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > ../out/raw/campaign.rc
+          test -f ../out/BRANCH_SWITCH_RESULT.json
+
+      - name: Adjudicate fail-closed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, pathlib
+          out = pathlib.Path('out')
+          result = json.loads((out/'BRANCH_SWITCH_RESULT.json').read_text())
+          rc = int((out/'raw/campaign.rc').read_text().strip())
+          failures = [r for r in result['records'] if not r['pass']]
+          controls = [r for r in result['records'] if 'control_' in r['case']]
+          controls_pass = all(r['pass'] for r in controls) and len(controls) == 3
+          candidate = bool(failures) and controls_pass
+          adjudication = {
+              'source_commit': result['source_commit'],
+              'scenario_count': result['scenario_count'],
+              'failure_count': len(failures),
+              'controls_pass': controls_pass,
+              'process_return_code': rc,
+              'candidate_signal': candidate,
+              'decision': (
+                  'CANDIDATE_REQUIRES_MINIMIZATION_AND_FULLNODE_PROMOTION'
+                  if candidate else
+                  'NO_CONSTRAINED_BRANCH_SWITCH_SIGNAL'
+                  if not failures and rc == 0 else
+                  'INFRASTRUCTURE_OR_CONTROL_FAILURE'
+              ),
+              'failed_cases': failures,
+              'security_boundary': {
+                  'attacker_stake_fraction': '1/4',
+                  'honest_to_honest_links_always_intact': True,
+                  'only_byzantine_same-key_persona_reachability_varied': True,
+                  'public_network_contacted': False,
+              },
+          }
+          (out/'ADJUDICATION.json').write_text(json.dumps(adjudication, indent=2, sort_keys=True)+'\n')
+          print(json.dumps(adjudication, indent=2))
+          if adjudication['decision'] == 'INFRASTRUCTURE_OR_CONTROL_FAILURE':
+              raise SystemExit(2)
+          PY
+          git -C monad-bft status --porcelain=v1 > out/meta/WORKTREE_STATUS.txt
+          git -C monad-bft diff -- monad-twins/tests/branch_switch_matrix.rs \
+            > out/meta/TEST_PATCH.diff
+          find monad-bft/monad-twins/tests/generated_branch_switch -type f -print0 \
+            | LC_ALL=C sort -z | xargs -0 sha256sum > out/meta/SCENARIO_SHA256SUMS.txt
+          sha256sum out/SCENARIO_MANIFEST.json out/BRANCH_SWITCH_RESULT.json \
+            out/ADJUDICATION.json out/raw/* out/meta/* > out/SHA256SUMS
+          tar --sort=name --mtime='UTC 2026-08-24' --owner=0 --group=0 --numeric-owner \
+            -C out -czf monad-v0160-branch-switch-campaign-20260824.tar.gz \
+            SCENARIO_MANIFEST.json BRANCH_SWITCH_RESULT.json ADJUDICATION.json \
+            SHA256SUMS raw meta cases
+          sha256sum monad-v0160-branch-switch-campaign-20260824.tar.gz \
+            > monad-v0160-branch-switch-campaign-20260824.tar.gz.sha256
+
+      - name: Upload campaign evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0160-branch-switch-campaign-20260824
+          path: |
+            monad-v0160-branch-switch-campaign-20260824.tar.gz
+            monad-v0160-branch-switch-campaign-20260824.tar.gz.sha256
+            out/ADJUDICATION.json
+            out/BRANCH_SWITCH_RESULT.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0

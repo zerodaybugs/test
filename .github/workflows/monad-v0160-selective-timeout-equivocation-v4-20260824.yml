@@ -1,0 +1,166 @@
+name: Monad v0.16.0 selective timeout equivocation V4 20260824
+
+on:
+  push:
+    branches:
+      - tooling/monad-v0160-frontier-source-dossier-20260824
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  campaign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - name: Checkout research tooling
+        uses: actions/checkout@v4
+
+      - name: Clone exact scoped source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global submodule.fetchJobs "$(nproc)"
+          git clone --filter=blob:none --no-recurse-submodules \
+            https://github.com/category-labs/monad-bft.git monad-bft
+          cd monad-bft
+          git checkout c616743d1358186605e1c1b74a3d6c4fdd9dd48c
+          git submodule update --init monad-execution
+          test "$(git rev-parse HEAD)" = "c616743d1358186605e1c1b74a3d6c4fdd9dd48c"
+          test "$(git -C monad-execution rev-parse HEAD)" = "e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0"
+          test -z "$(git status --porcelain=v1)"
+
+      - name: Enable recipient-selective valid timeout delivery
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('monad-bft/monad-mock-swarm/src/transformer.rs')
+          s = p.read_text()
+          needle = 'ProtocolMessage::Timeout(_) => TwinsCapture::Spread(pid),'
+          if s.count(needle) != 1:
+              raise SystemExit(f'expected exactly one timeout-spread token, found {s.count(needle)}')
+          replacement = '''ProtocolMessage::Timeout(t) => {
+                              // Research-only delivery-model promotion. Both personas run the
+                              // exact state machine and produce independently valid messages;
+                              // only their recipient sets differ.
+                              TwinsCapture::Process(pid, t.0.tminfo.round)
+                          },'''
+          p.write_text(s.replace(needle, replacement, 1))
+          PY
+          cp research/monad-v0160/selective_equivocation_matrix.rs \
+            monad-bft/monad-twins/tests/selective_timeout_equivocation_matrix.rs
+          cp research/monad-v0160/selective_equivocation_base.json \
+            monad-bft/monad-twins/tests/selective_equivocation_base.json
+          sed -i 's/fn selective_equivocation_matrix()/fn selective_timeout_equivocation_matrix()/' \
+            monad-bft/monad-twins/tests/selective_timeout_equivocation_matrix.rs
+          sed -i 's/MONAD_SELECTIVE_EQUIVOCATION_RESULT/MONAD_SELECTIVE_TIMEOUT_EQUIVOCATION_RESULT/g' \
+            monad-bft/monad-twins/tests/selective_timeout_equivocation_matrix.rs
+          cat >> monad-bft/monad-twins/Cargo.toml <<'TOML'
+          monad-types = { workspace = true }
+          TOML
+
+      - name: Compile exact campaign
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/raw out/meta
+          cd monad-bft
+          cargo test -p monad-twins --test selective_timeout_equivocation_matrix --no-run \
+            2>&1 | tee ../out/raw/build.log
+          cargo metadata --no-deps --format-version 1 > ../out/meta/CARGO_METADATA.json
+          rustc --version --verbose > ../out/meta/RUSTC_VERSION.txt
+          cargo --version --verbose > ../out/meta/CARGO_VERSION.txt
+
+      - name: Execute constrained campaign
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd monad-bft
+          set +e
+          MONAD_SELECTIVE_TIMEOUT_EQUIVOCATION_RESULT="$PWD/../out/SELECTIVE_TIMEOUT_EQUIVOCATION_RESULT.json" \
+            RUST_BACKTRACE=1 \
+            timeout --signal=TERM --kill-after=20s 3600s \
+            cargo test -p monad-twins --test selective_timeout_equivocation_matrix \
+              -- --exact selective_timeout_equivocation_matrix --nocapture --test-threads=1 \
+              > ../out/raw/campaign.log 2>&1
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > ../out/raw/campaign.rc
+          test -f ../out/SELECTIVE_TIMEOUT_EQUIVOCATION_RESULT.json
+
+      - name: Adjudicate fail-closed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib
+          out = pathlib.Path('out')
+          result = json.loads((out/'SELECTIVE_TIMEOUT_EQUIVOCATION_RESULT.json').read_text())
+          rc = int((out/'raw/campaign.rc').read_text().strip())
+          failures = [r for r in result['records'] if not r['pass']]
+          controls = [r for r in result['records'] if r['case'].startswith('control_')]
+          controls_pass = len(controls) == 3 and all(r['pass'] for r in controls)
+          candidate = bool(failures) and controls_pass
+          adjudication = {
+              'source_commit': result['source_commit'],
+              'scenario_count': result['scenario_count'],
+              'failure_count': len(failures),
+              'controls_pass': controls_pass,
+              'process_return_code': rc,
+              'candidate_signal': candidate,
+              'decision': (
+                  'CANDIDATE_REQUIRES_MINIMIZATION_AND_UNPATCHED_FULLNODE_PROMOTION'
+                  if candidate else
+                  'NO_SELECTIVE_TIMEOUT_EQUIVOCATION_SIGNAL'
+                  if not failures and rc == 0 else
+                  'INFRASTRUCTURE_OR_CONTROL_FAILURE'
+              ),
+              'failed_cases': failures,
+              'security_boundary': {
+                  'attacker_stake_fraction': '1/4',
+                  'honest_to_honest_links_always_intact': True,
+                  'honest_messages_remain_production_signed': True,
+                  'byzantine_personas_share_exact_signing_keys': True,
+                  'byzantine_timeout_messages_remain_independently_valid': True,
+                  'harness_change_only_relaxes_timeout_delivery_model': True,
+                  'public_network_contacted': False,
+              },
+          }
+          (out/'ADJUDICATION.json').write_text(json.dumps(adjudication, indent=2, sort_keys=True)+'\n')
+          print(json.dumps(adjudication, indent=2))
+          if adjudication['decision'] == 'INFRASTRUCTURE_OR_CONTROL_FAILURE':
+              raise SystemExit(2)
+          PY
+          git -C monad-bft status --porcelain=v1 > out/meta/WORKTREE_STATUS.txt
+          git -C monad-bft diff -- \
+            monad-mock-swarm/src/transformer.rs \
+            monad-twins/Cargo.toml \
+            monad-twins/tests/selective_timeout_equivocation_matrix.rs \
+            monad-twins/tests/selective_equivocation_base.json \
+            > out/meta/TEST_PATCH.diff
+          sha256sum out/SELECTIVE_TIMEOUT_EQUIVOCATION_RESULT.json out/ADJUDICATION.json \
+            out/raw/* out/meta/* > out/SHA256SUMS
+          tar --sort=name --mtime='UTC 2026-08-24' --owner=0 --group=0 --numeric-owner \
+            -C out -czf monad-v0160-selective-timeout-equivocation-v4-20260824.tar.gz \
+            SELECTIVE_TIMEOUT_EQUIVOCATION_RESULT.json ADJUDICATION.json SHA256SUMS raw meta
+          sha256sum monad-v0160-selective-timeout-equivocation-v4-20260824.tar.gz \
+            > monad-v0160-selective-timeout-equivocation-v4-20260824.tar.gz.sha256
+
+      - name: Upload campaign evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0160-selective-timeout-equivocation-v4-20260824
+          path: |
+            monad-v0160-selective-timeout-equivocation-v4-20260824.tar.gz
+            monad-v0160-selective-timeout-equivocation-v4-20260824.tar.gz.sha256
+            out/ADJUDICATION.json
+            out/SELECTIVE_TIMEOUT_EQUIVOCATION_RESULT.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0

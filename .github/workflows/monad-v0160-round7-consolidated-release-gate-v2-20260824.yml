@@ -1,0 +1,317 @@
+name: Monad v0.16.0 Round 7 consolidated release gate V2 20260824
+
+on:
+  push:
+    branches:
+      - tooling/monad-v0160-frontier-source-dossier-20260824
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  consolidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout research tooling
+        uses: actions/checkout@v4
+
+      - name: Resolve completed workflow runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/raw evidence/adjudications evidence/meta
+          cat > evidence/meta/EXPECTED_WORKFLOWS.json <<'JSON'
+          [
+            {
+              "key": "timeout_v4",
+              "workflow": "Monad v0.16.0 selective timeout equivocation V4 20260824",
+              "artifact": "monad-v0160-selective-timeout-equivocation-v4-20260824"
+            },
+            {
+              "key": "timeout_promotion",
+              "workflow": "Monad v0.16.0 timeout equivocation promotion gate 20260824",
+              "artifact": "monad-v0160-timeout-equivocation-promotion-20260824"
+            },
+            {
+              "key": "raptor_amplification",
+              "workflow": "Monad v0.16.0 RaptorCast authenticated verification amplification 20260824",
+              "artifact": "monad-v0160-raptorcast-authenticated-verification-amplification-20260824"
+            },
+            {
+              "key": "raptor_starvation",
+              "workflow": "Monad v0.16.0 RaptorCast global limiter starvation 20260824",
+              "artifact": "monad-v0160-raptorcast-global-limiter-starvation-20260824"
+            },
+            {
+              "key": "execution_frontier",
+              "workflow": "Monad execution post-v0.16 frontier export 20260824",
+              "artifact": "monad-execution-post-v0160-frontier-20260824"
+            }
+          ]
+          JSON
+
+          for attempt in $(seq 1 240); do
+            gh run list --repo zerodaybugs/test \
+              --branch tooling/monad-v0160-frontier-source-dossier-20260824 \
+              --limit 100 --json databaseId,name,status,conclusion,createdAt,headSha,event \
+              > evidence/meta/RUN_LIST.json
+            python3 - <<'PY'
+          import json,pathlib
+          root=pathlib.Path('evidence/meta')
+          expected=json.loads((root/'EXPECTED_WORKFLOWS.json').read_text())
+          runs=json.loads((root/'RUN_LIST.json').read_text())
+          resolved=[]
+          for item in expected:
+              matches=[r for r in runs if r.get('name')==item['workflow'] and r.get('status')=='completed']
+              matches.sort(key=lambda r:r.get('createdAt',''))
+              chosen=matches[-1] if matches else None
+              resolved.append({**item,'run':chosen})
+          (root/'RESOLVED_RUNS.json').write_text(json.dumps(resolved,indent=2,sort_keys=True)+'\n')
+          missing=[r['key'] for r in resolved if r['run'] is None]
+          (root/'MISSING_RUNS.txt').write_text('\n'.join(missing)+('\n' if missing else ''))
+          PY
+            if [ ! -s evidence/meta/MISSING_RUNS.txt ]; then
+              break
+            fi
+            sleep 5
+          done
+
+      - name: Download exact artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' > evidence/meta/DOWNLOAD_PLAN.tsv
+          import json
+          for r in json.load(open('evidence/meta/RESOLVED_RUNS.json')):
+              run=r.get('run')
+              if run:
+                  print(f"{r['key']}\t{run['databaseId']}\t{r['artifact']}")
+          PY
+          while IFS=$'\t' read -r key run_id artifact; do
+            mkdir -p "evidence/raw/$key"
+            set +e
+            gh run download "$run_id" --repo zerodaybugs/test \
+              --name "$artifact" --dir "evidence/raw/$key" \
+              > "evidence/meta/download-$key.log" 2>&1
+            rc=$?
+            set -e
+            printf '%s\n' "$rc" > "evidence/meta/download-$key.rc"
+          done < evidence/meta/DOWNLOAD_PLAN.tsv
+          find evidence/raw -type f -printf '%P\n' | LC_ALL=C sort \
+            > evidence/meta/DOWNLOADED_FILE_LIST.txt
+
+      - name: Extract machine adjudications
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib,shutil,tarfile,zipfile
+          root=pathlib.Path('evidence')
+
+          # Unpack nested evidence archives only into bounded per-gate folders.
+          for keydir in sorted((root/'raw').iterdir() if (root/'raw').exists() else []):
+              if not keydir.is_dir():
+                  continue
+              unpack=keydir/'_unpacked'
+              unpack.mkdir(exist_ok=True)
+              for p in list(keydir.iterdir()):
+                  try:
+                      if p.is_file() and zipfile.is_zipfile(p):
+                          with zipfile.ZipFile(p) as z:
+                              for info in z.infolist():
+                                  target=(unpack/info.filename).resolve()
+                                  if not str(target).startswith(str(unpack.resolve())):
+                                      raise RuntimeError(f'unsafe zip path: {info.filename}')
+                              z.extractall(unpack)
+                      elif p.is_file() and (p.name.endswith('.tar.gz') or p.name.endswith('.tgz')):
+                          with tarfile.open(p,'r:gz') as t:
+                              for member in t.getmembers():
+                                  target=(unpack/member.name).resolve()
+                                  if not str(target).startswith(str(unpack.resolve())):
+                                      raise RuntimeError(f'unsafe tar path: {member.name}')
+                              t.extractall(unpack,filter='data')
+                  except Exception as e:
+                      (root/'meta'/f'unpack-{keydir.name}.error').write_text(repr(e)+'\n')
+
+          records=[]
+          preferred_names={
+              'PROMOTION_ADJUDICATION.json',
+              'ADJUDICATION.json',
+              'EXPORT_RESULT.json',
+              'POST_V0160_RAPTOR_DIFF_ADJUDICATION.json',
+              'PUBLIC_DUPLICATE_SCAN.json',
+          }
+          for keydir in sorted((root/'raw').iterdir() if (root/'raw').exists() else []):
+              if not keydir.is_dir():
+                  continue
+              candidates=[]
+              for p in keydir.rglob('*.json'):
+                  try:
+                      d=json.loads(p.read_text())
+                  except Exception:
+                      continue
+                  if p.name in preferred_names:
+                      candidates.append((p,d))
+              for idx,(p,d) in enumerate(candidates):
+                  dst=root/'adjudications'/f'{keydir.name}-{idx:02d}-{p.name}'
+                  shutil.copy2(p,dst)
+                  records.append({
+                      'key':keydir.name,
+                      'source_path':str(p),
+                      'copied_path':str(dst),
+                      'data':d,
+                  })
+          (root/'meta'/'ADJUDICATION_INDEX.json').write_text(
+              json.dumps(records,indent=2,sort_keys=True)+'\n'
+          )
+          print(json.dumps(records,indent=2))
+          PY
+
+      - name: Consolidated fail-closed decision
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib
+          root=pathlib.Path('evidence')
+          expected=[r['key'] for r in json.loads((root/'meta'/'EXPECTED_WORKFLOWS.json').read_text())]
+          resolved=json.loads((root/'meta'/'RESOLVED_RUNS.json').read_text())
+          records=json.loads((root/'meta'/'ADJUDICATION_INDEX.json').read_text())
+          present={r['key'] for r in records}
+          missing_runs=[r['key'] for r in resolved if r.get('run') is None]
+          missing_adjudications=[k for k in expected if k not in present]
+          candidates=[]; holds=[]; kills=[]; submission_ready=[]; pin_errors=[]
+          for r in records:
+              d=r['data'] if isinstance(r.get('data'),dict) else {}
+              decision=str(d.get('decision') or d.get('release_decision') or '')
+              upper=decision.upper()
+              if d.get('submission_ready') is True or 'SUBMIT_READY' in upper:
+                  submission_ready.append(r)
+              if upper.startswith('CANDIDATE'):
+                  candidates.append(r)
+              elif upper.startswith('HOLD'):
+                  holds.append(r)
+              elif upper.startswith('KILL') or upper.startswith('NO_'):
+                  kills.append(r)
+              commit=d.get('source_commit')
+              if commit and commit != 'c616743d1358186605e1c1b74a3d6c4fdd9dd48c':
+                  pin_errors.append({'path':r['copied_path'],'source_commit':commit})
+          if pin_errors:
+              release='BLOCK_SOURCE_PIN_MISMATCH'
+          elif submission_ready:
+              release='BLOCK_REQUIRES_INDEPENDENT_FINAL_RELEASE_QA'
+          elif missing_runs or missing_adjudications:
+              release='HOLD_MISSING_MACHINE_ADJUDICATIONS'
+          elif candidates:
+              release='HOLD_CANDIDATE_REQUIRES_MINIMIZATION_PRODUCTION_IMPACT_AND_DUPLICATE_CLEARANCE'
+          else:
+              release='HOLD_NOT_FOR_SUBMISSION'
+          decision={
+              'project':'Monad v0.16.0 continued hunt Round 7',
+              'monad_bft_commit':'c616743d1358186605e1c1b74a3d6c4fdd9dd48c',
+              'monad_execution_commit':'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0',
+              'release_decision':release,
+              'submission_ready':False,
+              'new_high_proven':False,
+              'new_critical_proven':False,
+              'expected_gates':expected,
+              'present_gates':sorted(present),
+              'missing_runs':missing_runs,
+              'missing_adjudications':missing_adjudications,
+              'candidate_records':[r['copied_path'] for r in candidates],
+              'hold_records':[r['copied_path'] for r in holds],
+              'kill_records':[r['copied_path'] for r in kills],
+              'source_pin_errors':pin_errors,
+              'workflow_runs':resolved,
+              'mandatory_remaining_gates':[
+                  'current program and file-level scope confirmation',
+                  'unmodified production-ingress reproduction',
+                  'unauthorized-but-permitted attacker trigger',
+                  'direct reproducible High/Critical impact and negative controls',
+                  'matched natural security fix',
+                  'public duplicate, prior-art and natural-fix clearance',
+                  'private-duplicate risk assessment',
+                  'one root cause per report',
+                  'independent final QA, residue scan, manifest and checksum verification',
+              ],
+          }
+          (root/'ROUND7_MASTER_DECISION.json').write_text(json.dumps(decision,indent=2,sort_keys=True)+'\n')
+          lines=[
+              '# Monad v0.16.0 — Round 7 consolidated release gate V2',
+              '',
+              f'**Release decision:** `{release}`',
+              '',
+              f'- Present gates: {", ".join(sorted(present)) or "none"}',
+              f'- Missing workflow runs: {", ".join(missing_runs) or "none"}',
+              f'- Missing machine adjudications: {", ".join(missing_adjudications) or "none"}',
+              f'- Candidate records: {len(candidates)}',
+              f'- Submission-ready records: {len(submission_ready)}',
+              '',
+              'No submit-ready package is released by this gate.',
+          ]
+          (root/'ROUND7_STATUS.md').write_text('\n'.join(lines)+'\n')
+          print(json.dumps(decision,indent=2))
+          PY
+
+      - name: Integrity and residue QA
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib,re
+          root=pathlib.Path('evidence')
+          targets=[root/'ROUND7_MASTER_DECISION.json',root/'ROUND7_STATUS.md']
+          patterns=[
+              re.compile(r'(?i)as an ai'),
+              re.compile(r'(?i)language model'),
+              re.compile(r'(?i)chatgpt'),
+              re.compile(r'(?i)todo\s*:\s*write'),
+          ]
+          suspicious=[]
+          for p in targets:
+              text=p.read_text(errors='replace')
+              for pat in patterns:
+                  if pat.search(text):
+                      suspicious.append({'path':str(p),'pattern':pat.pattern})
+          master=json.loads((root/'ROUND7_MASTER_DECISION.json').read_text())
+          qa={
+              'qa_decision':'PASS_RESEARCH_CHECKPOINT' if not suspicious else 'BLOCK_RESIDUE',
+              'release_decision':master['release_decision'],
+              'submission_ready':False,
+              'suspicious_residue':suspicious,
+          }
+          (root/'FINAL_QA.json').write_text(json.dumps(qa,indent=2,sort_keys=True)+'\n')
+          if suspicious:
+              raise SystemExit(2)
+          PY
+          find evidence -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum \
+            > evidence/SHA256SUMS
+          tar --sort=name --mtime='UTC 2026-08-24' --owner=0 --group=0 --numeric-owner \
+            -C evidence -czf MONAD_V0160_ROUND7_RESEARCH_CHECKPOINT_NOT_FOR_SUBMISSION_20260824.tar.gz .
+          sha256sum MONAD_V0160_ROUND7_RESEARCH_CHECKPOINT_NOT_FOR_SUBMISSION_20260824.tar.gz \
+            > MONAD_V0160_ROUND7_RESEARCH_CHECKPOINT_NOT_FOR_SUBMISSION_20260824.tar.gz.sha256
+
+      - name: Upload consolidated checkpoint
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-v0160-round7-consolidated-release-gate-v2-20260824
+          path: |
+            MONAD_V0160_ROUND7_RESEARCH_CHECKPOINT_NOT_FOR_SUBMISSION_20260824.tar.gz
+            MONAD_V0160_ROUND7_RESEARCH_CHECKPOINT_NOT_FOR_SUBMISSION_20260824.tar.gz.sha256
+            evidence/ROUND7_MASTER_DECISION.json
+            evidence/ROUND7_STATUS.md
+            evidence/FINAL_QA.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
