@@ -1,0 +1,353 @@
+name: Pyth EVM owner and raw signer follow-up 20260730
+
+on:
+  push:
+    branches:
+      - research/pyth-source-mirror-20260730-b
+    paths:
+      - '.github/workflows/pyth-evm-owner-signer-followup-20260730.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/pyth-evm-owner-signer-followup-20260730.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  followup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout current public Pyth store
+        uses: actions/checkout@v4
+        with:
+          repository: pyth-network/pyth-crosschain
+          ref: main
+          path: pyth-crosschain
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install deterministic keccak dependency
+        shell: bash
+        run: python3 -m pip install --disable-pip-version-check --no-input pycryptodome==3.23.0
+
+      - name: Run read-only owner and raw signer analysis
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/raw
+          cat > /tmp/followup.py <<'PY'
+          import concurrent.futures
+          import json
+          import subprocess
+          import time
+          import urllib.request
+          from pathlib import Path
+          from Crypto.Hash import keccak
+
+          STORE = Path('pyth-crosschain/contract_manager/src/store')
+          OUT = Path('evidence')
+          RAW = OUT / 'raw'
+          RAW.mkdir(parents=True, exist_ok=True)
+          RANDOM = '0x1111111111111111111111111111111111111111'
+          IMPL_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
+          ADMIN_SLOT = '0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103'
+
+          EXTRA_RPCS = {
+              'base': [
+                  'https://mainnet.base.org',
+                  'https://base-rpc.publicnode.com',
+                  'https://base.api.pocket.network',
+                  'https://public.1rpc.io/base',
+              ],
+              'soneium': [
+                  'https://rpc.soneium.org',
+                  'https://soneium-rpc.publicnode.com',
+                  'https://1868.rpc.thirdweb.com',
+              ],
+              'polynomial': [
+                  'https://rpc.polynomial.fi',
+                  'https://rpc-proxy.polynomial.fi',
+                  'https://8008.rpc.thirdweb.com',
+              ],
+          }
+
+          def selector(sig: str) -> str:
+              h = keccak.new(digest_bits=256)
+              h.update(sig.encode())
+              return '0x' + h.hexdigest()[:8]
+
+          def enc_address(addr: str) -> str:
+              return addr.lower().removeprefix('0x').rjust(64, '0')
+
+          def request_json(url, payload, timeout=30):
+              req = urllib.request.Request(
+                  url,
+                  data=json.dumps(payload).encode(),
+                  headers={
+                      'content-type':'application/json',
+                      'user-agent':'Pyth-authorized-read-only-followup/1.0',
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as r:
+                      return json.loads(r.read())
+              except Exception as exc:
+                  return {'transport_error':type(exc).__name__, 'message':str(exc)}
+
+          def rpc(url, method, params, rpc_id=1):
+              return request_json(url, {'jsonrpc':'2.0','id':rpc_id,'method':method,'params':params})
+
+          def result(obj):
+              return obj.get('result') if isinstance(obj,dict) else None
+
+          def probe(url, expected_chain):
+              a = rpc(url,'eth_chainId',[])
+              b = rpc(url,'eth_blockNumber',[])
+              chain = result(a)
+              block = result(b)
+              return {
+                  'url':url,
+                  'chain_id_raw':a,
+                  'block_raw':b,
+                  'ok':isinstance(chain,str) and isinstance(block,str) and int(chain,16)==expected_chain,
+              }
+
+          def choose_rpc(chain_id, store_url, expected_chain):
+              urls=[]
+              for u in [store_url, *EXTRA_RPCS.get(chain_id,[])]:
+                  if u and u not in urls:
+                      urls.append(u)
+              probes=[probe(u,expected_chain) for u in urls]
+              selected=next((p['url'] for p in probes if p['ok']),None)
+              return selected, probes
+
+          def eth_call(url,to,sig,args='',from_addr=None):
+              tx={'to':to,'data':selector(sig)+args}
+              if from_addr:
+                  tx['from']=from_addr
+              return rpc(url,'eth_call',[tx,'latest'])
+
+          def word(raw,idx=0):
+              if not isinstance(raw,str) or not raw.startswith('0x'):
+                  return None
+              body=raw[2:]
+              start=idx*64
+              if len(body)<start+64:
+                  return None
+              return int(body[start:start+64],16)
+
+          def address_word(raw,idx=0):
+              v=word(raw,idx)
+              return None if v is None else f'0x{v & ((1<<160)-1):040x}'
+
+          def decode_string(raw):
+              try:
+                  body=raw.removeprefix('0x')
+                  off=int(body[:64],16)*2
+                  n=int(body[off:off+64],16)
+                  return bytes.fromhex(body[off+64:off+64+n*2]).decode(errors='replace')
+              except Exception:
+                  return None
+
+          def code_len(raw):
+              return max(0,(len(raw)-2)//2) if isinstance(raw,str) and raw.startswith('0x') else 0
+
+          def get_storage_slots(url,address,slots):
+              out={}
+              for start in range(0,len(slots),20):
+                  chunk=slots[start:start+20]
+                  payload=[
+                      {'jsonrpc':'2.0','id':slot+1,'method':'eth_getStorageAt','params':[address,hex(slot),'latest']}
+                      for slot in chunk
+                  ]
+                  response=request_json(url,payload,timeout=45)
+                  if isinstance(response,list):
+                      by_id={x.get('id'):x for x in response if isinstance(x,dict)}
+                      for slot in chunk:
+                          out[str(slot)]=by_id.get(slot+1,{'error':'missing batch response'})
+                  else:
+                      # Fail closed to individual calls when batching is unsupported.
+                      def one(slot):
+                          return slot,rpc(url,'eth_getStorageAt',[address,hex(slot),'latest'],slot+1)
+                      with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+                          for slot,obj in ex.map(one,chunk):
+                              out[str(slot)]=obj
+                  time.sleep(0.08)
+              return out
+
+          def decode_signers(storage):
+              signers=[]
+              for i in range(100):
+                  pub_raw=result(storage.get(str(2*i),{}))
+                  exp_raw=result(storage.get(str(2*i+1),{}))
+                  try:
+                      pub=int(pub_raw,16) if isinstance(pub_raw,str) else 0
+                      exp=int(exp_raw,16) if isinstance(exp_raw,str) else None
+                  except Exception:
+                      continue
+                  if pub:
+                      signers.append({
+                          'slot_index':i,
+                          'address':f'0x{pub & ((1<<160)-1):040x}',
+                          'expires_at':exp,
+                      })
+              return signers
+
+          def inspect_contract(url,address):
+              raw={}
+              raw['code']=rpc(url,'eth_getCode',[address,'latest'])
+              raw['impl']=rpc(url,'eth_getStorageAt',[address,IMPL_SLOT,'latest'])
+              raw['admin']=rpc(url,'eth_getStorageAt',[address,ADMIN_SLOT,'latest'])
+              for name,sig in {
+                  'owner':'owner()',
+                  'version':'version()',
+                  'owner_chain':'getOwnerChainId()',
+                  'owner_emitter':'getOwnerEmitterAddress()',
+                  'last_sequence':'getLastExecutedSequence()',
+              }.items():
+                  raw[name]=eth_call(url,address,sig)
+              raw['initialize_address']=eth_call(url,address,'initialize(address)',enc_address(RANDOM),RANDOM)
+              # Executor initializer used by current ExecutorUpgradable deployments.
+              init_args=(
+                  enc_address(RANDOM)
+                  + f'{0:064x}'
+                  + f'{1:064x}'
+                  + f'{1:064x}'
+                  + ('11'*32)
+              )
+              raw['initialize_executor']=eth_call(
+                  url,address,'initialize(address,uint64,uint16,uint16,bytes32)',init_args,RANDOM
+              )
+              decoded={
+                  'code_length':code_len(result(raw['code'])),
+                  'implementation':address_word(result(raw['impl'])),
+                  'admin':address_word(result(raw['admin'])),
+                  'owner':address_word(result(raw['owner'])),
+                  'version':decode_string(result(raw['version'])),
+                  'owner_chain':word(result(raw['owner_chain'])),
+                  'owner_emitter':result(raw['owner_emitter']),
+                  'last_sequence':word(result(raw['last_sequence'])),
+                  'initialize_address_reverted':result(raw['initialize_address']) is None,
+                  'initialize_executor_reverted':result(raw['initialize_executor']) is None,
+              }
+              return {'address':address,'raw':raw,'decoded':decoded}
+
+          chains={x['id']:x for x in json.load(open(STORE/'chains/EvmChains.json'))}
+          lazers=json.load(open(STORE/'contracts/EvmLazerContracts.json'))
+          executors={x['chain']:x['address'] for x in json.load(open(STORE/'contracts/EvmExecutorContracts.json'))}
+          known_executor_addresses=sorted({x['address'].lower() for x in json.load(open(STORE/'contracts/EvmExecutorContracts.json'))})
+          revision=subprocess.check_output(['git','-C','pyth-crosschain','rev-parse','HEAD'],text=True).strip()
+          now=int(time.time())
+          results=[]
+
+          for idx,rec in enumerate(lazers):
+              chain=chains.get(rec['chain'])
+              if not chain or not chain.get('mainnet'):
+                  continue
+              chain_name=rec['chain']
+              selected,probes=choose_rpc(chain_name,chain.get('rpcUrl'),chain['networkId'])
+              row={
+                  'chain':chain_name,
+                  'network_id':chain['networkId'],
+                  'lazer':rec['address'],
+                  'expected_executor':executors.get(chain_name),
+                  'selected_rpc':selected,
+                  'rpc_probes':probes,
+                  'source_revision':revision,
+                  'observed_at_unix':now,
+              }
+              if not selected:
+                  row['status']='RPC_UNAVAILABLE'
+                  results.append(row)
+                  (RAW/f'{idx:02d}_{chain_name}.json').write_text(json.dumps(row,indent=2,sort_keys=True))
+                  continue
+
+              lazer=inspect_contract(selected,rec['address'])
+              slots=get_storage_slots(selected,rec['address'],list(range(200)))
+              signers=decode_signers(slots)
+              owner=(lazer['decoded'].get('owner') or '').lower()
+              expected=(executors.get(chain_name) or '').lower()
+              owner_inspection=inspect_contract(selected,owner) if owner and owner!='0x0000000000000000000000000000000000000000' else None
+              expected_inspection=None
+              if expected and expected!=owner:
+                  expected_inspection=inspect_contract(selected,expected)
+
+              row.update({
+                  'status':'OK',
+                  'lazer_inspection':lazer,
+                  'raw_signer_storage':slots,
+                  'trusted_signers':signers,
+                  'owner_is_expected_executor':bool(expected) and owner==expected,
+                  'owner_is_known_executor_address':owner in known_executor_addresses,
+                  'owner_inspection':owner_inspection,
+                  'expected_executor_inspection':expected_inspection,
+              })
+              row['gates']={
+                  'lazer_has_code':lazer['decoded']['code_length']>0,
+                  'lazer_initialized':lazer['decoded']['initialize_address_reverted'],
+                  'signer_count_positive':len(signers)>0,
+                  'all_signers_unexpired':bool(signers) and all(s['expires_at'] and s['expires_at']>now for s in signers),
+                  'owner_not_zero':owner not in ('','0x0000000000000000000000000000000000000000'),
+                  'owner_has_code_or_known_deployer':(
+                      bool(owner_inspection and owner_inspection['decoded']['code_length']>0)
+                      or owner=='0x78357316239040e19fc823372cc179ca75e64b81'
+                  ),
+                  'contract_owner_initialized_when_contract':(
+                      True if not owner_inspection or owner_inspection['decoded']['code_length']==0
+                      else owner_inspection['decoded']['initialize_executor_reverted']
+                  ),
+              }
+              results.append(row)
+              (RAW/f'{idx:02d}_{chain_name}.json').write_text(json.dumps(row,indent=2,sort_keys=True))
+
+          summary={
+              'source_revision':revision,
+              'observed_at_unix':now,
+              'known_executor_addresses':known_executor_addresses,
+              'results':results,
+          }
+          (OUT/'followup.json').write_text(json.dumps(summary,indent=2,sort_keys=True))
+
+          compact=[]
+          failures=[]
+          signer_matrix={}
+          for r in results:
+              compact.append({
+                  'chain':r['chain'],
+                  'status':r.get('status'),
+                  'selected_rpc':r.get('selected_rpc'),
+                  'owner':((r.get('lazer_inspection') or {}).get('decoded') or {}).get('owner'),
+                  'expected_executor':r.get('expected_executor'),
+                  'owner_is_expected_executor':r.get('owner_is_expected_executor'),
+                  'owner_is_known_executor_address':r.get('owner_is_known_executor_address'),
+                  'owner_code_length':(((r.get('owner_inspection') or {}).get('decoded') or {}).get('code_length')),
+                  'owner_version':(((r.get('owner_inspection') or {}).get('decoded') or {}).get('version')),
+                  'signers':r.get('trusted_signers'),
+                  'gates':r.get('gates'),
+              })
+              for s in r.get('trusted_signers',[]):
+                  signer_matrix.setdefault(s['address'],[]).append({'chain':r['chain'],'expires_at':s['expires_at'],'slot_index':s['slot_index']})
+              for gate,ok in (r.get('gates') or {}).items():
+                  if ok is False:
+                      failures.append({'chain':r['chain'],'gate':gate})
+          (OUT/'compact.json').write_text(json.dumps(compact,indent=2,sort_keys=True))
+          (OUT/'signer_matrix.json').write_text(json.dumps(signer_matrix,indent=2,sort_keys=True))
+          (OUT/'gate_failures.json').write_text(json.dumps(failures,indent=2,sort_keys=True))
+          print(f'chains={len(results)} failures={len(failures)} unique_signers={len(signer_matrix)}')
+          for item in failures:
+              print(item['chain'],item['gate'])
+          PY
+          python3 /tmp/followup.py | tee evidence/run.log
+          find evidence -type f -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS.txt
+
+      - name: Upload read-only evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyth-evm-owner-signer-followup-${{ github.run_id }}
+          path: evidence/
+          retention-days: 1
+          compression-level: 6
+          if-no-files-found: error
