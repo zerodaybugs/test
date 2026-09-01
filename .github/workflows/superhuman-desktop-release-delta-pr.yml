@@ -1,0 +1,89 @@
+name: Superhuman desktop exact release security delta
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  delta:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Download and extract official 1041.0.28 and 1041.0.29 builds
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf desktop-delta
+          mkdir -p desktop-delta/raw desktop-delta/evidence
+          base='https://storage.googleapis.com/download.superhuman.com/supertron-update'
+          for version in 1041.0.28 1041.0.29; do
+            curl --fail --show-error --silent --location --retry 3 --retry-all-errors \
+              "$base/Superhuman-${version}-latest-mac.zip" -o "desktop-delta/raw/${version}.zip"
+            mkdir -p "desktop-delta/raw/${version}"
+            unzip -q "desktop-delta/raw/${version}.zip" -d "desktop-delta/raw/${version}"
+          done
+          echo '5b753f4c31dd0e5732f0e555bbd76e595c573445bf93b91fd25320e29bf2f014  desktop-delta/raw/1041.0.29.zip' | sha256sum -c -
+          npm --silent --no-progress install --global @electron/asar@3.4.1
+          for version in 1041.0.28 1041.0.29; do
+            app="$(find "desktop-delta/raw/${version}" -name 'Superhuman.app' -type d | head -1)"
+            test -n "$app"
+            asar extract "$app/Contents/Resources/app.asar" "desktop-delta/raw/${version}-source"
+          done
+
+      - name: Compute first-party security-sensitive delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import difflib,hashlib,json,os,re
+          root=Path('desktop-delta'); old=root/'raw/1041.0.28-source'; new=root/'raw/1041.0.29-source'; ev=root/'evidence'
+          sensitive=re.compile(r'ipcMain|ipcRenderer|contextBridge|preload|BrowserWindow|BrowserView|setWindowOpenHandler|will-navigate|will-redirect|openExternal|executeJavaScript|loadURL|protocol\.|setAsDefaultProtocolClient|open-url|oauth|token|cookie|authorization|channel|autoUpdater|setFeedURL|child_process|spawn\(|exec\(|shell\.|MessagePort|postMessage|NativeApi|isValidIpcSender',re.I)
+          def files(base):
+            out={}
+            for p in base.rglob('*'):
+              if not p.is_file(): continue
+              rel=str(p.relative_to(base))
+              if rel.startswith('node_modules/'): continue
+              if p.stat().st_size>20_000_000: continue
+              if p.suffix.lower() not in {'.js','.cjs','.mjs','.json','.html','.yml','.yaml'}: continue
+              out[rel]=p
+            return out
+          a=files(old); b=files(new); paths=sorted(set(a)|set(b))
+          changed=[]; snippets=[]
+          for rel in paths:
+            pa=a.get(rel); pb=b.get(rel)
+            ba=pa.read_bytes() if pa else b''; bb=pb.read_bytes() if pb else b''
+            if hashlib.sha256(ba).digest()==hashlib.sha256(bb).digest(): continue
+            ta=ba.decode('utf-8','replace'); tb=bb.decode('utf-8','replace')
+            entry={'path':rel,'old_size':len(ba),'new_size':len(bb),'old_sha256':hashlib.sha256(ba).hexdigest() if pa else None,'new_sha256':hashlib.sha256(bb).hexdigest() if pb else None,'sensitive_old_hits':len(sensitive.findall(ta)),'sensitive_new_hits':len(sensitive.findall(tb))}
+            entry['security_sensitive']=bool(sensitive.search(ta) or sensitive.search(tb))
+            changed.append(entry)
+            if entry['security_sensitive']:
+              diff=list(difflib.unified_diff(ta.splitlines(),tb.splitlines(),fromfile='1041.0.28/'+rel,tofile='1041.0.29/'+rel,n=4))
+              if diff:
+                joined='\n'.join(diff[:8000])
+                hits=[]
+                for m in sensitive.finditer(joined):
+                  hits.append(joined[max(0,m.start()-800):m.start()+1800])
+                  if len(hits)>=80: break
+                snippets.append({'path':rel,'contexts':hits,'diff_prefix':joined[:200000]})
+          status={'workflow_run_id':int(os.environ['GITHUB_RUN_ID']),'old_version':'1041.0.28','new_version':'1041.0.29','changed_file_count':len(changed),'security_sensitive_changed_file_count':sum(1 for x in changed if x['security_sensitive']),'changed_files':changed,'security_snippets':snippets,'finding_proven':False,'submit_ready':False,'decision':'REVIEW_RELEASE_DELTA'}
+          (ev/'RESULT.json').write_text(json.dumps(status,indent=2)+'\n')
+          PY
+          sha256sum desktop-delta/evidence/RESULT.json desktop-delta/raw/1041.0.28.zip desktop-delta/raw/1041.0.29.zip > desktop-delta/evidence/SHA256SUMS.txt
+          rm -rf desktop-delta/raw/1041.0.28 desktop-delta/raw/1041.0.29 desktop-delta/raw/1041.0.28-source desktop-delta/raw/1041.0.29-source
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: superhuman-desktop-1041.0.28-to-1041.0.29-security-delta
+          path: desktop-delta/evidence/
+          retention-days: 1
+          if-no-files-found: error
