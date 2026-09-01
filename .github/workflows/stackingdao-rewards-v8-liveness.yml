@@ -1,0 +1,218 @@
+name: StackingDAO rewards-v8 liveness snapshot
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/stackingdao-rewards-v8-liveness.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout workflow
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Query rewards-v8 state and public transaction history read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cd evidence
+          npm init -y >/dev/null 2>&1
+          npm install --no-save --package-lock=false @stacks/transactions@6.17.0 >/dev/null 2>&1
+
+          cat > query.mjs <<'NODE'
+          import {
+            contractPrincipalCV,
+            cvToHex,
+            cvToString,
+            hexToCV,
+            uintCV,
+          } from '@stacks/transactions';
+          import { writeFile } from 'node:fs/promises';
+
+          const address = 'SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG';
+          const rewards = `${address}.rewards-v8`;
+          const tracking = `${address}.ststxbtc-tracking-v2`;
+          const sbtcAddress = 'SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4';
+          const sbtc = `${sbtcAddress}.sbtc-token`;
+          const api = 'https://api.mainnet.hiro.so';
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+          async function fetchJson(url, options = {}, attempts = 8) {
+            let last;
+            for (let attempt = 1; attempt <= attempts; attempt += 1) {
+              try {
+                const response = await fetch(url, options);
+                const text = await response.text();
+                if (!response.ok) {
+                  const retryAfter = Number(response.headers.get('retry-after') ?? 0);
+                  if ((response.status === 429 || response.status >= 500) && attempt < attempts) {
+                    await sleep(Math.max(retryAfter * 1000, attempt * 1500));
+                    continue;
+                  }
+                  throw new Error(`${response.status} ${response.statusText}: ${text}`);
+                }
+                return JSON.parse(text);
+              } catch (error) {
+                last = error;
+                if (attempt < attempts) await sleep(attempt * 1500);
+              }
+            }
+            throw last;
+          }
+
+          function splitContract(id) {
+            const dot = id.indexOf('.');
+            return [id.slice(0, dot), id.slice(dot + 1)];
+          }
+
+          async function callRead(contractId, fn, args = []) {
+            const [owner, name] = splitContract(contractId);
+            const body = JSON.stringify({ sender: address, arguments: args.map(cvToHex) });
+            const json = await fetchJson(
+              `${api}/v2/contracts/call-read/${owner}/${name}/${fn}`,
+              { method: 'POST', headers: { 'content-type': 'application/json' }, body },
+            );
+            if (!json.result) throw new Error(`${contractId}.${fn}: ${JSON.stringify(json)}`);
+            return { decoded: cvToString(hexToCV(json.result)), raw: json };
+          }
+
+          async function fetchTransactions(principal, maxRows = 10000) {
+            const rows = [];
+            const limit = 50;
+            let offset = 0;
+            let total = Infinity;
+            while (offset < total && rows.length < maxRows) {
+              const page = await fetchJson(
+                `${api}/extended/v2/addresses/${principal}/transactions?limit=${limit}&offset=${offset}`,
+              );
+              const pageRows = page.results ?? [];
+              rows.push(...pageRows);
+              total = Number(page.total ?? rows.length);
+              if (pageRows.length === 0) break;
+              offset += pageRows.length;
+              await sleep(180);
+            }
+            return { rows, total };
+          }
+
+          function txCore(row) { return row.tx ?? row; }
+          function txCall(row) { return txCore(row).contract_call ?? row.contract_call ?? null; }
+          function txStatus(row) { return txCore(row).tx_status ?? row.tx_status ?? null; }
+          function txId(row) { return txCore(row).tx_id ?? row.tx_id ?? null; }
+          function txTime(row) {
+            const tx = txCore(row);
+            return tx.burn_block_time_iso ?? tx.block_time_iso ?? row.burn_block_time_iso ?? row.block_time_iso ?? null;
+          }
+
+          const currentCycleResult = await callRead(rewards, 'get-pox-cycle');
+          const cycleMatch = currentCycleResult.decoded.match(/u(\d+)/);
+          if (!cycleMatch) throw new Error(`Cannot decode cycle: ${currentCycleResult.decoded}`);
+          const currentCycle = Number(cycleMatch[1]);
+
+          const cycles = [];
+          for (let cycle = Math.max(0, currentCycle - 12); cycle <= currentCycle; cycle += 1) {
+            cycles.push({
+              cycle,
+              ststxbtc: await callRead(rewards, 'get-cycle-rewards-ststxbtc', [uintCV(cycle)]),
+              should_process: await callRead(rewards, 'should-process-rewards', [uintCV(cycle)]),
+            });
+            await sleep(120);
+          }
+
+          const current = {
+            current_cycle: currentCycleResult,
+            interval_length: await callRead(rewards, 'get-rewards-interval-length'),
+            rewards_sbtc_balance: await callRead(sbtc, 'get-balance', [contractPrincipalCV(address, 'rewards-v8')]),
+            tracking_sbtc_balance: await callRead(sbtc, 'get-balance', [contractPrincipalCV(address, 'ststxbtc-tracking-v2')]),
+          };
+
+          const txPage = await fetchTransactions(rewards);
+          const directCalls = [];
+          const counts = {};
+          for (const row of txPage.rows) {
+            const call = txCall(row);
+            if (!call || call.contract_id !== rewards) continue;
+            const fn = call.function_name ?? 'unknown';
+            counts[fn] = (counts[fn] ?? 0) + 1;
+            directCalls.push({
+              tx_id: txId(row),
+              status: txStatus(row),
+              block_time_iso: txTime(row),
+              sender_address: txCore(row).sender_address ?? row.sender_address ?? null,
+              function_name: fn,
+              function_args: call.function_args ?? [],
+            });
+          }
+
+          const successful = directCalls.filter(call => call.status === 'success');
+          const latestSuccessful = {};
+          for (const call of successful) {
+            if (!latestSuccessful[call.function_name]) latestSuccessful[call.function_name] = call;
+          }
+
+          const output = {
+            captured_at: new Date().toISOString(),
+            rewards,
+            tracking,
+            transaction_rows_fetched: txPage.rows.length,
+            transaction_rows_reported_total: txPage.total,
+            counts,
+            latest_successful: latestSuccessful,
+            direct_calls: directCalls,
+            current,
+            cycles,
+          };
+          await writeFile('snapshot.json', `${JSON.stringify(output, null, 2)}\n`);
+
+          const reprArgs = call => (call.function_args ?? []).map(arg => arg.repr ?? arg.hex ?? '').join(' | ');
+          const lines = [
+            `captured_at=${output.captured_at}`,
+            `current_cycle=${currentCycle}`,
+            `transaction_rows_fetched=${txPage.rows.length}`,
+            `transaction_rows_reported_total=${txPage.total}`,
+            `rewards_sbtc_balance=${current.rewards_sbtc_balance.decoded}`,
+            `tracking_sbtc_balance=${current.tracking_sbtc_balance.decoded}`,
+            ...Object.entries(counts).sort().map(([fn, count]) => `call_count_${fn}=${count}`),
+            ...Object.entries(latestSuccessful).sort().map(([fn, call]) =>
+              `latest_success_${fn}=${call.block_time_iso} ${call.tx_id} args=${reprArgs(call)}`,
+            ),
+            ...cycles.map(item =>
+              `cycle_${item.cycle}_rewards=${item.ststxbtc.decoded} should=${item.should_process.decoded}`,
+            ),
+          ];
+          await writeFile('snapshot.txt', `${lines.join('\n')}\n`);
+          console.log(lines.join('\n'));
+          NODE
+
+          node query.mjs
+          sha256sum snapshot.json snapshot.txt query.mjs > SHA256SUMS
+
+      - name: Upload rewards-v8 evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackingdao-rewards-v8-liveness-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          include-hidden-files: true
+          compression-level: 6
+          retention-days: 1
+
+      - name: Enforce liveness snapshot integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s evidence/snapshot.json
+          test -s evidence/snapshot.txt
+          grep -q '^current_cycle=' evidence/snapshot.txt
+          grep -q '^rewards_sbtc_balance=' evidence/snapshot.txt
+          grep -q '^tracking_sbtc_balance=' evidence/snapshot.txt
