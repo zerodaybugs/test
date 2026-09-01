@@ -1,0 +1,152 @@
+name: Build IBC-Go v11.2.0 ICS20 ABI oracle
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-oracle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact immutable release
+        uses: actions/checkout@v5
+        with:
+          repository: cosmos/ibc-go
+          ref: v11.2.0
+          path: ibc-go
+          fetch-depth: 1
+
+      - name: Verify exact release commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git -C ibc-go rev-parse HEAD)"
+          expected="cfc072e53eee42b2ab804cd4344ba610016f793c"
+          printf 'repository=cosmos/ibc-go\ntag=v11.2.0\nexpected=%s\nactual=%s\n' "$expected" "$actual" | tee SOURCE_PROVENANCE.txt
+          test "$actual" = "$expected"
+
+      - name: Install repository Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ibc-go/go.mod
+          cache: false
+
+      - name: Create neutral streaming ABI oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ibc-go/cmd/ics20-abi-oracle
+          cat > ibc-go/cmd/ics20-abi-oracle/main.go <<'GO'
+          package main
+
+          import (
+              "bufio"
+              "encoding/hex"
+              "encoding/json"
+              "fmt"
+              "math/big"
+              "os"
+
+              "github.com/ethereum/go-ethereum/crypto"
+              transfertypes "github.com/cosmos/ibc-go/v11/modules/apps/transfer/types"
+          )
+
+          type input struct {
+              ID  int    `json:"id"`
+              Hex string `json:"hex"`
+          }
+
+          type output struct {
+              ID           int    `json:"id"`
+              DecodeOK     bool   `json:"decode_ok"`
+              ValidOK      bool   `json:"valid_ok"`
+              Error        string `json:"error,omitempty"`
+              Validation   string `json:"validation_error,omitempty"`
+              DenomHash    string `json:"denom_hash,omitempty"`
+              SenderHash   string `json:"sender_hash,omitempty"`
+              ReceiverHash string `json:"receiver_hash,omitempty"`
+              MemoHash     string `json:"memo_hash,omitempty"`
+              DenomLen     int    `json:"denom_len,omitempty"`
+              SenderLen    int    `json:"sender_len,omitempty"`
+              ReceiverLen  int    `json:"receiver_len,omitempty"`
+              MemoLen      int    `json:"memo_len,omitempty"`
+              Amount       string `json:"amount,omitempty"`
+          }
+
+          func main() {
+              scanner := bufio.NewScanner(os.Stdin)
+              scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+              encoder := json.NewEncoder(os.Stdout)
+              for scanner.Scan() {
+                  var in input
+                  if err := json.Unmarshal(scanner.Bytes(), &in); err != nil {
+                      _ = encoder.Encode(output{Error: fmt.Sprintf("input: %v", err)})
+                      continue
+                  }
+                  raw, err := hex.DecodeString(in.Hex)
+                  if err != nil {
+                      _ = encoder.Encode(output{ID: in.ID, Error: fmt.Sprintf("hex: %v", err)})
+                      continue
+                  }
+                  decoded, err := transfertypes.DecodeABIFungibleTokenPacketData(raw)
+                  if err != nil {
+                      _ = encoder.Encode(output{ID: in.ID, Error: err.Error()})
+                      continue
+                  }
+                  amount, ok := new(big.Int).SetString(decoded.Amount, 10)
+                  if !ok {
+                      _ = encoder.Encode(output{ID: in.ID, DecodeOK: true, Error: "decoded amount is not decimal"})
+                      continue
+                  }
+                  out := output{
+                      ID: in.ID, DecodeOK: true,
+                      DenomHash: crypto.Keccak256Hash([]byte(decoded.Denom)).Hex(),
+                      SenderHash: crypto.Keccak256Hash([]byte(decoded.Sender)).Hex(),
+                      ReceiverHash: crypto.Keccak256Hash([]byte(decoded.Receiver)).Hex(),
+                      MemoHash: crypto.Keccak256Hash([]byte(decoded.Memo)).Hex(),
+                      DenomLen: len(decoded.Denom), SenderLen: len(decoded.Sender),
+                      ReceiverLen: len(decoded.Receiver), MemoLen: len(decoded.Memo),
+                      Amount: amount.String(),
+                  }
+                  _, validationErr := transfertypes.UnmarshalPacketData(raw, transfertypes.V1, transfertypes.EncodingABI)
+                  out.ValidOK = validationErr == nil
+                  if validationErr != nil {
+                      out.Validation = validationErr.Error()
+                  }
+                  if err := encoder.Encode(out); err != nil {
+                      panic(err)
+                  }
+              }
+              if err := scanner.Err(); err != nil {
+                  panic(err)
+              }
+          }
+          GO
+
+      - name: Build exact oracle
+        working-directory: ibc-go
+        run: |
+          CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o ../ics20-abi-oracle ./cmd/ics20-abi-oracle
+          go version | tee ../GO_VERSION.txt
+          sha256sum ../ics20-abi-oracle > ../ORACLE_SHA256SUMS
+          printf '{"id":1,"hex":""}\n' | ../ics20-abi-oracle | tee ../SMOKE_OUTPUT.jsonl
+
+      - name: Upload oracle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ibc-go-v11.2.0-ics20-abi-oracle
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+          path: |
+            ics20-abi-oracle
+            SOURCE_PROVENANCE.txt
+            GO_VERSION.txt
+            ORACLE_SHA256SUMS
+            SMOKE_OUTPUT.jsonl
