@@ -1,0 +1,185 @@
+name: StackingDAO withdrawal marketplace postconditions
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/stackingdao-marketplace-postconditions.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stackingdao-marketplace-postconditions-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout workflow
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Query public marketplace transactions read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cd evidence
+          cat > query.mjs <<'NODE'
+          import { writeFile } from 'node:fs/promises';
+
+          const owner = 'SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG';
+          const api = 'https://api.mainnet.hiro.so';
+          const contracts = [
+            `${owner}.ststx-withdraw-nft-v2`,
+            `${owner}.ststxbtc-withdraw-nft`,
+          ];
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+          async function fetchJson(url, options = {}, attempts = 10) {
+            let last;
+            for (let attempt = 1; attempt <= attempts; attempt += 1) {
+              try {
+                const response = await fetch(url, options);
+                const text = await response.text();
+                if (!response.ok) {
+                  const retryAfter = Number(response.headers.get('retry-after') ?? 0);
+                  if ((response.status === 429 || response.status >= 500) && attempt < attempts) {
+                    await sleep(Math.max(retryAfter * 1000, attempt * 1300));
+                    continue;
+                  }
+                  throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 500)}`);
+                }
+                return JSON.parse(text);
+              } catch (error) {
+                last = error;
+                if (attempt < attempts) await sleep(attempt * 1300);
+              }
+            }
+            throw last;
+          }
+
+          function core(row) { return row.tx ?? row; }
+          function call(row) { return core(row).contract_call ?? row.contract_call ?? null; }
+          function txid(row) { return core(row).tx_id ?? row.tx_id ?? null; }
+          function status(row) { return core(row).tx_status ?? row.tx_status ?? null; }
+          function height(row) { return core(row).block_height ?? row.block_height ?? null; }
+          function time(row) {
+            const tx = core(row);
+            return tx.burn_block_time_iso ?? tx.block_time_iso ?? row.burn_block_time_iso ?? row.block_time_iso ?? null;
+          }
+
+          async function fetchAll(principal) {
+            const rows = [];
+            let offset = 0;
+            let total = Infinity;
+            while (offset < total) {
+              const page = await fetchJson(
+                `${api}/extended/v2/addresses/${principal}/transactions?limit=50&offset=${offset}`,
+              );
+              const pageRows = page.results ?? [];
+              rows.push(...pageRows);
+              total = Number(page.total ?? rows.length);
+              if (pageRows.length === 0) break;
+              offset += pageRows.length;
+              await sleep(220);
+            }
+            return { rows, total };
+          }
+
+          const output = {
+            captured_at: new Date().toISOString(),
+            contracts: {},
+            relevant_transactions: [],
+          };
+
+          for (const contract of contracts) {
+            const page = await fetchAll(contract);
+            output.contracts[contract] = { reported_total: page.total, fetched: page.rows.length };
+            for (const row of page.rows) {
+              const c = call(row);
+              if (!c || c.contract_id !== contract) continue;
+              if (!['list-in-ustx', 'buy-in-ustx', 'unlist-in-ustx'].includes(c.function_name)) continue;
+              const id = txid(row);
+              const detail = await fetchJson(`${api}/extended/v1/tx/${id}`);
+              output.relevant_transactions.push({
+                tx_id: id,
+                contract_id: contract,
+                function_name: c.function_name,
+                function_args: c.function_args ?? [],
+                status: status(row),
+                block_height: height(row),
+                block_time_iso: time(row),
+                sender_address: core(row).sender_address ?? row.sender_address ?? null,
+                post_condition_mode: detail.post_condition_mode ?? core(row).post_condition_mode ?? null,
+                post_conditions: detail.post_conditions ?? core(row).post_conditions ?? [],
+                tx_result: detail.tx_result ?? core(row).tx_result ?? null,
+                event_count: (detail.events ?? []).length,
+                events: (detail.events ?? []).filter(event =>
+                  ['stx_asset', 'fungible_token_asset', 'non_fungible_token_asset'].includes(event.event_type),
+                ),
+              });
+              await sleep(180);
+            }
+          }
+
+          output.relevant_transactions.sort((a, b) => Number(b.block_height ?? 0) - Number(a.block_height ?? 0));
+          const successful = output.relevant_transactions.filter(row => row.status === 'success');
+          const buys = successful.filter(row => row.function_name === 'buy-in-ustx');
+          const lists = successful.filter(row => row.function_name === 'list-in-ustx');
+          output.summary = {
+            relevant_transactions: output.relevant_transactions.length,
+            successful_transactions: successful.length,
+            successful_lists: lists.length,
+            successful_buys: buys.length,
+            buy_allow_mode: buys.filter(row => String(row.post_condition_mode).toLowerCase().includes('allow')).length,
+            buy_deny_mode: buys.filter(row => String(row.post_condition_mode).toLowerCase().includes('deny')).length,
+            buy_zero_postconditions: buys.filter(row => (row.post_conditions ?? []).length === 0).length,
+            latest_successful_buy: buys[0] ?? null,
+            latest_successful_list: lists[0] ?? null,
+          };
+
+          await writeFile('snapshot.json', `${JSON.stringify(output, null, 2)}\n`);
+          const lines = [
+            `captured_at=${output.captured_at}`,
+            ...Object.entries(output.summary).map(([key, value]) =>
+              `${key}=${typeof value === 'object' ? JSON.stringify(value) : value}`,
+            ),
+            '',
+            'SUCCESSFUL BUYS',
+            ...buys.map(row =>
+              `${row.block_time_iso}\t${row.block_height}\tmode=${row.post_condition_mode}\tpcs=${(row.post_conditions ?? []).length}\t${row.tx_id}`,
+            ),
+            '',
+            'SUCCESSFUL LISTS',
+            ...lists.slice(0, 100).map(row =>
+              `${row.block_time_iso}\t${row.block_height}\tmode=${row.post_condition_mode}\tpcs=${(row.post_conditions ?? []).length}\t${row.tx_id}`,
+            ),
+          ];
+          await writeFile('snapshot.txt', `${lines.join('\n')}\n`);
+          console.log(lines.join('\n'));
+          NODE
+
+          node query.mjs
+          sha256sum snapshot.json snapshot.txt query.mjs > SHA256SUMS
+
+      - name: Upload marketplace evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackingdao-marketplace-postconditions-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Enforce integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd evidence && sha256sum -c SHA256SUMS)
+          grep -F 'successful_buys=' evidence/snapshot.txt
+          grep -F 'successful_lists=' evidence/snapshot.txt

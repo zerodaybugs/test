@@ -1,0 +1,219 @@
+name: StackingDAO full strategy reward event history
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/stackingdao-strategy-event-history-full.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stackingdao-strategy-event-history-full-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  history:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - name: Checkout workflow
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Query complete public strategy event history read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cd evidence
+
+          cat > query.mjs <<'NODE'
+          import { writeFile } from 'node:fs/promises';
+
+          const owner = 'SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG';
+          const strategy = `${owner}.strategy-v4`;
+          const handler = `${owner}.delegates-handler-v1`;
+          const rewards2 = `${owner}.rewards-v2`;
+          const api = 'https://api.mainnet.hiro.so';
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+          async function fetchJson(url, options = {}, attempts = 10) {
+            let last;
+            for (let attempt = 1; attempt <= attempts; attempt += 1) {
+              try {
+                const response = await fetch(url, options);
+                const text = await response.text();
+                if (!response.ok) {
+                  const retryAfter = Number(response.headers.get('retry-after') ?? 0);
+                  if ((response.status === 429 || response.status >= 500) && attempt < attempts) {
+                    await sleep(Math.max(retryAfter * 1000, attempt * 1800));
+                    continue;
+                  }
+                  throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 600)}`);
+                }
+                return JSON.parse(text);
+              } catch (error) {
+                last = error;
+                if (attempt < attempts) await sleep(attempt * 1800);
+              }
+            }
+            throw last;
+          }
+
+          async function fetchAllStrategyRows() {
+            const rows = [];
+            const limit = 50;
+            let offset = 0;
+            let total = Infinity;
+            while (offset < total) {
+              const page = await fetchJson(`${api}/extended/v2/addresses/${strategy}/transactions?limit=${limit}&offset=${offset}`);
+              const pageRows = page.results ?? [];
+              rows.push(...pageRows);
+              total = Number(page.total ?? rows.length);
+              if (pageRows.length === 0) break;
+              offset += pageRows.length;
+              await sleep(280);
+            }
+            return { rows, total };
+          }
+
+          function core(row) { return row.tx ?? row; }
+          function topCall(row) { return core(row).contract_call ?? row.contract_call ?? null; }
+          function txid(row) { return core(row).tx_id ?? row.tx_id ?? null; }
+          function status(row) { return core(row).tx_status ?? row.tx_status ?? null; }
+          function time(row) { const tx=core(row); return tx.burn_block_time_iso ?? tx.block_time_iso ?? null; }
+          function height(row) { const tx=core(row); return tx.block_height ?? row.block_height ?? null; }
+          function burnHeight(row) { const tx=core(row); return tx.burn_block_height ?? row.burn_block_height ?? null; }
+
+          const page = await fetchAllStrategyRows();
+          const candidates = page.rows.filter(row => {
+            const c = topCall(row);
+            return status(row) === 'success' && c?.contract_id === strategy && c?.function_name === 'perform-pool-delegation';
+          });
+
+          const transactions = [];
+          const rewardEvents = [];
+          const addEvents = [];
+          const failures = [];
+
+          function fieldAmounts(repr, field) {
+            const re = new RegExp(`\\(${field} u(\\d+)\\)`, 'g');
+            return [...String(repr ?? '').matchAll(re)].map(match => BigInt(match[1]));
+          }
+
+          for (const [index, row] of candidates.entries()) {
+            const id = txid(row);
+            try {
+              const detail = await fetchJson(`${api}/extended/v1/tx/${id}`);
+              let relevantLogCount = 0;
+              for (const event of detail.events ?? []) {
+                if (event.event_type !== 'smart_contract_log') continue;
+                const log = event.contract_log ?? event.smart_contract_log ?? {};
+                const contractId = log.contract_id ?? null;
+                const repr = log.value?.repr ?? null;
+                if (contractId === handler && String(repr).includes('(rewards u')) {
+                  relevantLogCount += 1;
+                  for (const amount of fieldAmounts(repr, 'rewards')) {
+                    rewardEvents.push({ tx_id: id, block_height: height(row), burn_block_height: detail.burn_block_height ?? burnHeight(row), block_time_iso: time(row), amount: amount.toString(), repr });
+                  }
+                }
+                if (contractId === rewards2 && String(repr).includes('(stx-amount u')) {
+                  relevantLogCount += 1;
+                  for (const amount of fieldAmounts(repr, 'stx-amount')) {
+                    addEvents.push({ tx_id: id, block_height: height(row), burn_block_height: detail.burn_block_height ?? burnHeight(row), block_time_iso: time(row), amount: amount.toString(), repr });
+                  }
+                }
+              }
+              transactions.push({ tx_id: id, block_height: height(row), burn_block_height: detail.burn_block_height ?? burnHeight(row), block_time_iso: time(row), relevant_log_count: relevantLogCount });
+            } catch (error) {
+              failures.push({ tx_id: id, error: String(error) });
+            }
+            if ((index + 1) % 25 === 0) console.log(`fetched=${index + 1}/${candidates.length} failures=${failures.length}`);
+            await sleep(260);
+          }
+
+          const positiveRewards = rewardEvents.filter(event => BigInt(event.amount) > 0n);
+          const positiveAdds = addEvents.filter(event => BigInt(event.amount) > 0n);
+          const byBurnBlock = {};
+          for (const event of positiveRewards) {
+            const key = String(event.burn_block_height ?? event.block_height);
+            byBurnBlock[key] ??= {
+              burn_block_height: event.burn_block_height,
+              block_height: event.block_height,
+              block_time_iso: event.block_time_iso,
+              count: 0,
+              total: 0n,
+            };
+            byBurnBlock[key].count += 1;
+            byBurnBlock[key].total += BigInt(event.amount);
+          }
+          const batches = Object.values(byBurnBlock)
+            .map(batch => ({ ...batch, total: batch.total.toString() }))
+            .sort((a, b) => Number(b.burn_block_height ?? b.block_height) - Number(a.burn_block_height ?? a.block_height));
+
+          const output = {
+            captured_at: new Date().toISOString(),
+            reported_total: page.total,
+            candidate_transactions: candidates.length,
+            fetched_transactions: transactions.length,
+            failures,
+            summary: {
+              reward_events: rewardEvents.length,
+              positive_reward_events: positiveRewards.length,
+              positive_reward_total: positiveRewards.reduce((sum, event) => sum + BigInt(event.amount), 0n).toString(),
+              rewards2_add_events: addEvents.length,
+              positive_rewards2_add_events: positiveAdds.length,
+              positive_rewards2_add_total: positiveAdds.reduce((sum, event) => sum + BigInt(event.amount), 0n).toString(),
+              positive_batches: batches.length,
+              latest_positive_batch: batches[0] ?? null,
+              oldest_positive_batch: batches.at(-1) ?? null,
+              failed_fetches: failures.length,
+            },
+            positive_batches: batches,
+            positive_reward_events: positiveRewards,
+            positive_rewards2_add_events: positiveAdds,
+            transactions,
+          };
+
+          await writeFile('full-events.json', `${JSON.stringify(output, null, 2)}\n`);
+          const lines = [
+            `captured_at=${output.captured_at}`,
+            `reported_total=${output.reported_total}`,
+            `candidate_transactions=${output.candidate_transactions}`,
+            `fetched_transactions=${output.fetched_transactions}`,
+            ...Object.entries(output.summary).map(([k, v]) => `${k}=${typeof v === 'object' ? JSON.stringify(v) : v}`),
+            '',
+            'POSITIVE BATCHES',
+            ...batches.map(batch => `${batch.block_time_iso}\tburn=${batch.burn_block_height}\tstacks=${batch.block_height}\tcount=${batch.count}\ttotal=${batch.total}`),
+          ];
+          await writeFile('full-events.txt', `${lines.join('\n')}\n`);
+          console.log(lines.join('\n'));
+          NODE
+
+          node query.mjs
+          sha256sum full-events.json full-events.txt query.mjs > SHA256SUMS
+
+      - name: Upload full event evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackingdao-strategy-event-history-full-${{ github.run_id }}
+          path: |
+            evidence/full-events.json
+            evidence/full-events.txt
+            evidence/query.mjs
+            evidence/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Enforce full history integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s evidence/full-events.json
+          test -s evidence/full-events.txt
+          (cd evidence && sha256sum -c SHA256SUMS)
+          grep -F 'positive_reward_events=' evidence/full-events.txt
