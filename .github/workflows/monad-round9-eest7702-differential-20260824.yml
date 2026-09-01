@@ -1,0 +1,241 @@
+name: Monad v0.16.0 EIP-7702 fixture differential Round 9
+
+on:
+  push:
+    branches:
+      - tooling/monad-round9-eest7702-differential-20260824
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  eest7702:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone exact execution and reference fixture source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone https://github.com/category-labs/monad.git execution
+          git -C execution checkout e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+          git -C execution submodule update --init --recursive
+          test "$(git -C execution rev-parse HEAD)" = e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+          test -z "$(git -C execution status --porcelain=v1)"
+          git clone --depth 1 https://github.com/ethereum/execution-spec-tests.git eest
+          mkdir -p out/raw out/meta out/fixtures out/results out/repro
+          git -C eest rev-parse HEAD > out/meta/EEST_COMMIT.txt
+          printf '%s\n' e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0 > out/meta/EXECUTION_COMMIT.txt
+
+      - name: Inventory EIP-7702 same-authority coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          rg -n --hidden \
+            '(AuthorizationTuple|authorization_list|authorizationList|EIP[-_ ]?7702|same.{0,40}author|duplicate.{0,40}author|authority.{0,40}nonce)' \
+            eest/tests > out/raw/EEST_7702_INDEX.txt || true
+          find eest/tests -type f -name '*.py' \( -ipath '*7702*' -o -ipath '*set_code*' \) \
+            -printf '%p\n' | sort > out/raw/EEST_7702_FILES.txt
+          test -s out/raw/EEST_7702_FILES.txt
+
+      - name: Fill the bounded official EIP-7702 suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd eest
+          if ! command -v uv >/dev/null 2>&1; then
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+            export PATH="$HOME/.local/bin:$PATH"
+          fi
+          uv --version > ../out/meta/UV_VERSION.txt
+          uv sync --all-extras > ../out/raw/EEST_UV_SYNC.log 2>&1
+          set +e
+          timeout --signal=TERM --kill-after=20s 2700s \
+            uv run fill tests/prague/eip7702_set_code_tx \
+              --output ../out/fixtures \
+              > ../out/raw/EEST_FILL.log 2>&1
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > ../out/raw/EEST_FILL.rc
+          if [ "$rc" -ne 0 ]; then
+            # CLI-compatible fallback for newer EEST releases.
+            set +e
+            timeout --signal=TERM --kill-after=20s 2700s \
+              uv run fill tests/prague/eip7702_set_code_tx \
+                --output-dir ../out/fixtures \
+                > ../out/raw/EEST_FILL_FALLBACK.log 2>&1
+            rc2=$?
+            set -e
+            printf '%s\n' "$rc2" > ../out/raw/EEST_FILL_FALLBACK.rc
+          fi
+          cd ..
+          find out/fixtures -type f -name '*.json' -printf '%p\n' | sort > out/raw/FIXTURE_FILES.txt
+
+      - name: Build exact official Ethereum fixture runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --target base -t monad-r9-eest-base -f execution/docker/Dockerfile execution
+          docker run --name monad-r9-eest \
+            -v "$PWD/execution:/src" -v "$PWD/out:/out" \
+            monad-r9-eest-base bash -lc '
+              set -euo pipefail
+              cd /src
+              rm -rf build-r9-eest
+              CC=clang-19 CXX=clang++-19 cmake -S . -B build-r9-eest -GNinja \
+                -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DCMAKE_TOOLCHAIN_FILE=category/core/toolchains/gcc-avx2.cmake
+              ninja -C build-r9-eest -t targets all > /out/raw/NINJA_TARGETS.txt
+              # Prefer the dedicated runner target, otherwise build the complete test tree.
+              if ninja -C build-r9-eest ethereum_test > /out/raw/RUNNER_BUILD.log 2>&1; then
+                :
+              else
+                cmake --build build-r9-eest --parallel "$(nproc)" > /out/raw/FULL_BUILD.log 2>&1
+              fi
+              find build-r9-eest -type f -perm -111 \
+                \( -iname "*ethereum*test*" -o -iname "*blockchain*test*" \) \
+                -printf "%p\n" | sort > /out/raw/RUNNER_CANDIDATES.txt
+              test -s /out/raw/RUNNER_CANDIDATES.txt
+              runner="$(head -n1 /out/raw/RUNNER_CANDIDATES.txt)"
+              printf "%s\n" "$runner" > /out/meta/RUNNER_PATH.txt
+              "$runner" --help > /out/raw/RUNNER_HELP.txt 2>&1 || true
+              clang-19 --version > /out/meta/CLANG_VERSION.txt
+              cmake --version > /out/meta/CMAKE_VERSION.txt
+            '
+
+      - name: Run filled fixtures with fail-closed CLI selection
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker start monad-r9-eest >/dev/null
+          docker exec monad-r9-eest bash -lc '
+            set -euo pipefail
+            runner="$(cat /out/meta/RUNNER_PATH.txt)"
+            help="$(cat /out/raw/RUNNER_HELP.txt 2>/dev/null || true)"
+            mode=positional
+            if grep -q -- "--input" <<<"$help"; then mode=input;
+            elif grep -q -- "--testpath" <<<"$help"; then mode=testpath;
+            elif grep -q -- "--path" <<<"$help"; then mode=path;
+            elif grep -q -- "--file" <<<"$help"; then mode=file;
+            fi
+            printf "%s\n" "$mode" > /out/meta/RUNNER_MODE.txt
+            : > /out/raw/FIXTURE_RESULTS.tsv
+            count=0
+            while IFS= read -r fixture; do
+              [ -n "$fixture" ] || continue
+              count=$((count+1))
+              [ "$count" -le 1200 ] || break
+              base="$(basename "$fixture")"
+              log="/out/results/${count}__${base}.log"
+              set +e
+              case "$mode" in
+                input) timeout --signal=TERM --kill-after=10s 90s "$runner" --input "$fixture" >"$log" 2>&1 ;;
+                testpath) timeout --signal=TERM --kill-after=10s 90s "$runner" --testpath "$fixture" >"$log" 2>&1 ;;
+                path) timeout --signal=TERM --kill-after=10s 90s "$runner" --path "$fixture" >"$log" 2>&1 ;;
+                file) timeout --signal=TERM --kill-after=10s 90s "$runner" --file "$fixture" >"$log" 2>&1 ;;
+                *) timeout --signal=TERM --kill-after=10s 90s "$runner" "$fixture" >"$log" 2>&1 ;;
+              esac
+              rc=$?
+              set -e
+              printf "%s\t%s\t%s\n" "$fixture" "$rc" "$log" >> /out/raw/FIXTURE_RESULTS.tsv
+            done < /out/raw/FIXTURE_FILES.txt
+          '
+
+      - name: Reproduce non-zero fixture outcomes three times
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker exec monad-r9-eest bash -lc '
+            set -euo pipefail
+            runner="$(cat /out/meta/RUNNER_PATH.txt)"; mode="$(cat /out/meta/RUNNER_MODE.txt)"
+            : > /out/raw/FIXTURE_REPRO.tsv
+            while IFS=$'"'"'\t'"'"' read -r fixture rc oldlog; do
+              [ -n "$fixture" ] || continue
+              [ "$rc" -ne 0 ] || continue
+              key="$(printf "%s" "$fixture" | sha256sum | cut -c1-16)"
+              for rep in 1 2 3; do
+                log="/out/repro/${key}__rep${rep}.log"
+                set +e
+                case "$mode" in
+                  input) timeout --signal=TERM --kill-after=10s 90s "$runner" --input "$fixture" >"$log" 2>&1 ;;
+                  testpath) timeout --signal=TERM --kill-after=10s 90s "$runner" --testpath "$fixture" >"$log" 2>&1 ;;
+                  path) timeout --signal=TERM --kill-after=10s 90s "$runner" --path "$fixture" >"$log" 2>&1 ;;
+                  file) timeout --signal=TERM --kill-after=10s 90s "$runner" --file "$fixture" >"$log" 2>&1 ;;
+                  *) timeout --signal=TERM --kill-after=10s 90s "$runner" "$fixture" >"$log" 2>&1 ;;
+                esac
+                rr=$?
+                set -e
+                printf "%s\t%s\t%s\t%s\n" "$fixture" "$rep" "$rr" "$log" >> /out/raw/FIXTURE_REPRO.tsv
+              done
+            done < /out/raw/FIXTURE_RESULTS.tsv
+          '
+
+      - name: Adjudicate fail-closed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib,hashlib,re
+          out=pathlib.Path('out')
+          fill_rcs=[]
+          for name in ('EEST_FILL.rc','EEST_FILL_FALLBACK.rc'):
+              p=out/'raw'/name
+              if p.exists(): fill_rcs.append(int(p.read_text().strip()))
+          fixtures=[x for x in (out/'raw/FIXTURE_FILES.txt').read_text().splitlines() if x.strip()] if (out/'raw/FIXTURE_FILES.txt').exists() else []
+          results=[]
+          p=out/'raw/FIXTURE_RESULTS.tsv'
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  if not line.strip(): continue
+                  fixture,rc,log=line.split('\t',2)
+                  text=pathlib.Path(log).read_text(errors='replace') if pathlib.Path(log).exists() else ''
+                  cli_error=bool(re.search(r'unknown option|unrecognized option|usage:',text,re.I))
+                  results.append({'fixture':fixture,'return_code':int(rc),'cli_error':cli_error,'log':log,'log_sha256':hashlib.sha256(text.encode()).hexdigest()})
+          repro=[]
+          rp=out/'raw/FIXTURE_REPRO.tsv'
+          if rp.exists():
+              for line in rp.read_text().splitlines():
+                  if not line.strip(): continue
+                  fixture,rep,rc,log=line.split('\t',3)
+                  text=pathlib.Path(log).read_text(errors='replace') if pathlib.Path(log).exists() else ''
+                  repro.append({'fixture':fixture,'rep':int(rep),'return_code':int(rc),'cli_error':bool(re.search(r'unknown option|unrecognized option|usage:',text,re.I))})
+          groups={}
+          for r in repro: groups.setdefault(r['fixture'],[]).append(r)
+          stable=[]
+          for f,rows in groups.items():
+              if len(rows)==3 and all(r['return_code']!=0 and not r['cli_error'] for r in rows):
+                  stable.append({'fixture':f,'runs':rows})
+          baseline_ok=bool(fixtures) and any(rc==0 for rc in fill_rcs) and bool(results) and not all(r['cli_error'] for r in results)
+          d={
+              'execution_commit':'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0',
+              'fixture_count':len(fixtures),'tested_count':len(results),'fill_return_codes':fill_rcs,
+              'baseline_ok':baseline_ok,'stable_reference_fixture_failures':stable,
+              'candidate_signal':baseline_ok and bool(stable),'submission_ready':False,
+              'decision':(
+                  'STABLE_EEST_MISMATCH_REQUIRES_MINIMIZATION_AND_FULLNODE_PROMOTION'
+                  if baseline_ok and stable else
+                  'INFRASTRUCTURE_OR_RUNNER_CLI_BLOCKED'
+                  if not baseline_ok else
+                  'NO_EIP7702_REFERENCE_FIXTURE_MISMATCH'
+              ),
+              'mandatory_next_gate':'For any stable mismatch: minimize to one valid block, run 3/3 serial and parallel controls, prove accepted state-root divergence, then matched fix and current scope/duplicate clearance.',
+          }
+          (out/'EEST7702_ADJUDICATION.json').write_text(json.dumps(d,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({'decision':d['decision'],'fixtures':len(fixtures),'stable':len(stable),'submission_ready':False}))
+          PY
+          sha256sum out/raw/* out/meta/* out/EEST7702_ADJUDICATION.json > out/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: monad-round9-eest7702-differential
+          path: |
+            out
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
