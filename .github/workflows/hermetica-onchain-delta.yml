@@ -1,0 +1,277 @@
+name: Hermetica on-chain delta census
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-onchain-delta.yml'
+      - 'public-data/hermetica-onchain-delta-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Capture public deployment, source and privileged-call deltas
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT=/tmp/hermetica-onchain-delta
+          mkdir -p "$OUT/raw" "$OUT/deployed-sources" "$OUT/repo"
+          git clone --depth 1 https://github.com/hermetica-fi/hermetica-contracts.git "$OUT/repo/hermetica-contracts"
+
+          cat > "$OUT/census.py" <<'PY'
+          import datetime as dt
+          import hashlib
+          import json
+          import pathlib
+          import re
+          import time
+          import urllib.parse
+          import urllib.request
+
+          OUT = pathlib.Path('/tmp/hermetica-onchain-delta')
+          API = 'https://api.hiro.so'
+          DEPLOYERS = {
+              'hbtc': 'SP1S1HSFH0SQQGWKB69EYFNY0B1MHRMGXR3J1FH4D',
+              'usdh': 'SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG',
+          }
+          SINCE = int(dt.datetime(2026, 7, 1, tzinfo=dt.timezone.utc).timestamp())
+          PROGRAM_UPDATE = int(dt.datetime(2026, 7, 11, tzinfo=dt.timezone.utc).timestamp())
+          REPO_HEAD_TIME = int(dt.datetime(2026, 4, 2, 20, 32, 31, tzinfo=dt.timezone.utc).timestamp())
+
+          PRIVILEGED_PATTERNS = re.compile(
+              r'(set-|request-|confirm-|cancel-|disable-|enable-|role|owner|guardian|trader|rewarder|manager|protocol|whitelist|asset|external|fee|cooldown|cap|limit|staleness|blacklist|migration)',
+              re.I,
+          )
+          HIGH_VALUE_PATTERNS = re.compile(
+              r'(mint|burn|transfer|withdraw|redeem|fund-claim|update-state|log-reward|settle|reserve|borrow|repay|collateral|liquidat|peg-out|role|protocol)',
+              re.I,
+          )
+
+          def get_json(url: str, attempts: int = 10):
+              last = None
+              for i in range(attempts):
+                  try:
+                      req = urllib.request.Request(url, headers={
+                          'User-Agent': 'read-only-security-research/1.0',
+                          'Accept': 'application/json',
+                      })
+                      with urllib.request.urlopen(req, timeout=40) as response:
+                          return json.loads(response.read().decode('utf-8'))
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(15.0, 1.5 * (i + 1)))
+              raise RuntimeError(f'failed after retries: {url}: {last}')
+
+          def paged_address_txs(address: str):
+              rows = []
+              offset = 0
+              limit = 50
+              while True:
+                  q = urllib.parse.urlencode({'limit': limit, 'offset': offset})
+                  body = get_json(f'{API}/extended/v1/address/{address}/transactions?{q}')
+                  page = body.get('results') or []
+                  rows.extend(page)
+                  total = int(body.get('total') or len(rows))
+                  if not page or len(rows) >= total:
+                      break
+                  offset += len(page)
+                  if offset > 5000:
+                      raise RuntimeError(f'unexpectedly large tx history for {address}')
+                  time.sleep(0.15)
+              return rows
+
+          def source_for(contract_id: str):
+              address, name = contract_id.split('.', 1)
+              return get_json(f'{API}/v2/contracts/source/{address}/{name}?proof=0').get('source') or ''
+
+          def metadata_for(contract_id: str):
+              return get_json(f'{API}/extended/v1/contract/{contract_id}')
+
+          def normalized(source: str):
+              source = re.sub(r';;[^\n]*', ' ', source)
+              return re.sub(r'\s+', ' ', source).strip()
+
+          def principal_masked(source: str):
+              value = normalized(source)
+              value = re.sub(r"'?(?:SP|ST|SM)[0-9A-Z]{20,50}(?:\.[A-Za-z0-9_-]+)?", '<PRINCIPAL>', value)
+              return value
+
+          def function_names(source: str):
+              return sorted(set(re.findall(r'\(define-(?:public|read-only|private)\s+\(([^\s\)]+)', source)))
+
+          repo_root = OUT / 'repo' / 'hermetica-contracts'
+          repo_rows = []
+          for path in sorted(repo_root.rglob('*.clar')):
+              source = path.read_text(encoding='utf-8', errors='replace')
+              norm = normalized(source)
+              masked = principal_masked(source)
+              repo_rows.append({
+                  'path': str(path.relative_to(repo_root)),
+                  'source_bytes': len(source.encode()),
+                  'normalized_sha256': hashlib.sha256(norm.encode()).hexdigest(),
+                  'masked_sha256': hashlib.sha256(masked.encode()).hexdigest(),
+                  'functions': function_names(source),
+              })
+
+          by_norm = {}
+          by_mask = {}
+          for row in repo_rows:
+              by_norm.setdefault(row['normalized_sha256'], []).append(row['path'])
+              by_mask.setdefault(row['masked_sha256'], []).append(row['path'])
+
+          all_txs = {}
+          deployments = []
+          recent_calls = []
+          errors = []
+
+          for label, deployer in DEPLOYERS.items():
+              txs = paged_address_txs(deployer)
+              all_txs[label] = txs
+              (OUT / 'raw' / f'{label}-transactions.json').write_text(json.dumps(txs, indent=2), encoding='utf-8')
+
+              for tx in txs:
+                  status = tx.get('tx_status')
+                  observed_time = int(tx.get('block_time') or tx.get('burn_block_time') or 0)
+                  tx_type = tx.get('tx_type')
+
+                  if tx_type == 'smart_contract' and status == 'success':
+                      contract_id = (tx.get('smart_contract') or {}).get('contract_id')
+                      if not contract_id:
+                          continue
+                      try:
+                          source = source_for(contract_id)
+                          metadata = metadata_for(contract_id)
+                          safe_name = contract_id.replace('.', '__')
+                          (OUT / 'deployed-sources' / f'{safe_name}.clar').write_text(source, encoding='utf-8')
+                          (OUT / 'raw' / f'{safe_name}.metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
+
+                          norm = normalized(source)
+                          masked = principal_masked(source)
+                          norm_hash = hashlib.sha256(norm.encode()).hexdigest()
+                          masked_hash = hashlib.sha256(masked.encode()).hexdigest()
+                          funcs = function_names(source)
+
+                          exact = by_norm.get(norm_hash, [])
+                          masked_matches = by_mask.get(masked_hash, [])
+                          nearest = []
+                          fs = set(funcs)
+                          for candidate in repo_rows:
+                              cs = set(candidate['functions'])
+                              union = fs | cs
+                              jaccard = (len(fs & cs) / len(union)) if union else 0.0
+                              size_ratio = min(len(source.encode()), candidate['source_bytes']) / max(1, max(len(source.encode()), candidate['source_bytes']))
+                              score = 0.8 * jaccard + 0.2 * size_ratio
+                              if score > 0:
+                                  nearest.append({'path': candidate['path'], 'score': round(score, 6), 'function_jaccard': round(jaccard, 6), 'size_ratio': round(size_ratio, 6)})
+                          nearest.sort(key=lambda x: x['score'], reverse=True)
+
+                          wedge_score = 0
+                          reasons = []
+                          if observed_time >= REPO_HEAD_TIME:
+                              wedge_score += 3; reasons.append('deployed_after_public_repo_head')
+                          if observed_time >= PROGRAM_UPDATE:
+                              wedge_score += 5; reasons.append('deployed_after_program_update')
+                          if not exact:
+                              wedge_score += 4; reasons.append('no_exact_normalized_repo_match')
+                          if not masked_matches:
+                              wedge_score += 2; reasons.append('no_principal_masked_repo_match')
+                          if HIGH_VALUE_PATTERNS.search(source):
+                              wedge_score += 2; reasons.append('contains_high_value_state_or_asset_operations')
+
+                          deployments.append({
+                              'label': label,
+                              'deployer': deployer,
+                              'contract_id': contract_id,
+                              'tx_id': tx.get('tx_id'),
+                              'status': status,
+                              'block_height': tx.get('block_height'),
+                              'observed_time': observed_time,
+                              'observed_iso': dt.datetime.fromtimestamp(observed_time, dt.timezone.utc).isoformat() if observed_time else None,
+                              'source_bytes': len(source.encode()),
+                              'normalized_sha256': norm_hash,
+                              'masked_sha256': masked_hash,
+                              'functions': funcs,
+                              'exact_repo_matches': exact,
+                              'principal_masked_repo_matches': masked_matches,
+                              'nearest_repo_candidates': nearest[:5],
+                              'wedge_score': wedge_score,
+                              'wedge_reasons': reasons,
+                          })
+                      except Exception as exc:
+                          errors.append({'stage': 'deployment-source', 'contract_id': contract_id, 'error': str(exc)})
+
+                  if tx_type == 'contract_call' and status == 'success' and observed_time >= SINCE:
+                      call = tx.get('contract_call') or {}
+                      cid = call.get('contract_id')
+                      fn = call.get('function_name')
+                      args = call.get('function_args') or []
+                      recent_calls.append({
+                          'label': label,
+                          'deployer': deployer,
+                          'tx_id': tx.get('tx_id'),
+                          'block_height': tx.get('block_height'),
+                          'observed_time': observed_time,
+                          'observed_iso': dt.datetime.fromtimestamp(observed_time, dt.timezone.utc).isoformat(),
+                          'contract_id': cid,
+                          'function_name': fn,
+                          'function_args': args,
+                          'privileged_or_config_like': bool(PRIVILEGED_PATTERNS.search(fn or '')),
+                      })
+
+          deployments.sort(key=lambda x: (x['wedge_score'], x['observed_time']), reverse=True)
+          recent_calls.sort(key=lambda x: x['observed_time'], reverse=True)
+
+          grouped_calls = {}
+          for row in recent_calls:
+              key = f"{row['contract_id']}::{row['function_name']}"
+              grouped_calls.setdefault(key, {'count': 0, 'latest_iso': None, 'privileged_or_config_like': row['privileged_or_config_like'], 'sample_tx_ids': []})
+              grouped_calls[key]['count'] += 1
+              if grouped_calls[key]['latest_iso'] is None:
+                  grouped_calls[key]['latest_iso'] = row['observed_iso']
+              if len(grouped_calls[key]['sample_tx_ids']) < 5:
+                  grouped_calls[key]['sample_tx_ids'].append(row['tx_id'])
+
+          summary = {
+              'generated_at': dt.datetime.now(dt.timezone.utc).isoformat(),
+              'source': 'Hiro public read-only API plus public Hermetica GitHub repository',
+              'deployers': DEPLOYERS,
+              'since': dt.datetime.fromtimestamp(SINCE, dt.timezone.utc).isoformat(),
+              'program_update_reference': dt.datetime.fromtimestamp(PROGRAM_UPDATE, dt.timezone.utc).isoformat(),
+              'public_repo_head_reference': dt.datetime.fromtimestamp(REPO_HEAD_TIME, dt.timezone.utc).isoformat(),
+              'repo_clarity_file_count': len(repo_rows),
+              'deployment_count': len(deployments),
+              'recent_call_count': len(recent_calls),
+              'privileged_or_config_call_count': sum(1 for x in recent_calls if x['privileged_or_config_like']),
+              'deployments_after_program_update': [x for x in deployments if x['observed_time'] >= PROGRAM_UPDATE],
+              'deployments_after_repo_head': [x for x in deployments if x['observed_time'] >= REPO_HEAD_TIME],
+              'top_wedge_candidates': deployments[:20],
+              'recent_privileged_or_config_calls': [x for x in recent_calls if x['privileged_or_config_like']],
+              'grouped_recent_calls': grouped_calls,
+              'errors': errors,
+          }
+
+          (OUT / 'repo-index.json').write_text(json.dumps(repo_rows, indent=2), encoding='utf-8')
+          (OUT / 'deployments.json').write_text(json.dumps(deployments, indent=2), encoding='utf-8')
+          (OUT / 'recent-calls.json').write_text(json.dumps(recent_calls, indent=2), encoding='utf-8')
+          (OUT / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+          print(json.dumps(summary, indent=2))
+          PY
+
+          python3 "$OUT/census.py"
+          (cd "$OUT" && find . -type f -not -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-onchain-delta
+          path: /tmp/hermetica-onchain-delta
+          retention-days: 2
+          if-no-files-found: error
+          compression-level: 0
