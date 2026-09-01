@@ -1,0 +1,231 @@
+name: Monad v0.16.0 Round 4 master collector 20260823
+
+on:
+  push:
+    branches:
+      - tooling/monad-v0160-round4-master-collector-20260823
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: zerodaybugs/test
+      RUN_OSAKA: '32661049895'
+      RUN_NATIVE: '32661386526'
+      SANITIZER_BRANCH: tooling/monad-v0160-vm-sanitizer-campaign-20260823
+      SANITIZER_WORKFLOW: Monad v0.16.0 VM sanitizer campaign 20260823
+    steps:
+      - name: Checkout collector branch
+        uses: actions/checkout@v4
+        with:
+          ref: tooling/monad-v0160-round4-master-collector-20260823
+          fetch-depth: 0
+
+      - name: Resolve runs, wait and download artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p round4/download round4/osaka round4/native round4/sanitizer
+
+          resolve_sanitizer_run() {
+            for _ in $(seq 1 60); do
+              id=$(gh api "repos/${REPO}/actions/runs?branch=${SANITIZER_BRANCH}&per_page=100" \
+                --jq ".workflow_runs | map(select(.name == \"${SANITIZER_WORKFLOW}\")) | sort_by(.created_at) | reverse | .[0].id // empty")
+              if [[ -n "$id" ]]; then printf '%s\n' "$id"; return; fi
+              sleep 10
+            done
+            return 1
+          }
+          RUN_SANITIZER=$(resolve_sanitizer_run)
+          printf '%s\n' "$RUN_SANITIZER" > round4/RUN_SANITIZER.txt
+
+          wait_run() {
+            local id="$1" label="$2"
+            for _ in $(seq 1 160); do
+              status=$(gh api "repos/${REPO}/actions/runs/${id}" --jq .status)
+              if [[ "$status" == completed ]]; then
+                conclusion=$(gh api "repos/${REPO}/actions/runs/${id}" --jq .conclusion)
+                printf '%s\n' "$conclusion" > "round4/${label}.conclusion"
+                if [[ "$conclusion" != success ]]; then
+                  gh run view "$id" --repo "$REPO" --log-failed > "round4/${label}.failed.log" 2>&1 || true
+                  return 1
+                fi
+                return 0
+              fi
+              sleep 30
+            done
+            echo timeout > "round4/${label}.conclusion"
+            return 1
+          }
+
+          fail=0
+          wait_run "$RUN_OSAKA" osaka || fail=1
+          wait_run "$RUN_NATIVE" native || fail=1
+          wait_run "$RUN_SANITIZER" sanitizer || fail=1
+          if [[ "$fail" != 0 ]]; then
+            echo 'At least one campaign failed; no security conclusion is authorized.' > round4/CAMPAIGN_FAILURE.txt
+          fi
+
+          download_named_artifact() {
+            local run_id="$1" name="$2" out="$3"
+            artifact_id=$(gh api "repos/${REPO}/actions/runs/${run_id}/artifacts?per_page=100" \
+              --jq ".artifacts[] | select(.name == \"${name}\") | .id" | head -n1)
+            [[ -n "$artifact_id" ]] || return 1
+            gh api "repos/${REPO}/actions/artifacts/${artifact_id}/zip" > "$out"
+            unzip -t "$out" >/dev/null
+          }
+
+          if [[ "$fail" == 0 ]]; then
+            download_named_artifact "$RUN_OSAKA" monad-v0160-vm-differential-campaign-20260823 round4/download/osaka.zip
+            download_named_artifact "$RUN_NATIVE" monad-v0160-native-revision-differential-20260823 round4/download/native.zip
+            download_named_artifact "$RUN_SANITIZER" monad-v0160-vm-sanitizer-campaign-20260823 round4/download/sanitizer.zip
+            unzip -q round4/download/osaka.zip -d round4/osaka
+            unzip -q round4/download/native.zip -d round4/native
+            unzip -q round4/download/sanitizer.zip -d round4/sanitizer
+          fi
+          find round4 -maxdepth 4 -type f -printf '%P\n' | sort > round4/FILES.txt
+
+      - name: Build fail-closed master decision
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, pathlib
+          root = pathlib.Path('round4')
+          failures = list(root.glob('*.failed.log')) + list(root.glob('CAMPAIGN_FAILURE.txt'))
+
+          def locate(name):
+              hits = list(root.rglob(name))
+              if len(hits) != 1:
+                  return None
+              return hits[0]
+
+          paths = {
+              'osaka_reference': locate('CAMPAIGN_RESULT.json'),
+              'monad_native': locate('NATIVE_REVISION_RESULT.json'),
+              'sanitizer': locate('SANITIZER_RESULT.json'),
+          }
+          campaigns = {}
+          candidate_lanes = []
+          parse_errors = []
+          for campaign, path in paths.items():
+              if path is None:
+                  parse_errors.append(f'missing_or_ambiguous:{campaign}')
+                  continue
+              try:
+                  obj = json.loads(path.read_text())
+              except Exception as exc:
+                  parse_errors.append(f'parse_error:{campaign}:{exc}')
+                  continue
+              campaigns[campaign] = obj
+              for lane in obj.get('lanes', []):
+                  if lane.get('candidate_signal'):
+                      candidate_lanes.append({
+                          'campaign': campaign,
+                          'name': lane.get('name'),
+                          'return_code': lane.get('return_code'),
+                          'anomaly_terms': lane.get('anomaly_terms', lane.get('sanitizer_hits', [])),
+                          'first_seed': lane.get('first_seed'),
+                          'last_seed': lane.get('last_seed'),
+                          'log_sha256': lane.get('log_sha256'),
+                      })
+
+          complete = not failures and not parse_errors and len(campaigns) == 3
+          if not complete:
+              decision = 'HOLD_CAMPAIGN_INFRASTRUCTURE_OR_PARSE_FAILURE'
+          elif candidate_lanes:
+              decision = 'CANDIDATES_REQUIRE_REPLAY_MINIMIZATION_AND_FULLNODE_IMPACT_GATE'
+          else:
+              decision = 'NO_DIFFERENTIAL_OR_SANITIZER_SIGNAL_IN_ROUND4_CAMPAIGNS'
+
+          result = {
+              'scope': {
+                  'program': 'Monad Consensus & Execution Bug Bounty',
+                  'monad_bft_tag': 'v0.16.0',
+                  'monad_bft_commit': 'c616743d1358186605e1c1b74a3d6c4fdd9dd48c',
+                  'execution_commit': 'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0',
+              },
+              'campaign_complete': complete,
+              'campaign_failures': [p.name for p in failures],
+              'parse_errors': parse_errors,
+              'campaigns': campaigns,
+              'candidate_lanes': candidate_lanes,
+              'candidate_count': len(candidate_lanes),
+              'submission_ready': False,
+              'high_proven': False,
+              'critical_proven': False,
+              'decision': decision,
+              'release_rule': (
+                  'A candidate becomes reportable only after exact-seed reproduction, minimization to a valid '
+                  'transaction or block, matched negative and fixed controls, normal monad-bft admission, '
+                  'repeated finality or accepted-state-root impact, current scope binding, and public duplicate clearance.'
+              ),
+          }
+          json_path = root / 'MONAD_V0160_ROUND4_MASTER_DECISION_2026-08-23.json'
+          json_path.write_text(json.dumps(result, indent=2, sort_keys=True) + '\n')
+
+          md = [
+              '# Monad v0.16.0 Round 4 master decision', '',
+              f"**Decision:** `{decision}`", '',
+              f"- Campaign complete: **{str(complete).lower()}**",
+              f"- Candidate lanes: **{len(candidate_lanes)}**",
+              '- Submission ready: **no**',
+              '- High proven: **no**',
+              '- Critical proven: **no**', '',
+          ]
+          if candidate_lanes:
+              md += ['## Candidate lanes', '']
+              for x in candidate_lanes:
+                  md.append(
+                      f"- `{x['campaign']} / {x['name']}` — rc={x['return_code']}; "
+                      f"signals={x['anomaly_terms']}; seed={x['last_seed'] or x['first_seed']}; "
+                      f"log SHA-256 `{x['log_sha256']}`"
+                  )
+              md += ['', 'These are replay/minimization inputs, not bounty findings.', '']
+          elif complete:
+              md += [
+                  'The official Osaka/reference differential, the custom `MONAD_NINE`/`MONAD_TEN` '
+                  'interpreter-versus-compiler campaign, and the baseline-isolated ASan/UBSan campaign '
+                  'completed without a machine-classified signal.', ''
+              ]
+          else:
+              md += [f"Infrastructure/parse blockers: `{parse_errors}`; failure files: `{[p.name for p in failures]}`.", '']
+          md += ['## Release boundary', '', result['release_rule'], '']
+          (root / 'MONAD_V0160_ROUND4_MASTER_DECISION_2026-08-23.md').write_text('\n'.join(md))
+
+          checksums = []
+          for p in sorted(root.rglob('*')):
+              if p.is_file() and p.name != 'SHA256SUMS':
+                  checksums.append(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(root)}")
+          (root / 'SHA256SUMS').write_text('\n'.join(checksums) + '\n')
+          print(json.dumps({'decision': decision, 'candidate_count': len(candidate_lanes), 'complete': complete}))
+          PY
+
+      - name: Commit compact Round 4 result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add round4/MONAD_V0160_ROUND4_MASTER_DECISION_2026-08-23.json \
+                  round4/MONAD_V0160_ROUND4_MASTER_DECISION_2026-08-23.md \
+                  round4/SHA256SUMS round4/FILES.txt round4/*.conclusion \
+                  round4/RUN_SANITIZER.txt round4/*.failed.log round4/CAMPAIGN_FAILURE.txt 2>/dev/null || true
+          git commit -m 'research: collect Monad Round 4 results [skip ci]'
+          git push origin HEAD:tooling/monad-v0160-round4-master-collector-20260823
+
+      - name: Upload full Round 4 collection
+        uses: actions/upload-artifact@v7
+        with:
+          name: monad-v0160-round4-master-collector-20260823
+          path: round4
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
