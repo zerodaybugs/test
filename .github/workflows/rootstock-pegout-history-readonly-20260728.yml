@@ -1,0 +1,301 @@
+name: Rootstock PegOut accepted-quote history read-only 20260728
+
+on:
+  push:
+    branches:
+      - ci/dependency-snapshot-20260727
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout runner repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Decode historical accepted PegOut quotes from public chain data
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ROOT="$RUNNER_TEMP/rootstock-pegout-history"
+          NODEDIR="$RUNNER_TEMP/pegout-history-ethers"
+          OUT="$ROOT/evidence"
+          RPC="https://public-node.rsk.co"
+          PEGOUT="0x9A0678742cfb567874eb4e99Df2106BDED78F5E4"
+          DISCOVERY="0x9A48C6b18Aa000d0bd35D55616bCc98aD3553e7a"
+          DEPLOYMENT_BLOCK="8893303"
+          mkdir -p "$OUT" "$NODEDIR"
+
+          cd "$NODEDIR"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund ethers@6.15.0 \
+            2>&1 | tee "$OUT/npm-install.log"
+
+          RPC="$RPC" PEGOUT="$PEGOUT" DISCOVERY="$DISCOVERY" DEPLOYMENT_BLOCK="$DEPLOYMENT_BLOCK" OUT="$OUT" node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const {
+            JsonRpcProvider,
+            Interface,
+            Contract,
+            id,
+          } = require('ethers');
+
+          const rpc = process.env.RPC;
+          const pegout = process.env.PEGOUT;
+          const discovery = process.env.DISCOVERY;
+          const deploymentBlock = Number(process.env.DEPLOYMENT_BLOCK);
+          const out = process.env.OUT;
+
+          const quoteTuple = '(uint256 chainId,uint256 callFee,uint256 penaltyFee,uint256 value,uint256 gasFee,address lbcAddress,address lpRskAddress,address rskRefundAddress,int64 nonce,uint32 agreementTimestamp,uint32 depositDateLimit,uint32 transferTime,uint32 expireDate,uint32 expireBlock,uint16 depositConfirmations,uint16 transferConfirmations,bytes depositAddress,bytes btcRefundAddress,bytes lpBtcAddress)';
+          const pegoutAbi = [
+            `function depositPegOut(${quoteTuple} quote,bytes signature) payable`,
+            'event PegOutDeposit(bytes32 indexed quoteHash,address indexed sender,uint256 indexed timestamp,uint256 amount)',
+            'event PegOutRefunded(bytes32 indexed quoteHash)',
+            'event PegOutUserRefunded(bytes32 indexed quoteHash,address indexed userAddress,uint256 indexed value)',
+          ];
+          const discoveryAbi = [
+            'function getProviders() view returns ((uint256 id,address providerAddress,bool status,uint8 providerType,string name,string apiBaseUrl)[])'
+          ];
+
+          function jsonReplacer(_key, value) {
+            return typeof value === 'bigint' ? value.toString() : value;
+          }
+
+          async function scanLogs(provider, topic0, latest) {
+            const all = [];
+            let from = deploymentBlock;
+            let step = 10000;
+            while (from <= latest) {
+              const to = Math.min(latest, from + step - 1);
+              try {
+                const logs = await provider.getLogs({
+                  address: pegout,
+                  fromBlock: from,
+                  toBlock: to,
+                  topics: [topic0],
+                });
+                all.push(...logs);
+                from = to + 1;
+                if (step < 25000) step = Math.min(25000, step * 2);
+              } catch (error) {
+                if (step <= 500) throw error;
+                step = Math.max(500, Math.floor(step / 2));
+              }
+            }
+            return all;
+          }
+
+          async function mapLimit(items, limit, worker) {
+            const result = new Array(items.length);
+            let index = 0;
+            async function run() {
+              while (true) {
+                const i = index++;
+                if (i >= items.length) return;
+                result[i] = await worker(items[i], i);
+              }
+            }
+            await Promise.all(Array.from({ length: Math.min(limit, items.length || 1) }, run));
+            return result;
+          }
+
+          async function main() {
+            const provider = new JsonRpcProvider(rpc, undefined, { staticNetwork: false });
+            const network = await provider.getNetwork();
+            const latest = await provider.getBlockNumber();
+            const iface = new Interface(pegoutAbi);
+            const discoveryContract = new Contract(discovery, discoveryAbi, provider);
+            const providerRows = await discoveryContract.getProviders();
+            const providerByAddress = {};
+            for (const p of providerRows) {
+              providerByAddress[p.providerAddress.toLowerCase()] = {
+                id: p.id.toString(),
+                name: p.name,
+                apiBaseUrl: p.apiBaseUrl,
+                providerType: Number(p.providerType),
+              };
+            }
+
+            const topics = {
+              deposit: id('PegOutDeposit(bytes32,address,uint256,uint256)'),
+              lpRefund: id('PegOutRefunded(bytes32)'),
+              userRefund: id('PegOutUserRefunded(bytes32,address,uint256)'),
+            };
+
+            const [depositLogs, lpRefundLogs, userRefundLogs] = await Promise.all([
+              scanLogs(provider, topics.deposit, latest),
+              scanLogs(provider, topics.lpRefund, latest),
+              scanLogs(provider, topics.userRefund, latest),
+            ]);
+
+            const completions = {};
+            for (const log of lpRefundLogs) {
+              const parsed = iface.parseLog(log);
+              completions[parsed.args.quoteHash.toLowerCase()] = {
+                type: 'LP_REFUND',
+                transactionHash: log.transactionHash,
+                blockNumber: log.blockNumber,
+              };
+            }
+            for (const log of userRefundLogs) {
+              const parsed = iface.parseLog(log);
+              completions[parsed.args.quoteHash.toLowerCase()] = {
+                type: 'USER_REFUND',
+                transactionHash: log.transactionHash,
+                blockNumber: log.blockNumber,
+                userAddress: parsed.args.userAddress,
+                value: parsed.args.value.toString(),
+              };
+            }
+
+            const blockCache = new Map();
+            async function getBlock(number) {
+              if (!blockCache.has(number)) {
+                blockCache.set(number, provider.getBlock(number));
+              }
+              return blockCache.get(number);
+            }
+
+            const quotes = await mapLimit(depositLogs, 5, async (log) => {
+              const parsedEvent = iface.parseLog(log);
+              const tx = await provider.getTransaction(log.transactionHash);
+              if (!tx) throw new Error(`transaction missing: ${log.transactionHash}`);
+              const parsedTx = iface.parseTransaction({ data: tx.data, value: tx.value });
+              if (!parsedTx || parsedTx.name !== 'depositPegOut') {
+                throw new Error(`unable to decode depositPegOut: ${log.transactionHash}`);
+              }
+              const q = parsedTx.args.quote;
+              const depositBlock = await getBlock(log.blockNumber);
+              const completion = completions[parsedEvent.args.quoteHash.toLowerCase()] || null;
+              let completionBlock = null;
+              if (completion) completionBlock = await getBlock(completion.blockNumber);
+              const lp = providerByAddress[q.lpRskAddress.toLowerCase()] || null;
+              const blockTimestamp = Number(depositBlock.timestamp);
+              const row = {
+                quoteHash: parsedEvent.args.quoteHash,
+                depositTransactionHash: log.transactionHash,
+                depositBlockNumber: log.blockNumber,
+                depositBlockTimestamp: blockTimestamp,
+                depositor: parsedEvent.args.sender,
+                depositedAmountWei: parsedEvent.args.amount.toString(),
+                provider: lp,
+                quote: {
+                  chainId: q.chainId.toString(),
+                  callFee: q.callFee.toString(),
+                  penaltyFee: q.penaltyFee.toString(),
+                  value: q.value.toString(),
+                  gasFee: q.gasFee.toString(),
+                  lbcAddress: q.lbcAddress,
+                  lpRskAddress: q.lpRskAddress,
+                  rskRefundAddress: q.rskRefundAddress,
+                  nonce: q.nonce.toString(),
+                  agreementTimestamp: Number(q.agreementTimestamp),
+                  depositDateLimit: Number(q.depositDateLimit),
+                  transferTime: Number(q.transferTime),
+                  expireDate: Number(q.expireDate),
+                  expireBlock: Number(q.expireBlock),
+                  depositConfirmations: Number(q.depositConfirmations),
+                  transferConfirmations: Number(q.transferConfirmations),
+                  depositAddress: q.depositAddress,
+                  btcRefundAddress: q.btcRefundAddress,
+                  lpBtcAddress: q.lpBtcAddress,
+                },
+                derived: {
+                  valueRbtc: Number(q.value) / 1e18,
+                  agreementToDepositSeconds: blockTimestamp - Number(q.agreementTimestamp),
+                  depositDateSlackSeconds: Number(q.depositDateLimit) - blockTimestamp,
+                  expireAfterDepositSeconds: Number(q.expireDate) - blockTimestamp,
+                  expireAfterDepositBlocks: Number(q.expireBlock) - log.blockNumber,
+                  expiryFromAgreementSeconds: Number(q.expireDate) - Number(q.agreementTimestamp),
+                  expiryFromAgreementBlocks: Number(q.expireBlock) - log.blockNumber,
+                  conservativeBtcProofSecondsAt600sBlocks: Number(q.transferConfirmations) * 600,
+                },
+                completion,
+              };
+              if (completion && completionBlock) {
+                row.completion.blockTimestamp = Number(completionBlock.timestamp);
+                row.completion.secondsAfterDeposit = Number(completionBlock.timestamp) - blockTimestamp;
+                row.completion.blocksAfterDeposit = completion.blockNumber - log.blockNumber;
+              }
+              return row;
+            });
+
+            quotes.sort((a, b) => a.depositBlockNumber - b.depositBlockNumber);
+            const output = {
+              generatedAt: new Date().toISOString(),
+              mode: 'read-only historical eth_getLogs/eth_getTransactionByHash/eth_getBlockByNumber; no transaction submitted and no quote requested',
+              rpc,
+              chainId: network.chainId.toString(),
+              pegoutContract: pegout,
+              discoveryContract: discovery,
+              deploymentBlock,
+              latestBlock: latest,
+              eventCounts: {
+                deposits: depositLogs.length,
+                lpRefunds: lpRefundLogs.length,
+                userRefunds: userRefundLogs.length,
+              },
+              providers: providerByAddress,
+              quotes,
+            };
+            fs.writeFileSync(path.join(out, 'pegout-history.json'), JSON.stringify(output, jsonReplacer, 2) + '\n');
+
+            const summary = quotes.map((row) => ({
+              quoteHash: row.quoteHash,
+              depositTransactionHash: row.depositTransactionHash,
+              block: row.depositBlockNumber,
+              provider: row.provider?.name || row.quote.lpRskAddress,
+              valueRbtc: row.derived.valueRbtc,
+              depositConfirmations: row.quote.depositConfirmations,
+              transferConfirmations: row.quote.transferConfirmations,
+              transferTimeSeconds: row.quote.transferTime,
+              expireAfterDepositSeconds: row.derived.expireAfterDepositSeconds,
+              expireAfterDepositBlocks: row.derived.expireAfterDepositBlocks,
+              completionType: row.completion?.type || null,
+              completionSecondsAfterDeposit: row.completion?.secondsAfterDeposit ?? null,
+              conservativeBtcProofSecondsAt600sBlocks: row.derived.conservativeBtcProofSecondsAt600sBlocks,
+              timingMarginSecondsVsTimeExpiry: row.derived.expireAfterDepositSeconds - row.derived.conservativeBtcProofSecondsAt600sBlocks,
+            }));
+            fs.writeFileSync(path.join(out, 'SUMMARY.json'), JSON.stringify(summary, null, 2) + '\n');
+            console.log(JSON.stringify({ eventCounts: output.eventCounts, summary }, null, 2));
+          }
+
+          main().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
+
+          {
+            echo "generated_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "rpc=$RPC"
+            echo "pegout_contract=$PEGOUT"
+            echo "discovery_contract=$DISCOVERY"
+            echo "deployment_block=$DEPLOYMENT_BLOCK"
+            echo "mode=read-only historical chain queries only"
+            echo "post_requests=0"
+            echo "transactions_submitted=0"
+            echo "quotes_requested=0"
+          } > "$OUT/MANIFEST.txt"
+          find "$OUT" -type f -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS.txt"
+
+      - name: Upload read-only history
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootstock-pegout-history-readonly-20260728
+          path: ${{ runner.temp }}/rootstock-pegout-history/evidence
+          if-no-files-found: error
+          retention-days: 1

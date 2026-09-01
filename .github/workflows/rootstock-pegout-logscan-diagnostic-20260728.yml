@@ -1,0 +1,116 @@
+name: Rootstock PegOut logscan diagnostic 20260728
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Diagnose public log scan and decode
+        shell: bash
+        run: |
+          set -uo pipefail
+          OUT="$RUNNER_TEMP/rootstock-pegout-logscan-diagnostic"
+          NODEDIR="$RUNNER_TEMP/rootstock-pegout-logscan-node"
+          mkdir -p "$OUT" "$NODEDIR"
+          cd "$NODEDIR"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund ethers@6.15.0 >"$OUT/npm.log" 2>&1
+          OUT="$OUT" node >"$OUT/node.log" 2>&1 <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const { JsonRpcProvider, Interface, id } = require('ethers');
+
+          const out = process.env.OUT;
+          const rpc = 'https://public-node.rsk.co';
+          const contract = '0x9A0678742cfb567874eb4e99Df2106BDED78F5E4';
+          const deployment = 8893303;
+          const topic = id('PegOutDeposit(bytes32,address,uint256,uint256)');
+          const tuple = '(uint256 chainId,uint256 callFee,uint256 penaltyFee,uint256 value,uint256 gasFee,address lbcAddress,address lpRskAddress,address rskRefundAddress,int64 nonce,uint32 agreementTimestamp,uint32 depositDateLimit,uint32 transferTime,uint32 expireDate,uint32 expireBlock,uint16 depositConfirmations,uint16 transferConfirmations,bytes depositAddress,bytes btcRefundAddress,bytes lpBtcAddress)';
+          const iface = new Interface([
+            `function depositPegOut(${tuple} quote,bytes signature) payable`,
+            'event PegOutDeposit(bytes32 indexed quoteHash,address indexed sender,uint256 indexed timestamp,uint256 amount)'
+          ]);
+
+          async function main() {
+            const provider = new JsonRpcProvider(rpc);
+            const latest = await provider.getBlockNumber();
+            console.log(JSON.stringify({ rpc, contract, deployment, latest, topic }, null, 2));
+            const sizes = [50000, 10000, 5000, 2000, 1000, 500, 100, 10, 1];
+            const probes = [];
+            let working = null;
+            for (const size of sizes) {
+              const to = Math.min(latest, deployment + size - 1);
+              try {
+                const logs = await provider.getLogs({ address: contract, fromBlock: deployment, toBlock: to, topics: [topic] });
+                probes.push({ size, ok: true, count: logs.length });
+                if (working === null) working = size;
+              } catch (error) {
+                probes.push({ size, ok: false, error: error.shortMessage || error.message, code: error.code });
+              }
+            }
+            fs.writeFileSync(path.join(out, 'range-probes.json'), JSON.stringify(probes, null, 2));
+            console.log('PROBES', JSON.stringify(probes, null, 2));
+            if (!working) throw new Error('No working eth_getLogs range');
+
+            const logs = [];
+            const step = Math.min(working, 5000);
+            for (let from = deployment; from <= latest; from += step) {
+              const to = Math.min(latest, from + step - 1);
+              const page = await provider.getLogs({ address: contract, fromBlock: from, toBlock: to, topics: [topic] });
+              logs.push(...page);
+              if ((from - deployment) % (step * 20) === 0) console.log('progress', { from, to, found: logs.length });
+            }
+            fs.writeFileSync(path.join(out, 'deposit-logs.json'), JSON.stringify(logs, null, 2));
+            console.log('deposit log count', logs.length);
+            if (logs.length) {
+              const log = logs[0];
+              const parsedEvent = iface.parseLog(log);
+              const tx = await provider.getTransaction(log.transactionHash);
+              console.log('first log', log);
+              console.log('first event', parsedEvent);
+              console.log('first tx data length', tx?.data?.length);
+              const parsedTx = iface.parseTransaction({ data: tx.data, value: tx.value });
+              console.log('first tx parsed', parsedTx);
+              fs.writeFileSync(path.join(out, 'first-decoded.json'), JSON.stringify({
+                log,
+                event: parsedEvent,
+                tx: { hash: tx.hash, data: tx.data, value: tx.value.toString() },
+                parsed: parsedTx,
+              }, (_k, v) => typeof v === 'bigint' ? v.toString() : v, 2));
+            }
+            fs.writeFileSync(path.join(out, 'RESULT.txt'), `PASS\nworking_range=${working}\ndeposit_logs=${logs.length}\n`);
+          }
+
+          main().catch((error) => {
+            console.error(error.stack || error);
+            fs.writeFileSync(path.join(out, 'ERROR.txt'), String(error.stack || error));
+            fs.writeFileSync(path.join(out, 'RESULT.txt'), 'FAIL\n');
+          });
+          NODE
+          {
+            echo "generated_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "mode=read-only public JSON-RPC only"
+            echo "transactions_submitted=0"
+          } > "$OUT/MANIFEST.txt"
+          find "$OUT" -type f -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS.txt"
+      - name: Upload diagnostic
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootstock-pegout-logscan-diagnostic-20260728
+          path: ${{ runner.temp }}/rootstock-pegout-logscan-diagnostic
+          if-no-files-found: error
+          retention-days: 1
