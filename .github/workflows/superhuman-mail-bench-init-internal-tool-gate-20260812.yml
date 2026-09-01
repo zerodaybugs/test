@@ -1,0 +1,289 @@
+name: Temporary Superhuman Mail bench-init internal-tool gate
+
+on:
+  push:
+    branches: [research/superhuman-mail-bench-init-20260812]
+    paths: [.github/workflows/superhuman-mail-bench-init-internal-tool-gate-20260812.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install exact stable Superhuman Packs SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf mail-bench-gate public-intake-status
+          mkdir -p mail-bench-gate/evidence public-intake-status
+          cd mail-bench-gate
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund @codahq/packs-sdk@1.17.1
+          node -e "const p=require('@codahq/packs-sdk/package.json'); if(p.version!=='1.17.1') process.exit(1); console.log(p.version)" > evidence/sdk-version.txt
+
+      - name: Run official upload-validator internal-tool gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd mail-bench-gate
+          cat > validator_gate.js <<'NODE'
+          'use strict';
+
+          const assert = require('assert');
+          const crypto = require('crypto');
+          const fs = require('fs');
+          const path = require('path');
+          const sdk = require('@codahq/packs-sdk');
+
+          const sdkRoot = path.dirname(require.resolve('@codahq/packs-sdk/package.json'));
+          const {compilePackMetadata} = require(path.join(sdkRoot, 'dist/helpers/metadata.js'));
+          const {validatePackVersionMetadata} = require(path.join(sdkRoot, 'dist/testing/upload_validation.js'));
+
+          async function main() {
+            const pack = sdk.newPack();
+            pack.setVersion('1.0.0');
+            pack.addNetworkDomain('api.example.com');
+            pack.setUserAuthentication({type: sdk.AuthenticationType.HeaderBearerToken});
+
+            pack.addFormula({
+              name: 'WriteSentinel',
+              description: 'Synthetic action formula used only for validation.',
+              parameters: [],
+              resultType: sdk.ValueType.String,
+              isAction: true,
+              connectionRequirement: sdk.ConnectionRequirement.Required,
+              execute: async function () {
+                return 'SYNTHETIC_ONLY';
+              },
+            });
+
+            const skill = {
+              prompt: 'Initialize the agent using only synthetic test metadata.',
+              tools: [
+                {type: sdk.ToolType.MailAndCalendar},
+                {
+                  type: sdk.ToolType.Pack,
+                  formulas: [{formulaName: 'WriteSentinel'}],
+                },
+              ],
+            };
+
+            pack.setBenchInitializationSkill(skill);
+            pack.setChatSkill(skill);
+
+            const compiled = compilePackMetadata(pack);
+            const validated = await validatePackVersionMetadata(compiled, '1.17.1');
+
+            const bench = validated.benchInitializationSkill;
+            const chat = validated.chatSkill;
+            assert(bench, 'benchInitializationSkill missing after validation');
+            assert(chat, 'chatSkill missing after validation');
+
+            function inspectSkill(value) {
+              const mail = value.tools.find((tool) => tool.type === sdk.ToolType.MailAndCalendar);
+              const packTool = value.tools.find((tool) => tool.type === sdk.ToolType.Pack);
+              assert(mail, 'MailAndCalendar tool missing');
+              assert(packTool, 'Pack tool missing');
+              assert.deepEqual(packTool.formulas, [{formulaName: 'WriteSentinel'}]);
+              return {
+                toolTypes: value.tools.map((tool) => tool.type),
+                mailAndCalendar: mail,
+                packTool,
+                mailToolHasApprovalField: Object.keys(mail).some((key) => /approval/i.test(key)),
+                packFormulaHasApprovalField: Object.keys(packTool.formulas[0]).some((key) => /approval/i.test(key)),
+                hasFirstPartyAttestationField: JSON.stringify(value).includes('firstParty') || JSON.stringify(value).includes('certifiedAgent'),
+              };
+            }
+
+            const result = {
+              pass: true,
+              sdkVersion: require(path.join(sdkRoot, 'package.json')).version,
+              officialUploadValidationAccepted: true,
+              benchInitializationSkill: inspectSkill(bench),
+              chatSkill: inspectSkill(chat),
+              actionFormula: validated.formulas.find((formula) => formula.name === 'WriteSentinel'),
+              validatorRejectsThirdPartyMailAndCalendar: false,
+              validatorBindsInternalToolToFirstPartyIdentity: false,
+              validatorAddsApprovalMode: false,
+              syntheticOnly: true,
+              productionRequestCount: 0,
+            };
+
+            assert.equal(result.benchInitializationSkill.mailToolHasApprovalField, false);
+            assert.equal(result.benchInitializationSkill.packFormulaHasApprovalField, false);
+            assert.equal(result.benchInitializationSkill.hasFirstPartyAttestationField, false);
+            assert.equal(result.actionFormula.isAction, true);
+
+            fs.writeFileSync('evidence/VALIDATOR_RESULT.json', JSON.stringify(result, null, 2) + '\n');
+            fs.writeFileSync('evidence/VALIDATED_METADATA.json', JSON.stringify(validated, null, 2) + '\n');
+            fs.writeFileSync('evidence/COMPILED_METADATA.json', JSON.stringify(compiled, null, 2) + '\n');
+            console.log(JSON.stringify(result, null, 2));
+          }
+
+          main().catch((error) => {
+            console.error(error && error.stack || error);
+            process.exit(1);
+          });
+          NODE
+          node validator_gate.js | tee evidence/VALIDATOR_OUTPUT.txt
+          jq -e '.pass == true and .officialUploadValidationAccepted == true and .benchInitializationSkill.toolTypes | index("MailAndCalendar") != null' evidence/VALIDATOR_RESULT.json >/dev/null
+
+      - name: Download current official Go CRX and extract automatic bench-init call graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd mail-bench-gate
+          mkdir -p crx/extracted
+          URL='https://clients2.google.com/service/update2/crx?response=redirect&prod=chromium&prodversion=151.0.0.0&acceptformat=crx3&x=id%3Dkbfnbcaeplbcioakkpcpgfkobkghlhen%26installsource%3Dondemand%26uc'
+          curl --fail --show-error --silent --location --retry 3 --retry-all-errors \
+            --user-agent 'Mozilla/5.0 Chrome/151.0.0.0' "$URL" -o crx/current.crx
+          test "$(head -c 4 crx/current.crx)" = 'Cr24'
+          python3 - <<'PY'
+          import hashlib, json, pathlib, re, struct, zipfile
+
+          root = pathlib.Path('crx')
+          data = (root / 'current.crx').read_bytes()
+          version = struct.unpack_from('<I', data, 4)[0]
+          header_len = struct.unpack_from('<I', data, 8)[0]
+          payload = data[12 + header_len:]
+          assert version == 3 and payload[:2] == b'PK'
+          (root / 'current.zip').write_bytes(payload)
+          with zipfile.ZipFile(root / 'current.zip') as zf:
+              zf.extractall(root / 'extracted')
+          manifest = json.loads((root / 'extracted' / 'manifest.json').read_text())
+
+          auto_trigger = None
+          mail_builder = None
+          mail_enum = None
+          files_scanned = 0
+          for path in sorted((root / 'extracted').rglob('*.js')):
+              files_scanned += 1
+              text = path.read_text(errors='ignore')
+              if auto_trigger is None and 'benchInitializationSkill' in text and 'agentBenchInitialization' in text and 'systemMessageMetadata' in text:
+                  idx = text.index('benchInitializationSkill')
+                  window = text[max(0, idx - 1800):idx + 5000]
+                  if 'sendMessage' in window and 'systemMessageMetadata' in window:
+                      auto_trigger = (path, window)
+              if mail_builder is None and 'mailEnabled&&' in text and 'MailAndCalendar' in text:
+                  idx = text.index('mailEnabled&&')
+                  mail_builder = (path, text[max(0, idx - 600):idx + 1300])
+              if mail_enum is None and 'MailAndCalendar="MailAndCalendar"' in text:
+                  idx = text.index('MailAndCalendar="MailAndCalendar"')
+                  mail_enum = (path, text[max(0, idx - 500):idx + 900])
+
+          assert auto_trigger, 'current build automatic bench-init call graph not found'
+          assert 'getChatMessages' in auto_trigger[1]
+          assert 'length>0' in auto_trigger[1]
+          assert 'createChat' in auto_trigger[1]
+          assert 'systemMessageMetadata:{kind:"agentBenchInitialization"}' in auto_trigger[1]
+          assert mail_enum, 'MailAndCalendar current-build enum not found'
+
+          def item(pair):
+              path, snippet = pair
+              return {
+                  'path': str(path.relative_to(root / 'extracted')),
+                  'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                  'snippet': snippet,
+              }
+
+          result = {
+              'pass': True,
+              'extensionId': 'kbfnbcaeplbcioakkpcpgfkobkghlhen',
+              'extensionVersion': manifest.get('version'),
+              'manifestVersion': manifest.get('manifest_version'),
+              'crxSha256': hashlib.sha256(data).hexdigest(),
+              'filesScanned': files_scanned,
+              'automaticBenchInitialization': item(auto_trigger),
+              'mailAndCalendarEnum': item(mail_enum),
+              'customAgentMailBuilder': item(mail_builder) if mail_builder else None,
+              'autoCreatesChatForEmptyChat': True,
+              'autoSendsSystemMessageWithoutUserText': True,
+              'systemMessageKind': 'agentBenchInitialization',
+              'requiresBenchInitializationMetadata': True,
+              'syntheticOnly': True,
+              'productionRequestCount': 0,
+            }
+          pathlib.Path('evidence/CURRENT_BUILD_RESULT.json').write_text(json.dumps(result, indent=2) + '\n')
+          pathlib.Path('evidence/CURRENT_BUILD_AUTO_TRIGGER.txt').write_text(auto_trigger[1] + '\n')
+          pathlib.Path('evidence/CURRENT_BUILD_MAIL_ENUM.txt').write_text(mail_enum[1] + '\n')
+          if mail_builder:
+              pathlib.Path('evidence/CURRENT_BUILD_MAIL_BUILDER.txt').write_text(mail_builder[1] + '\n')
+          print(json.dumps(result, indent=2))
+          PY
+          jq -e '.pass == true and .autoSendsSystemMessageWithoutUserText == true and .systemMessageKind == "agentBenchInitialization"' evidence/CURRENT_BUILD_RESULT.json >/dev/null
+
+      - name: Produce combined candidate decision
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd mail-bench-gate
+          python3 - <<'PY'
+          import json, os, pathlib
+          ev = pathlib.Path('evidence')
+          validator = json.loads((ev / 'VALIDATOR_RESULT.json').read_text())
+          current = json.loads((ev / 'CURRENT_BUILD_RESULT.json').read_text())
+          primitive = all([
+              validator['pass'],
+              validator['officialUploadValidationAccepted'],
+              'MailAndCalendar' in validator['benchInitializationSkill']['toolTypes'],
+              validator['benchInitializationSkill']['mailToolHasApprovalField'] is False,
+              validator['benchInitializationSkill']['hasFirstPartyAttestationField'] is False,
+              current['pass'],
+              current['autoSendsSystemMessageWithoutUserText'],
+              current['systemMessageKind'] == 'agentBenchInitialization',
+          ])
+          result = {
+              'pass': primitive,
+              'workflowRunId': int(os.environ['GITHUB_RUN_ID']),
+              'sourceCommit': os.environ['GITHUB_SHA'],
+              'rootCauseCandidate': 'The official upload validator accepts third-party Pack skills containing the internal MailAndCalendar tool without first-party attestation, while the current Go client automatically triggers benchInitializationSkill through a system message on first activation.',
+              'officialValidatorAcceptedInternalMailTool': validator['officialUploadValidationAccepted'],
+              'currentClientAutoTriggersBenchInitialization': current['autoSendsSystemMessageWithoutUserText'],
+              'technicalPrimitiveConfirmed': primitive,
+              'serverResolvesMailAndCalendarForThirdPartyPackProven': False,
+              'mailboxReadOrMutationProven': False,
+              'candidateSeverity': 'CRITICAL_CANDIDATE_IF_SERVER_RESOLUTION_PASSES',
+              'submissionReady': False,
+              'submissionDecision': 'HOLD_PENDING_SERVER_CAPABILITY_RESOLUTION_AND_RESEARCHER_OWNED_MAILBOX_SENTINEL',
+              'remainingGate': 'Using researcher-owned accounts only, prove that an installed third-party Pack with this accepted metadata receives a MailAndCalendar capability and that first activation reads or mutates a unique mailbox/calendar sentinel without an explicit user request.',
+              'syntheticOnly': True,
+              'productionRequestCount': 0,
+            }
+          (ev / 'RESULT.json').write_text(json.dumps(result, indent=2) + '\n')
+          pathlib.Path('public-intake-status/superhuman-mail-bench-init-internal-tool-result.json').write_text(json.dumps(result, indent=2) + '\n')
+          print(json.dumps(result, indent=2))
+          if not primitive:
+              raise SystemExit(1)
+          PY
+          find evidence -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: superhuman-mail-bench-init-internal-tool-gate
+          path: mail-bench-gate/evidence/
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: Commit compact result
+        if: github.event_name == 'push' && success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-mail-bench-init-internal-tool-result.json
+          git commit -m 'chore: record Superhuman Mail bench-init internal-tool gate'
+          git push
