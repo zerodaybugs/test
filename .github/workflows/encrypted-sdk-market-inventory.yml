@@ -1,0 +1,170 @@
+name: encrypted-sdk-market-inventory
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/encrypted-sdk-market-inventory.yml'
+      - 'security/snapshot_public.pem'
+      - 'security/encrypted-sdk-market-trigger.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: ethereum-sdk
+            chain: ethereum
+            factories: '0xF2BDa87CA467eB90A1b68f824cB136baA68a8177:23430000,0x5b8B26a6734B5eABDBe6C5A19580Ab2D0424f027:23430000,0xc1E9640F04B802Bbf0B02a4e9Fe394039AbE8B59:24883366'
+          - label: bnb-sdk
+            chain: bsc
+            factories: '0x1401049368eD6AD8194f8bb7E41732c4620F170b:63100000,0xdffE6De6de1dB8e1B5Ce77D3222eba401C2573b5:63100000,0x4a34b4cAaA6AD23B95d6ec6394472fbB857eB064:92629573,0x22105089AFC8F35D55a9Efb19785fd350ADdd7C3:92629573'
+          - label: base-sdk
+            chain: base
+            factories: '0xDA4aAF85Bb924B53DCc2DFFa9e1A9C2Ef97aCFDF:43289755,0x08c50Bd46992d35694208eC3Cf1f1EDcE38f5fd1:44722441'
+          - label: arbitrum-sdk
+            chain: arbitrum
+            factories: '0xa7c93162962D050098f4BB44E88661517484C5EB:385228046,0x18b8A9433dBefcd15370F10a75e28149bcc2e301:385228046,0xcaF2632BdB12Aa20b17f3E80CeAF9781b4aD4F38:452661450'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install SDK
+        run: |
+          mkdir sdk && cd sdk
+          npm init -y
+          npm install --no-audit --no-fund @defillama/sdk@5.0.219 ethers@5.7.2
+      - name: Enumerate factory markets and current state
+        env:
+          LABEL: ${{ matrix.label }}
+          CHAIN: ${{ matrix.chain }}
+          FACTORIES: ${{ matrix.factories }}
+        run: |
+          set -euo pipefail
+          rm -rf encrypted-sdk-evidence encrypted-sdk-upload
+          mkdir -p encrypted-sdk-evidence encrypted-sdk-upload
+          cd sdk
+          node - <<'NODE' > ../encrypted-sdk-evidence/execution.stdout 2> ../encrypted-sdk-evidence/execution.stderr
+          const fs = require('fs');
+          const sdk = require('@defillama/sdk');
+          const chain = process.env.CHAIN;
+          const label = process.env.LABEL;
+          const factories = process.env.FACTORIES.split(',').map((x) => {
+            const [address, fromBlock] = x.split(':');
+            return { address, fromBlock: Number(fromBlock) };
+          });
+          const MARKET_TOPIC = '0x3f544a0e66146e1c515b04e3d00d07fabc299aa08db26f13ae0a2e3797503286';
+          const addr = (topic) => `0x${topic.slice(-40)}`;
+          const call = async (target, abi, params = []) => {
+            try {
+              return { ok: true, value: (await sdk.api.abi.call({ target, abi, params, chain })).output };
+            } catch (error) {
+              return { ok: false, error: String(error) };
+            }
+          };
+          const main = async () => {
+            const latest = (await sdk.api.util.getLatestBlock(chain)).number;
+            const map = new Map();
+            const scans = [];
+            for (const factory of factories) {
+              try {
+                const logs = await sdk.getLogs({
+                  target: factory.address,
+                  topic: MARKET_TOPIC,
+                  fromBlock: factory.fromBlock,
+                  toBlock: latest,
+                  chain,
+                  entireLog: true,
+                  parseLog: false,
+                  skipCache: true,
+                });
+                scans.push({ ...factory, ok: true, count: logs.length });
+                for (const log of logs) {
+                  if (!log.topics || log.topics.length < 4) continue;
+                  const market = addr(log.topics[1]);
+                  map.set(market.toLowerCase(), {
+                    market,
+                    collateralEvent: addr(log.topics[2]),
+                    debtEvent: addr(log.topics[3]),
+                    factory: factory.address,
+                    createdBlock: Number(log.blockNumber || log.block_number || 0),
+                    createdTx: log.transactionHash || log.transaction_hash,
+                  });
+                }
+              } catch (error) {
+                scans.push({ ...factory, ok: false, error: String(error) });
+              }
+            }
+            const markets = [];
+            for (const base of map.values()) {
+              const tokens = await call(base.market, 'function tokens() view returns (address ft,address xt,address gt,address collateral,address debtToken)');
+              const config = await call(base.market, 'function config() view returns (address treasurer,uint64 maturity,(uint32 lendTakerFeeRatio,uint32 lendMakerFeeRatio,uint32 borrowTakerFeeRatio,uint32 borrowMakerFeeRatio,uint32 mintGtFeeRatio,uint32 mintGtFeeRef) feeConfig)');
+              let gtConfig = { ok: false, error: 'tokens unavailable' };
+              let balances = {};
+              let tokenMeta = {};
+              if (tokens.ok) {
+                const t = tokens.value;
+                const ft = t.ft || t[0];
+                const xt = t.xt || t[1];
+                const gt = t.gt || t[2];
+                const collateral = t.collateral || t[3];
+                const debtToken = t.debtToken || t[4];
+                gtConfig = await call(gt, 'function getGtConfig() view returns (address collateral,address debtToken,address ft,address treasurer,uint64 maturity,(address oracle,uint32 liquidationLtv,uint32 maxLtv,bool liquidatable) loanConfig)');
+                balances = {
+                  ftSupply: await call(ft, 'uint256:totalSupply'),
+                  xtSupply: await call(xt, 'uint256:totalSupply'),
+                  gtSupply: await call(gt, 'uint256:totalSupply'),
+                  debtMarketBalance: await call(debtToken, 'function balanceOf(address) view returns(uint256)', [base.market]),
+                  collateralGtBalance: await call(collateral, 'function balanceOf(address) view returns(uint256)', [gt]),
+                };
+                tokenMeta = {
+                  debtSymbol: await call(debtToken, 'string:symbol'),
+                  debtDecimals: await call(debtToken, 'uint8:decimals'),
+                  collateralSymbol: await call(collateral, 'string:symbol'),
+                  collateralDecimals: await call(collateral, 'uint8:decimals'),
+                };
+              }
+              markets.push({
+                ...base,
+                name: await call(base.market, 'string:name'),
+                tokens,
+                config,
+                gtConfig,
+                balances,
+                tokenMeta,
+              });
+            }
+            const result = { label, chain, latest, scans, marketCount: markets.length, markets };
+            fs.writeFileSync('../encrypted-sdk-evidence/sdk-market-inventory.json', JSON.stringify(result, null, 2));
+            console.log(JSON.stringify({ label, chain, latest, scans, marketCount: markets.length }, null, 2));
+          };
+          main().catch((error) => {
+            fs.writeFileSync('../encrypted-sdk-evidence/FATAL.txt', String(error.stack || error));
+            console.error(error);
+          });
+          NODE
+          cd ..
+          sha256sum encrypted-sdk-evidence/* | sort > encrypted-sdk-evidence/SHA256SUMS.txt
+          tar -czf sdk-markets.tar.gz encrypted-sdk-evidence
+      - name: Encrypt before upload
+        run: |
+          set -euo pipefail
+          ENC_KEY=$(openssl rand -hex 32); MAC_KEY=$(openssl rand -hex 32); IV=$(openssl rand -hex 16)
+          printf '%s:%s:%s' "$ENC_KEY" "$MAC_KEY" "$IV" > key-material.txt
+          openssl enc -aes-256-cbc -K "$ENC_KEY" -iv "$IV" -in sdk-markets.tar.gz -out encrypted-sdk-upload/sdk-markets.enc
+          openssl dgst -sha256 -mac HMAC -macopt "hexkey:$MAC_KEY" encrypted-sdk-upload/sdk-markets.enc | awk '{print $2}' > encrypted-sdk-upload/sdk-markets.hmac
+          openssl pkeyutl -encrypt -pubin -inkey security/snapshot_public.pem -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -in key-material.txt -out encrypted-sdk-upload/key-material.enc
+          sha256sum encrypted-sdk-upload/* > encrypted-sdk-upload/CIPHERTEXT_SHA256SUMS.txt
+          printf '%s\n' 'RSA-OAEP-SHA256 + AES-256-CBC + HMAC-SHA256' > encrypted-sdk-upload/FORMAT.txt
+          rm -rf encrypted-sdk-evidence sdk-markets.tar.gz key-material.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: encrypted-sdk-market-${{ matrix.label }}
+          path: encrypted-sdk-upload/
+          if-no-files-found: warn
+          retention-days: 2
