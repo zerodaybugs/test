@@ -1,0 +1,195 @@
+name: TermMax Router V2 read-only live gate 20260731
+
+on:
+  push:
+    branches:
+      - termmax-router-holdings-census-20260730
+    paths:
+      - '.github/workflows/push-termmax-router-v2-live-gate-20260731.yml'
+      - 'monitor/ROUTER_V2_LIVE_GATE_TRIGGER.txt'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: termmax-router-v2-live-gate-20260731
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact research branch
+        uses: actions/checkout@v4
+        with:
+          ref: termmax-router-holdings-census-20260730
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install read-only dependencies
+        run: python -m pip install --disable-pip-version-check --no-input web3==7.13.0 requests==2.32.4
+
+      - name: Read current Ethereum Router V2 state
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf evidence
+          mkdir -p evidence
+          cat > /tmp/router_v2_live_gate.py <<'PY'
+          from __future__ import annotations
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from web3 import Web3
+
+          OUT = Path('evidence')
+          ROUTER = Web3.to_checksum_address('0x324596C1682a5675008f6E58F9C4E0A894b079c7')
+          EXPECTED_WL = Web3.to_checksum_address('0xB84f2a39b271D92586c61232a73ee1F7adFBf317')
+          ADAPTERS = {
+              'termMaxSwapAdapter': '0xd8a90e69aFa072B9ff33BbFdFf56767BE2028Dc9',
+              'erc4626VaultAdapterV2': '0xf03f14d1c1672D9740E0B23c8Fe88dc25Ae4d463',
+              'lifiSwapAdapter': '0x4eBA5ebC7E96922229FfA5cC8d959357497666d2',
+              'odosV2AdapterV2': '0x7a9d038285aBf4B35906508821E5C3bB41493cf5',
+              'okxSwapAdapter': '0x8fE56ef6fD4f64dd2A0eB21FB634391890455f63',
+              'ondoSwapAdapter': '0xfaa4cBa1aaa206FfB774A252224fFd54f7f2F082',
+              'oneInchSwapAdapter': '0x06035214e843C0f115eE02a74a38B95bF978a3B8',
+              'pancakeSmartAdapter': '0x043516D022bF814ccfAF6e9eB2eAc6E97341D14b',
+              'pendleSwapV3AdapterV2': '0xfaF7D0EE1300631f465fF8cA6ea332F9c5a27bbe',
+          }
+          RPCS = [
+              'https://ethereum-rpc.publicnode.com',
+              'https://eth.drpc.org',
+              'https://1rpc.io/eth',
+          ]
+          INITIALIZABLE_SLOT = int('f0c57e16840df040f15088dc2f81fe391c3923bec73e23a9662efc9c229c6a00', 16)
+          REENTRANCY_SLOT = int('9b779b17422d0df92223018b32b4d1fa46e071723d6817e2486d003becc55f00', 16)
+          IMPLEMENTATION_SLOT = int('360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc', 16)
+
+          router_abi = [
+              {'type':'function','name':'owner','stateMutability':'view','inputs':[],'outputs':[{'type':'address'}]},
+              {'type':'function','name':'paused','stateMutability':'view','inputs':[],'outputs':[{'type':'bool'}]},
+              {'type':'function','name':'whitelistManager','stateMutability':'view','inputs':[],'outputs':[{'type':'address'}]},
+              {'type':'function','name':'defaultWhitelistModule','stateMutability':'view','inputs':[],'outputs':[{'type':'uint8'}]},
+              {'type':'function','name':'adapterWhitelist','stateMutability':'view','inputs':[{'type':'address'}],'outputs':[{'type':'bool'}]},
+          ]
+          wl_abi = [
+              {'type':'function','name':'isWhitelisted','stateMutability':'view','inputs':[{'type':'address'},{'type':'uint8'}],'outputs':[{'type':'bool'}]},
+          ]
+
+          attempts=[]
+          w3=None
+          rpc=None
+          for url in RPCS:
+              try:
+                  cand=Web3(Web3.HTTPProvider(url, request_kwargs={'timeout':30}))
+                  chain_id=cand.eth.chain_id
+                  block=cand.eth.get_block('latest')
+                  if chain_id != 1:
+                      raise RuntimeError(f'unexpected chain id {chain_id}')
+                  attempts.append({'rpc':url,'ok':True,'block':block.number,'hash':block.hash.hex()})
+                  w3=cand; rpc=url; break
+              except Exception as exc:
+                  attempts.append({'rpc':url,'ok':False,'error':f'{type(exc).__name__}: {exc}'})
+          if w3 is None:
+              raise SystemExit(json.dumps(attempts, indent=2))
+
+          block=w3.eth.get_block('latest')
+          router=w3.eth.contract(address=ROUTER, abi=router_abi)
+          init_raw=w3.eth.get_storage_at(ROUTER, INITIALIZABLE_SLOT)
+          guard_raw=w3.eth.get_storage_at(ROUTER, REENTRANCY_SLOT)
+          impl_raw=w3.eth.get_storage_at(ROUTER, IMPLEMENTATION_SLOT)
+          initialized=int.from_bytes(init_raw[-8:], 'big')
+          initializing=bool(init_raw[-9])
+          guard_status=int.from_bytes(guard_raw, 'big')
+          implementation=Web3.to_checksum_address('0x'+impl_raw[-20:].hex())
+          wl_addr=Web3.to_checksum_address(router.functions.whitelistManager().call(block_identifier=block.number))
+          wl=w3.eth.contract(address=wl_addr, abi=wl_abi)
+
+          sender=Web3.to_checksum_address('0x1000000000000000000000000000000000000001')
+          init_selector=Web3.keccak(text='initializeV2()')[:4]
+          init_call={'ok':False}
+          try:
+              ret=w3.eth.call({'from':sender,'to':ROUTER,'data':init_selector}, block_identifier=block.number)
+              init_call={'ok':True,'returnData':'0x'+ret.hex()}
+          except Exception as exc:
+              init_call={'ok':False,'error':f'{type(exc).__name__}: {exc}'}
+
+          adapters=[]
+          for name,addr in ADAPTERS.items():
+              a=Web3.to_checksum_address(addr)
+              adapters.append({
+                  'name':name,
+                  'address':a,
+                  'codeBytes':len(w3.eth.get_code(a, block_identifier=block.number)),
+                  'moduleAdapterWhitelisted':bool(wl.functions.isWhitelisted(a, 1).call(block_identifier=block.number)),
+                  'legacyAdapterWhitelist':bool(router.functions.adapterWhitelist(a).call(block_identifier=block.number)),
+              })
+
+          result={
+              'schema':'termmax-router-v2-live-gate/v1',
+              'generatedAtUtc':datetime.now(timezone.utc).isoformat(),
+              'safety':{'privateKeys':0,'signedTransactions':0,'broadcastTransactions':0,'stateChanges':0},
+              'rpc':rpc,
+              'rpcAttempts':attempts,
+              'block':{'number':block.number,'hash':block.hash.hex(),'timestamp':block.timestamp,'timestampUtc':datetime.fromtimestamp(block.timestamp,tz=timezone.utc).isoformat()},
+              'router':ROUTER,
+              'routerCodeBytes':len(w3.eth.get_code(ROUTER, block_identifier=block.number)),
+              'implementation':implementation,
+              'implementationCodeBytes':len(w3.eth.get_code(implementation, block_identifier=block.number)),
+              'owner':router.functions.owner().call(block_identifier=block.number),
+              'paused':router.functions.paused().call(block_identifier=block.number),
+              'whitelistManager':wl_addr,
+              'expectedWhitelistManager':EXPECTED_WL,
+              'whitelistManagerMatchesDeployment':wl_addr.lower()==EXPECTED_WL.lower(),
+              'defaultWhitelistModule':router.functions.defaultWhitelistModule().call(block_identifier=block.number),
+              'initializableStorageRaw':'0x'+init_raw.hex(),
+              'initializedVersion':initialized,
+              'initializing':initializing,
+              'reentrancyStorageRaw':'0x'+guard_raw.hex(),
+              'reentrancyStatus':guard_status,
+              'arbitrarySenderInitializeV2EthCall':init_call,
+              'adapters':adapters,
+              'verdict':{
+                  'initializeV2CurrentlyCallableByArbitrarySender':bool(init_call.get('ok')),
+                  'initializedVersionIsOne':initialized==1,
+                  'guardIdleStatusIsOne':guard_status==1,
+                  'okxAdapterLiveAndWhitelisted':any(x['name']=='okxSwapAdapter' and x['codeBytes']>0 and x['moduleAdapterWhitelisted'] for x in adapters),
+              },
+          }
+          (OUT/'ROUTER_V2_LIVE_GATE.json').write_text(json.dumps(result,indent=2),encoding='utf-8')
+          (OUT/'VERDICT.txt').write_text(json.dumps(result['verdict'],indent=2),encoding='utf-8')
+          print(json.dumps(result,indent=2))
+          PY
+          set +e
+          python /tmp/router_v2_live_gate.py > >(tee evidence/stdout.log) 2> >(tee evidence/stderr.log >&2)
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > evidence/exit_code.txt
+          {
+            python --version
+            python -m pip freeze | sort
+            uname -a
+            sha256sum /tmp/router_v2_live_gate.py
+          } > evidence/environment.txt
+          find evidence -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS.txt
+          exit 0
+
+      - name: Upload read-only evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: termmax-router-v2-live-gate-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
+
+      - name: Final gate
+        if: always()
+        run: test "$(cat evidence/exit_code.txt 2>/dev/null || echo 99)" = 0
