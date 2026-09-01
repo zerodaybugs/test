@@ -1,0 +1,161 @@
+name: Bucket Liquidation Rule Live Gate R38
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-framework-lineage-r28-20260811]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Inspect deployed liquidation rule ABI, bytecode and recent calls
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-liquidation-rule-r38
+          mkdir -p bucket-liquidation-rule-r38/{raw,asm}
+          cat > bucket-liquidation-rule-r38/probe.py <<'PY'
+          import json, pathlib, re, time, urllib.request
+
+          OUT=pathlib.Path('bucket-liquidation-rule-r38'); RAW=OUT/'raw'; ASM=OUT/'asm'
+          RPCS=['https://sui-mainnet-endpoint.blockvision.org','https://fullnode.mainnet.sui.io:443']
+          GQL='https://graphql.mainnet.sui.io/graphql'
+          PACKAGE='0xbe1457c92f8e8c39e85fa4f77bfcd8cfbda30d1861286ba64c76a94773138b5d'
+          RULE_TYPE=PACKAGE+'::liquidation_rule::LiquidationRule'
+
+          def post(url,payload,retries=6,timeout=150):
+              data=json.dumps(payload).encode(); last=None
+              for n in range(retries):
+                  try:
+                      req=urllib.request.Request(url,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-liquidation-rule-r38/2'})
+                      with urllib.request.urlopen(req,timeout=timeout) as r: return json.loads(r.read().decode())
+                  except Exception as e:
+                      last=e; time.sleep(min(2**n,30))
+              raise RuntimeError(f'{url}: {last}')
+
+          def rpc(method,params):
+              errors=[]
+              for ep in RPCS:
+                  try:
+                      body=post(ep,{'jsonrpc':'2.0','id':1,'method':method,'params':params})
+                      if body.get('error'): raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint':ep,'result':body.get('result')}
+                  except Exception as e: errors.append({'endpoint':ep,'error':str(e)})
+              return {'failures':errors}
+
+          def gql(query,variables=None):
+              body=post(GQL,{'query':query,'variables':variables or {}})
+              if body.get('errors'): raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          def dump(name,value): (RAW/name).write_text(json.dumps(value,indent=2,sort_keys=True)+'\n')
+
+          normalized=rpc('sui_getNormalizedMoveModulesByPackage',[PACKAGE])
+          package_obj=rpc('sui_getObject',[PACKAGE,{'showType':True,'showOwner':True,'showPreviousTransaction':True,'showDisplay':False,'showContent':True,'showBcs':True}])
+          dump('normalized.json',normalized); dump('package_object.json',package_obj)
+
+          query='''query P($address:SuiAddress!){object(address:$address){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}modules{nodes{name fileFormatVersion disassembly functions(first:50){nodes{name visibility isEntry parameters{repr}return{repr}typeParameters{constraints}}}structs(first:50){nodes{name abilities fields{name type{repr}}typeParameters{constraints}}}}}}}}'''
+          graph=gql(query,{'address':PACKAGE})
+          dump('graphql_package.json',graph)
+          package=((graph.get('object') or {}).get('asMovePackage')) or {}
+          functions=[]; structs=[]; disassembly=''
+          for module in package.get('modules',{}).get('nodes',[]):
+              name=module.get('name'); text=module.get('disassembly') or ''
+              (ASM/f'{name}.asm').write_text(text)
+              disassembly += '\n'+text
+              for fn in (module.get('functions') or {}).get('nodes',[]): functions.append({'module':name,**fn})
+              for st in (module.get('structs') or {}).get('nodes',[]): structs.append({'module':name,**st})
+
+          object_query='''query O($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+          rule_objects=[]; cursor=None
+          while True:
+              conn=gql(object_query,{'type':RULE_TYPE,'after':cursor})['objects']; rule_objects.extend(conn.get('nodes') or [])
+              page=conn.get('pageInfo') or {}
+              if not page.get('hasNextPage'): break
+              cursor=page.get('endCursor')
+          dump('rule_objects.json',rule_objects)
+
+          # Query recent package activity. Some public RPCs reject the MoveFunction filter,
+          # so fall back to transaction digests referenced by package events/objects if needed.
+          txs=[]; cursor=None; tx_query_errors=[]
+          opts={'showInput':True,'showRawInput':False,'showEffects':True,'showEvents':True,'showObjectChanges':True,'showBalanceChanges':True}
+          for _ in range(20):
+              wrapper=rpc('suix_queryTransactionBlocks',[{'filter':{'MoveFunction':{'package':PACKAGE}},'options':opts},cursor,50,True])
+              result=wrapper.get('result') if isinstance(wrapper,dict) else None
+              if not isinstance(result,dict):
+                  tx_query_errors.append(wrapper)
+                  break
+              txs.extend(result.get('data') or [])
+              if not result.get('hasNextPage'): break
+              cursor=result.get('nextCursor')
+          dump('recent_transactions.json',txs); dump('transaction_query_errors.json',tx_query_errors)
+          calls=[]; senders={}
+          for tx in txs:
+              sender=(((tx.get('transaction') or {}).get('data') or {}).get('sender'))
+              senders[sender]=senders.get(sender,0)+1
+              try: commands=tx['transaction']['data']['transaction']['transactions']
+              except Exception: commands=[]
+              for index,command in enumerate(commands or []):
+                  call=command.get('MoveCall') if isinstance(command,dict) else None
+                  if call and str(call.get('package')).lower()==PACKAGE.lower():
+                      calls.append({'digest':tx.get('digest'),'timestampMs':tx.get('timestampMs'),'sender':sender,'status':((tx.get('effects') or {}).get('status')),'index':index,'module':call.get('module'),'function':call.get('function'),'typeArguments':call.get('type_arguments'),'arguments':call.get('arguments')})
+          dump('calls.json',calls)
+
+          rule_structs=[s for s in structs if s.get('module')=='liquidation_rule' and s.get('name')=='LiquidationRule']
+          constructor_functions=[]
+          for fn in functions:
+              if fn.get('module')!='liquidation_rule': continue
+              serial=json.dumps(fn)
+              if 'LiquidationRule' in serial or 'liquidat' in str(fn.get('name')).lower(): constructor_functions.append(fn)
+          public_constructor=any(str(fn.get('visibility')).upper()=='PUBLIC' and any('LiquidationRule' in str(x.get('repr')) for x in fn.get('return',[]) or []) for fn in functions)
+          public_entry_liquidation=any((str(fn.get('visibility')).upper()=='PUBLIC' or fn.get('isEntry')) and 'liquidat' in str(fn.get('name')).lower() for fn in functions)
+          sender_checks=bool(re.search(r'tx_context::sender|sender_is_not|is_manager|liquidator|access_control|allowed',disassembly,re.I))
+          summary={
+              'schema':'bucket-liquidation-rule-live-gate-r38/v2','network':'sui-mainnet','readOnly':True,
+              'package':PACKAGE,'ruleType':RULE_TYPE,'packageMetadata':package_obj,
+              'functions':functions,'structs':structs,'ruleStructs':rule_structs,
+              'constructorAndLiquidationFunctions':constructor_functions,
+              'publicRuleConstructorFound':public_constructor,
+              'publicOrEntryLiquidationFunctionFound':public_entry_liquidation,
+              'senderOrAllowlistCheckSignals':sender_checks,
+              'ruleObjectCount':len(rule_objects),'ruleObjects':rule_objects,
+              'recentTransactionCount':len(txs),'recentCallCount':len(calls),'recentCalls':calls,
+              'senderCounts':senders,'transactionQueryErrors':tx_query_errors,
+              'permissionlessReachabilityCandidate':(public_constructor or public_entry_liquidation) and not sender_checks,
+              'writes':0,'transactionsConstructed':0,'productionTransactionsSubmitted':0,
+              'generatedUnix':int(time.time()),
+          }
+          (OUT/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({'ruleStructs':rule_structs,'constructorAndLiquidationFunctions':constructor_functions,'publicRuleConstructorFound':public_constructor,'publicOrEntryLiquidationFunctionFound':public_entry_liquidation,'senderOrAllowlistCheckSignals':sender_checks,'recentCallCount':len(calls),'senderCounts':senders,'permissionlessReachabilityCandidate':summary['permissionlessReachabilityCandidate'],'transactionQueryErrors':tx_query_errors},indent=2))
+          PY
+          python3 bucket-liquidation-rule-r38/probe.py | tee bucket-liquidation-rule-r38/run.log
+          find bucket-liquidation-rule-r38 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-liquidation-rule-r38/SHA256SUMS.txt
+
+      - name: Validate passive boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-liquidation-rule-r38 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          s=json.load(open('bucket-liquidation-rule-r38/SUMMARY.json'))
+          assert s['readOnly'] is True and s['writes']==0 and s['transactionsConstructed']==0 and s['productionTransactionsSubmitted']==0
+          print('BUCKET_LIQUIDATION_RULE_R38_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-liquidation-rule-r38
+          path: bucket-liquidation-rule-r38
+          if-no-files-found: error
+          retention-days: 3

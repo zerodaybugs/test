@@ -1,0 +1,176 @@
+name: Bucket GCoin Game Witness and Risk Gate R41
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-framework-lineage-r28-20260811]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enumerate Unihouse game configs and inspect registered witness packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-gcoin-game-r41
+          mkdir -p bucket-gcoin-game-r41/{raw,asm}
+          cat > bucket-gcoin-game-r41/probe.py <<'PY'
+          import json, pathlib, re, time, urllib.request
+
+          OUT=pathlib.Path('bucket-gcoin-game-r41'); RAW=OUT/'raw'; ASM=OUT/'asm'
+          RPCS=['https://sui-mainnet-endpoint.blockvision.org','https://fullnode.mainnet.sui.io:443']
+          GQL='https://graphql.mainnet.sui.io/graphql'
+          UNIHOUSE='0x75c63644536b1a7155d20d62d9f88bf794dc847ea296288ddaf306aa320168ab'
+          KNOWN_PACKAGES={
+            'suilend_pond':'0x48add966e0ecbcb701beba1f649ae8b30f09e9ec86af7a24b28b0446db673e90',
+            'buck_pond':'0xf0f1ae3923595785268512d304bf7dc45eb6aa3a577bbbbeaa5018c781ec4328',
+          }
+
+          def post(url,payload,retries=6,timeout=150):
+            data=json.dumps(payload).encode(); last=None
+            for n in range(retries):
+              try:
+                req=urllib.request.Request(url,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'bucket-gcoin-game-r41/1'})
+                with urllib.request.urlopen(req,timeout=timeout) as r: return json.loads(r.read().decode())
+              except Exception as e:
+                last=e; time.sleep(min(2**n,30))
+            raise RuntimeError(f'{url}: {last}')
+
+          def rpc(method,params):
+            errors=[]
+            for ep in RPCS:
+              try:
+                body=post(ep,{'jsonrpc':'2.0','id':1,'method':method,'params':params})
+                if body.get('error'): raise RuntimeError(json.dumps(body['error']))
+                return {'endpoint':ep,'result':body.get('result')}
+              except Exception as e: errors.append({'endpoint':ep,'error':str(e)})
+            return {'failures':errors}
+
+          def gql(query,variables=None):
+            body=post(GQL,{'query':query,'variables':variables or {}})
+            if body.get('errors'): raise RuntimeError(json.dumps(body['errors']))
+            return body['data']
+
+          def dump(name,value): (RAW/name).write_text(json.dumps(value,indent=2,sort_keys=True)+'\n')
+
+          package_query='''query P($address:SuiAddress!){object(address:$address){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}modules{nodes{name fileFormatVersion disassembly functions(first:100){nodes{name visibility isEntry parameters{repr}return{repr}typeParameters{constraints}}}structs(first:100){nodes{name abilities fields{name type{repr}}typeParameters{constraints}}}}}}}}'''
+
+          # Enumerate all dynamic fields, including GameConfig values and House objects.
+          fields=[]; cursor=None
+          while True:
+            wrapper=rpc('suix_getDynamicFields',[UNIHOUSE,cursor,50]); page=wrapper.get('result') if isinstance(wrapper,dict) else None
+            if not isinstance(page,dict): break
+            fields.extend(page.get('data') or [])
+            if not page.get('hasNextPage'): break
+            cursor=page.get('nextCursor')
+          dump('dynamic_fields.json',fields)
+
+          objects={}
+          ids=[row.get('objectId') for row in fields if row.get('objectId')]
+          for start in range(0,len(ids),50):
+            wrapper=rpc('sui_multiGetObjects',[ids[start:start+50],{'showType':True,'showOwner':True,'showPreviousTransaction':True,'showDisplay':False,'showContent':True,'showBcs':True}])
+            result=wrapper.get('result') if isinstance(wrapper,dict) else None
+            if isinstance(result,list):
+              for obj in result:
+                data=(obj or {}).get('data') or {}; objects[data.get('objectId')]=obj
+          dump('dynamic_field_objects.json',objects)
+
+          # Extract package IDs appearing in dynamic field names/values and include known pond managers.
+          package_ids=set(KNOWN_PACKAGES.values())
+          addr_re=re.compile(r'0x[0-9a-fA-F]{64}')
+          for row in fields:
+            for match in addr_re.findall(json.dumps(row)):
+              package_ids.add(match.lower())
+          for obj in objects.values():
+            for match in addr_re.findall(json.dumps(obj)):
+              package_ids.add(match.lower())
+
+          package_results={}; witness_candidates=[]
+          for pid in sorted(package_ids):
+            try:
+              graph=gql(package_query,{'address':pid})
+            except Exception as e:
+              package_results[pid]={'error':str(e)}; continue
+            pkg=((graph.get('object') or {}).get('asMovePackage'))
+            if not pkg: continue
+            functions=[]; structs=[]
+            for module in pkg.get('modules',{}).get('nodes',[]):
+              mname=module.get('name'); text=module.get('disassembly') or ''
+              (ASM/f'{pid[2:10]}__{mname}.asm').write_text(text)
+              for fn in (module.get('functions') or {}).get('nodes',[]): functions.append({'module':mname,**fn})
+              for st in (module.get('structs') or {}).get('nodes',[]): structs.append({'module':mname,**st})
+            package_results[pid]={'functions':functions,'structs':structs,'version':pkg.get('version')}
+            for st in structs:
+              abilities=[str(x).upper() for x in st.get('abilities') or []]
+              if 'DROP' not in abilities: continue
+              type_name=f"{pid}::{st.get('module')}::{st.get('name')}"
+              constructors=[]; operational=[]
+              for fn in functions:
+                public=str(fn.get('visibility')).upper()=='PUBLIC' or fn.get('isEntry')
+                if not public: continue
+                returns=' '.join(str(x.get('repr')) for x in fn.get('return') or [])
+                params=' '.join(str(x.get('repr')) for x in fn.get('parameters') or [])
+                if type_name in returns or st.get('name') in returns:
+                  constructors.append(fn)
+                if st.get('name') in params and re.search(r'deposit|withdraw|join|split|take|put|borrow|repay|output|input',str(fn.get('name')),re.I):
+                  operational.append(fn)
+              if constructors or operational or re.search(r'POND|Game|Witness|Entity|Pipe',st.get('name'),re.I):
+                witness_candidates.append({'type':type_name,'struct':st,'constructors':constructors,'operationalFunctions':operational})
+          dump('packages.json',package_results); dump('witness_candidates.json',witness_candidates)
+
+          # Normalize dynamic GameConfig payloads and limits.
+          configs=[]
+          for field in fields:
+            oid=field.get('objectId'); obj=objects.get(oid) or {}; data=(obj.get('data') or {}); content=(data.get('content') or {})
+            typ=str(data.get('type') or '')
+            if 'GameConfig' in typ or 'GameKey' in json.dumps(field):
+              configs.append({'field':field,'objectId':oid,'objectType':typ,'content':content})
+
+          unprotected=[]
+          for row in witness_candidates:
+            for fn in row['constructors']:
+              params=' '.join(str(x.get('repr')) for x in fn.get('parameters') or [])
+              if not re.search(r'Admin|Manager|Owner|Cap|Publisher|AccessControl',params,re.I):
+                unprotected.append({'type':row['type'],'constructor':fn})
+
+          summary={
+            'schema':'bucket-gcoin-game-witness-r41/v1','network':'sui-mainnet','readOnly':True,
+            'unihouse':UNIHOUSE,'dynamicFieldCount':len(fields),'gameConfigs':configs,
+            'witnessCandidates':witness_candidates,'unprotectedWitnessConstructors':unprotected,
+            'permissionlessWitnessCandidateCount':len(unprotected),
+            'writes':0,'transactionsConstructed':0,'productionTransactionsSubmitted':0,'generatedUnix':int(time.time()),
+          }
+          (OUT/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({'dynamicFieldCount':len(fields),'gameConfigs':configs,'witnessCandidates':witness_candidates,'unprotectedWitnessConstructors':unprotected,'permissionlessWitnessCandidateCount':len(unprotected)},indent=2))
+          PY
+          python3 bucket-gcoin-game-r41/probe.py | tee bucket-gcoin-game-r41/run.log
+          find bucket-gcoin-game-r41 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-gcoin-game-r41/SHA256SUMS.txt
+
+      - name: Validate passive boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-gcoin-game-r41 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          s=json.load(open('bucket-gcoin-game-r41/SUMMARY.json'))
+          assert s['readOnly'] is True and s['writes']==0 and s['transactionsConstructed']==0 and s['productionTransactionsSubmitted']==0
+          print('BUCKET_GCOIN_GAME_R41_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-gcoin-game-r41
+          path: bucket-gcoin-game-r41
+          if-no-files-found: error
+          retention-days: 3

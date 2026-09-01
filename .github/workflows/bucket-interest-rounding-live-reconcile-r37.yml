@@ -1,0 +1,324 @@
+name: Bucket Interest Rounding Live Reconciliation R37
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-framework-lineage-r28-20260811]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconcile current position debts against aggregate debt and supply
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-interest-rounding-r37
+          mkdir -p bucket-interest-rounding-r37/raw
+          cat > bucket-interest-rounding-r37/reconcile.py <<'PY'
+          import json
+          import pathlib
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-interest-rounding-r37')
+          RAW = OUT / 'raw'
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+          RPCS = [
+              'https://sui-mainnet-endpoint.blockvision.org',
+              'https://fullnode.mainnet.sui.io:443',
+          ]
+          VAULT_TYPE = '0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e::vault::Vault'
+          CLOCK = '0x0000000000000000000000000000000000000000000000000000000000000006'
+          SCALE = 10**18
+          YEAR_MS = 31_536_000_000
+
+          def post(url, payload, retries=6, timeout=150):
+              data = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      req = urllib.request.Request(
+                          url,
+                          data=data,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-interest-rounding-r37/1',
+                          },
+                      )
+                      with urllib.request.urlopen(req, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2**attempt, 30))
+              raise RuntimeError(f'POST failed {url}: {last}')
+
+          def gql(query, variables=None):
+              body = post(GQL, {'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': str(exc)})
+              raise RuntimeError(f'RPC {method} failed: {json.dumps(failures)}')
+
+          def result(wrapper):
+              return wrapper.get('result') if isinstance(wrapper, dict) else None
+
+          def dump(name, value):
+              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def as_int(value):
+              if isinstance(value, bool) or value is None:
+                  raise ValueError(value)
+              if isinstance(value, int):
+                  return value
+              if isinstance(value, str):
+                  return int(value)
+              if isinstance(value, dict):
+                  if 'value' in value:
+                      return as_int(value['value'])
+                  fields = value.get('fields')
+                  if isinstance(fields, dict):
+                      return as_int(fields)
+              raise ValueError(value)
+
+          def ceil_div(n, d):
+              return 0 if n == 0 else (n + d - 1) // d
+
+          def find_position(value):
+              stack = [value]
+              while stack:
+                  node = stack.pop()
+                  if isinstance(node, dict):
+                      if {'coll_amount', 'debt_amount', 'interest_unit'} <= set(node):
+                          return node
+                      stack.extend(node.values())
+                  elif isinstance(node, list):
+                      stack.extend(node)
+              return None
+
+          def find_account(value):
+              stack = [value]
+              while stack:
+                  node = stack.pop()
+                  if isinstance(node, dict):
+                      name = node.get('name')
+                      if isinstance(name, str) and name.startswith('0x') and len(name) == 66:
+                          return name
+                      stack.extend(node.values())
+                  elif isinstance(node, list):
+                      stack.extend(node)
+              return None
+
+          checkpoint = gql('query { checkpoint { sequenceNumber timestamp } }')['checkpoint']
+          clock_wrapper = rpc('sui_getObject', [CLOCK, {
+              'showType': True,
+              'showOwner': True,
+              'showContent': True,
+              'showBcs': True,
+          }])
+          dump('clock.json', clock_wrapper)
+          clock_data = ((result(clock_wrapper) or {}).get('data') or {})
+          clock_fields = ((clock_data.get('content') or {}).get('fields') or {})
+          now_ms = int(clock_fields.get('timestamp_ms') or clock_fields.get('timestampMs'))
+
+          query = '''query V($after:String){objects(first:50,after:$after,filter:{type:"'''+VAULT_TYPE+'''"}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename}previousTransaction{digest sender{address}}asMoveObject{contents{type{repr}json bcs}}}}}'''
+          vaults = []
+          cursor = None
+          while True:
+              connection = gql(query, {'after': cursor})['objects']
+              vaults.extend(connection.get('nodes') or [])
+              page = connection.get('pageInfo') or {}
+              if not page.get('hasNextPage'):
+                  break
+              cursor = page.get('endCursor')
+          dump('vaults.json', vaults)
+
+          rows = []
+          all_positions = {}
+          for vault in vaults:
+              contents = ((vault.get('asMoveObject') or {}).get('contents') or {})
+              state = contents.get('json') or {}
+              vault_id = vault.get('address')
+              table = state.get('position_table') or {}
+              table_id = table.get('id')
+              expected_count = int(table.get('size') or 0)
+              total_debt = int(state.get('total_debt_amount') or 0)
+              supply = int((state.get('limited_supply') or {}).get('supply') or 0)
+              rate = as_int(state.get('interest_rate'))
+              vault_unit = as_int(state.get('interest_unit'))
+              timestamp = int(state.get('timestamp') or 0)
+
+              duration = max(0, now_ms - timestamp)
+              if total_debt > 0:
+                  duration_double = duration * SCALE // YEAR_MS
+                  current_unit = vault_unit + rate * duration_double // SCALE
+              else:
+                  current_unit = vault_unit
+              aggregate_interest = ceil_div((current_unit - vault_unit) * total_debt, SCALE)
+              aggregate_current_debt = total_debt + aggregate_interest
+
+              fields = []
+              cursor = None
+              while True:
+                  page = result(rpc('suix_getDynamicFields', [table_id, cursor, 50])) or {}
+                  fields.extend(page.get('data') or [])
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('nextCursor')
+
+              ids = [field.get('objectId') for field in fields if field.get('objectId')]
+              objects = []
+              for start in range(0, len(ids), 50):
+                  batch = result(rpc('sui_multiGetObjects', [ids[start:start+50], {
+                      'showType': True,
+                      'showOwner': True,
+                      'showPreviousTransaction': True,
+                      'showContent': True,
+                      'showBcs': True,
+                  }]))
+                  if isinstance(batch, list):
+                      objects.extend(batch)
+
+              positions = []
+              for obj in objects:
+                  data = (obj or {}).get('data') or {}
+                  content = data.get('content') or {}
+                  payload = find_position(content.get('fields') or {})
+                  if payload is None:
+                      continue
+                  raw_debt = int(payload['debt_amount'])
+                  position_unit = as_int(payload['interest_unit'])
+                  delta = max(0, current_unit - position_unit)
+                  position_interest = ceil_div(delta * raw_debt, SCALE)
+                  positions.append({
+                      'account': find_account(content.get('fields') or {}),
+                      'fieldObject': data.get('objectId'),
+                      'rawDebt': raw_debt,
+                      'positionUnit': position_unit,
+                      'currentInterest': position_interest,
+                      'currentDebt': raw_debt + position_interest,
+                  })
+
+              sum_raw = sum(item['rawDebt'] for item in positions)
+              sum_current = sum(item['currentDebt'] for item in positions)
+              rounding_gap = sum_current - aggregate_current_debt
+              stored_gap = sum_raw - total_debt
+              max_one_epoch_gap = max(0, len(positions) - 1)
+              row = {
+                  'vaultId': vault_id,
+                  'vaultType': (contents.get('type') or {}).get('repr'),
+                  'expectedPositionCount': expected_count,
+                  'parsedPositionCount': len(positions),
+                  'storedTotalDebt': total_debt,
+                  'limitedSupply': supply,
+                  'storedSupplyMinusDebt': supply - total_debt,
+                  'sumRawPositionDebt': sum_raw,
+                  'storedRawPositionMinusAggregate': stored_gap,
+                  'currentVaultInterestUnit': current_unit,
+                  'aggregateUncollectedInterest': aggregate_interest,
+                  'aggregateCurrentDebt': aggregate_current_debt,
+                  'sumCurrentPositionDebt': sum_current,
+                  'currentPositionMinusAggregate': rounding_gap,
+                  'maximumSingleEpochCeilGapForPositionCount': max_one_epoch_gap,
+                  'positiveUndercount': rounding_gap > 0,
+                  'positionCountComplete': len(positions) == expected_count,
+              }
+              rows.append(row)
+              all_positions[vault_id] = positions
+
+          dump('positions.json', all_positions)
+          positive = sorted(
+              [row for row in rows if row['positiveUndercount']],
+              key=lambda row: row['currentPositionMinusAggregate'],
+              reverse=True,
+          )
+          incomplete = [row for row in rows if not row['positionCountComplete']]
+          summary = {
+              'schema': 'bucket-interest-rounding-live-reconciliation-r37/v1',
+              'network': 'sui-mainnet',
+              'readOnly': True,
+              'checkpoint': checkpoint,
+              'clockTimestampMs': now_ms,
+              'vaultCount': len(rows),
+              'positionCount': sum(row['parsedPositionCount'] for row in rows),
+              'completeVaultCount': sum(1 for row in rows if row['positionCountComplete']),
+              'incompleteVaults': incomplete,
+              'positiveUndercountVaultCount': len(positive),
+              'maximumPositiveUndercountRaw': max(
+                  [row['currentPositionMinusAggregate'] for row in positive] or [0]
+              ),
+              'maximumPositiveUndercountUSDB': max(
+                  [row['currentPositionMinusAggregate'] for row in positive] or [0]
+              ) / 1_000_000,
+              'positiveUndercountVaults': positive,
+              'vaults': rows,
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'productionTransactionsSubmitted': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'checkpoint': checkpoint,
+              'vaultCount': summary['vaultCount'],
+              'positionCount': summary['positionCount'],
+              'completeVaultCount': summary['completeVaultCount'],
+              'positiveUndercountVaultCount': summary['positiveUndercountVaultCount'],
+              'maximumPositiveUndercountRaw': summary['maximumPositiveUndercountRaw'],
+              'maximumPositiveUndercountUSDB': summary['maximumPositiveUndercountUSDB'],
+              'positiveUndercountVaults': positive,
+              'incompleteVaults': incomplete,
+          }, indent=2))
+          PY
+          python3 bucket-interest-rounding-r37/reconcile.py | tee bucket-interest-rounding-r37/run.log
+          find bucket-interest-rounding-r37 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-interest-rounding-r37/SHA256SUMS.txt
+
+      - name: Validate passive boundary and complete census
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-interest-rounding-r37 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-interest-rounding-r37/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          assert summary['productionTransactionsSubmitted'] == 0
+          assert summary['vaultCount'] > 0
+          assert summary['completeVaultCount'] == summary['vaultCount']
+          print('BUCKET_INTEREST_ROUNDING_R37_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-interest-rounding-r37
+          path: bucket-interest-rounding-r37
+          if-no-files-found: error
+          retention-days: 3
