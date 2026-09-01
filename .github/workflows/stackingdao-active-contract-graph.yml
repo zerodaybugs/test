@@ -1,0 +1,219 @@
+name: StackingDAO active contract graph snapshot
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/stackingdao-active-contract-graph.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stackingdao-active-graph-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout workflow
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Build read-only deployed-contract and DAO-active graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p snapshot/sources
+          cd snapshot
+          npm init -y >/dev/null 2>&1
+          npm install --no-save --package-lock=false @stacks/transactions@6.17.0 >/dev/null 2>&1
+
+          cat > inventory.mjs <<'NODE'
+          import {
+            boolCV,
+            contractPrincipalCV,
+            cvToHex,
+            cvToString,
+            hexToCV,
+          } from '@stacks/transactions';
+          import { mkdir, writeFile } from 'node:fs/promises';
+
+          const address = 'SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG';
+          const api = 'https://api.mainnet.hiro.so';
+          const sender = address;
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+          async function request(url, options = {}, attempts = 8) {
+            let last;
+            for (let i = 1; i <= attempts; i += 1) {
+              try {
+                const response = await fetch(url, options);
+                const text = await response.text();
+                if (!response.ok) {
+                  const retryAfter = Number(response.headers.get('retry-after') ?? 0);
+                  if ((response.status === 429 || response.status >= 500) && i < attempts) {
+                    await sleep(Math.max(2000, retryAfter * 1000, i * 2000));
+                    continue;
+                  }
+                  throw new Error(`${response.status} ${response.statusText}: ${text}`);
+                }
+                return JSON.parse(text);
+              } catch (error) {
+                last = error;
+                if (i < attempts) await sleep(i * 2000);
+              }
+            }
+            throw last;
+          }
+
+          async function callRead(contract, fn, args = []) {
+            const body = JSON.stringify({ sender, arguments: args.map(cvToHex) });
+            const json = await request(
+              `${api}/v2/contracts/call-read/${address}/${contract}/${fn}`,
+              { method: 'POST', headers: { 'content-type': 'application/json' }, body },
+            );
+            if (!json.result) throw new Error(`${contract}.${fn}: missing result: ${JSON.stringify(json)}`);
+            return cvToString(hexToCV(json.result));
+          }
+
+          async function fetchAllAddressTransactions() {
+            const all = [];
+            const limit = 50;
+            let offset = 0;
+            let total = Infinity;
+            while (offset < total) {
+              const page = await request(
+                `${api}/extended/v2/addresses/${address}/transactions?limit=${limit}&offset=${offset}`,
+              );
+              const rows = page.results ?? [];
+              all.push(...rows);
+              total = Number(page.total ?? all.length);
+              if (rows.length === 0) break;
+              offset += rows.length;
+              await sleep(350);
+            }
+            return all;
+          }
+
+          function contractIdFromTx(tx) {
+            return tx.smart_contract?.contract_id
+              ?? tx.tx?.smart_contract?.contract_id
+              ?? tx.contract_id
+              ?? null;
+          }
+
+          const transactions = await fetchAllAddressTransactions();
+          const deploymentTxs = transactions.filter(tx => {
+            const type = tx.tx_type ?? tx.tx?.tx_type;
+            return type === 'smart_contract' || Boolean(contractIdFromTx(tx));
+          });
+
+          const names = new Set();
+          for (const tx of deploymentTxs) {
+            const id = contractIdFromTx(tx);
+            if (typeof id === 'string' && id.startsWith(`${address}.`)) names.add(id.slice(address.length + 1));
+          }
+
+          // Known historical names ensure coverage if the address endpoint omits very old deployments.
+          for (const name of [
+            'dao','reserve-v1','ststx-token','ststx-withdraw-nft','ststx-withdraw-nft-v2',
+            'ststxbtc-token','ststxbtc-token-v2','ststxbtc-withdraw-nft',
+            'ststxbtc-tracking','ststxbtc-tracking-v2','ststxbtc-tracking-data','ststxbtc-tracking-data-v2',
+            'data-core-v1','data-core-v2','data-core-v3','data-pools-v1','data-direct-stacking-v1',
+            'stacking-dao-core-v1','stacking-dao-core-v2','stacking-dao-core-v3','stacking-dao-core-v4',
+            'stacking-dao-core-v5','stacking-dao-core-v6','stacking-dao-core-btc-v1',
+            'stacking-dao-core-btc-v2','stacking-dao-core-btc-v3','direct-helpers-v1','direct-helpers-v2',
+            'direct-helpers-v3','direct-helpers-v4','rewards-v1','rewards-v2','rewards-v3','rewards-v4',
+            'rewards-v5','rewards-v6','rewards-v7','commission-v1','commission-v2','commission-btc-v1',
+            'staking-v0','staking-v1','strategy-v0','strategy-v2','strategy-v3','strategy-v4',
+            'delegates-handler-v1','stacking-pool-v1','stacking-pool-signer-v1','stacking-pool-payout-v1',
+            'ststxbtc-migration-v1','swap-ststx-ststxbtc-v1','swap-ststx-ststxbtc-v2',
+            'stacking-delegate-1-1','stacking-delegate-1-2','stacking-delegate-1-3',
+          ]) names.add(name);
+
+          await mkdir('sources', { recursive: true });
+          const contracts = [];
+          for (const name of [...names].sort()) {
+            const item = { name, principal: `${address}.${name}` };
+            try {
+              item.active = await callRead('dao', 'get-contract-active', [contractPrincipalCV(address, name)]);
+            } catch (error) {
+              item.active_error = String(error);
+            }
+            try {
+              const source = await request(`${api}/v2/contracts/source/${address}/${name}?proof=0`);
+              item.source_available = typeof source.source === 'string';
+              item.publish_height = source.publish_height ?? null;
+              item.clarity_version = source.clarity_version ?? null;
+              if (item.source_available) await writeFile(`sources/${name}.clar`, `${source.source}\n`);
+            } catch (error) {
+              item.source_available = false;
+              item.source_error = String(error);
+            }
+            try {
+              item.stx_account = await request(`${api}/extended/v1/address/${address}.${name}/stx`);
+            } catch (error) {
+              item.stx_account_error = String(error);
+            }
+            contracts.push(item);
+            await sleep(250);
+          }
+
+          const daoEnabled = await callRead('dao', 'get-contracts-enabled');
+          const active = contracts.filter(item => item.active === 'true');
+          const output = {
+            captured_at: new Date().toISOString(),
+            address,
+            dao_enabled: daoEnabled,
+            transaction_count: transactions.length,
+            deployment_count: deploymentTxs.length,
+            contracts,
+            deployment_transactions: deploymentTxs.map(tx => ({
+              tx_id: tx.tx_id,
+              status: tx.tx_status,
+              contract_id: contractIdFromTx(tx),
+              block_time_iso: tx.burn_block_time_iso ?? tx.block_time_iso ?? null,
+            })),
+          };
+          await writeFile('inventory.json', `${JSON.stringify(output, null, 2)}\n`);
+          const lines = [
+            `captured_at=${output.captured_at}`,
+            `dao_enabled=${daoEnabled}`,
+            `address_transaction_count=${transactions.length}`,
+            `deployment_count=${deploymentTxs.length}`,
+            `active_count=${active.length}`,
+            ...contracts.map(item =>
+              `${item.active === 'true' ? 'ACTIVE' : 'inactive'} ${item.name} ` +
+              `source=${item.source_available ? 'yes' : 'no'} balance=${item.stx_account?.balance ?? 'unknown'}`,
+            ),
+          ];
+          await writeFile('inventory.txt', `${lines.join('\n')}\n`);
+          console.log(lines.join('\n'));
+          NODE
+
+          node inventory.mjs
+          find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+
+      - name: Upload active graph snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackingdao-active-graph-${{ github.run_id }}
+          path: snapshot/
+          if-no-files-found: error
+          include-hidden-files: true
+          compression-level: 6
+          retention-days: 1
+
+      - name: Enforce snapshot integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fx 'dao_enabled=true' snapshot/inventory.txt
+          grep -q '^ACTIVE ' snapshot/inventory.txt
+          test -s snapshot/inventory.json
+          test -s snapshot/SHA256SUMS
