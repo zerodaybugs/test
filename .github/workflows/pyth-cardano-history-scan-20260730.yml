@@ -1,0 +1,136 @@
+name: Pyth Cardano full history scan
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/pyth-cardano-history-scan-20260730.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout harness
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Checkout full Pyth crosschain history
+        uses: actions/checkout@v4
+        with:
+          repository: pyth-network/pyth-crosschain
+          path: pyth-crosschain
+          persist-credentials: false
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Fetch all public branches and scan provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/snapshots
+          cd pyth-crosschain
+          git fetch --force origin '+refs/heads/*:refs/remotes/origin/*'
+
+          {
+            echo 'HEAD='
+            git rev-parse HEAD
+            echo 'REMOTE_BRANCHES='
+            git for-each-ref --format='%(refname:short)' refs/remotes/origin | sort
+          } > "$GITHUB_WORKSPACE/evidence/repository-state.txt"
+
+          git log --all --date=iso-strict --format='%H%x09%ad%x09%D%x09%s' \
+            -- lazer/contracts/cardano \
+            > "$GITHUB_WORKSPACE/evidence/cardano-path-history.tsv"
+
+          git log --all --date=iso-strict --format='%H%x09%ad%x09%D%x09%s' \
+            --since='2026-03-01' --until='2026-06-15' \
+            -- lazer/contracts/cardano contract_manager apps/developer-hub \
+            > "$GITHUB_WORKSPACE/evidence/cardano-deployment-window.tsv"
+
+          for needle in \
+            c935c937d0deda8975142c7b77aeef8f8cd48791e89a8ca7a0edc154 \
+            6d0b0ce6fc4336c208377ca85a99a7e18ad283a3b191b109befb9ab1 \
+            4949403eece2eea554df601a883c50d0ef005fa66e7a7300bad5ebc2 \
+            20dedb9c6e51112ac3059366b65c31ee59fc136aa400a16f9d01554fe0da4c6f; do
+            safe=${needle:0:12}
+            git log --all --reverse --date=iso-strict \
+              --format='%H%x09%ad%x09%D%x09%s' -S "$needle" \
+              > "$GITHUB_WORKSPACE/evidence/string-${safe}.tsv" || true
+            git grep -n "$needle" $(git for-each-ref --format='%(objectname)' refs/remotes/origin | sort -u) \
+              > "$GITHUB_WORKSPACE/evidence/grep-${safe}.txt" || true
+          done
+
+          git log --all --reverse --date=iso-strict \
+            --format='%H%x09%ad%x09%D%x09%s' \
+            --all-match \
+            --grep='cardano' --grep='deploy' \
+            > "$GITHUB_WORKSPACE/evidence/cardano-deploy-message-history.tsv" || true
+
+          git log --all --reverse --date=iso-strict \
+            --format='%H%x09%ad%x09%D%x09%s' \
+            -- '**/offchain.ts' '**/plutus.json' '**/CardanoLazerContracts.json' \
+            > "$GITHUB_WORKSPACE/evidence/generated-binding-history.tsv" || true
+
+          # Capture unique commits that introduced or changed the exact live hashes.
+          {
+            git log --all --reverse --format='%H' \
+              -S '6d0b0ce6fc4336c208377ca85a99a7e18ad283a3b191b109befb9ab1'
+            git log --all --reverse --format='%H' \
+              -S '4949403eece2eea554df601a883c50d0ef005fa66e7a7300bad5ebc2'
+            git log --all --reverse --format='%H' \
+              -S 'c935c937d0deda8975142c7b77aeef8f8cd48791e89a8ca7a0edc154'
+          } | sort -u > "$GITHUB_WORKSPACE/evidence/candidate-commits.txt"
+
+          while IFS= read -r commit; do
+            test -n "$commit" || continue
+            out="$GITHUB_WORKSPACE/evidence/snapshots/$commit"
+            mkdir -p "$out"
+            git show -s --date=iso-strict \
+              --format='%H%n%ad%n%D%n%s%n%b' "$commit" \
+              > "$out/commit.txt"
+            git diff-tree --no-commit-id --name-status -r "$commit" \
+              > "$out/files.txt"
+            for path in \
+              lazer/contracts/cardano/aiken.toml \
+              lazer/contracts/cardano/aiken.lock \
+              lazer/contracts/cardano/validators/pyth_price.ak \
+              lazer/contracts/cardano/validators/pyth_state.ak \
+              lazer/contracts/cardano/validators/wormhole_state.ak \
+              lazer/contracts/cardano/cli/js/src/offchain.ts \
+              contract_manager/src/store/contracts/CardanoLazerContracts.json; do
+              if git cat-file -e "$commit:$path" 2>/dev/null; then
+                mkdir -p "$out/$(dirname "$path")"
+                git show "$commit:$path" > "$out/$path"
+              fi
+            done
+          done < "$GITHUB_WORKSPACE/evidence/candidate-commits.txt"
+
+          git fsck --no-progress --full > "$GITHUB_WORKSPACE/evidence/git-fsck.txt"
+
+      - name: Package evidence manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          find evidence -type f -printf '%P\t%s bytes\n' | sort \
+            > evidence/FILE_INDEX.txt
+          (
+            cd evidence
+            find . -type f ! -name SHA256SUMS.txt -print0 | sort -z \
+              | xargs -0 sha256sum > SHA256SUMS.txt
+          )
+
+      - name: Upload history evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyth-cardano-history-scan-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
