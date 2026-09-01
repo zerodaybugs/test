@@ -1,0 +1,93 @@
+name: Temporary Katana voting-window block scan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-katana-clock-scan.yml'
+      - 'tmp-katana-clock-scan.trigger'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+      - name: Locate closed-window blocks and capture vote state
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          import json, subprocess
+          RPC='https://rpc.katana.network/'
+          PIN=38248477
+          CLOCK='0x17049d374A2bcdA70F8939C21ad92bcF6B2A95ab'
+          VOTER='0x5e755A3C5dc81A79DE7a7cEF192FFA60964c9352'
+          STRATEGY='0x60233D1c150F9C08D886906d597aA79a205b0463'
+          ADAPTER='0xB67Ac05e2C1d8592692a90BF61712274b988f25A'
+
+          def run(*args):
+              return subprocess.check_output(list(args), text=True).strip()
+          def call(addr,sig,*args,block):
+              return run('cast','call',addr,sig,*args,'--block',str(block),'--rpc-url',RPC)
+          def block_json(n):
+              return json.loads(run('cast','block',str(n),'--json','--rpc-url',RPC))
+          def ivalue(x):
+              return int(x.split()[0],0)
+          latest=int(run('cast','block-number','--rpc-url',RPC))
+          pb=block_json(PIN)
+          pts=int(pb['timestamp'],16) if isinstance(pb['timestamp'],str) else int(pb['timestamp'])
+          vote_end=ivalue(call(CLOCK,'epochVoteEndTs()(uint256)',block=PIN))
+          vote_start=ivalue(call(CLOCK,'epochVoteStartTs()(uint256)',block=PIN))
+          epoch_start=ivalue(call(CLOCK,'epochStartTs()(uint256)',block=PIN))
+          epoch=ivalue(call(CLOCK,'currentEpoch()(uint256)',block=PIN))
+
+          # Locate the first block whose timestamp is at or after this epoch's vote end.
+          lo=PIN
+          hi=min(latest, PIN+1_000_000)
+          while int(block_json(hi)['timestamp'],16) < vote_end and hi < latest:
+              hi=min(latest, hi+1_000_000)
+          while lo < hi:
+              mid=(lo+hi)//2
+              ts=int(block_json(mid)['timestamp'],16)
+              if ts < vote_end:
+                  lo=mid+1
+              else:
+                  hi=mid
+          boundary=lo
+          candidates=sorted(set([PIN, max(PIN,boundary-2), max(PIN,boundary-1), boundary, boundary+1, boundary+2, boundary+10, boundary+100, min(latest,boundary+1000), latest]))
+          rows=[]
+          for b in candidates:
+              bj=block_json(b)
+              ts=int(bj['timestamp'],16)
+              row={'block':b,'timestamp':ts}
+              queries=[
+                ('epoch',CLOCK,'currentEpoch()(uint256)',()),
+                ('votingActive',VOTER,'votingActive()(bool)',()),
+                ('epochVoteStartTs',CLOCK,'epochVoteStartTs()(uint256)',()),
+                ('epochVoteEndTs',CLOCK,'epochVoteEndTs()(uint256)',()),
+                ('isVoting',VOTER,'isVoting(address)(bool)',(STRATEGY,)),
+                ('usedVotingPower',VOTER,'usedVotingPower(address)(uint256)',(STRATEGY,)),
+                ('globalVotes',VOTER,'totalVotingPowerCast()(uint256)',()),
+                ('currentPower',ADAPTER,'getVotes(address)(uint256)',(STRATEGY,)),
+              ]
+              for name,addr,sig,args in queries:
+                  try: row[name]=call(addr,sig,*args,block=b)
+                  except subprocess.CalledProcessError as e: row[name]=f'ERROR:{e}'
+              rows.append(row)
+          out={'latest':latest,'pin':PIN,'pinTimestamp':pts,'pinEpoch':epoch,'pinVoteStart':vote_start,'pinVoteEnd':vote_end,'boundary':boundary,'rows':rows}
+          open('evidence/clock-scan.json','w').write(json.dumps(out,indent=2,sort_keys=True))
+          print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: katana-clock-scan-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 2
