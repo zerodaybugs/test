@@ -1,0 +1,159 @@
+name: Katana vbToken pinned rounding profile
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-vbtoken-pinned-rounding-profile.yml'
+      - 'katana-vbtoken-pinned/**'
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Pin one Ethereum block and quantify yield-vault rounding
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          import json,time,urllib.request
+          from pathlib import Path
+          RPCS=['https://ethereum-rpc.publicnode.com','https://eth.llamarpc.com','https://1rpc.io/eth','https://cloudflare-eth.com']
+          TOKENS={
+            'vbETH':'0x2DC70fb75b88d2eB4715bc06E1595E6D97c34DFF',
+            'vbUSDC':'0x53E82ABbb12638F09d9e624578ccB666217a765e',
+            'vbUSDT':'0x6d4f9f9f8f0155509ecd6Ac6c544fF27999845CC',
+            'vbUSDS':'0x3DD459dE96F9C28e3a343b831cbDC2B93c8C4855',
+            'vbWBTC':'0x2C24B57e2CCd1f273045Af6A5f632504C432374F',
+          }
+          rid=0;selected=None;cache={};BLOCK=None
+          def rpc(method,params):
+            global rid,selected
+            rid+=1;body=json.dumps({'jsonrpc':'2.0','id':rid,'method':method,'params':params}).encode()
+            urls=([selected] if selected else [])+[u for u in RPCS if u!=selected];errs=[]
+            for u in urls:
+              for i in range(3):
+                try:
+                  req=urllib.request.Request(u,data=body,headers={'content-type':'application/json','user-agent':'katana-pinned-rounding-readonly/1.0'})
+                  with urllib.request.urlopen(req,timeout=35) as r:x=json.loads(r.read())
+                  if 'error' in x:raise RuntimeError(x['error'])
+                  selected=u;return x['result']
+                except Exception as e:errs.append(f'{u}:{e!r}');time.sleep(.4*(i+1))
+            raise RuntimeError(' | '.join(errs))
+          def sel(s):
+            if s not in cache:cache[s]=rpc('web3_sha3',['0x'+s.encode().hex()])[:10]
+            return cache[s]
+          def w(n):return hex(int(n))[2:].rjust(64,'0')
+          def enc(s,args=()):
+            x=sel(s)
+            for t,v in args:
+              if t.startswith('uint'):x+=w(v)
+              elif t=='address':x+=v.lower().replace('0x','').rjust(64,'0')
+            return x
+          def call(to,s,args=()):
+            d=enc(s,args)
+            try:return {'ok':True,'raw':rpc('eth_call',[{'to':to,'data':d},BLOCK]),'selector':d[:10]}
+            except Exception as e:return {'ok':False,'error':repr(e),'selector':d[:10]}
+          def n(r):
+            try:return int(r,16)
+            except:return None
+          def a(r):return None if not isinstance(r,str) or len(r)<42 else '0x'+r[-40:]
+          def u(to,s,args=()):
+            r=call(to,s,args);r['value']=n(r['raw']) if r.get('ok') else None;return r
+          def ad(to,s,args=()):
+            r=call(to,s,args);r['value']=a(r['raw']) if r.get('ok') else None;return r
+          def bu(to,s,args=()):
+            r=call(to,s,args)
+            if r.get('ok'):
+              h=r['raw'][2:];r['positive']=bool(int(h[:64],16));r['difference']=int(h[64:128],16)
+            return r
+          latest=int(rpc('eth_blockNumber',[]),16);BLOCK=hex(latest);blk=rpc('eth_getBlockByNumber',[BLOCK,False])
+          out={'rpc':None,'block':latest,'block_tag':BLOCK,'timestamp':int(blk['timestamp'],16),'tokens':{}}
+          for label,vb in TOKENS.items():
+            calls={
+              'totalSupply':u(vb,'totalSupply()'),'totalAssets':u(vb,'totalAssets()'),
+              'reservedAssets':u(vb,'reservedAssets()'),'stakedAssets':u(vb,'stakedAssets()'),
+              'yield':u(vb,'yield()'),'backingDifference':bu(vb,'backingDifference()'),
+              'migrationFeesFund':u(vb,'migrationFeesFund()'),'minimumReservePercentage':u(vb,'minimumReservePercentage()'),
+              'minimumYieldVaultDeposit':u(vb,'minimumYieldVaultDeposit()'),
+              'yieldVaultMaximumSlippagePercentage':u(vb,'yieldVaultMaximumSlippagePercentage()'),
+              'yieldVault':ad(vb,'yieldVault()'),'underlying':ad(vb,'underlyingToken()'),
+            }
+            yv=calls['yieldVault']['value'];underlying=calls['underlying']['value']
+            decimals=u(underlying,'decimals()')['value'] if underlying else None
+            physical=u(underlying,'balanceOf(address)',(('address',vb),)) if underlying else {'value':None}
+            held=u(yv,'balanceOf(address)',(('address',vb),)) if yv else {'value':None}
+            yv_assets=u(yv,'convertToAssets(uint256)',(('uint256',held['value']),)) if yv and held['value'] is not None else {'value':None}
+            yv_preview_redeem=u(yv,'previewRedeem(uint256)',(('uint256',held['value']),)) if yv and held['value'] is not None else {'value':None}
+            # Find the minimum positive previewDeposit amount and quantify its immediate share value.
+            rounding={'samples':[],'minimum_assets_for_positive_share':None,'shares_at_minimum':None,'immediate_assets_value':None,'immediate_rounding_gap':None}
+            if yv and decimals is not None:
+              probes=[]
+              x=1
+              for _ in range(32):
+                r=u(yv,'previewDeposit(uint256)',(('uint256',x),))
+                probes.append((x,r['value'],r.get('error')))
+                if r['value'] is not None and r['value']>0:break
+                x*=2
+              if probes and probes[-1][1] and probes[-1][1]>0:
+                lo=probes[-2][0]+1 if len(probes)>1 else 1;hi=probes[-1][0]
+                while lo<hi:
+                  mid=(lo+hi)//2;mv=u(yv,'previewDeposit(uint256)',(('uint256',mid),))['value']
+                  if mv and mv>0:hi=mid
+                  else:lo=mid+1
+                min_assets=lo;min_shares=u(yv,'previewDeposit(uint256)',(('uint256',min_assets),))['value']
+                immediate=u(yv,'convertToAssets(uint256)',(('uint256',min_shares),))['value'] if min_shares is not None else None
+                rounding.update({'minimum_assets_for_positive_share':min_assets,'shares_at_minimum':min_shares,'immediate_assets_value':immediate,'immediate_rounding_gap':None if immediate is None else min_assets-immediate})
+              unit=10**decimals
+              sample_amounts=sorted(set([1,2,10,100,1000,unit//1000000 if unit>=1000000 else 1,unit//1000 if unit>=1000 else 1,unit,10*unit]))
+              for amt in sample_amounts:
+                if amt<=0:continue
+                sh=u(yv,'previewDeposit(uint256)',(('uint256',amt),))
+                av=u(yv,'convertToAssets(uint256)',(('uint256',sh['value']),)) if sh['value'] is not None else {'value':None}
+                rounding['samples'].append({'assets':amt,'preview_shares':sh['value'],'share_value_assets':av['value'],'rounding_gap':None if av['value'] is None else amt-av['value']})
+            ts=calls['totalSupply']['value'];ta=calls['totalAssets']['value'];ra=calls['reservedAssets']['value'];sa=calls['stakedAssets']['value'];mf=calls['migrationFeesFund']['value'];bd=calls['backingDifference']
+            checks={
+              'pinned_total_assets_equals_reserve_plus_staked':None not in (ta,ra,sa) and ta==ra+sa,
+              'pinned_yield_vault_value_equals_staked':yv_assets['value'] is not None and sa is not None and yv_assets['value']==sa,
+              'pinned_backing_difference_consistent':None not in (ta,ts) and bd.get('positive')==(ta>=ts) and bd.get('difference')==abs(ta-ts),
+              'pinned_total_assets_cover_supply':None not in (ta,ts) and ta>=ts,
+              'physical_balance_covers_reserve_and_migration_fund':physical['value'] is not None and None not in (ra,mf) and physical['value']>=ra+mf,
+            }
+            out['tokens'][label]={'address':vb,'calls':calls,'underlying_decimals':decimals,'physical_underlying':physical,'yield_vault_shares':held,'yield_vault_assets_for_shares':yv_assets,'yield_vault_preview_redeem':yv_preview_redeem,'rounding':rounding,'checks':checks}
+          out['rpc']=selected
+          out['summary']={
+            'all_pinned_solvent':all(v['checks']['pinned_total_assets_cover_supply'] for v in out['tokens'].values()),
+            'all_pinned_equations_hold':all(v['checks']['pinned_total_assets_equals_reserve_plus_staked'] and v['checks']['pinned_yield_vault_value_equals_staked'] and v['checks']['pinned_backing_difference_consistent'] for v in out['tokens'].values()),
+          }
+          Path('evidence/katana_vbtoken_pinned_rounding_profile.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          compact={'rpc':selected,'block':latest,'timestamp':out['timestamp'],'summary':out['summary'],'tokens':{}}
+          for k,v in out['tokens'].items():
+            c=v['calls'];compact['tokens'][k]={
+              'address':v['address'],'total_supply':c['totalSupply']['value'],'total_assets':c['totalAssets']['value'],
+              'backing_positive':c['backingDifference'].get('positive'),'backing_difference':c['backingDifference'].get('difference'),
+              'yield':c['yield']['value'],'yield_vault':c['yieldVault']['value'],'yield_vault_assets_for_shares':v['yield_vault_assets_for_shares']['value'],
+              'minimum_assets_for_positive_share':v['rounding']['minimum_assets_for_positive_share'],'rounding_gap_at_minimum':v['rounding']['immediate_rounding_gap'],
+              'checks':v['checks'],'rounding_samples':v['rounding']['samples']}
+          Path('evidence/katana_vbtoken_pinned_rounding_compact.json').write_text(json.dumps(compact,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(compact,indent=2,sort_keys=True))
+          PY
+          sha256sum evidence/* > evidence/SHA256SUMS
+
+      - name: Upload pinned rounding profile
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-vbtoken-pinned-rounding-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
