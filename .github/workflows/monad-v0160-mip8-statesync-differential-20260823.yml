@@ -1,0 +1,270 @@
+name: Monad v0.16.0 MIP-8 statesync differential 20260823
+
+on:
+  push:
+    branches:
+      - tooling/monad-v0160-mip8-statesync-differential-20260823
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  differential:
+    runs-on: ubuntu-latest
+    timeout-minutes: 115
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout tooling branch
+        uses: actions/checkout@v4
+
+      - name: Clone exact scoped execution source twice
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global submodule.fetchJobs "$(nproc)"
+          git clone --recurse-submodules https://github.com/category-labs/monad.git slot-source
+          cd slot-source
+          git checkout e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+          git submodule update --init --recursive
+          test "$(git rev-parse HEAD)" = "e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0"
+          git status --porcelain=v1 > ../SOURCE_STATUS.txt
+          test ! -s ../SOURCE_STATUS.txt
+          cd ..
+          cp -a slot-source page-source
+          mkdir -p out/meta out/logs out/rc out/artifacts out/corpus
+          git -C slot-source submodule status --recursive > out/meta/SUBMODULES.txt
+
+      - name: Export and port only the upstream statesync fuzz coverage PR
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh pr diff 2422 --repo category-labs/monad --patch > out/meta/UPSTREAM_PR_2422.patch
+          test -s out/meta/UPSTREAM_PR_2422.patch
+          gh pr view 2422 --repo category-labs/monad \
+            --json number,title,state,mergedAt,baseRefName,headRefName,headRefOid,url \
+            > out/meta/UPSTREAM_PR_2422.json
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          patch = Path('out/meta/UPSTREAM_PR_2422.patch').read_text(errors='replace')
+          files = re.findall(r'^diff --git a/(.*?) b/', patch, flags=re.M)
+          Path('out/meta/UPSTREAM_PR_2422_FILES.txt').write_text('\n'.join(files)+'\n')
+          allowed = all(
+              ('fuzz' in f.lower() or 'test' in f.lower() or f.endswith('CMakeLists.txt'))
+              for f in files
+          )
+          Path('out/meta/UPSTREAM_PATCH_TEST_ONLY.txt').write_text(str(allowed).lower()+'\n')
+          PY
+
+          set +e
+          git -C page-source apply --3way ../out/meta/UPSTREAM_PR_2422.patch \
+            >out/logs/patch-apply.log 2>&1
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > out/rc/patch-apply.rc
+          if [[ "$rc" == 0 ]]; then
+            git -C page-source diff --check > out/logs/patch-diff-check.log
+            git -C page-source diff --stat > out/meta/PORTED_PATCH_STAT.txt
+            git -C page-source diff --name-status > out/meta/PORTED_PATCH_FILES.txt
+            echo PORTED > out/meta/PORT_STATUS.txt
+          else
+            echo PORT_FAILED > out/meta/PORT_STATUS.txt
+          fi
+
+      - name: Build official dependency image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --target base -t monad-v0160-base -f slot-source/docker/Dockerfile slot-source
+
+      - name: Configure and discover statesync fuzz targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --name monad-v0160-mip8 \
+            -v "$PWD/slot-source:/slot" \
+            -v "$PWD/page-source:/page" \
+            -v "$PWD/out:/out" \
+            monad-v0160-base bash -lc '
+              set -euo pipefail
+              configure() {
+                src="$1" build="$2"
+                CC=clang-19 CXX=clang++-19 cmake -S "$src" -B "$build" -GNinja \
+                  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                  -DCMAKE_TOOLCHAIN_FILE=category/core/toolchains/gcc-avx2.cmake \
+                  -DMONAD_COMPILER_TESTING=On
+                ninja -C "$build" -t targets all > "/out/meta/$(basename "$build")-targets.txt"
+              }
+              configure /slot /slot/build-mip8
+              if [[ "$(cat /out/meta/PORT_STATUS.txt)" == PORTED ]]; then
+                configure /page /page/build-mip8
+              fi
+            '
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          targets=[]
+          for p in Path('out/meta').glob('*-targets.txt'):
+              for line in p.read_text(errors='replace').splitlines():
+                  target=line.split(':',1)[0].strip()
+                  low=target.lower()
+                  if ('fuzz' in low and ('state' in low or 'sync' in low or 'trie' in low or 'mpt' in low)):
+                      targets.append((p.name,target))
+          Path('out/meta/DISCOVERED_TARGETS.tsv').write_text(
+              ''.join(f'{a}\t{b}\n' for a,b in sorted(set(targets)))
+          )
+          PY
+
+      - name: Build discovered exact and page-mode targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker start monad-v0160-mip8 >/dev/null
+          docker exec monad-v0160-mip8 bash -lc '
+            set -euo pipefail
+            : > /out/meta/BUILT_TARGETS.tsv
+            while IFS=$'"'"'\t'"'"' read -r inventory target; do
+              [[ -n "$target" ]] || continue
+              if [[ "$inventory" == build-mip8-targets.txt ]]; then
+                src=/slot; build=/slot/build-mip8; mode=slot
+              else
+                [[ "$(cat /out/meta/PORT_STATUS.txt)" == PORTED ]] || continue
+                src=/page; build=/page/build-mip8; mode=page
+              fi
+              set +e
+              timeout 1200s cmake --build "$build" --target "$target" --parallel "$(nproc)" \
+                >"/out/logs/build-${mode}-$(echo "$target" | tr /: __).log" 2>&1
+              rc=$?
+              set -e
+              printf "%s\n" "$rc" >"/out/rc/build-${mode}-$(echo "$target" | tr /: __).rc"
+              if [[ "$rc" == 0 ]]; then
+                printf "%s\t%s\t%s\n" "$mode" "$target" "$build" >> /out/meta/BUILT_TARGETS.tsv
+              fi
+            done < /out/meta/DISCOVERED_TARGETS.tsv
+          '
+
+      - name: Generate deterministic shared corpus and execute targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, random
+          root=Path('out/corpus')
+          root.mkdir(parents=True,exist_ok=True)
+          vectors=[b'',b'\x00',b'\xff',bytes(range(256)),bytes(reversed(range(256)))]
+          for n in [2,3,4,7,8,15,16,31,32,63,64,127,128,255,256,511,512,1023,1024,2048,4096,8192]:
+              vectors.append(bytes((i*131+n)&255 for i in range(n)))
+          for seed in [0,1,2,7,31,127,255,256,1024,1337,0xDEADBEEF]:
+              r=random.Random(seed)
+              for n in [1,17,65,129,257,513,1025,4097]:
+                  vectors.append(bytes(r.randrange(256) for _ in range(n)))
+          for data in vectors:
+              h=hashlib.sha256(data).hexdigest()
+              (root/h).write_bytes(data)
+          PY
+          sha256sum out/corpus/* > out/meta/CORPUS_SHA256.txt
+
+          docker start monad-v0160-mip8 >/dev/null
+          docker exec monad-v0160-mip8 bash -lc '
+            set -euo pipefail
+            : > /out/meta/EXECUTED_TARGETS.tsv
+            while IFS=$'"'"'\t'"'"' read -r mode target build; do
+              [[ -n "$target" ]] || continue
+              exe=""
+              for candidate in "$build/$target" "$build/bin/$target"; do
+                [[ -x "$candidate" ]] && exe="$candidate" && break
+              done
+              if [[ -z "$exe" ]]; then
+                exe=$(find "$build" -type f -perm -111 -name "$(basename "$target")" -print -quit || true)
+              fi
+              [[ -n "$exe" ]] || continue
+              safe=$(echo "$target" | tr /: __)
+              set +e
+              timeout --signal=TERM --kill-after=20s 900s "$exe" \
+                -runs=250000 -timeout=10 -rss_limit_mb=6144 -artifact_prefix="/out/artifacts/${mode}-${safe}-" \
+                /out/corpus >"/out/logs/run-${mode}-${safe}.log" 2>&1
+              rc=$?
+              set -e
+              printf "%s\n" "$rc" >"/out/rc/run-${mode}-${safe}.rc"
+              printf "%s\t%s\t%s\t%s\n" "$mode" "$target" "$exe" "$rc" >> /out/meta/EXECUTED_TARGETS.tsv
+            done < /out/meta/BUILT_TARGETS.tsv
+          '
+
+      - name: Analyze MIP-8 differential fail-closed
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp SOURCE_STATUS.txt out/meta/
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json,re
+          root=Path('out')
+          port=(root/'meta'/'PORT_STATUS.txt').read_text().strip()
+          executed=[]
+          if (root/'meta'/'EXECUTED_TARGETS.tsv').exists():
+              for line in (root/'meta'/'EXECUTED_TARGETS.tsv').read_text().splitlines():
+                  if not line.strip(): continue
+                  mode,target,exe,rc=line.split('\t')
+                  log=root/'logs'/f"run-{mode}-{target.replace('/','_').replace(':','_')}.log"
+                  text=log.read_text(errors='replace') if log.exists() else ''
+                  artifacts=[p.name for p in root.glob(f'artifacts/{mode}-{target.replace("/","_").replace(":","_")}-*')]
+                  markers=[m for m in ['ERROR:','SUMMARY:','crash','mismatch','assert','runtime error','Segmentation fault','Aborted'] if m.lower() in text.lower()]
+                  executed.append({
+                      'mode':mode,'target':target,'return_code':int(rc),
+                      'artifacts':artifacts,'markers':markers,
+                      'log_sha256':hashlib.sha256(log.read_bytes()).hexdigest() if log.exists() else None,
+                  })
+          slot={(x['target']):x for x in executed if x['mode']=='slot'}
+          page={(x['target']):x for x in executed if x['mode']=='page'}
+          pairs=[]; candidates=[]
+          for target in sorted(set(slot)&set(page)):
+              s,p=slot[target],page[target]
+              item={'target':target,'slot':s,'page':p}
+              pair_signal=(bool(s['artifacts']) != bool(p['artifacts'])) or (s['return_code'] != p['return_code']) or (s['markers'] != p['markers'])
+              item['differential_signal']=pair_signal
+              pairs.append(item)
+              if pair_signal: candidates.append(item)
+          complete=(port=='PORTED' and bool(pairs))
+          if port!='PORTED': decision='HOLD_UPSTREAM_TEST_HARNESS_PORT_FAILED'
+          elif not pairs: decision='HOLD_NO_MATCHED_SLOT_PAGE_TARGET_PAIR_EXECUTED'
+          elif candidates: decision='CANDIDATE_REQUIRES_ARTIFACT_MINIMIZATION_AND_STATE_ROOT_GATE'
+          else: decision='NO_SLOT_PAGE_FUZZ_DIFFERENTIAL_SIGNAL'
+          result={
+              'scope_commit':'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0',
+              'upstream_test_harness_pr':'category-labs/monad#2422',
+              'port_status':port,'campaign_complete':complete,
+              'executed_targets':executed,'matched_pairs':pairs,
+              'candidate_count':len(candidates),
+              'submission_ready':False,'high_proven':False,'critical_proven':False,
+              'decision':decision,
+              'release_rule':'A target crash or slot/page harness differential is not a finding until minimized to one valid state transition, proven to produce an accepted state-root or statesync divergence through the exact product path, reproduced at least three times, fixed by a narrow product patch, and cleared against public prior art.'
+          }
+          (root/'MIP8_STATESYNC_RESULT.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({'decision':decision,'candidate_count':len(candidates),'pairs':len(pairs)}))
+          PY
+          sha256sum out/meta/* out/logs/* out/rc/* out/corpus/* out/artifacts/* out/MIP8_STATESYNC_RESULT.json 2>/dev/null > out/SHA256SUMS || true
+          tar --sort=name --mtime='UTC 2026-08-23' --owner=0 --group=0 --numeric-owner \
+            -C out -czf monad-v0160-mip8-statesync-differential-20260823.tar.gz \
+            MIP8_STATESYNC_RESULT.json SHA256SUMS meta logs rc corpus artifacts
+          sha256sum monad-v0160-mip8-statesync-differential-20260823.tar.gz > monad-v0160-mip8-statesync-differential-20260823.tar.gz.sha256
+
+      - name: Upload MIP-8 differential evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: monad-v0160-mip8-statesync-differential-20260823
+          path: |
+            monad-v0160-mip8-statesync-differential-20260823.tar.gz
+            monad-v0160-mip8-statesync-differential-20260823.tar.gz.sha256
+            out/MIP8_STATESYNC_RESULT.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
