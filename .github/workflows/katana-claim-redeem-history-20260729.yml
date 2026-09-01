@@ -1,0 +1,105 @@
+name: Katana claimAndRedeem production history census
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-claim-redeem-history-20260729.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: actions/checkout@v4
+        with:
+          repository: agglayer/vault-bridge
+          ref: v0.5.0
+          path: vault-bridge
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Derive exact ABI selector and scan production transactions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cd vault-bridge
+          forge build >/tmp/build.log 2>&1
+          forge inspect VaultBridgeToken abi > /tmp/vb_abi.json
+          cd ..
+          python3 - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          abi=json.loads(Path('/tmp/vb_abi.json').read_text())
+          fn=next((x for x in abi if x.get('type')=='function' and x.get('name')=='claimAndRedeem'),None)
+          if fn is None:
+              raise SystemExit('claimAndRedeem not found')
+          sig=fn['name']+'('+','.join(i['type'] for i in fn['inputs'])+')'
+          selector=subprocess.check_output(['cast','sig',sig],text=True).strip().lower()
+          Path('evidence/FUNCTION.json').write_text(json.dumps({'abi':fn,'signature':sig,'selector':selector},indent=2)+'\n')
+          PY
+          python3 - <<'PY'
+          import json,time,urllib.parse,urllib.request
+          from pathlib import Path
+          function=json.loads(Path('evidence/FUNCTION.json').read_text())
+          selector=function['selector']
+          addresses={
+            'vbUSDC':'0x53E82ABbb12638F09d9e624578ccB666217a765e',
+            'vbETH':'0x2DC70fb75b88d2eB4715bc06E1595E6D97c34DFF',
+            'vbWBTC':'0x2C24B57e2CCd1f273045Af6A5f632504C432374F',
+            'vbUSDT':'0x6d4f9f9f8f0155509ecd6Ac6c544fF27999845CC',
+            'vbUSDS':'0x3DD459dE96F9C28e3a343b831cbDC2B93c8C4855',
+          }
+          matches=[]; stats={}
+          for label,address in addresses.items():
+              url=f'https://eth.blockscout.com/api/v2/addresses/{address}/transactions?filter=to'
+              seen=0;pages=0
+              while url and pages<200:
+                  req=urllib.request.Request(url,headers={'user-agent':'katana-claim-history/1.0','accept':'application/json'})
+                  try:
+                      with urllib.request.urlopen(req,timeout=45) as r:data=json.loads(r.read())
+                  except Exception as exc:
+                      stats[label]={'seen':seen,'pages':pages,'error':repr(exc)}
+                      break
+                  pages+=1
+                  for tx in data.get('items',[]):
+                      seen+=1
+                      inp=(tx.get('raw_input') or tx.get('input') or '').lower()
+                      if inp.startswith(selector):
+                          tx['token_label']=label;tx['token_address']=address.lower();matches.append(tx)
+                  nxt=data.get('next_page_params')
+                  if not nxt: url=None
+                  else: url=f'https://eth.blockscout.com/api/v2/addresses/{address}/transactions?filter=to&'+urllib.parse.urlencode(nxt)
+                  time.sleep(0.08)
+              stats.setdefault(label,{'seen':seen,'pages':pages})
+          result={'function':function,'stats':stats,'matches':matches,'match_count':len(matches)}
+          Path('evidence/HISTORY.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          lines=['# claimAndRedeem production history','',f"- signature: `{function['signature']}`",f"- selector: `{selector}`",f"- matches: `{len(matches)}`",'']
+          for label,s in stats.items():lines.append(f"- {label}: seen={s.get('seen')} pages={s.get('pages')} error={s.get('error')}")
+          for tx in matches:lines.append(f"- MATCH {tx.get('token_label')} tx={tx.get('hash')} block={tx.get('block')} from={tx.get('from',{}).get('hash') if isinstance(tx.get('from'),dict) else tx.get('from')}")
+          Path('evidence/SUMMARY.md').write_text('\n'.join(lines)+'\n')
+          PY
+          sha256sum evidence/* > evidence/SHA256SUMS
+          cat evidence/SUMMARY.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: katana-claim-redeem-history-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9

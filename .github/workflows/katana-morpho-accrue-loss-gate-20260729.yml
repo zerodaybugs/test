@@ -1,0 +1,189 @@
+name: Katana MetaMorpho accrue-loss gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-morpho-accrue-loss-gate-20260729.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Select RPC and pin Ethereum block
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import json, urllib.request
+          endpoints = [
+              'https://ethereum-rpc.publicnode.com',
+              'https://eth.llamarpc.com',
+              'https://1rpc.io/eth',
+              'https://cloudflare-eth.com',
+          ]
+          rid = 0
+          def rpc(url, method, params):
+              global rid
+              rid += 1
+              req = urllib.request.Request(
+                  url,
+                  data=json.dumps({'jsonrpc':'2.0','id':rid,'method':method,'params':params}).encode(),
+                  headers={'content-type':'application/json','user-agent':'katana-morpho-accrue-loss-gate/1.0'},
+              )
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  payload = json.loads(response.read())
+              if 'error' in payload:
+                  raise RuntimeError(payload['error'])
+              return payload['result']
+          failures = {}
+          for endpoint in endpoints:
+              try:
+                  if int(rpc(endpoint,'eth_chainId',[]),16) != 1:
+                      raise RuntimeError('wrong chain')
+                  block = int(rpc(endpoint,'eth_blockNumber',[]),16)
+                  header = rpc(endpoint,'eth_getBlockByNumber',[hex(block),False])
+                  print(f'ETH_RPC={endpoint}')
+                  print(f'ETH_BLOCK={block}')
+                  print(f'ETH_BLOCK_HASH={header["hash"]}')
+                  print(f'ETH_BLOCK_TIMESTAMP={int(header["timestamp"],16)}')
+                  break
+              except Exception as exc:
+                  failures[endpoint] = repr(exc)
+          else:
+              raise SystemExit(json.dumps(failures, sort_keys=True))
+          PY
+
+      - name: Execute accrueInterest only on disposable local fork
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          anvil \
+            --fork-url "$ETH_RPC" \
+            --fork-block-number "$ETH_BLOCK" \
+            --host 127.0.0.1 \
+            --port 8545 \
+            --silent \
+            > evidence/anvil.log 2>&1 &
+          ANVIL_PID=$!
+          trap 'kill "$ANVIL_PID" 2>/dev/null || true' EXIT
+          for i in $(seq 1 60); do
+            cast block-number --rpc-url http://127.0.0.1:8545 >/dev/null 2>&1 && break
+            sleep 1
+          done
+          test "$(cast block-number --rpc-url http://127.0.0.1:8545)" = "$ETH_BLOCK"
+
+          cat > /tmp/accrue_gate.py <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          RPC = 'http://127.0.0.1:8545'
+          ANVIL_KEY_0 = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80'
+          VAULTS = [
+              ('vbUSDC','0xbeefb9f61cc44895d8aec381373555a64191a9c4'),
+              ('vbETH','0x31a5684983eee865d943a696aac155363ba024f9'),
+              ('vbWBTC','0x812b2c6ab3f4471c0e43d4bb61098a9211017427'),
+              ('vbUSDT','0xc54b4e08c1dcc199fdd35c6b5ab589ffd3428a8d'),
+          ]
+
+          def command(args, check=True):
+              result = subprocess.run(args, text=True, capture_output=True)
+              if check and result.returncode != 0:
+                  raise RuntimeError(f"{args!r}: {result.stderr.strip()}")
+              return result
+
+          def call_uint(address, signature, *args):
+              out = command(['cast','call','--rpc-url',RPC,address,signature,*map(str,args)]).stdout.strip()
+              token = out.split()[0]
+              return int(token, 0)
+
+          def call_address(address, signature, *args):
+              out = command(['cast','call','--rpc-url',RPC,address,signature,*map(str,args)]).stdout.strip()
+              return out.split()[0].lower()
+
+          def snapshot(vault):
+              asset = call_address(vault,'asset()(address)')
+              return {
+                  'lost_assets': call_uint(vault,'lostAssets()(uint256)'),
+                  'last_total_assets': call_uint(vault,'lastTotalAssets()(uint256)'),
+                  'reported_total_assets': call_uint(vault,'totalAssets()(uint256)'),
+                  'total_supply': call_uint(vault,'totalSupply()(uint256)'),
+                  'asset': asset,
+                  'idle_asset_balance': call_uint(asset,'balanceOf(address)(uint256)',vault),
+                  'max_withdraw_owner': call_uint(vault,'maxWithdraw(address)(uint256)',vault),
+              }
+
+          rows = []
+          for name, vault in VAULTS:
+              before = snapshot(vault)
+              tx = command([
+                  'cast','send','--rpc-url',RPC,'--private-key',ANVIL_KEY_0,
+                  vault,'accrueInterest()'
+              ], check=False)
+              after = snapshot(vault)
+              row = {
+                  'name': name,
+                  'vault': vault,
+                  'before': before,
+                  'accrue_returncode': tx.returncode,
+                  'accrue_stdout': tx.stdout.strip(),
+                  'accrue_stderr': tx.stderr.strip(),
+                  'after': after,
+                  'new_loss_crystallized': after['lost_assets'] - before['lost_assets'],
+                  'lost_assets_nonzero_after': after['lost_assets'] != 0,
+                  'effective_real_assets_after': after['reported_total_assets'] - after['lost_assets'],
+                  'reported_minus_last_after': after['reported_total_assets'] - after['last_total_assets'],
+              }
+              rows.append(row)
+
+          result = {
+              'schema': 'katana-metamorpho-accrue-loss-gate/v1',
+              'rows': rows,
+          }
+          Path('evidence/LOSS_GATE.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          lines = [
+              '# Katana MetaMorpho accrue-loss gate','',
+              '| token | accrue success | lost before | lost after | newly crystallized | reported assets after | effective real assets after |',
+              '|---|:---:|---:|---:|---:|---:|---:|',
+          ]
+          for row in rows:
+              lines.append(
+                  f"| {row['name']} | {row['accrue_returncode'] == 0} | {row['before']['lost_assets']} | "
+                  f"{row['after']['lost_assets']} | {row['new_loss_crystallized']} | "
+                  f"{row['after']['reported_total_assets']} | {row['effective_real_assets_after']} |"
+              )
+          Path('evidence/SUMMARY.md').write_text('\n'.join(lines)+'\n')
+          PY
+          python3 /tmp/accrue_gate.py
+          {
+            echo "ETH_RPC=$ETH_RPC"
+            echo "ETH_BLOCK=$ETH_BLOCK"
+            echo "ETH_BLOCK_HASH=$ETH_BLOCK_HASH"
+            echo "ETH_BLOCK_TIMESTAMP=$ETH_BLOCK_TIMESTAMP"
+          } > evidence/PIN.txt
+          (cd evidence && sha256sum LOSS_GATE.json SUMMARY.md PIN.txt anvil.log > SHA256SUMS)
+          cat evidence/SUMMARY.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: katana-morpho-accrue-loss-gate-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9

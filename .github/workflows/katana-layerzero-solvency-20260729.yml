@@ -1,0 +1,286 @@
+name: Katana LayerZero peer and escrow solvency profile
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-layerzero-solvency-20260729.yml'
+      - 'katana-layerzero-solvency/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Bind Katana liabilities to exact Ethereum peers and escrow
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > /tmp/profile.py <<'PY'
+          import hashlib
+          import json
+          import time
+          import urllib.request
+          from pathlib import Path
+
+          CHAINS = {
+              'katana': {
+                  'chain_id': 747474,
+                  'eid': 30375,
+                  'remote_eid': 30101,
+                  'endpoints': [
+                      'https://rpc.katana.network/',
+                      'https://rpc.katanarpc.com/',
+                      'https://katana.gateway.tenderly.co/',
+                  ],
+              },
+              'ethereum': {
+                  'chain_id': 1,
+                  'eid': 30101,
+                  'remote_eid': 30375,
+                  'endpoints': [
+                      'https://ethereum-rpc.publicnode.com',
+                      'https://eth.llamarpc.com',
+                      'https://1rpc.io/eth',
+                      'https://cloudflare-eth.com',
+                  ],
+              },
+          }
+
+          ITEMS = [
+              ('vbETH',  '0xEE7D8BCFb72bC1880D0Cf19822eB0A2e6577aB62', '0x694d1697F6909361775139357d99fb60b5caB683'),
+              ('vbUSDC', '0x203A662b0BD271A6ed5a60EdFbd04bFce608FD36', '0x807275727Dd3E640c5F2b5DE7d1eC72B4Dd293C0'),
+              ('vbUSDT', '0x2DCa96907fde857dd3D816880A0df407eeB2D2F2', '0x4690f346337eD8737BeA462ac71Ff16Ef95B985E'),
+              ('vbUSDS', '0x62D6A123E8D19d06d68cf0d2294F9A3A0362c6b3', '0xB42ab636ac69f073970a94d1ACE13379E7621665'),
+              ('vbWBTC', '0x0913DA6Da4b42f538B445599b46Bb4622342Cf52', '0x8169e532Bc781985e155037db1F96c267a520DFC'),
+          ]
+
+          IMPL_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
+          ADMIN_SLOT = '0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103'
+          ZERO32 = '0x' + '00' * 32
+          request_id = 0
+          selected = {}
+          endpoint_errors = {name: {} for name in CHAINS}
+
+          def raw_request(url, method, params, timeout=35):
+              global request_id
+              request_id += 1
+              body = json.dumps({'jsonrpc': '2.0', 'id': request_id, 'method': method, 'params': params}).encode()
+              request = urllib.request.Request(
+                  url,
+                  data=body,
+                  headers={'content-type': 'application/json', 'user-agent': 'katana-lz-solvency-read-only/2.0'},
+              )
+              with urllib.request.urlopen(request, timeout=timeout) as response:
+                  payload = json.loads(response.read())
+              if 'error' in payload:
+                  raise RuntimeError(f"{method}: {payload['error']}")
+              return payload['result']
+
+          for chain, cfg in CHAINS.items():
+              for endpoint in cfg['endpoints']:
+                  try:
+                      if int(raw_request(endpoint, 'eth_chainId', []), 16) != cfg['chain_id']:
+                          raise RuntimeError('wrong chain id')
+                      raw_request(endpoint, 'eth_blockNumber', [])
+                      selected[chain] = endpoint
+                      break
+                  except Exception as exc:
+                      endpoint_errors[chain][endpoint] = repr(exc)
+              if chain not in selected:
+                  raise SystemExit(f'No usable {chain} RPC: {endpoint_errors[chain]}')
+
+          def rpc(chain, method, params, timeout=35):
+              # Retry the selected endpoint, then fail over to every other endpoint.
+              candidates = [selected[chain]] + [x for x in CHAINS[chain]['endpoints'] if x != selected[chain]]
+              last = None
+              for endpoint in candidates:
+                  try:
+                      result = raw_request(endpoint, method, params, timeout)
+                      selected[chain] = endpoint
+                      return result
+                  except Exception as exc:
+                      last = exc
+                      endpoint_errors[chain][endpoint] = repr(exc)
+              raise RuntimeError(f'{chain} {method} failed on all endpoints: {last!r}')
+
+          def sha3(chain, text):
+              return rpc(chain, 'web3_sha3', ['0x' + text.encode().hex()])
+
+          selectors = {}
+          def selector(chain, signature):
+              key = (chain, signature)
+              if key not in selectors:
+                  selectors[key] = sha3(chain, signature)[:10]
+              return selectors[key]
+
+          def pad_uint(value):
+              return hex(value)[2:].rjust(64, '0')
+
+          def pad_address(address):
+              return address.lower().replace('0x', '').rjust(64, '0')
+
+          def eth_call(chain, address, signature, args=''):
+              return rpc(chain, 'eth_call', [{'to': address, 'data': selector(chain, signature) + args}, 'latest'])
+
+          def call_uint(chain, address, signature, args=''):
+              raw = eth_call(chain, address, signature, args)
+              return int(raw, 16) if raw and raw != '0x' else None
+
+          def call_address(chain, address, signature, args=''):
+              raw = eth_call(chain, address, signature, args)
+              return ('0x' + raw[-40:]).lower() if raw and raw != '0x' and len(raw) >= 42 else None
+
+          def call_bytes32(chain, address, signature, args=''):
+              raw = eth_call(chain, address, signature, args)
+              return raw.lower() if raw and raw != '0x' else None
+
+          def safe(fn):
+              try:
+                  return fn()
+              except Exception as exc:
+                  return {'error': repr(exc)}
+
+          def storage_address(chain, address, slot):
+              raw = rpc(chain, 'eth_getStorageAt', [address, slot, 'latest'])
+              return ('0x' + raw[-40:]).lower() if int(raw, 16) else None
+
+          def code_profile(chain, address):
+              raw = rpc(chain, 'eth_getCode', [address, 'latest'])
+              code = bytes.fromhex(raw[2:]) if raw and raw != '0x' else b''
+              return {
+                  'has_code': bool(code),
+                  'code_bytes': len(code),
+                  'sha256': hashlib.sha256(code).hexdigest() if code else None,
+                  'implementation': safe(lambda: storage_address(chain, address, IMPL_SLOT)),
+                  'proxy_admin': safe(lambda: storage_address(chain, address, ADMIN_SLOT)),
+              }
+
+          blocks = {}
+          for chain in CHAINS:
+              number = int(rpc(chain, 'eth_blockNumber', []), 16)
+              header = rpc(chain, 'eth_getBlockByNumber', [hex(number), False])
+              blocks[chain] = {
+                  'number': number,
+                  'hash': header['hash'],
+                  'timestamp': int(header['timestamp'], 16),
+                  'rpc': selected[chain],
+                  'eid': CHAINS[chain]['eid'],
+              }
+
+          rows = []
+          for name, katana_token, katana_adapter in ITEMS:
+              row = {
+                  'name': name,
+                  'katana_token': katana_token.lower(),
+                  'katana_adapter': katana_adapter.lower(),
+                  'katana_adapter_profile': code_profile('katana', katana_adapter),
+                  'katana_adapter_token': safe(lambda a=katana_adapter: call_address('katana', a, 'token()')),
+                  'katana_secondary_balance': safe(lambda a=katana_adapter: call_uint('katana', a, 'secondaryChainBalance()')),
+                  'katana_owner': safe(lambda a=katana_adapter: call_address('katana', a, 'owner()')),
+              }
+
+              primary_peer = safe(
+                  lambda a=katana_adapter: call_bytes32(
+                      'katana', a, 'peers(uint32)', pad_uint(CHAINS['katana']['remote_eid'])
+                  )
+              )
+              row['katana_peer_ethereum_bytes32'] = primary_peer
+              if isinstance(primary_peer, str) and primary_peer != ZERO32:
+                  ethereum_adapter = ('0x' + primary_peer[-40:]).lower()
+              else:
+                  ethereum_adapter = None
+              row['ethereum_adapter'] = ethereum_adapter
+
+              if ethereum_adapter:
+                  row['ethereum_adapter_profile'] = code_profile('ethereum', ethereum_adapter)
+                  row['ethereum_adapter_token'] = safe(lambda a=ethereum_adapter: call_address('ethereum', a, 'token()'))
+                  row['ethereum_owner'] = safe(lambda a=ethereum_adapter: call_address('ethereum', a, 'owner()'))
+                  reverse_peer = safe(
+                      lambda a=ethereum_adapter: call_bytes32(
+                          'ethereum', a, 'peers(uint32)', pad_uint(CHAINS['ethereum']['remote_eid'])
+                      )
+                  )
+                  row['ethereum_peer_katana_bytes32'] = reverse_peer
+                  row['reverse_peer_address'] = (
+                      ('0x' + reverse_peer[-40:]).lower()
+                      if isinstance(reverse_peer, str) and reverse_peer != ZERO32
+                      else None
+                  )
+                  token = row['ethereum_adapter_token']
+                  if isinstance(token, str):
+                      row['ethereum_vbtoken_profile'] = code_profile('ethereum', token)
+                      row['ethereum_escrow_balance'] = safe(
+                          lambda t=token, a=ethereum_adapter: call_uint(
+                              'ethereum', t, 'balanceOf(address)', pad_address(a)
+                          )
+                      )
+                      row['ethereum_vbtoken_total_supply'] = safe(
+                          lambda t=token: call_uint('ethereum', t, 'totalSupply()')
+                      )
+                      row['ethereum_vbtoken_decimals'] = safe(
+                          lambda t=token: call_uint('ethereum', t, 'decimals()')
+                      )
+                  else:
+                      row['ethereum_escrow_balance'] = None
+
+                  secondary = row['katana_secondary_balance']
+                  escrow = row.get('ethereum_escrow_balance')
+                  row['peer_is_bidirectional'] = row.get('reverse_peer_address') == katana_adapter.lower()
+                  row['token_pointer_matches'] = row['katana_adapter_token'] == katana_token.lower()
+                  row['escrow_covers_katana_liability'] = (
+                      isinstance(secondary, int) and isinstance(escrow, int) and escrow >= secondary
+                  )
+                  row['escrow_minus_katana_liability'] = (
+                      escrow - secondary if isinstance(secondary, int) and isinstance(escrow, int) else None
+                  )
+              rows.append(row)
+
+          result = {
+              'schema': 'katana-layerzero-solvency/v2',
+              'blocks': blocks,
+              'endpoint_errors': endpoint_errors,
+              'eids': {'ethereum': 30101, 'katana': 30375},
+              'rows': rows,
+          }
+          Path('evidence/PROFILE.json').write_text(json.dumps(result, indent=2, sort_keys=True) + '\n')
+
+          lines = [
+              '# Katana LayerZero peer and escrow solvency profile', '',
+              f"- Katana block: `{blocks['katana']['number']}`",
+              f"- Ethereum block: `{blocks['ethereum']['number']}`",
+              '- Ethereum EID: `30101`',
+              '- Katana EID: `30375`', '',
+              '| token | Katana liability | Ethereum escrow | covers | bidirectional peer | Ethereum adapter | Ethereum vbToken | surplus / other-chain escrow |',
+              '|---|---:|---:|:---:|:---:|---|---|---:|',
+          ]
+          for row in rows:
+              lines.append(
+                  f"| {row['name']} | {row['katana_secondary_balance']} | {row.get('ethereum_escrow_balance')} | "
+                  f"{row.get('escrow_covers_katana_liability')} | {row.get('peer_is_bidirectional')} | "
+                  f"`{row.get('ethereum_adapter')}` | `{row.get('ethereum_adapter_token')}` | "
+                  f"{row.get('escrow_minus_katana_liability')} |"
+              )
+          Path('evidence/SUMMARY.md').write_text('\n'.join(lines) + '\n')
+          PY
+          python3 /tmp/profile.py
+          (cd evidence && sha256sum PROFILE.json SUMMARY.md > SHA256SUMS)
+          cat evidence/SUMMARY.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: katana-layerzero-solvency-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9

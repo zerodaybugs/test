@@ -1,0 +1,150 @@
+name: Katana MetaMorpho market and oracle census
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-metamorpho-market-census-20260729.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Read all live MetaMorpho markets and oracles
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > /tmp/census.py <<'PY'
+          import hashlib, json, urllib.request
+          from pathlib import Path
+
+          ENDPOINTS=['https://ethereum-rpc.publicnode.com','https://eth.llamarpc.com','https://1rpc.io/eth','https://cloudflare-eth.com']
+          VAULTS=[
+            ('vbUSDC','0xbeefb9f61cc44895d8aec381373555a64191a9c4'),
+            ('vbETH','0x31a5684983eee865d943a696aac155363ba024f9'),
+            ('vbWBTC','0x812b2c6ab3f4471c0e43d4bb61098a9211017427'),
+            ('vbUSDT','0xc54b4e08c1dcc199fdd35c6b5ab589ffd3428a8d'),
+          ]
+          rid=0; selected=None; errors={}
+          def raw(url,m,p,t=40):
+            global rid;rid+=1
+            req=urllib.request.Request(url,data=json.dumps({'jsonrpc':'2.0','id':rid,'method':m,'params':p}).encode(),headers={'content-type':'application/json','user-agent':'katana-metamorpho-census/1.0'})
+            with urllib.request.urlopen(req,timeout=t) as r:d=json.loads(r.read())
+            if 'error' in d:raise RuntimeError(d['error'])
+            return d['result']
+          for e in ENDPOINTS:
+            try:
+              if int(raw(e,'eth_chainId',[]),16)!=1:raise RuntimeError('wrong chain')
+              raw(e,'eth_blockNumber',[]);selected=e;break
+            except Exception as x:errors[e]=repr(x)
+          if not selected:raise SystemExit(json.dumps(errors))
+          def rpc(m,p,t=40):
+            global selected
+            last=None
+            for e in [selected]+[x for x in ENDPOINTS if x!=selected]:
+              try:v=raw(e,m,p,t);selected=e;return v
+              except Exception as x:errors[e]=repr(x);last=x
+            raise RuntimeError(repr(last))
+          sels={}
+          def sel(s):
+            if s not in sels:sels[s]=rpc('web3_sha3',['0x'+s.encode().hex()])[:10]
+            return sels[s]
+          def pu(x):return hex(x)[2:].rjust(64,'0')
+          def pa(a):return a.lower().replace('0x','').rjust(64,'0')
+          def call(a,s,args=''):return rpc('eth_call',[{'to':a,'data':sel(s)+args},'latest'])
+          def words(rawv):
+            h=rawv[2:] if rawv.startswith('0x') else rawv
+            return [h[i:i+64] for i in range(0,len(h),64)]
+          def uint(a,s,args=''):
+            v=call(a,s,args);return int(v,16) if v and v!='0x' else None
+          def addr(a,s,args=''):
+            v=call(a,s,args);return ('0x'+v[-40:]).lower() if v and v!='0x' and len(v)>=42 else None
+          def b32(a,s,args=''):
+            v=call(a,s,args);return v.lower() if v and v!='0x' else None
+          def text(a,s):
+            v=call(a,s)
+            if not v or v=='0x':return None
+            b=bytes.fromhex(v[2:])
+            if len(b)==32:
+              return b.rstrip(b'\x00').decode(errors='replace')
+            off=int.from_bytes(b[:32],'big');ln=int.from_bytes(b[off:off+32],'big');return b[off+32:off+32+ln].decode(errors='replace')
+          def safe(f):
+            try:return f()
+            except Exception as x:return {'error':repr(x)}
+          def code(a):
+            v=rpc('eth_getCode',[a,'latest']);b=bytes.fromhex(v[2:]) if v and v!='0x' else b''
+            return {'bytes':len(b),'sha256':hashlib.sha256(b).hexdigest() if b else None}
+          def decode_market_params(v):
+            w=words(v);return {'loan_token':'0x'+w[0][-40:],'collateral_token':'0x'+w[1][-40:],'oracle':'0x'+w[2][-40:],'irm':'0x'+w[3][-40:],'lltv':int(w[4],16)}
+          def decode_market(v):
+            w=words(v);keys=['total_supply_assets','total_supply_shares','total_borrow_assets','total_borrow_shares','last_update','fee'];return {k:int(w[i],16) for i,k in enumerate(keys)}
+          def decode_position(v):
+            w=words(v);return {'supply_shares':int(w[0],16),'borrow_shares':int(w[1],16),'collateral':int(w[2],16)}
+          def decode_config(v):
+            w=words(v);return {'cap':int(w[0],16),'removable_at':int(w[1],16),'enabled':bool(int(w[2],16))}
+          block=int(rpc('eth_blockNumber',[]),16);header=rpc('eth_getBlockByNumber',[hex(block),False])
+          result={'schema':'katana-metamorpho-market-census/v1','block':block,'block_hash':header['hash'],'timestamp':int(header['timestamp'],16),'rpc':selected,'endpoint_errors':errors,'vaults':[]}
+          for label,vault in VAULTS:
+            morpho=addr(vault,'MORPHO()')
+            supply_len=uint(vault,'supplyQueueLength()')
+            withdraw_len=uint(vault,'withdrawQueueLength()')
+            ids=[]
+            for i in range(supply_len or 0):
+              mid=b32(vault,'supplyQueue(uint256)',pu(i));ids.append(mid)
+            for i in range(withdraw_len or 0):
+              mid=b32(vault,'withdrawQueue(uint256)',pu(i));ids.append(mid)
+            ids=list(dict.fromkeys(ids))
+            vr={'label':label,'vault':vault,'morpho':morpho,'vault_total_assets':safe(lambda v=vault:uint(v,'totalAssets()')),'vault_total_supply':safe(lambda v=vault:uint(v,'totalSupply()')),'lost_assets':safe(lambda v=vault:uint(v,'lostAssets()')),'markets':[]}
+            for mid in ids:
+              params=decode_market_params(call(morpho,'idToMarketParams(bytes32)',mid[2:]))
+              market=decode_market(call(morpho,'market(bytes32)',mid[2:]))
+              pos=decode_position(call(morpho,'position(bytes32,address)',mid[2:]+pa(vault)))
+              config=decode_config(call(vault,'config(bytes32)',mid[2:]))
+              loan=params['loan_token'];coll=params['collateral_token'];oracle=params['oracle']
+              mr={'id':mid,'params':params,'market':market,'vault_position':pos,'config':config}
+              for prefix,token in [('loan',loan),('collateral',coll)]:
+                mr[prefix+'_code']=code(token)
+                mr[prefix+'_symbol']=safe(lambda t=token:text(t,'symbol()'))
+                mr[prefix+'_name']=safe(lambda t=token:text(t,'name()'))
+                mr[prefix+'_decimals']=safe(lambda t=token:uint(t,'decimals()'))
+              mr['oracle_code']=code(oracle)
+              mr['oracle_price']=safe(lambda o=oracle:uint(o,'price()'))
+              mr['oracle_base_feed_1']=safe(lambda o=oracle:addr(o,'BASE_FEED_1()'))
+              mr['oracle_base_feed_2']=safe(lambda o=oracle:addr(o,'BASE_FEED_2()'))
+              mr['oracle_quote_feed_1']=safe(lambda o=oracle:addr(o,'QUOTE_FEED_1()'))
+              mr['oracle_quote_feed_2']=safe(lambda o=oracle:addr(o,'QUOTE_FEED_2()'))
+              ts=market['total_supply_shares'];ta=market['total_supply_assets'];ss=pos['supply_shares']
+              mr['vault_supply_assets_down']=(ss*(ta+1))//(ts+1_000_000) if ts is not None else None
+              mr['vault_exposure_bps']=mr['vault_supply_assets_down']*10000//vr['vault_total_assets'] if isinstance(vr['vault_total_assets'],int) and vr['vault_total_assets'] else None
+              mr['market_utilization_bps']=market['total_borrow_assets']*10000//market['total_supply_assets'] if market['total_supply_assets'] else None
+              vr['markets'].append(mr)
+            result['vaults'].append(vr)
+          Path('evidence/CENSUS.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          lines=['# Katana MetaMorpho market and oracle census','',f'- Ethereum block: `{block}`','', '| vault | market | loan | collateral | LLTV | vault exposure | exposure bps | utilization bps | oracle | oracle code hash |','|---|---|---|---|---:|---:|---:|---:|---|---|']
+          for v in result['vaults']:
+            for m in v['markets']:
+              lines.append(f"| {v['label']} | `{m['id']}` | {m['loan_symbol']} | {m['collateral_symbol']} | {m['params']['lltv']} | {m['vault_supply_assets_down']} | {m['vault_exposure_bps']} | {m['market_utilization_bps']} | `{m['params']['oracle']}` | `{m['oracle_code']['sha256']}` |")
+          Path('evidence/SUMMARY.md').write_text('\n'.join(lines)+'\n')
+          PY
+          python3 /tmp/census.py
+          (cd evidence && sha256sum CENSUS.json SUMMARY.md > SHA256SUMS)
+          cat evidence/SUMMARY.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: katana-metamorpho-market-census-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9

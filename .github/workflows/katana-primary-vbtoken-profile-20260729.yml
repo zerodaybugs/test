@@ -1,0 +1,295 @@
+name: Katana primary vbToken and yield-vault live profile
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-primary-vbtoken-profile-20260729.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Read primary-chain backing and yield-vault state
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > /tmp/profile.py <<'PY'
+          import hashlib
+          import json
+          import urllib.request
+          from pathlib import Path
+
+          ENDPOINTS = [
+              'https://ethereum-rpc.publicnode.com',
+              'https://eth.llamarpc.com',
+              'https://1rpc.io/eth',
+              'https://cloudflare-eth.com',
+          ]
+          TOKENS = [
+              ('vbUSDC', '0x53E82ABbb12638F09d9e624578ccB666217a765e'),
+              ('vbETH',  '0x2DC70fb75b88d2eB4715bc06E1595E6D97c34DFF'),
+              ('vbWBTC', '0x2C24B57e2CCd1f273045Af6A5f632504C432374F'),
+              ('vbUSDT', '0x6d4f9f9f8f0155509ecd6Ac6c544fF27999845CC'),
+              ('vbUSDS', '0x3DD459dE96F9C28e3a343b831cbDC2B93c8C4855'),
+          ]
+          IMPL_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
+          ADMIN_SLOT = '0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103'
+          request_id = 0
+          selected = None
+          endpoint_errors = {}
+
+          def raw_request(url, method, params, timeout=35):
+              global request_id
+              request_id += 1
+              body = json.dumps({'jsonrpc':'2.0','id':request_id,'method':method,'params':params}).encode()
+              req = urllib.request.Request(
+                  url,
+                  data=body,
+                  headers={'content-type':'application/json','user-agent':'katana-primary-vbtoken-read-only/1.0'},
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as response:
+                  payload = json.loads(response.read())
+              if 'error' in payload:
+                  raise RuntimeError(f"{method}: {payload['error']}")
+              return payload['result']
+
+          for endpoint in ENDPOINTS:
+              try:
+                  if int(raw_request(endpoint, 'eth_chainId', []), 16) != 1:
+                      raise RuntimeError('wrong chain')
+                  raw_request(endpoint, 'eth_blockNumber', [])
+                  selected = endpoint
+                  break
+              except Exception as exc:
+                  endpoint_errors[endpoint] = repr(exc)
+          if selected is None:
+              raise SystemExit('No Ethereum RPC: ' + json.dumps(endpoint_errors, sort_keys=True))
+
+          def rpc(method, params, timeout=35):
+              global selected
+              candidates = [selected] + [x for x in ENDPOINTS if x != selected]
+              last = None
+              for endpoint in candidates:
+                  try:
+                      value = raw_request(endpoint, method, params, timeout)
+                      selected = endpoint
+                      return value
+                  except Exception as exc:
+                      endpoint_errors[endpoint] = repr(exc)
+                      last = exc
+              raise RuntimeError(f'{method} failed on all endpoints: {last!r}')
+
+          def sha3(text):
+              return rpc('web3_sha3', ['0x' + text.encode().hex()])
+
+          selectors = {}
+          def selector(signature):
+              if signature not in selectors:
+                  selectors[signature] = sha3(signature)[:10]
+              return selectors[signature]
+
+          def pad_address(address):
+              return address.lower().replace('0x','').rjust(64,'0')
+
+          def pad_uint(value):
+              return hex(value)[2:].rjust(64,'0')
+
+          def eth_call(address, signature, args=''):
+              return rpc('eth_call', [{'to':address,'data':selector(signature)+args}, 'latest'])
+
+          def call_uint(address, signature, args=''):
+              raw = eth_call(address, signature, args)
+              return int(raw,16) if raw and raw != '0x' else None
+
+          def call_bool(address, signature, args=''):
+              value = call_uint(address, signature, args)
+              return bool(value) if value is not None else None
+
+          def call_address(address, signature, args=''):
+              raw = eth_call(address, signature, args)
+              return ('0x'+raw[-40:]).lower() if raw and raw != '0x' and len(raw) >= 42 else None
+
+          def call_pair_bool_uint(address, signature, args=''):
+              raw = eth_call(address, signature, args)
+              if not raw or raw == '0x' or len(raw) < 130:
+                  return None
+              payload = raw[2:].ljust(128,'0')
+              return {'positive':bool(int(payload[:64],16)), 'difference':int(payload[64:128],16)}
+
+          def call_raw(address, signature, args=''):
+              return eth_call(address, signature, args)
+
+          def safe(fn):
+              try:
+                  return fn()
+              except Exception as exc:
+                  return {'error':repr(exc)}
+
+          def storage_address(address, slot):
+              raw = rpc('eth_getStorageAt', [address,slot,'latest'])
+              return ('0x'+raw[-40:]).lower() if int(raw,16) else None
+
+          def code_profile(address):
+              raw = rpc('eth_getCode', [address,'latest'])
+              code = bytes.fromhex(raw[2:]) if raw and raw != '0x' else b''
+              return {
+                  'has_code':bool(code),
+                  'code_bytes':len(code),
+                  'sha256':hashlib.sha256(code).hexdigest() if code else None,
+                  'implementation':safe(lambda:storage_address(address,IMPL_SLOT)),
+                  'proxy_admin':safe(lambda:storage_address(address,ADMIN_SLOT)),
+              }
+
+          block = int(rpc('eth_blockNumber', []),16)
+          header = rpc('eth_getBlockByNumber',[hex(block),False])
+          rows = []
+          for name, vbtoken in TOKENS:
+              row = {'name':name,'vbtoken':vbtoken.lower(),'vbtoken_profile':code_profile(vbtoken)}
+              for key, signature, kind in [
+                  ('underlying','underlyingToken()','address'),
+                  ('asset','asset()','address'),
+                  ('yield_vault','yieldVault()','address'),
+                  ('yield_recipient','yieldRecipient()','address'),
+                  ('migration_manager','migrationManager()','address'),
+                  ('agglayer_bridge','agglayerBridge()','address'),
+                  ('total_supply','totalSupply()','uint'),
+                  ('total_assets','totalAssets()','uint'),
+                  ('staked_assets','stakedAssets()','uint'),
+                  ('reserved_assets','reservedAssets()','uint'),
+                  ('uncollected_yield','yield()','uint'),
+                  ('minimum_reserve_percentage','minimumReservePercentage()','uint'),
+                  ('reserve_percentage','reservePercentage()','uint'),
+                  ('migration_fees_fund','migrationFeesFund()','uint'),
+                  ('minimum_yield_vault_deposit','minimumYieldVaultDeposit()','uint'),
+                  ('yield_vault_maximum_slippage','yieldVaultMaximumSlippagePercentage()','uint'),
+                  ('paused','paused()','bool'),
+                  ('global_initialization_counter','globalInitializationCounter()','uint'),
+              ]:
+                  if kind == 'address':
+                      row[key] = safe(lambda s=signature:call_address(vbtoken,s))
+                  elif kind == 'bool':
+                      row[key] = safe(lambda s=signature:call_bool(vbtoken,s))
+                  else:
+                      row[key] = safe(lambda s=signature:call_uint(vbtoken,s))
+              row['backing_difference'] = safe(lambda:call_pair_bool_uint(vbtoken,'backingDifference()'))
+
+              underlying = row.get('underlying')
+              vault = row.get('yield_vault')
+              if isinstance(underlying,str):
+                  row['underlying_profile'] = code_profile(underlying)
+                  row['underlying_decimals'] = safe(lambda u=underlying:call_uint(u,'decimals()'))
+                  row['physical_underlying_at_vbtoken'] = safe(
+                      lambda u=underlying,v=vbtoken:call_uint(u,'balanceOf(address)',pad_address(v))
+                  )
+              if isinstance(vault,str):
+                  row['yield_vault_profile'] = code_profile(vault)
+                  vault_fields = [
+                      ('vault_asset','asset()','address'),
+                      ('vault_total_assets','totalAssets()','uint'),
+                      ('vault_total_supply','totalSupply()','uint'),
+                      ('vault_decimals','decimals()','uint'),
+                      ('vault_owner','owner()','address'),
+                      ('vault_curator','curator()','address'),
+                      ('vault_guardian','guardian()','address'),
+                      ('vault_fee_recipient','feeRecipient()','address'),
+                      ('vault_accountant','accountant()','address'),
+                      ('vault_price_per_share','pricePerShare()','uint'),
+                      ('vault_price_per_share_snake','price_per_share()','uint'),
+                      ('vault_locked_profit','lockedProfit()','uint'),
+                      ('vault_profit_max_unlock_time','profitMaxUnlockTime()','uint'),
+                  ]
+                  for key, signature, kind in vault_fields:
+                      if kind == 'address':
+                          row[key] = safe(lambda s=signature,a=vault:call_address(a,s))
+                      else:
+                          row[key] = safe(lambda s=signature,a=vault:call_uint(a,s))
+                  shares = safe(lambda a=vault,v=vbtoken:call_uint(a,'balanceOf(address)',pad_address(v)))
+                  row['vbtoken_yield_vault_shares'] = shares
+                  row['vault_max_withdraw_for_vbtoken'] = safe(
+                      lambda a=vault,v=vbtoken:call_uint(a,'maxWithdraw(address)',pad_address(v))
+                  )
+                  row['vault_max_redeem_for_vbtoken'] = safe(
+                      lambda a=vault,v=vbtoken:call_uint(a,'maxRedeem(address)',pad_address(v))
+                  )
+                  if isinstance(shares,int):
+                      row['vault_convert_all_shares_to_assets'] = safe(
+                          lambda a=vault,x=shares:call_uint(a,'convertToAssets(uint256)',pad_uint(x))
+                      )
+                      row['vault_preview_redeem_all_shares'] = safe(
+                          lambda a=vault,x=shares:call_uint(a,'previewRedeem(uint256)',pad_uint(x))
+                      )
+                  row['vault_raw_name'] = safe(lambda a=vault:call_raw(a,'name()'))
+                  row['vault_raw_symbol'] = safe(lambda a=vault:call_raw(a,'symbol()'))
+                  row['vault_raw_api_version'] = safe(lambda a=vault:call_raw(a,'apiVersion()'))
+
+              total_assets = row.get('total_assets')
+              total_supply = row.get('total_supply')
+              physical = row.get('physical_underlying_at_vbtoken')
+              reserved = row.get('reserved_assets')
+              reported_staked = row.get('staked_assets')
+              converted = row.get('vault_convert_all_shares_to_assets')
+              row['derived'] = {
+                  'assets_minus_supply': total_assets-total_supply if isinstance(total_assets,int) and isinstance(total_supply,int) else None,
+                  'physical_reserve_equals_accounting': physical==reserved if isinstance(physical,int) and isinstance(reserved,int) else None,
+                  'reported_staked_equals_vault_conversion': reported_staked==converted if isinstance(reported_staked,int) and isinstance(converted,int) else None,
+                  'asset_pointer_matches_underlying': row.get('asset')==underlying if isinstance(underlying,str) else None,
+                  'yield_vault_asset_matches_underlying': row.get('vault_asset')==underlying if isinstance(underlying,str) else None,
+              }
+              rows.append(row)
+
+          result = {
+              'schema':'katana-primary-vbtoken-live-profile/v1',
+              'rpc':selected,
+              'endpoint_errors':endpoint_errors,
+              'block_number':block,
+              'block_hash':header['hash'],
+              'block_timestamp':int(header['timestamp'],16),
+              'rows':rows,
+          }
+          Path('evidence/PROFILE.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          lines = [
+              '# Katana primary vbToken and yield-vault profile','',
+              f'- Ethereum block: `{block}`',
+              f'- timestamp: `{result["block_timestamp"]}`','',
+              '| token | supply | total assets | backing diff | reserve | staked | vault | max withdraw | paused |',
+              '|---|---:|---:|---|---:|---:|---|---:|:---:|',
+          ]
+          for r in rows:
+              lines.append(
+                  f"| {r['name']} | {r['total_supply']} | {r['total_assets']} | {r['backing_difference']} | "
+                  f"{r['reserved_assets']} | {r['staked_assets']} | `{r['yield_vault']}` | "
+                  f"{r.get('vault_max_withdraw_for_vbtoken')} | {r['paused']} |"
+              )
+          lines += ['', '## Yield-vault identity and invariants', '']
+          for r in rows:
+              lines.append(
+                  f"- **{r['name']}** vault `{r['yield_vault']}`: codeHash=`{r.get('yield_vault_profile',{}).get('sha256')}`, "
+                  f"impl=`{r.get('yield_vault_profile',{}).get('implementation')}`, asset=`{r.get('vault_asset')}`, "
+                  f"shares=`{r.get('vbtoken_yield_vault_shares')}`, converted=`{r.get('vault_convert_all_shares_to_assets')}`, "
+                  f"previewRedeem=`{r.get('vault_preview_redeem_all_shares')}`, derived=`{r['derived']}`"
+              )
+          Path('evidence/SUMMARY.md').write_text('\n'.join(lines)+'\n')
+          PY
+          python3 /tmp/profile.py
+          (cd evidence && sha256sum PROFILE.json SUMMARY.md > SHA256SUMS)
+          cat evidence/SUMMARY.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: katana-primary-vbtoken-profile-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9

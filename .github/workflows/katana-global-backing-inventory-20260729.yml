@@ -1,0 +1,372 @@
+name: Katana global backing and minter inventory
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-global-backing-inventory-20260729.yml'
+      - 'katana-global-backing/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Read current Katana deployment and role ledger
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p katana-global-backing-evidence
+          cat > /tmp/inventory.py <<'PY'
+          import hashlib
+          import json
+          import time
+          import urllib.error
+          import urllib.request
+          from collections import defaultdict
+          from pathlib import Path
+
+          OUT = Path('katana-global-backing-evidence')
+          OUT.mkdir(exist_ok=True)
+
+          ENDPOINTS = [
+              'https://rpc.katana.network/',
+              'https://rpc.katanarpc.com/',
+              'https://katana.gateway.tenderly.co/',
+          ]
+
+          TOKENS = [
+              {
+                  'name': 'vbUSDC',
+                  'custom': '0x203A662b0BD271A6ed5a60EdFbd04bFce608FD36',
+                  'converter': '0x97a3500083348a147f419b8a65717909762c389f',
+                  'underlying': '0xfd415d011ffaa8e6f17fa753cdb080d1de266784',
+              },
+              {
+                  'name': 'vbUSDT',
+                  'custom': '0x2DCa96907fde857dd3D816880A0df407eeB2D2F2',
+                  'converter': '0x053fa9b934b83e1e0ffc7e98a41aadc3640bb462',
+                  'underlying': '0xf44e3bcb7a2461cc08185e127b324f2486a74e20',
+              },
+              {
+                  'name': 'vbWBTC',
+                  'custom': '0x0913DA6Da4b42f538B445599b46Bb4622342Cf52',
+                  'converter': '0xb00aa68b87256e2f22058fb2ba3246eec54a44fc',
+                  'underlying': '0xb33e43a3f276e8e75792b941bccc996ecb2c0bbd',
+              },
+              {
+                  'name': 'vbUSDS',
+                  'custom': '0x62D6A123E8D19d06d68cf0d2294F9A3A0362c6b3',
+                  'converter': '0x639f13d5f30b47c792b6851238c05d0b623c77de',
+                  'underlying': '0x2134866886ce784fe2e0de819118e4d32b4be32c',
+              },
+              {
+                  'name': 'vbETH',
+                  'custom': '0xEE7D8BCFb72bC1880D0Cf19822eB0A2e6577aB62',
+                  'converter': '0xa6b0db1293144ebe9478b6a84f75dd651e45914a',
+                  'underlying': '0x815955d051C6262c16A720b19D735426254bEC5B',
+              },
+          ]
+
+          BRIDGE = '0x2a3dd3eb832af982ec71669e178424b10dca2ede'
+          MIGRATION_MANAGER = '0x417d01b64ea30c4e163873f3a1f77b727c689e02'
+          FROM_BLOCK = 1_790_000
+          EIP1967_IMPLEMENTATION = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
+          EIP1967_ADMIN = '0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103'
+
+          request_id = 0
+          RPC = None
+
+          def rpc_at(url, method, params, timeout=45):
+              global request_id
+              request_id += 1
+              payload = json.dumps({'jsonrpc': '2.0', 'id': request_id, 'method': method, 'params': params}).encode()
+              req = urllib.request.Request(url, data=payload, headers={'content-type': 'application/json', 'user-agent': 'katana-read-only-inventory/1.0'})
+              with urllib.request.urlopen(req, timeout=timeout) as response:
+                  data = json.loads(response.read())
+              if 'error' in data:
+                  raise RuntimeError(f"{method}: {data['error']}")
+              return data['result']
+
+          endpoint_errors = {}
+          for candidate in ENDPOINTS:
+              try:
+                  chain_id = int(rpc_at(candidate, 'eth_chainId', []), 16)
+                  block = int(rpc_at(candidate, 'eth_blockNumber', []), 16)
+                  if chain_id != 747474:
+                      raise RuntimeError(f'wrong chain id {chain_id}')
+                  RPC = candidate
+                  break
+              except Exception as exc:
+                  endpoint_errors[candidate] = repr(exc)
+          if RPC is None:
+              raise SystemExit('No Katana RPC endpoint available: ' + json.dumps(endpoint_errors, sort_keys=True))
+
+          def rpc(method, params, timeout=45):
+              return rpc_at(RPC, method, params, timeout=timeout)
+
+          def h256(value):
+              return hex(value)
+
+          def web3_sha3(text):
+              return rpc('web3_sha3', ['0x' + text.encode().hex()])
+
+          def selector(signature):
+              return web3_sha3(signature)[:10]
+
+          def pad_address(address):
+              return address.lower().replace('0x', '').rjust(64, '0')
+
+          def pad_uint(value):
+              return hex(value)[2:].rjust(64, '0')
+
+          def call(address, signature, args='', block='latest'):
+              data = selector(signature) + args
+              return rpc('eth_call', [{'to': address, 'data': data}, block])
+
+          def call_uint(address, signature, args='', block='latest'):
+              raw = call(address, signature, args, block)
+              return int(raw, 16) if raw not in ('0x', None) else None
+
+          def call_address(address, signature, args='', block='latest'):
+              raw = call(address, signature, args, block)
+              if not raw or raw == '0x' or len(raw) < 42:
+                  return None
+              return '0x' + raw[-40:]
+
+          def call_bool(address, signature, args='', block='latest'):
+              value = call_uint(address, signature, args, block)
+              return bool(value) if value is not None else None
+
+          def safe(fn):
+              try:
+                  return fn()
+              except Exception as exc:
+                  return {'error': repr(exc)}
+
+          def storage_address(address, slot):
+              raw = rpc('eth_getStorageAt', [address, slot, 'latest'])
+              return '0x' + raw[-40:] if int(raw, 16) else None
+
+          def code_profile(address):
+              code = rpc('eth_getCode', [address, 'latest'])
+              data = bytes.fromhex(code[2:]) if code and code != '0x' else b''
+              return {
+                  'has_code': bool(data),
+                  'code_bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest() if data else None,
+                  'implementation': safe(lambda: storage_address(address, EIP1967_IMPLEMENTATION)),
+                  'proxy_admin': safe(lambda: storage_address(address, EIP1967_ADMIN)),
+              }
+
+          latest_block = int(rpc('eth_blockNumber', []), 16)
+          latest_header = rpc('eth_getBlockByNumber', [hex(latest_block), False])
+
+          signatures = [
+              'totalSupply()', 'decimals()', 'paused()', 'version()',
+              'nativeConverter()', 'lxlyBridge()', 'bridge()',
+              'totalNetMintedByAdditionalMintersBurners()',
+              'customToken()', 'underlyingToken()', 'backingOnLayerY()',
+              'backingOnSecondaryChain()', 'nonMigratableBackingPercentage()',
+              'migratableBacking()', 'migrationManager()',
+              'MIGRATOR_ROLE()', 'MINTER_BURNER_ROLE()', 'PAUSER_ROLE()',
+              'DEFAULT_ADMIN_ROLE()', 'owner()', 'token()', 'endpoint()', 'oft()',
+              'gasBackingOnLayerY()', 'gasBackingOnSecondaryChain()',
+          ]
+          selectors = {sig: selector(sig) for sig in signatures}
+
+          role_granted = web3_sha3('RoleGranted(bytes32,address,address)')
+          role_revoked = web3_sha3('RoleRevoked(bytes32,address,address)')
+          role_names = {
+              '0x' + '00' * 32: 'DEFAULT_ADMIN_ROLE',
+              web3_sha3('PAUSER_ROLE'): 'PAUSER_ROLE',
+              web3_sha3('MINTER_BURNER_ROLE'): 'MINTER_BURNER_ROLE',
+              web3_sha3('MIGRATOR_ROLE'): 'MIGRATOR_ROLE',
+          }
+
+          scanned_addresses = [row['custom'] for row in TOKENS] + [row['converter'] for row in TOKENS]
+
+          def get_logs_bisect(start, end, depth=0):
+              params = [{
+                  'fromBlock': hex(start),
+                  'toBlock': hex(end),
+                  'address': scanned_addresses,
+                  'topics': [[role_granted, role_revoked]],
+              }]
+              try:
+                  return rpc('eth_getLogs', params, timeout=90)
+              except Exception:
+                  if start >= end or depth >= 24:
+                      raise
+                  mid = (start + end) // 2
+                  return get_logs_bisect(start, mid, depth + 1) + get_logs_bisect(mid + 1, end, depth + 1)
+
+          raw_logs = get_logs_bisect(FROM_BLOCK, latest_block)
+          raw_logs.sort(key=lambda row: (int(row['blockNumber'], 16), int(row['transactionIndex'], 16), int(row['logIndex'], 16)))
+
+          ledger = defaultdict(dict)
+          normalized_events = []
+          for log in raw_logs:
+              role = log['topics'][1].lower()
+              account = '0x' + log['topics'][2][-40:]
+              sender = '0x' + log['topics'][3][-40:]
+              granted = log['topics'][0].lower() == role_granted.lower()
+              contract = log['address'].lower()
+              ledger[(contract, role)][account.lower()] = granted
+              normalized_events.append({
+                  'contract': contract,
+                  'role': role,
+                  'role_name': role_names.get(role, 'UNKNOWN_ROLE'),
+                  'account': account.lower(),
+                  'sender': sender.lower(),
+                  'granted': granted,
+                  'block': int(log['blockNumber'], 16),
+                  'transaction_hash': log['transactionHash'],
+                  'log_index': int(log['logIndex'], 16),
+              })
+
+          active_roles = []
+          role_accounts = set()
+          for (contract, role), accounts in sorted(ledger.items()):
+              for account, event_state in sorted(accounts.items()):
+                  onchain = safe(lambda c=contract, r=role, a=account: call_bool(c, 'hasRole(bytes32,address)', r[2:] + pad_address(a)))
+                  active = onchain is True
+                  if active:
+                      role_accounts.add(account)
+                  active_roles.append({
+                      'contract': contract,
+                      'role': role,
+                      'role_name': role_names.get(role, 'UNKNOWN_ROLE'),
+                      'account': account,
+                      'last_event_granted': event_state,
+                      'has_role_now': onchain,
+                  })
+
+          account_profiles = {}
+          for account in sorted(role_accounts | {BRIDGE.lower(), MIGRATION_MANAGER.lower()}):
+              profile = code_profile(account)
+              for sig, kind in [
+                  ('owner()', 'address'), ('token()', 'address'), ('endpoint()', 'address'),
+                  ('oft()', 'address'), ('customToken()', 'address'), ('nativeConverter()', 'address'),
+                  ('bridge()', 'address'), ('paused()', 'bool'), ('version()', 'uint'),
+              ]:
+                  if not profile['has_code']:
+                      break
+                  if kind == 'address':
+                      profile[sig] = safe(lambda a=account, s=sig: call_address(a, s))
+                  elif kind == 'bool':
+                      profile[sig] = safe(lambda a=account, s=sig: call_bool(a, s))
+                  else:
+                      profile[sig] = safe(lambda a=account, s=sig: call_uint(a, s))
+              account_profiles[account] = profile
+
+          rows = []
+          for token in TOKENS:
+              custom = token['custom']
+              converter = token['converter']
+              underlying = token['underlying']
+              row = dict(token)
+              row['custom_profile'] = code_profile(custom)
+              row['converter_profile'] = code_profile(converter)
+              row['underlying_profile'] = code_profile(underlying)
+              row['custom_total_supply'] = safe(lambda: call_uint(custom, 'totalSupply()'))
+              row['custom_decimals'] = safe(lambda: call_uint(custom, 'decimals()'))
+              row['custom_paused'] = safe(lambda: call_bool(custom, 'paused()'))
+              row['custom_native_converter'] = safe(lambda: call_address(custom, 'nativeConverter()'))
+              row['custom_bridge'] = safe(lambda: call_address(custom, 'lxlyBridge()'))
+              if isinstance(row['custom_bridge'], dict):
+                  row['custom_bridge'] = safe(lambda: call_address(custom, 'bridge()'))
+              row['additional_minter_net_supply'] = safe(lambda: call_uint(custom, 'totalNetMintedByAdditionalMintersBurners()'))
+              row['converter_custom_token'] = safe(lambda: call_address(converter, 'customToken()'))
+              row['converter_underlying'] = safe(lambda: call_address(converter, 'underlyingToken()'))
+              row['converter_backing'] = safe(lambda: call_uint(converter, 'backingOnLayerY()'))
+              if isinstance(row['converter_backing'], dict):
+                  row['converter_backing'] = safe(lambda: call_uint(converter, 'backingOnSecondaryChain()'))
+              row['converter_non_migratable_percentage'] = safe(lambda: call_uint(converter, 'nonMigratableBackingPercentage()'))
+              row['converter_migratable_backing'] = safe(lambda: call_uint(converter, 'migratableBacking()'))
+              row['converter_migration_manager'] = safe(lambda: call_address(converter, 'migrationManager()'))
+              row['converter_paused'] = safe(lambda: call_bool(converter, 'paused()'))
+              row['underlying_balance_at_converter'] = safe(lambda: call_uint(underlying, 'balanceOf(address)', pad_address(converter)))
+              row['custom_balance_at_converter'] = safe(lambda: call_uint(custom, 'balanceOf(address)', pad_address(converter)))
+              row['custom_balance_at_bridge'] = safe(lambda: call_uint(custom, 'balanceOf(address)', pad_address(BRIDGE)))
+              row['bridge_wrapped_address_is_not_mintable'] = safe(
+                  lambda: call_bool(BRIDGE, 'wrappedAddressIsNotMintable(address)', pad_address(underlying))
+              )
+              row['native_balance_at_converter'] = int(rpc('eth_getBalance', [converter, 'latest']), 16)
+              rows.append(row)
+
+          inventory = {
+              'rpc': RPC,
+              'endpoint_errors': endpoint_errors,
+              'chain_id': 747474,
+              'block_number': latest_block,
+              'block_hash': latest_header['hash'],
+              'block_timestamp': int(latest_header['timestamp'], 16),
+              'from_block': FROM_BLOCK,
+              'bridge': BRIDGE,
+              'migration_manager': MIGRATION_MANAGER,
+              'selectors': selectors,
+              'role_topics': {'granted': role_granted, 'revoked': role_revoked},
+              'tokens': rows,
+              'active_roles': active_roles,
+              'role_account_profiles': account_profiles,
+              'role_event_count': len(normalized_events),
+          }
+
+          (OUT / 'INVENTORY.json').write_text(json.dumps(inventory, indent=2, sort_keys=True) + '\n')
+          (OUT / 'ROLE_EVENTS.json').write_text(json.dumps(normalized_events, indent=2, sort_keys=True) + '\n')
+
+          lines = [
+              '# Katana global backing / minter inventory', '',
+              f'- RPC: `{RPC}`',
+              f'- block: `{latest_block}`',
+              f'- timestamp: `{inventory["block_timestamp"]}`',
+              f'- role events: `{len(normalized_events)}`', '',
+              '## Token accounting', '',
+              '| token | supply | local backing | physical underlying | migratable | additional-minter net | custom impl | converter impl |',
+              '|---|---:|---:|---:|---:|---:|---|---|',
+          ]
+          for row in rows:
+              lines.append(
+                  f"| {row['name']} | {row['custom_total_supply']} | {row['converter_backing']} | "
+                  f"{row['underlying_balance_at_converter']} | {row['converter_migratable_backing']} | "
+                  f"{row['additional_minter_net_supply']} | "
+                  f"{row['custom_profile'].get('implementation')} | {row['converter_profile'].get('implementation')} |"
+              )
+          lines += ['', '## Active roles', '']
+          for item in active_roles:
+              if item['has_role_now'] is True:
+                  account = item['account']
+                  p = account_profiles.get(account, {})
+                  lines.append(
+                      f"- `{item['contract']}` `{item['role_name']}` -> `{account}` "
+                      f"(code={p.get('has_code')}, bytes={p.get('code_bytes')}, impl={p.get('implementation')})"
+                  )
+          (OUT / 'SUMMARY.md').write_text('\n'.join(lines) + '\n')
+
+          for path in OUT.iterdir():
+              if path.is_file():
+                  pass
+          PY
+          python3 /tmp/inventory.py
+          (cd katana-global-backing-evidence && sha256sum INVENTORY.json ROLE_EVENTS.json SUMMARY.md > SHA256SUMS)
+          find katana-global-backing-evidence -maxdepth 1 -type f -printf '%f\t%s bytes\n' | sort > katana-global-backing-evidence/INDEX.txt
+          cat katana-global-backing-evidence/SUMMARY.md
+
+      - name: Upload read-only inventory
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-global-backing-inventory-${{ github.run_id }}
+          path: katana-global-backing-evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
