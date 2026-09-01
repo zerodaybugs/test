@@ -1,0 +1,170 @@
+name: Sui Publisher Identity and Project Metadata R24
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-cdp-account-gate-r23-20260811]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  identity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve public Sui identity, owned metadata, and package topology
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf sui-publisher-identity-r24
+          mkdir -p sui-publisher-identity-r24/raw
+          cat > sui-publisher-identity-r24/query.py <<'PY'
+          import json, pathlib, time, urllib.request
+
+          OUT=pathlib.Path('sui-publisher-identity-r24'); RAW=OUT/'raw'
+          RPCS=['https://fullnode.mainnet.sui.io:443','https://sui-mainnet-endpoint.blockvision.org']
+          PUBLISHER='0x1ae73dabfa4b71abd21fead6a14c5861cea4b9dc1cfb456748751cff8baed61e'
+          PACKAGES={
+            'vault_a_origin':'0x75ecf86d06f900ceaa979339965b5f9fa4e8a43a60816e58cbbfa37762bba5b7',
+            'vault_a_current':'0x16136081deb1652e889911c6a97ceaa94a3a7ed67f29260d6f2a0d56c0679aa8',
+            'vault_b':'0x2f567f02e37a7e97cf603a7118e3b44f58401d4970cac2dda04d6bc71a25d9f5',
+            'receipt_a':'0xa4ffc4778b541f2c962c1548a80eebb21e884061ac7f5efea419c9aa8dd9a484',
+            'receipt_b':'0x46ed88368c5c1fbac0f9da490d6fd76fe65f9dea33f64ccc75c74a161ffb11c2',
+            'strategy':'0x4e9b19f8dce994aca2f57bbfaae4f92dc6a6e4b14d2e49324513b240f6840a1c',
+            'receipt_runtime':'0xd32c31d0e1e5d5ab839f68a192a8bcf196cf200536fe0ecede3be100cab721f8',
+            'vault_runtime':'0x4760190f3d43f84cabf71d9809afd17805a7780b0ede3a40afe66150f7d43b77',
+            'abyss_vault':'0x89a2379902ee37959c0dd95820ebb474531ef7727fa135d0324e62e8d4e06da5',
+          }
+
+          def post(url,payload,retries=6):
+            data=json.dumps(payload).encode(); last=None
+            for n in range(retries):
+              try:
+                req=urllib.request.Request(url,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'sui-publisher-identity-r24/1'})
+                with urllib.request.urlopen(req,timeout=120) as r: return json.loads(r.read().decode())
+              except Exception as e:
+                last=e; time.sleep(2**n)
+            raise RuntimeError(f'{url}: {last}')
+          def rpc(method,params):
+            errors=[]
+            for ep in RPCS:
+              try:
+                body=post(ep,{'jsonrpc':'2.0','id':1,'method':method,'params':params})
+                if body.get('error'): raise RuntimeError(json.dumps(body['error']))
+                return {'endpoint':ep,'result':body.get('result')}
+              except Exception as e: errors.append({'endpoint':ep,'error':str(e)})
+            return {'failures':errors}
+          def dump(name,value): (RAW/name).write_text(json.dumps(value,indent=2,sort_keys=True)+'\n')
+
+          reverse={}
+          for method,params in [
+            ('suix_resolveNameServiceNames',[PUBLISHER,None,50]),
+            ('suix_resolveNameServiceNames',[PUBLISHER,None,10]),
+            ('suix_resolveNameServiceNames',[PUBLISHER]),
+          ]:
+            key=method+'_'+str(len(params))
+            reverse[key]=rpc(method,params)
+          dump('reverse_names.json',reverse)
+
+          owned_pages=[]; cursor=None
+          for _ in range(20):
+            wrapper=rpc('suix_getOwnedObjects',[PUBLISHER,{'filter':None,'options':{'showType':True,'showOwner':True,'showPreviousTransaction':True,'showDisplay':True,'showContent':True,'showBcs':True}},cursor,50])
+            owned_pages.append(wrapper)
+            result=wrapper.get('result') if isinstance(wrapper,dict) else None
+            if not isinstance(result,dict) or not result.get('hasNextPage'): break
+            cursor=result.get('nextCursor')
+          dump('owned_pages.json',owned_pages)
+
+          tx_pages=[]; cursor=None
+          opts={'showInput':True,'showRawInput':False,'showEffects':True,'showEvents':True,'showObjectChanges':True,'showBalanceChanges':True}
+          for _ in range(10):
+            wrapper=rpc('suix_queryTransactionBlocks',[{'filter':{'FromAddress':PUBLISHER},'options':opts},cursor,50,False])
+            tx_pages.append(wrapper)
+            result=wrapper.get('result') if isinstance(wrapper,dict) else None
+            if not isinstance(result,dict) or not result.get('hasNextPage'): break
+            cursor=result.get('nextCursor')
+          dump('publisher_tx_pages.json',tx_pages)
+
+          normalized={label:rpc('sui_getNormalizedMoveModulesByPackage',[pid]) for label,pid in PACKAGES.items()}
+          dump('normalized_modules.json',normalized)
+          package_objects={label:rpc('sui_getObject',[pid,{'showType':True,'showOwner':True,'showPreviousTransaction':True,'showDisplay':True,'showContent':True,'showBcs':True}]) for label,pid in PACKAGES.items()}
+          dump('package_objects.json',package_objects)
+
+          owned=[]
+          for page in owned_pages:
+            result=page.get('result') if isinstance(page,dict) else None
+            if isinstance(result,dict): owned.extend(result.get('data') or [])
+          owner_types={}
+          displays=[]
+          for row in owned:
+            data=row.get('data') or {}
+            typ=str(data.get('type'))
+            owner_types[typ]=owner_types.get(typ,0)+1
+            display=(data.get('display') or {}).get('data')
+            if display: displays.append({'objectId':data.get('objectId'),'type':typ,'display':display,'content':data.get('content')})
+
+          txs=[]
+          for page in tx_pages:
+            result=page.get('result') if isinstance(page,dict) else None
+            if isinstance(result,dict): txs.extend(result.get('data') or [])
+          counterparties={}; functions={}; published=[]
+          for tx in txs:
+            txdata=((tx.get('transaction') or {}).get('data') or {})
+            sender=txdata.get('sender')
+            counterparties[sender]=counterparties.get(sender,0)+1
+            try: commands=txdata['transaction']['transactions']
+            except Exception: commands=[]
+            for command in commands or []:
+              call=command.get('MoveCall') if isinstance(command,dict) else None
+              if call:
+                key=f"{call.get('package')}::{call.get('module')}::{call.get('function')}"
+                functions[key]=functions.get(key,0)+1
+            for change in tx.get('objectChanges') or []:
+              if change.get('type')=='published': published.append({'digest':tx.get('digest'),'packageId':change.get('packageId'),'modules':change.get('modules'),'sender':sender})
+
+          module_index={}
+          for label,wrapper in normalized.items():
+            result=wrapper.get('result') if isinstance(wrapper,dict) else None
+            module_index[label]=sorted((result or {}).keys()) if isinstance(result,dict) else []
+          summary={
+            'schema':'sui-publisher-identity-r24/v1','network':'sui-mainnet','publisher':PUBLISHER,
+            'reverseNames':reverse,'ownedObjectCount':len(owned),'ownedTypeCounts':owner_types,'displayObjects':displays,
+            'transactionCount':len(txs),'counterpartyCounts':counterparties,
+            'topFunctions':sorted(functions.items(),key=lambda x:(-x[1],x[0]))[:100],
+            'publishedPackages':published,'packageModuleIndex':module_index,
+            'writes':0,'transactionsConstructed':0,'generatedUnix':int(time.time()),
+          }
+          (OUT/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({
+            'reverseNames':reverse,'ownedObjectCount':len(owned),'ownedTypeCounts':owner_types,
+            'displayObjects':displays,'transactionCount':len(txs),'publishedPackages':published,
+            'packageModuleIndex':module_index,
+          },indent=2))
+          PY
+          python3 sui-publisher-identity-r24/query.py | tee sui-publisher-identity-r24/run.log
+          find sui-publisher-identity-r24 -type f -print0 | sort -z | xargs -0 sha256sum > sui-publisher-identity-r24/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' sui-publisher-identity-r24 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          s=json.load(open('sui-publisher-identity-r24/SUMMARY.json'))
+          assert s['writes']==0 and s['transactionsConstructed']==0
+          print('SUI_PUBLISHER_IDENTITY_R24_READ_ONLY_PASS')
+          PY
+
+      - name: Upload public identity evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: sui-publisher-identity-r24
+          path: sui-publisher-identity-r24
+          if-no-files-found: error
+          retention-days: 2
