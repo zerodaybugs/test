@@ -1,0 +1,89 @@
+name: Hermetica trader relay state
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-trader-relay-state.yml'
+      - 'public-data/hermetica-trader-relay-state-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconstruct trader maps and caller types
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT=/tmp/hermetica-trader-relay-state
+          mkdir -p "$OUT/raw" "$OUT/sources"
+          python3 - <<'PY'
+          import datetime as dt,json,pathlib,time,urllib.parse,urllib.request
+          OUT=pathlib.Path('/tmp/hermetica-trader-relay-state'); API='https://api.hiro.so'
+          CONTRACTS=[
+            'SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG.minting-v1',
+            'SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG.minting-otc-v1-1',
+          ]
+          def get(url,attempts=10):
+            last=None
+            for i in range(attempts):
+              try:
+                req=urllib.request.Request(url,headers={'User-Agent':'read-only-security-research/1.0','Accept':'application/json'})
+                with urllib.request.urlopen(req,timeout=40) as r:return json.loads(r.read().decode())
+              except Exception as e:last=e;time.sleep(min(12,1.4*(i+1)))
+            raise RuntimeError(f'{url}: {last}')
+          def txs(cid):
+            rows=[];off=0
+            while True:
+              q=urllib.parse.urlencode({'limit':50,'offset':off})
+              b=get(f'{API}/extended/v1/address/{cid}/transactions?{q}');p=b.get('results') or [];rows+=p
+              if not p or len(rows)>=int(b.get('total') or len(rows)):break
+              off+=len(p);time.sleep(.12)
+            return rows
+          report={}
+          all_candidates=set()
+          for cid in CONTRACTS:
+            rows=txs(cid); (OUT/'raw'/f'{cid}.transactions.json').write_text(json.dumps(rows,indent=2))
+            history=[]; execution_callers=[]; state={}
+            for tx in sorted(rows,key=lambda x:(int(x.get('block_height') or 0),int(x.get('nonce') or 0))):
+              if tx.get('tx_type')!='contract_call' or tx.get('tx_status')!='success':continue
+              c=tx.get('contract_call') or {}; fn=c.get('function_name'); args=c.get('function_args') or []
+              if fn=='set-trader' and len(args)>=3:
+                address=args[0].get('repr','').lstrip("'"); mint=args[1].get('repr')=='true'; redeem=args[2].get('repr')=='true'
+                state[address]={'minter':mint,'redeemer':redeem,'tx_id':tx.get('tx_id'),'block_height':tx.get('block_height'),'observed_time':int(tx.get('block_time') or tx.get('burn_block_time') or 0)}
+                history.append({'address':address,'minter':mint,'redeemer':redeem,'tx_id':tx.get('tx_id'),'block_height':tx.get('block_height')});all_candidates.add(address)
+              if fn in ('confirm-mint','confirm-redeem','cancel-mint-request','cancel-redeem-request'):
+                a=tx.get('sender_address'); execution_callers.append({'caller':a,'function':fn,'tx_id':tx.get('tx_id'),'block_height':tx.get('block_height')});all_candidates.add(a)
+            report[cid]={'transaction_count':len(rows),'set_trader_history':history,'replayed_trader_state':state,'execution_callers':execution_callers}
+          classified={}
+          for p in sorted(all_candidates):
+            is_contract='.' in p
+            row={'principal':p,'is_contract_principal':is_contract}
+            if is_contract:
+              try:
+                a,n=p.split('.',1); src=get(f'{API}/v2/contracts/source/{a}/{n}?proof=0').get('source') or ''
+                (OUT/'sources'/f'{p}.clar').write_text(src); row['source_bytes']=len(src.encode())
+                row['public_functions']=__import__('re').findall(r'\(define-public\s+\(([^\s\)]+)',src)
+              except Exception as e:row['source_error']=str(e)
+            classified[p]=row
+          summary={'generated_at':dt.datetime.now(dt.timezone.utc).isoformat(),'source':'Hiro public read-only API','contracts':report,'candidate_principals':classified,'active_contract_traders':[]}
+          for cid,data in report.items():
+            for p,st in data['replayed_trader_state'].items():
+              if (st['minter'] or st['redeemer']) and classified.get(p,{}).get('is_contract_principal'):
+                summary['active_contract_traders'].append({'contract':cid,'principal':p,'state':st,'classification':classified[p]})
+          (OUT/'summary.json').write_text(json.dumps(summary,indent=2));print(json.dumps(summary,indent=2))
+          PY
+          (cd "$OUT" && find . -type f -not -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-trader-relay-state
+          path: /tmp/hermetica-trader-relay-state
+          retention-days: 2
+          if-no-files-found: error
+          compression-level: 0
