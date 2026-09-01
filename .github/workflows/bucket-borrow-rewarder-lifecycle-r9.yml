@@ -1,0 +1,450 @@
+name: Bucket Borrow Rewarder Lifecycle R9
+
+on:
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enumerate all live rewarders, registry membership, balances, and removal history
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-borrow-rewarder-lifecycle-r9
+          mkdir -p bucket-borrow-rewarder-lifecycle-r9/raw
+          cat > bucket-borrow-rewarder-lifecycle-r9/census.py <<'PY'
+          import json
+          import pathlib
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-borrow-rewarder-lifecycle-r9')
+          RAW = OUT / 'raw'
+          RPCS = [
+              'https://fullnode.mainnet.sui.io:443',
+              'https://sui-mainnet-endpoint.blockvision.org',
+          ]
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+          CURRENT = '0xef9719a3392d3742ae09c42ebf01030d88b1a75651430932be1eb017b79fb372'
+          ORIGIN = '0x8cc2eed1b1012881a623e9bafd58ff0f17a8c5f807662631e623acf7779a78ee'
+          REGISTRY = '0x14c57bf1085babf6e408c0488f2b68443f887e67a43436cadf1b84e5d41f54ba'
+          REWARDER_TYPES = [
+              f'{ORIGIN}::borrow_incentive::VaultRewarder',
+              f'{CURRENT}::borrow_incentive::VaultRewarder',
+          ]
+
+          def post(url, payload, retries=6, timeout=180):
+              body = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      req = urllib.request.Request(
+                          url,
+                          data=body,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-borrow-rewarder-lifecycle-r9/1',
+                          },
+                      )
+                      with urllib.request.urlopen(req, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2 ** attempt, 30))
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': str(exc)})
+              return {'failures': failures}
+
+          def gql(query, variables=None):
+              body = post(GQL, {'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          def dump(name, value):
+              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def unwrap_result(wrapper):
+              return wrapper.get('result') if isinstance(wrapper, dict) else None
+
+          def walk(value, path=()):
+              if isinstance(value, dict):
+                  for key, child in value.items():
+                      yield from walk(child, path + (str(key),))
+              elif isinstance(value, list):
+                  for index, child in enumerate(value):
+                      yield from walk(child, path + (str(index),))
+              else:
+                  yield '.'.join(path), value
+
+          def all_addresses(value):
+              found = set()
+              for _, scalar in walk(value):
+                  if isinstance(scalar, str) and scalar.startswith('0x') and len(scalar) == 66:
+                      found.add(scalar)
+              return sorted(found)
+
+          def find_key(value, key):
+              if isinstance(value, dict):
+                  if key in value:
+                      return value[key]
+                  for child in value.values():
+                      found = find_key(child, key)
+                      if found is not None:
+                          return found
+              elif isinstance(value, list):
+                  for child in value:
+                      found = find_key(child, key)
+                      if found is not None:
+                          return found
+              return None
+
+          def numeric_leaf(value):
+              if isinstance(value, bool):
+                  return None
+              if isinstance(value, int):
+                  return value
+              if isinstance(value, str):
+                  try:
+                      return int(value)
+                  except ValueError:
+                      return None
+              if isinstance(value, dict):
+                  for key in ('value', 'fields', 'bits', 'scaled_val', 'scaledVal', 'v'):
+                      if key in value:
+                          found = numeric_leaf(value[key])
+                          if found is not None:
+                              return found
+                  for child in value.values():
+                      found = numeric_leaf(child)
+                      if found is not None:
+                          return found
+              elif isinstance(value, list):
+                  for child in value:
+                      found = numeric_leaf(child)
+                      if found is not None:
+                          return found
+              return None
+
+          def balance_value(value):
+              if isinstance(value, dict):
+                  fields = value.get('fields')
+                  if isinstance(fields, dict) and 'value' in fields:
+                      found = numeric_leaf(fields['value'])
+                      if found is not None:
+                          return found
+                  if 'value' in value:
+                      found = numeric_leaf(value['value'])
+                      if found is not None:
+                          return found
+              return numeric_leaf(value)
+
+          object_options = {
+              'showType': True,
+              'showOwner': True,
+              'showPreviousTransaction': True,
+              'showDisplay': False,
+              'showContent': True,
+              'showBcs': True,
+          }
+
+          checkpoint = rpc('sui_getLatestCheckpointSequenceNumber', [])
+          registry_wrapper = rpc('sui_getObject', [REGISTRY, object_options])
+          dump('registry.json', registry_wrapper)
+          registry_result = unwrap_result(registry_wrapper) or {}
+          registry_data = registry_result.get('data') or {}
+          registry_state = ((registry_data.get('content') or {}).get('fields') or {})
+          table_value = find_key(registry_state, 'vault_rewarders')
+          table_addresses = all_addresses(table_value)
+          table_id = table_addresses[0] if table_addresses else None
+
+          registry_fields = []
+          current_membership = {}
+          registered_rewarders = set()
+          if table_id:
+              cursor = None
+              for page_index in range(50):
+                  wrapper = rpc('suix_getDynamicFields', [table_id, cursor, 50])
+                  result = unwrap_result(wrapper)
+                  if not isinstance(result, dict):
+                      registry_fields.append({'queryFailure': wrapper})
+                      break
+                  page = result.get('data') or []
+                  registry_fields.extend(page)
+                  for field_index, field in enumerate(page):
+                      object_id = field.get('objectId')
+                      if not object_id:
+                          continue
+                      node = rpc('sui_getObject', [object_id, object_options])
+                      dump(f'registry_node_{page_index:02d}_{field_index:03d}_{object_id}.json', node)
+                      node_result = unwrap_result(node) or {}
+                      node_data = node_result.get('data') or {}
+                      node_state = ((node_data.get('content') or {}).get('fields') or {})
+                      addresses = all_addresses(node_state)
+                      vault_candidates = [
+                          addr for addr in addresses
+                          if addr != object_id and addr != table_id
+                      ]
+                      name = field.get('name') or {}
+                      name_value = name.get('value') if isinstance(name, dict) else None
+                      vault_id = name_value if isinstance(name_value, str) and name_value.startswith('0x') else None
+                      rewarder_ids = [addr for addr in vault_candidates if addr != vault_id]
+                      if not rewarder_ids:
+                          # VecSet IDs can be represented as scalar strings nested in `value`.
+                          value_subtree = find_key(node_state, 'value')
+                          rewarder_ids = [addr for addr in all_addresses(value_subtree) if addr != vault_id]
+                      if vault_id:
+                          current_membership[vault_id] = sorted(set(rewarder_ids))
+                      registered_rewarders.update(rewarder_ids)
+                  if not result.get('hasNextPage'):
+                      break
+                  cursor = result.get('nextCursor')
+          dump('registry_dynamic_fields.json', registry_fields)
+
+          discovered_ids = set(registered_rewarders)
+          query_rows = {}
+          for type_name in REWARDER_TYPES:
+              rows = []
+              cursor = None
+              for page_index in range(50):
+                  wrapper = rpc('suix_queryObjects', [{
+                      'filter': {'StructType': type_name},
+                      'options': object_options,
+                  }, cursor, 50])
+                  result = unwrap_result(wrapper)
+                  if not isinstance(result, dict):
+                      rows.append({'queryFailure': wrapper})
+                      break
+                  page = result.get('data') or []
+                  rows.extend(page)
+                  for item in page:
+                      data = item.get('data') if isinstance(item, dict) else None
+                      object_id = (data or {}).get('objectId')
+                      if object_id:
+                          discovered_ids.add(object_id)
+                  if not result.get('hasNextPage'):
+                      break
+                  cursor = result.get('nextCursor')
+              query_rows[type_name] = rows
+              dump(f'query_rewarders_{type_name.split("::")[0]}.json', rows)
+
+          tx_options = {
+              'showInput': True,
+              'showRawInput': False,
+              'showEffects': True,
+              'showEvents': True,
+              'showObjectChanges': True,
+              'showBalanceChanges': True,
+          }
+          history = []
+          package_candidates = (CURRENT, ORIGIN)
+          functions = (
+              'create',
+              'remove_rewarder',
+              'deposit_to_source',
+              'deposit_to_pool',
+              'withdraw_from_source',
+              'update_flow_rate',
+              'update_rewarder_timestamp',
+              'claim',
+          )
+          for package in package_candidates:
+              for function in functions:
+                  cursor = None
+                  for page_index in range(50):
+                      wrapper = rpc('suix_queryTransactionBlocks', [{
+                          'filter': {
+                              'MoveFunction': {
+                                  'package': package,
+                                  'module': 'borrow_incentive',
+                                  'function': function,
+                              }
+                          },
+                          'options': tx_options,
+                      }, cursor, 50, False])
+                      result = unwrap_result(wrapper)
+                      if not isinstance(result, dict):
+                          history.append({
+                              'package': package,
+                              'function': function,
+                              'queryFailure': wrapper,
+                          })
+                          break
+                      for tx in result.get('data') or []:
+                          row = {
+                              'package': package,
+                              'function': function,
+                              'digest': tx.get('digest'),
+                              'timestampMs': tx.get('timestampMs'),
+                              'sender': (((tx.get('transaction') or {}).get('data') or {}).get('sender')),
+                              'transaction': tx.get('transaction'),
+                              'effects': tx.get('effects'),
+                              'events': tx.get('events'),
+                              'objectChanges': tx.get('objectChanges'),
+                              'balanceChanges': tx.get('balanceChanges'),
+                          }
+                          history.append(row)
+                          for change in tx.get('objectChanges') or []:
+                              if not isinstance(change, dict):
+                                  continue
+                              object_type = change.get('objectType')
+                              object_id = change.get('objectId')
+                              if (
+                                  object_id
+                                  and isinstance(object_type, str)
+                                  and '::borrow_incentive::VaultRewarder<' in object_type
+                              ):
+                                  discovered_ids.add(object_id)
+                      if not result.get('hasNextPage'):
+                          break
+                      cursor = result.get('nextCursor')
+          dump('function_history.json', history)
+
+          rewarders = []
+          for object_id in sorted(discovered_ids):
+              wrapper = rpc('sui_getObject', [object_id, object_options])
+              dump(f'rewarder_{object_id}.json', wrapper)
+              result = unwrap_result(wrapper) or {}
+              data = result.get('data') or {}
+              state = ((data.get('content') or {}).get('fields') or {})
+              object_type = data.get('type')
+              if not (isinstance(object_type, str) and '::borrow_incentive::VaultRewarder<' in object_type):
+                  continue
+              vault_id_value = find_key(state, 'vault_id')
+              vault_addresses = all_addresses(vault_id_value)
+              vault_id = vault_addresses[0] if vault_addresses else None
+              source_raw = balance_value(find_key(state, 'source'))
+              pool_raw = balance_value(find_key(state, 'pool'))
+              flow_raw = numeric_leaf(find_key(state, 'flow_rate'))
+              timestamp = numeric_leaf(find_key(state, 'timestamp'))
+              is_registered = object_id in registered_rewarders
+              rewarders.append({
+                  'id': object_id,
+                  'type': object_type,
+                  'owner': data.get('owner'),
+                  'version': data.get('version'),
+                  'digest': data.get('digest'),
+                  'previousTransaction': data.get('previousTransaction'),
+                  'vaultId': vault_id,
+                  'sourceRaw': source_raw,
+                  'poolRaw': pool_raw,
+                  'flowRateRawCandidate': flow_raw,
+                  'timestampMs': timestamp,
+                  'registered': is_registered,
+                  'liveUnregistered': not is_registered,
+                  'funded': bool((source_raw or 0) > 0 or (pool_raw or 0) > 0),
+                  'potentiallyAccruing': bool((flow_raw or 0) > 0 and (source_raw or 0) > 0),
+                  'state': state,
+              })
+
+          remove_history = [row for row in history if row.get('function') == 'remove_rewarder' and row.get('digest')]
+          created_history = [row for row in history if row.get('function') == 'create' and row.get('digest')]
+          unregistered = [row for row in rewarders if not row['registered']]
+          funded_unregistered = [row for row in unregistered if row['funded']]
+          accruing_unregistered = [row for row in unregistered if row['potentiallyAccruing']]
+
+          summary = {
+              'schema': 'bucket-borrow-rewarder-lifecycle-r9/v1',
+              'network': 'sui-mainnet',
+              'readOnly': True,
+              'checkpoint': checkpoint,
+              'currentPackage': CURRENT,
+              'originPackage': ORIGIN,
+              'registry': REGISTRY,
+              'registryType': registry_data.get('type'),
+              'registryTableId': table_id,
+              'currentMembership': current_membership,
+              'registeredRewarderIds': sorted(registered_rewarders),
+              'rewarderQueryCounts': {key: len(value) for key, value in query_rows.items()},
+              'discoveredRewarderIds': sorted(discovered_ids),
+              'rewarders': rewarders,
+              'rewarderCount': len(rewarders),
+              'unregisteredRewarders': unregistered,
+              'fundedUnregisteredRewarders': funded_unregistered,
+              'accruingUnregisteredRewarders': accruing_unregistered,
+              'removeHistoryCount': len(remove_history),
+              'removeHistory': remove_history,
+              'createHistoryCount': len(created_history),
+              'removedRewarderClaimCandidate': bool(accruing_unregistered),
+              'fundedRemovedRewarderCandidate': bool(funded_unregistered),
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'registryTableId': table_id,
+              'currentMembership': current_membership,
+              'registeredRewarderIds': sorted(registered_rewarders),
+              'rewarderCount': len(rewarders),
+              'rewarders': [
+                  {
+                      'id': row['id'],
+                      'type': row['type'],
+                      'vaultId': row['vaultId'],
+                      'sourceRaw': row['sourceRaw'],
+                      'poolRaw': row['poolRaw'],
+                      'flowRateRawCandidate': row['flowRateRawCandidate'],
+                      'registered': row['registered'],
+                      'funded': row['funded'],
+                      'potentiallyAccruing': row['potentiallyAccruing'],
+                  }
+                  for row in rewarders
+              ],
+              'removeHistoryCount': len(remove_history),
+              'fundedUnregisteredRewarders': funded_unregistered,
+              'accruingUnregisteredRewarders': accruing_unregistered,
+              'removedRewarderClaimCandidate': summary['removedRewarderClaimCandidate'],
+          }, indent=2))
+          PY
+          python3 bucket-borrow-rewarder-lifecycle-r9/census.py | tee bucket-borrow-rewarder-lifecycle-r9/run.log
+          find bucket-borrow-rewarder-lifecycle-r9 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-borrow-rewarder-lifecycle-r9/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-borrow-rewarder-lifecycle-r9 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-borrow-rewarder-lifecycle-r9/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          print('BUCKET_BORROW_REWARDER_LIFECYCLE_R9_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-borrow-rewarder-lifecycle-r9
+          path: bucket-borrow-rewarder-lifecycle-r9
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,319 @@
+name: Bucket Provider Mint-Domain Audit R6C
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  provider-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Audit live provider packages through normalized RPC and bytecode
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-provider-audit-r6c
+          mkdir -p bucket-provider-audit-r6c/{raw,asm,analysis}
+          cat > bucket-provider-audit-r6c/audit.py <<'PY'
+          import json
+          import pathlib
+          import re
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-provider-audit-r6c')
+          RAW = OUT / 'raw'
+          ASM = OUT / 'asm'
+          ANALYSIS = OUT / 'analysis'
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+          RPCS = [
+              'https://sui-mainnet-endpoint.blockvision.org',
+              'https://fullnode.mainnet.sui.io:443',
+          ]
+          PACKAGES = {
+              'cetus_lp': '0xb9204c991f982e4ec53dd9161ed56ff837716c81861929853e894d77eec71bea',
+              'momentum_lp': '0x42df76466b4df87f875e044dea3f011f3c0824ded63f77abbb41deb5aa8eb351',
+              'bluefin_lp': '0x266588b4ade88033ebe61e158ca25504b772fb7c1cdb89294a2c25c9073c3ecf',
+              'ferra_lp': '0x94d6ef0a563955eb3cca10752e7dda02729b6d3d5f11493d5c1e5971e9bde2af',
+              'steamm_lp': '0x00985a81917a9632acfa47f8e402ed389d0765f29eae25fc6bbbe047436fb6e5',
+              'current_lp_a': '0x7dd03ca2dfff17c40fd0b6d9e85b5e68f12499e68d35e5e8483a4c16409bfe42',
+              'current_lp_b': '0x66dc696ab05177efd117c6d80a0627b4b61ae10b2fbcccc37f81241ab7803611',
+              'contingency': '0xf5efcfb849fd4ea967a4b67a1d6b008c8246eaaf737dc14e226f27a9ade3f548',
+          }
+
+          def post(url, payload, retries=6, timeout=180):
+              data = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      req = urllib.request.Request(
+                          url,
+                          data=data,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-provider-audit-r6c/1',
+                          },
+                      )
+                      with urllib.request.urlopen(req, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2 ** attempt)
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def gql(query, variables=None):
+              body = post(GQL, {'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': str(exc)})
+              return {'failures': failures}
+
+          def result(wrapper):
+              return wrapper.get('result') if isinstance(wrapper, dict) else None
+
+          def dump(path, value):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          package_query = '''query Package($address:SuiAddress!) { object(address:$address) { address version digest previousTransaction { digest sender { address } } asMovePackage { address version linkage { originalId upgradedId version } typeOrigins { module struct definingId } modules { nodes { name disassembly } } } } }'''
+          checkpoint = gql('query { checkpoint { sequenceNumber timestamp } }')['checkpoint']
+
+          patterns = {
+              'mint': re.compile(r'usdb::mint', re.I),
+              'burn': re.compile(r'usdb::burn', re.I),
+              'treasury': re.compile(r'Treasury|borrow_cap|module_supply', re.I),
+              'split': re.compile(r'balance::split|coin::split', re.I),
+              'transfer': re.compile(r'transfer::', re.I),
+              'auth': re.compile(r'AdminCap|ManagerCap|tx_context::sender|assert_sender|authorized', re.I),
+              'oracle': re.compile(r'oracle|price|sqrt_price|tick|reserve', re.I),
+              'rounding': re.compile(r'floor|ceil|div_u64|mul_div|saturating|checked', re.I),
+              'external_call': re.compile(r'cetus|bluefin|momentum|ferra|steamm|current', re.I),
+          }
+
+          packages = []
+          functions = []
+          hits = []
+          transaction_summaries = []
+
+          for label, package_id in PACKAGES.items():
+              graph = gql(package_query, {'address': package_id})['object']
+              normalized_wrapper = rpc('sui_getNormalizedMoveModulesByPackage', [package_id])
+              normalized = result(normalized_wrapper)
+              dump(RAW / f'{label}_package.json', graph)
+              dump(RAW / f'{label}_normalized.json', normalized_wrapper)
+
+              move_package = (graph or {}).get('asMovePackage')
+              package_row = {
+                  'label': label,
+                  'package': package_id,
+                  'exists': move_package is not None,
+                  'version': (move_package or {}).get('version'),
+                  'linkage': (move_package or {}).get('linkage'),
+                  'type_origins': (move_package or {}).get('typeOrigins'),
+                  'modules': [],
+              }
+              if move_package:
+                  directory = ASM / label
+                  directory.mkdir(parents=True, exist_ok=True)
+                  for module in (move_package.get('modules') or {}).get('nodes', []):
+                      module_name = module.get('name')
+                      text = module.get('disassembly') or ''
+                      package_row['modules'].append(module_name)
+                      (directory / f'{module_name}.asm').write_text(text)
+                      lines = text.splitlines()
+                      for line_index, line in enumerate(lines):
+                          for kind, pattern in patterns.items():
+                              if pattern.search(line):
+                                  hits.append({
+                                      'label': label,
+                                      'package': package_id,
+                                      'module': module_name,
+                                      'kind': kind,
+                                      'line': line_index + 1,
+                                      'text': line.strip(),
+                                      'context': '\n'.join(lines[max(0, line_index - 22):min(len(lines), line_index + 30)]),
+                                  })
+              packages.append(package_row)
+
+              if isinstance(normalized, dict):
+                  for module_name, module in normalized.items():
+                      for function_name, function in (module.get('exposedFunctions') or {}).items():
+                          functions.append({
+                              'label': label,
+                              'package': package_id,
+                              'module': module_name,
+                              'function': function_name,
+                              'visibility': function.get('visibility'),
+                              'is_entry': function.get('isEntry'),
+                              'parameters': function.get('parameters') or [],
+                              'returns': function.get('return') or [],
+                              'type_parameters': function.get('typeParameters') or [],
+                          })
+
+              cursor = None
+              recent_calls = []
+              failures = []
+              for _ in range(10):
+                  wrapper = rpc('suix_queryTransactionBlocks', [
+                      {
+                          'filter': {'MoveFunction': {'package': package_id}},
+                          'options': {
+                              'showInput': True,
+                              'showEffects': True,
+                              'showEvents': True,
+                              'showObjectChanges': True,
+                              'showBalanceChanges': True,
+                          },
+                      },
+                      cursor,
+                      50,
+                      True,
+                  ])
+                  page = result(wrapper)
+                  if not isinstance(page, dict):
+                      failures.append(wrapper)
+                      break
+                  for tx in page.get('data') or []:
+                      try:
+                          commands = tx['transaction']['data']['transaction']['transactions']
+                      except Exception:
+                          commands = []
+                      for index, command in enumerate(commands or []):
+                          move = command.get('MoveCall') if isinstance(command, dict) else None
+                          if move and move.get('package') == package_id:
+                              recent_calls.append({
+                                  'digest': tx.get('digest'),
+                                  'timestampMs': tx.get('timestampMs'),
+                                  'sender': ((tx.get('transaction') or {}).get('data') or {}).get('sender'),
+                                  'status': (tx.get('effects') or {}).get('status'),
+                                  'index': index,
+                                  'module': move.get('module'),
+                                  'function': move.get('function'),
+                                  'type_arguments': move.get('type_arguments'),
+                                  'balance_changes': tx.get('balanceChanges'),
+                                  'object_changes': tx.get('objectChanges'),
+                              })
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('nextCursor')
+              dump(RAW / f'{label}_recent_calls.json', recent_calls)
+              dump(RAW / f'{label}_query_failures.json', failures)
+              counts = {}
+              for call in recent_calls:
+                  key = f"{call.get('module')}::{call.get('function')}"
+                  counts[key] = counts.get(key, 0) + 1
+              transaction_summaries.append({
+                  'label': label,
+                  'package': package_id,
+                  'call_count': len(recent_calls),
+                  'unique_senders': len({row.get('sender') for row in recent_calls if row.get('sender')}),
+                  'function_counts': counts,
+                  'query_failure_count': len(failures),
+              })
+
+          public_functions = [
+              row for row in functions
+              if str(row.get('visibility')).lower() == 'public' or row.get('is_entry')
+          ]
+          sensitive_words = (
+              'mint', 'burn', 'deposit', 'withdraw', 'redeem', 'claim',
+              'supply', 'remove', 'destroy', 'collect', 'contingency',
+              'borrow', 'repay', 'settle', 'liquidat',
+          )
+          sensitive_functions = [
+              row for row in public_functions
+              if any(word in json.dumps(row).lower() for word in sensitive_words)
+          ]
+          mint_hits = [row for row in hits if row['kind'] == 'mint']
+          burn_hits = [row for row in hits if row['kind'] == 'burn']
+
+          dump(ANALYSIS / 'functions.json', functions)
+          dump(ANALYSIS / 'public_functions.json', public_functions)
+          dump(ANALYSIS / 'sensitive_functions.json', sensitive_functions)
+          dump(ANALYSIS / 'hits.json', hits)
+
+          summary = {
+              'schema': 'bucket-provider-mint-domain-audit-r6c/v1',
+              'network': 'sui-mainnet',
+              'checkpoint': checkpoint,
+              'readOnly': True,
+              'packages': packages,
+              'public_function_count': len(public_functions),
+              'sensitive_functions': sensitive_functions,
+              'mint_hits': mint_hits,
+              'burn_hits': burn_hits,
+              'transaction_summaries': transaction_summaries,
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'packages': [
+                  {'label': row['label'], 'exists': row['exists'], 'modules': row['modules']}
+                  for row in packages
+              ],
+              'public_function_count': len(public_functions),
+              'sensitive_functions': sensitive_functions,
+              'mint_hits': [
+                  {'label': row['label'], 'module': row['module'], 'line': row['line'], 'text': row['text']}
+                  for row in mint_hits
+              ],
+              'burn_hits': [
+                  {'label': row['label'], 'module': row['module'], 'line': row['line'], 'text': row['text']}
+                  for row in burn_hits
+              ],
+              'transaction_summaries': transaction_summaries,
+          }, indent=2))
+          PY
+          python3 bucket-provider-audit-r6c/audit.py | tee bucket-provider-audit-r6c/run.log
+          find bucket-provider-audit-r6c -type f -print0 | sort -z | xargs -0 sha256sum > bucket-provider-audit-r6c/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-provider-audit-r6c && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-provider-audit-r6c/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          assert len(summary['packages']) == 8
+          print('BUCKET_PROVIDER_AUDIT_R6C_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-provider-audit-r6c
+          path: bucket-provider-audit-r6c
+          if-no-files-found: error
+          retention-days: 7

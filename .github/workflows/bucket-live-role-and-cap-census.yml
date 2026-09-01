@@ -1,0 +1,406 @@
+name: Bucket Live Role and Cap Census
+
+on:
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Query live Bucket objects through Sui GraphQL
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-live-census
+          mkdir -p bucket-live-census/raw
+          cat > bucket-live-census/census.py <<'PY'
+          import json
+          import pathlib
+          import re
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-live-census')
+          RAW = OUT / 'raw'
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+
+          ENTRY_CONFIG = '0x03e79aa64ac007d200aefdcb445e31e24f460279bab6c73babfb031b7464072e'
+          TREASURY = '0x4de1c29a89d6888ebf8f7ae20364571dce4e1e42b9c9221f7df924ad6f9e617d'
+          USD_ADMIN_CAP = '0x14bdc35f9759cdba6d6a76b5cb4f56341f7421e2bc814317a53463c003020e30'
+          USD_UPGRADE_CAP = '0x4035e8134f67518779278b3f3fcf9212249bde705a5f2e04005c686d7cf2f357'
+          CDP_UPGRADE_CAP = '0x9e9a1e879aa062c46e0beb731a974ee9de0c242989127d4da0b1edcf37bf7526'
+          CONFIG_ADMIN_CAP = '0xd1ce0affeda5aa8f3ec50ff617f27717673acd74fecaf850a7d1096f421d4131'
+          KNOWN_MANAGER = '0x3b23b0a29ff0cd68144930cc409d242fdc10201ac9d9159d3c597252e8e0781e'
+          CDP_ORIGINAL = '0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e'
+          CDP_KNOWN_CALL_TARGET = '0xc1dd29778f3fccd19a4ac79d1c35a14bf9d65a0b48f1c5bba98a949cacc53e26'
+          HEX_ID = re.compile(r'^0x[0-9a-fA-F]{64}$')
+
+          # Historical SDK list is only a fallback. The live on-chain config is authoritative.
+          FALLBACK_VAULTS = [
+              '0xdb3b2f1ce99c935a5c5e14ce8321e0c252a8b16c50861407d2253d392d5fb836',
+              '0x1e90eb4184e3303ee69d1728630c872b214f8699982b00dc39aabde8b4ff5ce3',
+              '0x38057191f48cf748d3b018e83ec0dda9f769f3f2d98010561002d6d2378f8ec3',
+              '0x13ca385797229d6ad23a3ff0981fc30971735b0efd307d02920b58730d923a14',
+              '0x6677cdcc3186900914823fc8e5de7a2d1e874bbc0682cbcf7637ddf9342b1cbd',
+              '0xe1c7630ef33094491ab291bed669fcc64a48a88fcc99ddc200bcc38deb00400e',
+              '0xf985037e218946d20344810be7c07e42e7fae1666cdce60e7f028706768daed0',
+              '0xbd0079fb337dc5c79ae8f522aab72fcda38b6f10e38f2477c075777d8b1ac263',
+              '0x5d76ee14fc4b1f501653c65eb3dc2ba0cd42f7d0d11480a840322e77d4b56362',
+              '0xd3ef65a1dec4b5c5f0e0bb7caf29f4a425bd04ad43bce942ec6e1c70385b79de',
+              '0x9cd535e14d25767387e29798cfd61cf8c780d4836798cd64a5ce0d6fdc4659b2',
+              '0xee2d62b04abd9064a5526043395e09b0481e89fa3309d428fcb271ac53ce3103',
+              '0x755c54dd718d350afd03314fe6ccc71e0ab36a974caf6721f1e03b7675dfaba1',
+              '0xb36fea26a681f44b9a075297ddb9ebb9d4f35210c48d133e767bb294ac6427c6',
+              '0x2169f7a9f7c693265dad755bd7e75382e88cc4432595a22950432cb512bc6cd7',
+              '0x83367e510389536e2041d50b3faabc2d1b1c8194ca5570a2a3a3e460d6113e86',
+              '0x542eff36534bc5d7d07808953ebb8c580c23f047b41c094601d40a0fc7e99238',
+              '0x1f32b8b587b69a97cb779b2df1e2aa90f6fbb43edcc887f11a8f4a6de0944937',
+              '0x94f785bda085beb012e9e96d16a36cf16b6729f776e620ef8c3b37d1e06c2d82',
+              '0x61c4f4e0849de36b840a5198dbe0ac5bbdedf3a514f8a66ecedd2c6f7b2fb380',
+          ]
+
+          OBJECT_QUERY = '''
+          query Objects($keys: [ObjectKey!]!) {
+            multiGetObjects(keys: $keys) {
+              address
+              version
+              digest
+              owner {
+                __typename
+                ... on AddressOwner { address { address } }
+                ... on ObjectOwner { address { address } }
+              }
+              previousTransaction { digest sender { address } }
+              asMoveObject {
+                contents { type { repr } json bcs }
+              }
+              asMovePackage {
+                address
+                version
+                linkage { originalId upgradedId version }
+                typeOrigins { module struct definingId }
+              }
+            }
+          }
+          '''
+
+          ADDRESS_QUERY = '''
+          query AddressObjects($address: SuiAddress!) {
+            address(address: $address) {
+              address
+              objects(first: 100) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  address
+                  version
+                  owner {
+                    __typename
+                    ... on AddressOwner { address { address } }
+                    ... on ObjectOwner { address { address } }
+                  }
+                  asMoveObject { contents { type { repr } json bcs } }
+                }
+              }
+            }
+          }
+          '''
+
+          def post(query, variables, retries=5):
+              payload = json.dumps({'query': query, 'variables': variables}).encode()
+              last = None
+              for attempt in range(retries):
+                  req = urllib.request.Request(
+                      GQL,
+                      data=payload,
+                      method='POST',
+                      headers={
+                          'Content-Type': 'application/json',
+                          'User-Agent': 'bucket-live-role-cap-census/2',
+                      },
+                  )
+                  try:
+                      with urllib.request.urlopen(req, timeout=90) as r:
+                          body = json.loads(r.read().decode())
+                          if body.get('errors'):
+                              raise RuntimeError(json.dumps(body['errors']))
+                          return body
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2 ** attempt)
+              raise RuntimeError(f'GraphQL failed after {retries} attempts: {last}')
+
+          def dump(name, value):
+              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def get_objects(ids):
+              ids = list(dict.fromkeys(x.lower() for x in ids if HEX_ID.match(x)))
+              out = []
+              for i in range(0, len(ids), 40):
+                  batch = ids[i:i+40]
+                  body = post(OBJECT_QUERY, {'keys': [{'address': x} for x in batch]})
+                  out.extend(body['data']['multiGetObjects'])
+              return out
+
+          def content(obj):
+              if not obj:
+                  return None, None
+              mo = obj.get('asMoveObject')
+              if not mo or not mo.get('contents'):
+                  return None, None
+              c = mo['contents']
+              return (c.get('type') or {}).get('repr'), c.get('json')
+
+          def owner_summary(obj):
+              if not obj:
+                  return None
+              o = obj.get('owner') or {}
+              address = ((o.get('address') or {}).get('address'))
+              return {'kind': o.get('__typename'), 'address': address}
+
+          def collect_hex_ids(value, out):
+              if isinstance(value, str) and HEX_ID.match(value):
+                  out.add(value.lower())
+              elif isinstance(value, list):
+                  for x in value: collect_hex_ids(x, out)
+              elif isinstance(value, dict):
+                  for x in value.values(): collect_hex_ids(x, out)
+
+          def as_int(v):
+              try: return int(v)
+              except Exception: return None
+
+          def managers_from_vault(j):
+              try:
+                  managers = j['access_control']['managers']
+                  if isinstance(managers, dict): managers = managers.get('contents', [])
+                  result = []
+                  for item in managers or []:
+                      if isinstance(item, dict):
+                          result.append({'address': item.get('key'), 'level': as_int(item.get('value'))})
+                  return result
+              except Exception:
+                  return []
+
+          # 1. Entry config and its referenced subobjects.
+          seed_objects = get_objects([ENTRY_CONFIG])
+          dump('01_entry_config.json', seed_objects)
+          entry_type, entry_json = content(seed_objects[0])
+          sub_ids = []
+          if isinstance(entry_json, dict):
+              sub_ids = [x.lower() for x in entry_json.get('id_vector', []) if isinstance(x, str)]
+          sub_objects = get_objects(sub_ids)
+          dump('02_config_subobjects.json', sub_objects)
+
+          # 2. Derive current package/object/vault IDs from authoritative config.
+          package_config = None
+          object_config = None
+          vault_registry = None
+          all_config_ids = set()
+          for obj in sub_objects:
+              t, j = content(obj)
+              collect_hex_ids(j, all_config_ids)
+              if t and t.endswith('::package_config::PackageConfig'):
+                  package_config = j
+              elif t and t.endswith('::object_config::ObjectConfig'):
+                  object_config = j
+              elif t and t.endswith('::vault::Vault'):
+                  vault_registry = j
+
+          live_cdp_package = None
+          if isinstance(package_config, dict):
+              live_cdp_package = package_config.get('cdp_package_id')
+
+          configured_treasury = None
+          if isinstance(object_config, dict):
+              x = object_config.get('treasury_obj')
+              if isinstance(x, str): configured_treasury = x
+              elif isinstance(x, dict): configured_treasury = x.get('id') or x.get('objectId')
+
+          vault_ids = set(FALLBACK_VAULTS)
+          if isinstance(vault_registry, dict):
+              table = vault_registry.get('table')
+              entries = table.get('contents', []) if isinstance(table, dict) else (table or [])
+              for entry in entries:
+                  value = entry.get('value') if isinstance(entry, dict) else None
+                  ids = set(); collect_hex_ids(value, ids)
+                  # VaultInfo entries contain the shared vault ID plus optional rewarder IDs.
+                  # Prefer explicit vault.id/objectId when available; otherwise add all and filter by type later.
+                  explicit = None
+                  if isinstance(value, dict):
+                      v = value.get('vault')
+                      if isinstance(v, str): explicit = v
+                      elif isinstance(v, dict): explicit = v.get('id') or v.get('objectId')
+                  if explicit and HEX_ID.match(explicit): vault_ids.add(explicit.lower())
+                  else: vault_ids.update(ids)
+
+          # 3. Query every relevant live object in one bounded census.
+          query_ids = set(vault_ids)
+          query_ids.update(all_config_ids)
+          query_ids.update([
+              TREASURY, configured_treasury or TREASURY, USD_ADMIN_CAP, USD_UPGRADE_CAP,
+              CDP_UPGRADE_CAP, CONFIG_ADMIN_CAP, CDP_ORIGINAL, CDP_KNOWN_CALL_TARGET,
+          ])
+          if isinstance(live_cdp_package, str): query_ids.add(live_cdp_package)
+          all_objects = get_objects(sorted(query_ids))
+          dump('03_all_relevant_objects.json', all_objects)
+          by_id = {o['address'].lower(): o for o in all_objects if o and o.get('address')}
+
+          # 4. Parse vaults, live exposure, and manager assignments.
+          vaults = []
+          managers = {}
+          total_debt = 0
+          total_supply = 0
+          total_vault_limit = 0
+          for oid, obj in by_id.items():
+              t, j = content(obj)
+              if not (t and '::vault::Vault<' in t and isinstance(j, dict)):
+                  continue
+              limited = j.get('limited_supply') or {}
+              debt = as_int(j.get('total_debt_amount')) or 0
+              supply = as_int(limited.get('supply')) or 0
+              limit = as_int(limited.get('limit')) or 0
+              mgrs = managers_from_vault(j)
+              for m in mgrs:
+                  managers.setdefault(str(m.get('address')).lower(), []).append({
+                      'vault_id': oid, 'vault_type': t, 'level': m.get('level'), 'debt_raw': debt,
+                  })
+              positions = j.get('position_table') or {}
+              pos_size = as_int(positions.get('size'))
+              row = {
+                  'id': oid,
+                  'type': t,
+                  'version': obj.get('version'),
+                  'security_level': j.get('security_level'),
+                  'managers': mgrs,
+                  'total_debt_raw': debt,
+                  'total_collateral_raw': as_int(j.get('total_coll_amount')),
+                  'position_count': pos_size,
+                  'vault_supply_raw': supply,
+                  'vault_limit_raw': limit,
+                  'vault_headroom_raw': max(limit - supply, 0),
+                  'interest_rate_raw': ((j.get('interest_rate') or {}).get('value')),
+                  'mcr_raw': ((j.get('min_collateral_ratio') or {}).get('value')),
+              }
+              vaults.append(row)
+              total_debt += debt
+              total_supply += supply
+              total_vault_limit += limit
+          vaults.sort(key=lambda x: x['total_debt_raw'], reverse=True)
+
+          # 5. Treasury module config and module cap.
+          treasury_obj = by_id.get((configured_treasury or TREASURY).lower()) or by_id.get(TREASURY.lower())
+          treasury_type, treasury_json = content(treasury_obj)
+          module_configs = []
+          if isinstance(treasury_json, dict):
+              mmap = treasury_json.get('module_config_map') or treasury_json.get('module_configs') or {}
+              entries = mmap.get('contents', []) if isinstance(mmap, dict) else (mmap or [])
+              for entry in entries:
+                  if not isinstance(entry, dict): continue
+                  module_configs.append({'key': entry.get('key'), 'value': entry.get('value')})
+          cdp_module = None
+          for row in module_configs:
+              if 'BucketV2CDP' in json.dumps(row.get('key')):
+                  cdp_module = row
+                  break
+
+          def find_numeric(node, keys):
+              if isinstance(node, dict):
+                  for k in keys:
+                      if k in node and as_int(node[k]) is not None: return as_int(node[k])
+                  for v in node.values():
+                      x = find_numeric(v, keys)
+                      if x is not None: return x
+              elif isinstance(node, list):
+                  for v in node:
+                      x = find_numeric(v, keys)
+                      if x is not None: return x
+              return None
+
+          module_supply = find_numeric((cdp_module or {}).get('value'), ['supply', 'current_supply'])
+          module_limit = find_numeric((cdp_module or {}).get('value'), ['limit', 'supply_limit', 'max_supply'])
+          module_headroom = None if module_supply is None or module_limit is None else module_limit - module_supply
+
+          # 6. Resolve owners and the known manager's owned capability set.
+          cap_ids = [USD_ADMIN_CAP, USD_UPGRADE_CAP, CDP_UPGRADE_CAP, CONFIG_ADMIN_CAP]
+          cap_owners = {x: owner_summary(by_id.get(x.lower())) for x in cap_ids}
+          owner_ids = [x['address'] for x in cap_owners.values() if x and x.get('address')]
+          owner_objects = get_objects(owner_ids)
+          dump('04_cap_owner_objects.json', owner_objects)
+
+          manager_owned = post(ADDRESS_QUERY, {'address': KNOWN_MANAGER})
+          dump('05_known_manager_owned_objects.json', manager_owned)
+
+          summary = {
+              'captured_unix': int(time.time()),
+              'network': 'sui-mainnet',
+              'writes': 0,
+              'transactions_constructed': 0,
+              'entry_config': {'id': ENTRY_CONFIG, 'type': entry_type, 'subobject_ids': sub_ids},
+              'live_config': {
+                  'cdp_package_id': live_cdp_package,
+                  'configured_treasury': configured_treasury,
+                  'package_config': package_config,
+                  'object_config': object_config,
+              },
+              'vault_totals': {
+                  'active_vault_objects_found': len(vaults),
+                  'total_debt_raw': total_debt,
+                  'sum_vault_supply_raw': total_supply,
+                  'sum_vault_limits_raw': total_vault_limit,
+                  'sum_vault_headroom_raw': total_vault_limit - total_supply,
+              },
+              'vaults': vaults,
+              'manager_assignments': managers,
+              'known_manager': KNOWN_MANAGER,
+              'treasury': {
+                  'type': treasury_type,
+                  'module_config_count': len(module_configs),
+                  'cdp_module_config': cdp_module,
+                  'module_supply_raw': module_supply,
+                  'module_limit_raw': module_limit,
+                  'module_headroom_raw': module_headroom,
+              },
+              'cap_owners': cap_owners,
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'vault_totals': summary['vault_totals'],
+              'known_manager_assignments': managers.get(KNOWN_MANAGER.lower(), []),
+              'treasury': summary['treasury'],
+              'cap_owners': cap_owners,
+              'live_cdp_package_id': live_cdp_package,
+          }, indent=2))
+          PY
+          python3 bucket-live-census/census.py | tee bucket-live-census/run.log
+          find bucket-live-census -type f -print0 | sort -z | xargs -0 sha256sum > bucket-live-census/SHA256SUMS.txt
+
+      - name: Enforce read-only boundary and required evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-live-census && exit 1 || true
+          python3 - <<'PY'
+          import json
+          s=json.load(open('bucket-live-census/SUMMARY.json'))
+          assert s['writes'] == 0
+          assert s['transactions_constructed'] == 0
+          assert s['entry_config']['subobject_ids'], 'entry config did not resolve'
+          assert s['vault_totals']['active_vault_objects_found'] > 0, 'no vault objects resolved'
+          print('BUCKET_LIVE_CENSUS_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-live-role-and-cap-census
+          path: bucket-live-census
+          if-no-files-found: error
+          retention-days: 7

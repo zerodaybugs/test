@@ -1,0 +1,293 @@
+name: Bucket R21 Materiality and Duplicate Gate
+
+on:
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+    paths:
+      - '.github/workflows/bucket-r21-materiality-duplicate-gate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  materiality-duplicate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/bucket-pyth-revival-gate-20260809
+          fetch-depth: 0
+
+      - name: Install public-report inspection tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y poppler-utils
+
+      - name: Bind promoted candidates to live exposure and duplicate corpus
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-r21-materiality-duplicate
+          mkdir -p bucket-r21-materiality-duplicate/{raw,audits,text,analysis}
+          cat > bucket-r21-materiality-duplicate/gate.py <<'PY'
+          import json
+          import pathlib
+          import re
+          import subprocess
+          import time
+          import urllib.parse
+          import urllib.request
+
+          OUT=pathlib.Path('bucket-r21-materiality-duplicate')
+          RAW=OUT/'raw'; AUDITS=OUT/'audits'; TEXT=OUT/'text'; ANALYSIS=OUT/'analysis'
+          RPCS=['https://fullnode.mainnet.sui.io:443','https://sui-mainnet-endpoint.blockvision.org']
+          HERMES='https://hermes.pyth.network'
+          COMPACT_PATH=pathlib.Path('analysis-results/bucket-r20/COMPACT.json')
+          FULL_PATH=pathlib.Path('analysis-results/bucket-r20/FULL_SUMMARY.json')
+          POOLS={
+              'USDC':'0x37721762186721fb6eaf053f249aaf594503a6ad98dbcc998916be78d20a2df4',
+              'BUCK':'0x4fef507f41f5b141625f0f193283820fbee26e883f24212d149e4220320ae321',
+          }
+          AUDIT_FILES=[
+              'Movebit_Bucket_V2_Report_Final_Report.pdf',
+              'Hashlock_Bucket_V2_Report_Final_Report.pdf',
+              'Quantstamp_Bucket_V2_Final_Report.pdf',
+          ]
+
+          def request(url,payload=None,retries=6,timeout=180,headers=None):
+              last=None
+              for attempt in range(retries):
+                  try:
+                      data=None if payload is None else json.dumps(payload).encode()
+                      base={'Content-Type':'application/json','User-Agent':'bucket-r21-materiality/1'}
+                      if headers: base.update(headers)
+                      req=urllib.request.Request(url,data=data,method='GET' if payload is None else 'POST',headers=base)
+                      with urllib.request.urlopen(req,timeout=timeout) as response: return response.read()
+                  except Exception as exc:
+                      last=exc; time.sleep(min(2**attempt,30))
+              raise RuntimeError(f'request failed {url}: {last}')
+
+          def rpc(method,params):
+              failures=[]
+              for endpoint in RPCS:
+                  try:
+                      body=json.loads(request(endpoint,{'jsonrpc':'2.0','id':1,'method':method,'params':params}).decode())
+                      if body.get('error'): raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint':endpoint,'result':body.get('result')}
+                  except Exception as exc: failures.append({'endpoint':endpoint,'error':str(exc)})
+              return {'failures':failures}
+
+          def result(wrapper): return wrapper.get('result') if isinstance(wrapper,dict) else None
+          def dump(path,value):
+              path.parent.mkdir(parents=True,exist_ok=True)
+              path.write_text(json.dumps(value,indent=2,sort_keys=True)+'\n')
+          def walk(value,path=()):
+              if isinstance(value,dict):
+                  for key,child in value.items(): yield from walk(child,path+(str(key),))
+              elif isinstance(value,list):
+                  for index,child in enumerate(value): yield from walk(child,path+(str(index),))
+              else: yield '.'.join(path),value
+          def integer(value):
+              if isinstance(value,bool) or value is None: return None
+              if isinstance(value,int): return value
+              if isinstance(value,str) and (value.isdigit() or (value.startswith('-') and value[1:].isdigit())): return int(value)
+              if isinstance(value,dict):
+                  for key in ('value','magnitude'):
+                      if key in value:
+                          inner=integer(value[key])
+                          if inner is not None: return -inner if value.get('negative') or value.get('is_negative') else inner
+                  if isinstance(value.get('fields'),dict): return integer(value['fields'])
+              return None
+          def generic_arg(type_name):
+              if not isinstance(type_name,str) or '<' not in type_name or '>' not in type_name: return None
+              return type_name[type_name.find('<')+1:type_name.rfind('>')]
+
+          compact=json.loads(COMPACT_PATH.read_text()) if COMPACT_PATH.exists() else {}
+          full=json.loads(FULL_PATH.read_text()) if FULL_PATH.exists() else {}
+          positive=compact.get('nextGate')=='R21_MATERIALITY_AND_DUPLICATE_SCAN'
+          promoted=compact.get('promotedCandidates') or []
+
+          pool_rows={}
+          for label,object_id in POOLS.items():
+              wrapper=rpc('sui_getObject',[object_id,{
+                  'showType':True,'showOwner':True,'showPreviousTransaction':True,
+                  'showDisplay':False,'showContent':True,'showBcs':True,
+              }])
+              dump(RAW/f'pool_{label}.json',wrapper)
+              data=(result(wrapper) or {}).get('data') if isinstance(result(wrapper),dict) else None
+              fields=((data or {}).get('content') or {}).get('fields') or {}
+              numerics=[]
+              for path,value in walk(fields):
+                  number=integer(value)
+                  if number is None: continue
+                  if re.search(r'balance|supply|liquidity|reserve|limit|amount|fee',path,re.I):
+                      numerics.append({'path':path,'valueRaw':number})
+              pool_type=(data or {}).get('type')
+              coin_type=generic_arg(pool_type)
+              metadata=result(rpc('suix_getCoinMetadata',[coin_type])) if coin_type else None
+              decimals=(metadata or {}).get('decimals') if isinstance(metadata,dict) else None
+              pool_rows[label]={
+                  'objectId':object_id,'type':pool_type,'owner':(data or {}).get('owner'),
+                  'version':(data or {}).get('version'),'previousTransaction':(data or {}).get('previousTransaction'),
+                  'coinType':coin_type,'coinMetadata':metadata,'decimals':decimals,'numericCandidates':numerics,
+              }
+
+          # Conservative exposure candidates: only explicitly named balance/reserve/liquidity/supply fields.
+          exposure_rows=[]
+          for promoted_row in promoted:
+              label=promoted_row.get('target')
+              pool=pool_rows.get(label) or {}
+              decimals=pool.get('decimals')
+              advantage_bps=float(promoted_row.get('maxAdvantageBps') or 0)
+              candidates=[]
+              for row in pool.get('numericCandidates') or []:
+                  path=row['path'].lower()
+                  if re.search(r'(^|\.)(balance_amount|balance|reserve|liquidity|usdb_supply|total_supply)(\.|$)',path):
+                      candidates.append(row)
+              for row in candidates:
+                  raw=max(0,int(row['valueRaw']))
+                  units=(raw/(10**decimals)) if isinstance(decimals,int) else None
+                  extractable_raw=int(raw*advantage_bps/10000)
+                  extractable_units=(extractable_raw/(10**decimals)) if isinstance(decimals,int) else None
+                  exposure_rows.append({
+                      'target':label,'pool':pool.get('objectId'),'path':row['path'],'balanceRaw':raw,
+                      'decimals':decimals,'balanceUnits':units,'advantageBps':advantage_bps,
+                      'conservativeExtractableRaw':extractable_raw,'conservativeExtractableUnits':extractable_units,
+                  })
+          dump(ANALYSIS/'exposure_rows.json',exposure_rows)
+
+          # Public audit duplicate corpus.
+          base='https://raw.githubusercontent.com/Bucket-Protocol/Audit/main/BucketV2/'
+          audit_results=[]
+          overlap_pattern=re.compile(r'(pyth|priceinfo|price info|stale|tolerance|replay).{0,500}(psm|swap|oracle|price)|(?:psm|swap|oracle|price).{0,500}(pyth|priceinfo|price info|stale|tolerance|replay)',re.I|re.S)
+          for filename in AUDIT_FILES:
+              pdf=AUDITS/filename
+              try:
+                  pdf.write_bytes(request(base+filename,headers={'Accept':'application/pdf'}))
+                  txt=TEXT/(filename+'.txt')
+                  subprocess.run(['pdftotext','-layout',str(pdf),str(txt)],check=True)
+                  text=txt.read_text(errors='replace')
+                  overlaps=[' '.join(match.group(0).split())[:1600] for match in list(overlap_pattern.finditer(text))[:40]]
+                  audit_results.append({'file':filename,'downloaded':True,'overlapCount':len(overlaps),'overlaps':overlaps})
+              except Exception as exc:
+                  audit_results.append({'file':filename,'downloaded':False,'error':str(exc),'overlapCount':None,'overlaps':[]})
+          dump(ANALYSIS/'audit_duplicate_scan.json',audit_results)
+
+          # Source-history and GitHub public search for the exact tolerance/replay concepts.
+          history_dir=OUT/'source'
+          history_dir.mkdir()
+          clone_log=''
+          history_hits=[]
+          try:
+              proc=subprocess.run(['git','clone','--filter=blob:none','--no-checkout','https://github.com/Bucket-Protocol/bucket-interface.git',str(history_dir/'bucket-interface')],capture_output=True,text=True,timeout=240)
+              clone_log=proc.stdout+'\n'+proc.stderr
+              if proc.returncode==0:
+                  repo=history_dir/'bucket-interface'
+                  subprocess.run(['git','-C',str(repo),'checkout','main','--','bucket-protocol-v2'],capture_output=True,text=True,timeout=240)
+                  for needle in ('600000','set_tolerance_sec','PriceInfoObject','tolerance_sec_map'):
+                      log=subprocess.run(['git','-C',str(repo),'log','--all','--oneline','-S',needle,'--','bucket-protocol-v2'],capture_output=True,text=True,timeout=180)
+                      history_hits.append({'needle':needle,'matches':[line for line in log.stdout.splitlines() if line.strip()][:100]})
+          except Exception as exc:
+              clone_log+=f'\nERROR: {exc}'
+          (ANALYSIS/'source_clone.log').write_text(clone_log)
+          dump(ANALYSIS/'source_history_hits.json',history_hits)
+
+          github_search=[]
+          token=__import__('os').environ.get('GH_TOKEN')
+          headers={'Accept':'application/vnd.github+json'}
+          if token: headers['Authorization']=f'Bearer {token}'
+          for query in (
+              'repo:Bucket-Protocol/bucket-interface "600000"',
+              'repo:Bucket-Protocol/bucket-interface "set_tolerance_sec"',
+              'org:Bucket-Protocol "stale price"',
+              'org:Bucket-Protocol "PriceInfoObject" replay',
+          ):
+              try:
+                  url='https://api.github.com/search/code?'+urllib.parse.urlencode({'q':query,'per_page':50})
+                  payload=json.loads(request(url,headers=headers).decode())
+                  github_search.append({'query':query,'totalCount':payload.get('total_count'),'items':[{'name':row.get('name'),'path':row.get('path'),'repository':(row.get('repository') or {}).get('full_name'),'htmlUrl':row.get('html_url')} for row in payload.get('items') or []]})
+              except Exception as exc: github_search.append({'query':query,'error':str(exc)})
+          dump(ANALYSIS/'github_duplicate_search.json',github_search)
+
+          exact_audit_overlap=sum((row.get('overlapCount') or 0) for row in audit_results)
+          source_history_hit_count=sum(len(row.get('matches') or []) for row in history_hits)
+          max_extractable_units=max([row.get('conservativeExtractableUnits') or 0 for row in exposure_rows] or [0])
+          unambiguous_exposure=bool(exposure_rows) and all(isinstance(row.get('decimals'),int) for row in exposure_rows)
+          # USD materiality is deliberately not inferred from token units without an independently bound live price.
+          material_high=False
+          duplicate_clean=(exact_audit_overlap==0)
+          summary={
+              'schema':'bucket-r21-materiality-duplicate/v1','network':'sui-mainnet','readOnly':True,
+              'r20PositivePromotion':positive,'r20Compact':compact,
+              'promotedCandidates':promoted,'pools':pool_rows,'exposureRows':exposure_rows,
+              'maxConservativeExtractableUnits':max_extractable_units,
+              'auditDuplicateScan':audit_results,'sourceHistoryHits':history_hits,'githubSearch':github_search,
+              'gates':{
+                  'r20PositivePromotion':positive,
+                  'unambiguousLiveExposureBound':unambiguous_exposure,
+                  'auditExactOrNearOverlapCount':exact_audit_overlap,
+                  'auditDuplicateClean':duplicate_clean,
+                  'sourceHistoryHitCount':source_history_hit_count,
+                  'liveUsdMaterialityBound':False,
+                  'materialHighOrCriticalImpactProven':material_high,
+                  'scopeVerified':False,
+              },
+              'duplicateRisk':('HIGH' if exact_audit_overlap>0 else 'MEDIUM' if source_history_hit_count>0 else 'LOW_UNVERIFIED'),
+              'submissionReady':False,
+              'requiredNextGate':(
+                  'LIVE_USD_MATERIALITY_AND_SCOPE'
+                  if positive and unambiguous_exposure and duplicate_clean
+                  else 'KILL_R20_NON_MATERIAL_OR_DUPLICATE'
+                  if positive
+                  else 'KILL_NO_R20_PROMOTION'
+              ),
+              'writes':0,'transactionsConstructed':0,'productionTransactionsSubmitted':0,
+              'generatedUnix':int(time.time()),
+          }
+          (OUT/'SUMMARY.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({
+              'r20PositivePromotion':positive,'promotedCandidates':promoted,
+              'exposureRows':exposure_rows,'maxConservativeExtractableUnits':max_extractable_units,
+              'auditExactOrNearOverlapCount':exact_audit_overlap,'sourceHistoryHitCount':source_history_hit_count,
+              'duplicateRisk':summary['duplicateRisk'],'gates':summary['gates'],
+              'requiredNextGate':summary['requiredNextGate'],'submissionReady':summary['submissionReady'],
+          },indent=2))
+          PY
+          GH_TOKEN="$GH_TOKEN" python3 bucket-r21-materiality-duplicate/gate.py | tee bucket-r21-materiality-duplicate/run.log
+          find bucket-r21-materiality-duplicate -type f ! -path '*/source/bucket-interface/.git/*' -print0 | sort -z | xargs -0 sha256sum > bucket-r21-materiality-duplicate/SHA256SUMS.txt
+
+      - name: Validate read-only and no-submit boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-r21-materiality-duplicate/gate.py bucket-r21-materiality-duplicate/SUMMARY.json && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary=json.load(open('bucket-r21-materiality-duplicate/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes']==0 and summary['transactionsConstructed']==0
+          assert summary['productionTransactionsSubmitted']==0
+          assert summary['submissionReady'] is False
+          print('BUCKET_R21_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-r21-materiality-duplicate
+          path: |
+            bucket-r21-materiality-duplicate/SUMMARY.json
+            bucket-r21-materiality-duplicate/run.log
+            bucket-r21-materiality-duplicate/SHA256SUMS.txt
+            bucket-r21-materiality-duplicate/raw
+            bucket-r21-materiality-duplicate/audits
+            bucket-r21-materiality-duplicate/text
+            bucket-r21-materiality-duplicate/analysis
+          if-no-files-found: error
+          retention-days: 7

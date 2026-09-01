@@ -1,0 +1,288 @@
+name: Bucket PSM ACL Direct Resolution R8
+
+on:
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve known ACL, struct-type indexes, and ACL mutation history
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-psm-acl-direct-r8
+          mkdir -p bucket-psm-acl-direct-r8/raw
+          cat > bucket-psm-acl-direct-r8/probe.py <<'PY'
+          import json
+          import pathlib
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-psm-acl-direct-r8')
+          RAW = OUT / 'raw'
+          RPCS = [
+              'https://fullnode.mainnet.sui.io:443',
+              'https://sui-mainnet-endpoint.blockvision.org',
+          ]
+          PSM_ORIGIN = '0xc2ae6693383e4a81285136effc8190c7baaf0e75aafa36d1c69cd2170cfc3803'
+          PSM_CURRENT = '0x8a46afe6ab0b972e2ee3923f5669104ae9465c12b84cd5e78ea1ff6404e4bfaf'
+          KNOWN_ACL = '0xac135783599c19f7fd0f3462c1bbde8639ae4519e72aee759630d5cdf559f3cc'
+          CANDIDATE_TYPES = [
+              f'{PSM_ORIGIN}::pool::AccessControl',
+              f'{PSM_CURRENT}::pool::AccessControl',
+          ]
+
+          def post(url, payload, retries=6, timeout=180):
+              body = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      request = urllib.request.Request(
+                          url,
+                          data=body,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-psm-acl-direct-r8/1',
+                          },
+                      )
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2 ** attempt, 30))
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': str(exc)})
+              return {'failures': failures}
+
+          def dump(name, value):
+              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def walk(value, path=()):
+              if isinstance(value, dict):
+                  for key, child in value.items():
+                      yield from walk(child, path + (str(key),))
+              elif isinstance(value, list):
+                  for index, child in enumerate(value):
+                      yield from walk(child, path + (str(index),))
+              else:
+                  yield '.'.join(path), value
+
+          def addresses(value):
+              found = set()
+              for _, scalar in walk(value):
+                  if isinstance(scalar, str) and scalar.startswith('0x') and len(scalar) == 66:
+                      found.add(scalar)
+              return sorted(found)
+
+          object_options = {
+              'showType': True,
+              'showOwner': True,
+              'showPreviousTransaction': True,
+              'showDisplay': False,
+              'showContent': True,
+              'showBcs': True,
+          }
+
+          known = rpc('sui_getObject', [KNOWN_ACL, object_options])
+          dump('known_acl.json', known)
+
+          indexed = {}
+          discovered_ids = {KNOWN_ACL}
+          for type_name in CANDIDATE_TYPES:
+              rows = []
+              cursor = None
+              for page_index in range(20):
+                  wrapper = rpc('suix_queryObjects', [{
+                      'filter': {'StructType': type_name},
+                      'options': object_options,
+                  }, cursor, 50])
+                  result = wrapper.get('result') if isinstance(wrapper, dict) else None
+                  if not isinstance(result, dict):
+                      rows.append({'queryFailure': wrapper})
+                      break
+                  rows.extend(result.get('data') or [])
+                  for item in result.get('data') or []:
+                      data = item.get('data') if isinstance(item, dict) else None
+                      object_id = (data or {}).get('objectId')
+                      if object_id:
+                          discovered_ids.add(object_id)
+                  if not result.get('hasNextPage'):
+                      break
+                  cursor = result.get('nextCursor')
+              indexed[type_name] = rows
+              dump(f'query_objects_{type_name.split("::")[0]}.json', rows)
+
+          tx_options = {
+              'showInput': True,
+              'showRawInput': False,
+              'showEffects': True,
+              'showEvents': True,
+              'showObjectChanges': True,
+              'showBalanceChanges': False,
+          }
+          history = []
+          for package in (PSM_ORIGIN, PSM_CURRENT):
+              for function in ('create_acl', 'add_manager', 'remove_manager'):
+                  cursor = None
+                  for page_index in range(20):
+                      wrapper = rpc('suix_queryTransactionBlocks', [{
+                          'filter': {
+                              'MoveFunction': {
+                                  'package': package,
+                                  'module': 'pool',
+                                  'function': function,
+                              }
+                          },
+                          'options': tx_options,
+                      }, cursor, 50, False])
+                      result = wrapper.get('result') if isinstance(wrapper, dict) else None
+                      if not isinstance(result, dict):
+                          history.append({
+                              'package': package,
+                              'function': function,
+                              'queryFailure': wrapper,
+                          })
+                          break
+                      for tx in result.get('data') or []:
+                          row = {
+                              'package': package,
+                              'function': function,
+                              'digest': tx.get('digest'),
+                              'timestampMs': tx.get('timestampMs'),
+                              'sender': (((tx.get('transaction') or {}).get('data') or {}).get('sender')),
+                              'transaction': tx.get('transaction'),
+                              'effects': tx.get('effects'),
+                              'events': tx.get('events'),
+                              'objectChanges': tx.get('objectChanges'),
+                          }
+                          history.append(row)
+                          for change in tx.get('objectChanges') or []:
+                              object_type = change.get('objectType') if isinstance(change, dict) else None
+                              object_id = change.get('objectId') if isinstance(change, dict) else None
+                              if object_id and isinstance(object_type, str) and object_type.endswith('::pool::AccessControl'):
+                                  discovered_ids.add(object_id)
+                      if not result.get('hasNextPage'):
+                          break
+                      cursor = result.get('nextCursor')
+          dump('acl_history.json', history)
+
+          resolved = []
+          for object_id in sorted(discovered_ids):
+              wrapper = rpc('sui_getObject', [object_id, object_options])
+              dump(f'object_{object_id}.json', wrapper)
+              result = wrapper.get('result') if isinstance(wrapper, dict) else None
+              data = (result or {}).get('data') if isinstance(result, dict) else None
+              state = (((data or {}).get('content') or {}).get('fields') or {})
+              resolved.append({
+                  'id': object_id,
+                  'exists': bool(data),
+                  'type': (data or {}).get('type'),
+                  'owner': (data or {}).get('owner'),
+                  'version': (data or {}).get('version'),
+                  'digest': (data or {}).get('digest'),
+                  'previousTransaction': (data or {}).get('previousTransaction'),
+                  'managers': addresses(state),
+                  'state': state,
+                  'rpcError': (result or {}).get('error') if isinstance(result, dict) else None,
+              })
+
+          live_acls = [
+              row for row in resolved
+              if row['exists'] and isinstance(row['type'], str) and row['type'].endswith('::pool::AccessControl')
+          ]
+          manager_sets = {tuple(row['managers']) for row in live_acls}
+          differences = []
+          for left_index, left in enumerate(live_acls):
+              for right in live_acls[left_index + 1:]:
+                  left_set = set(left['managers'])
+                  right_set = set(right['managers'])
+                  if left_set != right_set:
+                      differences.append({
+                          'leftAcl': left['id'],
+                          'rightAcl': right['id'],
+                          'leftOnly': sorted(left_set - right_set),
+                          'rightOnly': sorted(right_set - left_set),
+                          'shared': sorted(left_set & right_set),
+                      })
+
+          summary = {
+              'schema': 'bucket-psm-acl-direct-resolution-r8/v1',
+              'network': 'sui-mainnet',
+              'readOnly': True,
+              'knownAcl': KNOWN_ACL,
+              'candidateTypes': CANDIDATE_TYPES,
+              'knownAclResponse': known,
+              'indexedCounts': {key: len(value) for key, value in indexed.items()},
+              'discoveredIds': sorted(discovered_ids),
+              'resolved': resolved,
+              'liveAcls': live_acls,
+              'liveAclCount': len(live_acls),
+              'managerSetCount': len(manager_sets),
+              'managerSetDifferences': differences,
+              'crossAclPrivilegeCandidate': bool(len(live_acls) > 1 and differences),
+              'historyCount': len([row for row in history if row.get('digest')]),
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'indexedCounts': summary['indexedCounts'],
+              'discoveredIds': summary['discoveredIds'],
+              'liveAcls': live_acls,
+              'managerSetDifferences': differences,
+              'crossAclPrivilegeCandidate': summary['crossAclPrivilegeCandidate'],
+              'historyCount': summary['historyCount'],
+          }, indent=2))
+          PY
+          python3 bucket-psm-acl-direct-r8/probe.py | tee bucket-psm-acl-direct-r8/run.log
+          find bucket-psm-acl-direct-r8 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-psm-acl-direct-r8/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-psm-acl-direct-r8 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-psm-acl-direct-r8/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          print('BUCKET_PSM_ACL_DIRECT_R8_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-psm-acl-direct-r8
+          path: bucket-psm-acl-direct-r8
+          if-no-files-found: error
+          retention-days: 7

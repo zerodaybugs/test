@@ -1,0 +1,396 @@
+name: Bucket Shared Account Sender Differential R17
+
+on:
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  differential:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install official Mysten SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-shared-account-sender-r17
+          mkdir -p bucket-shared-account-sender-r17/raw
+          cd bucket-shared-account-sender-r17
+          npm init -y >/dev/null
+          npm pkg set type=module >/dev/null
+          npm install --no-audit --no-fund @mysten/sui@2.23.2
+          npm list @mysten/sui | tee SDK_VERSION.txt
+
+      - name: Rebuild production withdraws and compare unrelated senders
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > bucket-shared-account-sender-r17/probe.mjs <<'JS'
+          import fs from 'node:fs';
+          import { Transaction, Inputs } from '@mysten/sui/transactions';
+          import { bcs } from '@mysten/sui/bcs';
+          import { SuiGrpcClient } from '@mysten/sui/grpc';
+
+          const RPC = 'https://sui-mainnet-endpoint.blockvision.org';
+          const GRPC = 'https://fullnode.mainnet.sui.io:443';
+          const client = new SuiGrpcClient({ network: 'mainnet', baseUrl: GRPC });
+          const CASES = {
+            vault_a: '6C8J9PRtkpt8HoJQtqojcN2xwgTFjhiAdoJ4v1H71cHR',
+            vault_b: '35mjLeDwGu6ksJXUkc4teTZ31Sk96PH2XjWFwG69hpsH',
+          };
+          const CONTROL_SENDERS = [
+            '0x0ec7974af96340d8f3df57dd568135774da676eddbed200ee25785f36ae019db',
+            '0x46f70cc0eb7715bac5409390136fa285b63a7313e361d050161a8e507245efff',
+            '0x1111111111111111111111111111111111111111111111111111111111111111',
+          ];
+
+          async function rpc(method, params) {
+            const response = await fetch(RPC, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+            });
+            const body = await response.json();
+            if (body.error) throw new Error(JSON.stringify(body.error));
+            return body.result;
+          }
+
+          async function currentObjectRef(input) {
+            const objectId = input.objectId;
+            const object = await rpc('sui_getObject', [objectId, {
+              showType: true,
+              showOwner: true,
+              showPreviousTransaction: true,
+              showContent: true,
+              showBcs: true,
+            }]);
+            const data = object?.data;
+            if (!data) throw new Error(`Current object unavailable: ${objectId}`);
+            if (input.objectType === 'sharedObject') {
+              const shared = data.owner?.Shared;
+              const initial = shared?.initial_shared_version ?? shared?.initialSharedVersion ?? input.initialSharedVersion;
+              return {
+                kind: 'shared',
+                objectId,
+                initialSharedVersion: String(initial),
+                mutable: Boolean(input.mutable),
+                type: data.type,
+                owner: data.owner,
+              };
+            }
+            return {
+              kind: input.objectType === 'receiving' ? 'receiving' : 'owned',
+              objectId,
+              version: String(data.version),
+              digest: data.digest,
+              type: data.type,
+              owner: data.owner,
+            };
+          }
+
+          function pureArg(tx, input, sender, originalSender) {
+            const type = input.valueType;
+            let value = input.value;
+            if ((type === 'address' || /::address::/.test(type ?? '')) && String(value).toLowerCase() === String(originalSender).toLowerCase()) {
+              value = sender;
+            }
+            if (type === 'u8') return tx.pure.u8(value);
+            if (type === 'u16') return tx.pure.u16(value);
+            if (type === 'u32') return tx.pure.u32(value);
+            if (type === 'u64') return tx.pure.u64(value);
+            if (type === 'u128') return tx.pure.u128(value);
+            if (type === 'u256') return tx.pure.u256(value);
+            if (type === 'bool') return tx.pure.bool(value);
+            if (type === 'address') return tx.pure.address(value);
+            if (type === 'vector<u8>') return tx.pure(bcs.vector(bcs.U8).serialize(value));
+            if (type === '0x1::string::String' || type === '0x1::ascii::String') return tx.pure.string(value);
+            if (/^vector<address>$/.test(type ?? '')) return tx.pure.vector('address', value);
+            throw new Error(`Unsupported pure input ${type}: ${JSON.stringify(value)}`);
+          }
+
+          function resolveArgument(argument, builtInputs, commandResults, tx) {
+            if (argument === 'GasCoin' || argument?.GasCoin !== undefined) return tx.gas;
+            if (argument?.Input !== undefined) return builtInputs[Number(argument.Input)];
+            if (argument?.Result !== undefined) return commandResults[Number(argument.Result)];
+            if (argument?.NestedResult !== undefined) {
+              const [command, result] = argument.NestedResult;
+              return commandResults[Number(command)][Number(result)];
+            }
+            throw new Error(`Unsupported argument: ${JSON.stringify(argument)}`);
+          }
+
+          async function buildFromParsed(source, sender) {
+            const tx = new Transaction();
+            tx.setSender(sender);
+            const originalSender = source.transaction.data.sender;
+            const programmable = source.transaction.data.transaction;
+            const sourceInputs = programmable.inputs ?? [];
+            const builtInputs = [];
+            const inputMeta = [];
+            for (const input of sourceInputs) {
+              if (input.type === 'pure') {
+                builtInputs.push(pureArg(tx, input, sender, originalSender));
+                inputMeta.push({ kind: 'pure', valueType: input.valueType, value: input.value });
+                continue;
+              }
+              const ref = await currentObjectRef(input);
+              inputMeta.push(ref);
+              if (ref.kind === 'shared') {
+                builtInputs.push(tx.object(Inputs.SharedObjectRef({
+                  objectId: ref.objectId,
+                  initialSharedVersion: ref.initialSharedVersion,
+                  mutable: ref.mutable,
+                })));
+              } else if (ref.kind === 'receiving') {
+                builtInputs.push(tx.object(Inputs.ReceivingRef({
+                  objectId: ref.objectId,
+                  version: ref.version,
+                  digest: ref.digest,
+                })));
+              } else {
+                builtInputs.push(tx.object(Inputs.ObjectRef({
+                  objectId: ref.objectId,
+                  version: ref.version,
+                  digest: ref.digest,
+                })));
+              }
+            }
+
+            const commandResults = [];
+            const commandKinds = [];
+            for (const command of programmable.transactions ?? []) {
+              if (command.MoveCall) {
+                const call = command.MoveCall;
+                const result = tx.moveCall({
+                  target: `${call.package}::${call.module}::${call.function}`,
+                  typeArguments: call.type_arguments ?? call.typeArguments ?? [],
+                  arguments: (call.arguments ?? []).map((arg) => resolveArgument(arg, builtInputs, commandResults, tx)),
+                });
+                commandResults.push(result);
+                commandKinds.push(`MoveCall:${call.module}::${call.function}`);
+                continue;
+              }
+              if (command.TransferObjects) {
+                const [objects, address] = command.TransferObjects;
+                const result = tx.transferObjects(
+                  objects.map((arg) => resolveArgument(arg, builtInputs, commandResults, tx)),
+                  resolveArgument(address, builtInputs, commandResults, tx),
+                );
+                commandResults.push(result);
+                commandKinds.push('TransferObjects');
+                continue;
+              }
+              if (command.SplitCoins) {
+                const [coin, amounts] = command.SplitCoins;
+                const result = tx.splitCoins(
+                  resolveArgument(coin, builtInputs, commandResults, tx),
+                  amounts.map((arg) => resolveArgument(arg, builtInputs, commandResults, tx)),
+                );
+                commandResults.push(result);
+                commandKinds.push('SplitCoins');
+                continue;
+              }
+              if (command.MergeCoins) {
+                const [destination, sources] = command.MergeCoins;
+                const result = tx.mergeCoins(
+                  resolveArgument(destination, builtInputs, commandResults, tx),
+                  sources.map((arg) => resolveArgument(arg, builtInputs, commandResults, tx)),
+                );
+                commandResults.push(result);
+                commandKinds.push('MergeCoins');
+                continue;
+              }
+              if (command.MakeMoveVec) {
+                const vector = command.MakeMoveVec;
+                const result = tx.makeMoveVec({
+                  type: vector.type ?? null,
+                  elements: (vector.objects ?? vector.elements ?? []).map((arg) => resolveArgument(arg, builtInputs, commandResults, tx)),
+                });
+                commandResults.push(result);
+                commandKinds.push('MakeMoveVec');
+                continue;
+              }
+              throw new Error(`Unsupported command: ${JSON.stringify(command)}`);
+            }
+            return { tx, inputMeta, commandKinds, originalSender };
+          }
+
+          function classify(result) {
+            if (result?.$kind === 'Transaction') return { success: true, payload: result.Transaction, error: null };
+            if (result?.$kind === 'FailedTransaction') {
+              const payload = result.FailedTransaction;
+              return { success: false, payload, error: payload?.status?.error ?? payload?.effects?.status?.error ?? null };
+            }
+            if (result?.Transaction) return { success: true, payload: result.Transaction, error: null };
+            if (result?.FailedTransaction) {
+              const payload = result.FailedTransaction;
+              return { success: false, payload, error: payload?.status?.error ?? payload?.effects?.status?.error ?? null };
+            }
+            return { success: false, payload: result, error: result?.thrown ?? { message: 'unknown result shape' } };
+          }
+
+          function ownerAddress(owner) {
+            if (!owner || typeof owner !== 'object') return null;
+            return owner.AddressOwner ?? owner.addressOwner ?? owner.address ?? null;
+          }
+
+          async function simulate(source, sender, label, checksEnabled) {
+            let built;
+            let result;
+            try {
+              built = await buildFromParsed(source, sender);
+              result = await client.core.simulateTransaction({
+                transaction: built.tx,
+                checksEnabled,
+                include: {
+                  commandResults: true,
+                  effects: true,
+                  balanceChanges: true,
+                  objectTypes: true,
+                },
+              });
+            } catch (error) {
+              result = { thrown: { name: error?.name, message: error?.message, stack: error?.stack, cause: error?.cause } };
+            }
+            fs.writeFileSync(`raw/${label}.json`, JSON.stringify(result, null, 2));
+            const parsed = classify(result);
+            const error = parsed.error;
+            const balanceChanges = parsed.payload?.balanceChanges ?? [];
+            const senderChanges = balanceChanges.filter((row) => String(ownerAddress(row.owner)).toLowerCase() === String(sender).toLowerCase());
+            const positiveSenderChanges = senderChanges.filter((row) => BigInt(row.amount ?? 0) > 0n);
+            return {
+              label,
+              sender,
+              checksEnabled,
+              success: parsed.success,
+              errorKind: error?.$kind ?? error?.name ?? null,
+              errorMessage: error?.message ?? JSON.stringify(error),
+              abortCode: error?.MoveAbort?.abortCode ?? null,
+              abortLocation: error?.MoveAbort?.location ?? null,
+              inputMeta: built?.inputMeta ?? null,
+              commandKinds: built?.commandKinds ?? null,
+              originalSender: built?.originalSender ?? source.transaction.data.sender,
+              balanceChanges,
+              senderChanges,
+              positiveSenderChanges,
+              effects: parsed.payload?.effects ?? null,
+            };
+          }
+
+          const caseRows = [];
+          for (const [name, digest] of Object.entries(CASES)) {
+            const source = await rpc('sui_getTransactionBlock', [digest, {
+              showInput: true,
+              showRawInput: true,
+              showEffects: true,
+              showEvents: true,
+              showObjectChanges: true,
+              showBalanceChanges: true,
+            }]);
+            fs.writeFileSync(`raw/${name}_source.json`, JSON.stringify(source, null, 2));
+            const originalSender = source.transaction.data.sender;
+            const senders = [originalSender, ...CONTROL_SENDERS];
+            const simulations = [];
+            for (const sender of senders) {
+              simulations.push(await simulate(source, sender, `${name}_${sender.slice(2,10)}_checks_on`, true));
+              simulations.push(await simulate(source, sender, `${name}_${sender.slice(2,10)}_checks_off`, false));
+            }
+            const inputKinds = (source.transaction.data.transaction.inputs ?? []).map((input) => input.objectType ?? input.type);
+            const ownedInputCount = inputKinds.filter((kind) => kind === 'immOrOwnedObject').length;
+            const unrelated = simulations.filter((row) => row.sender !== originalSender && row.checksEnabled === true);
+            caseRows.push({
+              name,
+              digest,
+              originalSender,
+              sourceStatus: source.effects?.status,
+              inputKinds,
+              ownedInputCount,
+              simulations,
+              arbitrarySenderSuccessCount: unrelated.filter((row) => row.success).length,
+              arbitrarySenderPositiveRecipientCount: unrelated.filter((row) => row.success && row.positiveSenderChanges.length > 0).length,
+            });
+          }
+
+          const exactExploitCases = caseRows.filter((row) =>
+            row.ownedInputCount === 0
+            && row.arbitrarySenderSuccessCount >= 2
+            && row.arbitrarySenderPositiveRecipientCount >= 2
+          );
+          const summary = {
+            schema: 'bucket-shared-account-sender-differential-r17/v1',
+            network: 'sui-mainnet',
+            readOnly: true,
+            cases: caseRows,
+            gates: {
+              sourceWithdrawCount: caseRows.length,
+              allSourceWithdrawsSuccessful: caseRows.every((row) => row.sourceStatus?.status === 'success'),
+              anyWithdrawWithoutOwnedInput: caseRows.some((row) => row.ownedInputCount === 0),
+              anyArbitrarySenderSuccess: caseRows.some((row) => row.arbitrarySenderSuccessCount > 0),
+              anyArbitrarySenderPositiveRecipient: caseRows.some((row) => row.arbitrarySenderPositiveRecipientCount > 0),
+              exactExploitCaseCount: exactExploitCases.length,
+            },
+            exactExploitCases: exactExploitCases.map((row) => row.name),
+            exploitConfirmed: exactExploitCases.length > 0,
+            productionTransactionsSubmitted: 0,
+            generatedUnix: Math.floor(Date.now() / 1000),
+          };
+          fs.writeFileSync('SUMMARY.json', JSON.stringify(summary, null, 2));
+          console.log(JSON.stringify({
+            gates: summary.gates,
+            exploitConfirmed: summary.exploitConfirmed,
+            cases: caseRows.map((row) => ({
+              name: row.name,
+              ownedInputCount: row.ownedInputCount,
+              inputKinds: row.inputKinds,
+              arbitrarySenderSuccessCount: row.arbitrarySenderSuccessCount,
+              arbitrarySenderPositiveRecipientCount: row.arbitrarySenderPositiveRecipientCount,
+              simulations: row.simulations.map((sim) => ({
+                sender: sim.sender,
+                checksEnabled: sim.checksEnabled,
+                success: sim.success,
+                errorKind: sim.errorKind,
+                errorMessage: sim.errorMessage,
+                abortCode: sim.abortCode,
+                abortLocation: sim.abortLocation,
+                positiveSenderChanges: sim.positiveSenderChanges,
+                commandKinds: sim.commandKinds,
+              })),
+            })),
+          }, null, 2));
+          JS
+          cd bucket-shared-account-sender-r17
+          node probe.mjs | tee run.log
+          find . -type f ! -path './node_modules/*' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-shared-account-sender-r17/probe.mjs bucket-shared-account-sender-r17/SUMMARY.json && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-shared-account-sender-r17/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['productionTransactionsSubmitted'] == 0
+          print('BUCKET_SHARED_ACCOUNT_SENDER_R17_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-shared-account-sender-r17
+          path: |
+            bucket-shared-account-sender-r17/SUMMARY.json
+            bucket-shared-account-sender-r17/SDK_VERSION.txt
+            bucket-shared-account-sender-r17/probe.mjs
+            bucket-shared-account-sender-r17/run.log
+            bucket-shared-account-sender-r17/SHA256SUMS.txt
+            bucket-shared-account-sender-r17/raw
+          if-no-files-found: error
+          retention-days: 7

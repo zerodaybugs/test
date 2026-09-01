@@ -1,0 +1,596 @@
+name: Bucket Pyth PSM Economic Differential R20
+
+on:
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+    paths:
+      - '.github/workflows/bucket-pyth-psm-economic-differential-r20.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  economic-differential:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/bucket-pyth-revival-gate-20260809
+
+      - name: Install official Mysten SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-pyth-psm-economic-r20 /tmp/bucket-r20
+          mkdir -p bucket-pyth-psm-economic-r20/raw /tmp/bucket-r20
+          cd bucket-pyth-psm-economic-r20
+          npm init -y >/dev/null
+          npm pkg set type=module >/dev/null
+          npm install --no-audit --no-fund @mysten/sui@2.23.2
+          npm list @mysten/sui | tee SDK_VERSION.txt
+
+      - name: Download latest successful R19 evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GH_BRANCH: agent/bucket-pyth-revival-gate-20260809
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import io, json, os, pathlib, urllib.parse, urllib.request, zipfile
+          token=os.environ['GH_TOKEN']; repo=os.environ['GH_REPO']; branch=os.environ['GH_BRANCH']
+          out=pathlib.Path('/tmp/bucket-r20')
+          headers={
+              'Accept':'application/vnd.github+json',
+              'Authorization':f'Bearer {token}',
+              'X-GitHub-Api-Version':'2022-11-28',
+              'User-Agent':'bucket-r20-prerequisite/1',
+          }
+          def read(url,accept=None):
+              h=dict(headers)
+              if accept: h['Accept']=accept
+              req=urllib.request.Request(url,headers=h)
+              with urllib.request.urlopen(req,timeout=180) as response: return response.read()
+          query=urllib.parse.urlencode({'branch':branch,'status':'completed','per_page':20})
+          runs=json.loads(read(f'https://api.github.com/repos/{repo}/actions/workflows/bucket-pyth-priceinfo-differential-r19.yml/runs?{query}').decode()).get('workflow_runs') or []
+          run=next((row for row in runs if row.get('conclusion')=='success'),None)
+          metadata={'run':run,'artifact':None,'summaryMember':None}
+          if run:
+              artifacts=json.loads(read(f'https://api.github.com/repos/{repo}/actions/runs/{run["id"]}/artifacts?per_page=100').decode()).get('artifacts') or []
+              artifact=next((row for row in artifacts if row.get('name')=='bucket-pyth-priceinfo-differential-r19' and not row.get('expired')),None)
+              metadata['artifact']=artifact
+              if artifact:
+                  raw=read(f'https://api.github.com/repos/{repo}/actions/artifacts/{artifact["id"]}/zip','application/octet-stream')
+                  (out/'r19-artifact.zip').write_bytes(raw)
+                  with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                      candidates=[name for name in archive.namelist() if name=='SUMMARY.json' or name.endswith('/SUMMARY.json')]
+                      if candidates:
+                          name=sorted(candidates,key=lambda value:(value.count('/'),len(value)))[0]
+                          metadata['summaryMember']=name
+                          (out/'R19_SUMMARY.json').write_bytes(archive.read(name))
+          (out/'PREREQUISITE.json').write_text(json.dumps(metadata,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({'runId':(run or {}).get('id'),'runConclusion':(run or {}).get('conclusion'),'artifactId':((metadata.get('artifact') or {}).get('id')),'summaryMember':metadata.get('summaryMember')},indent=2))
+          PY
+          cp /tmp/bucket-r20/PREREQUISITE.json bucket-pyth-psm-economic-r20/raw/
+          if [ -f /tmp/bucket-r20/R19_SUMMARY.json ]; then
+            cp /tmp/bucket-r20/R19_SUMMARY.json bucket-pyth-psm-economic-r20/raw/
+          fi
+
+      - name: Run canonical-vs-alternate full PSM transaction differentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > bucket-pyth-psm-economic-r20/probe.mjs <<'JS'
+          import fs from 'node:fs';
+          import { Transaction, Inputs } from '@mysten/sui/transactions';
+          import { bcs } from '@mysten/sui/bcs';
+          import { SuiGrpcClient } from '@mysten/sui/grpc';
+
+          const OUT = 'raw';
+          const RPCS = [
+            'https://sui-mainnet-endpoint.blockvision.org',
+            'https://fullnode.mainnet.sui.io:443',
+          ];
+          const client = new SuiGrpcClient({ network: 'mainnet', baseUrl: 'https://fullnode.mainnet.sui.io:443' });
+          const r19Path = '/tmp/bucket-r20/R19_SUMMARY.json';
+
+          async function rpc(method, params) {
+            const failures = [];
+            for (const endpoint of RPCS) {
+              try {
+                const response = await fetch(endpoint, {
+                  method: 'POST',
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+                });
+                const body = await response.json();
+                if (body.error) throw new Error(JSON.stringify(body.error));
+                return body.result;
+              } catch (error) {
+                failures.push({ endpoint, message: error?.message });
+              }
+            }
+            throw new Error(`RPC ${method} failed: ${JSON.stringify(failures)}`);
+          }
+
+          async function objectData(objectId) {
+            const result = await rpc('sui_getObject', [objectId, {
+              showType: true,
+              showOwner: true,
+              showPreviousTransaction: true,
+              showContent: true,
+              showBcs: true,
+            }]);
+            return result?.data ?? null;
+          }
+
+          function ownerAddress(owner) {
+            if (!owner || typeof owner !== 'object') return null;
+            const raw = owner.AddressOwner ?? owner.addressOwner ?? null;
+            if (typeof raw === 'string') return raw;
+            if (raw && typeof raw === 'object') return raw.address ?? null;
+            return null;
+          }
+
+          function inputObjectId(input) {
+            return input?.objectId ?? input?.Shared?.objectId ?? input?.sharedObject?.objectId ?? null;
+          }
+
+          async function currentInput(input, substitution) {
+            const originalId = inputObjectId(input);
+            const objectId = substitution?.[originalId] ?? originalId;
+            if (!objectId) throw new Error(`Object input missing ID: ${JSON.stringify(input)}`);
+            const data = await objectData(objectId);
+            if (!data) throw new Error(`Current object unavailable: ${objectId}`);
+            const objectType = input.objectType;
+            if (objectType === 'sharedObject') {
+              const shared = data.owner?.Shared;
+              const initial = shared?.initial_shared_version ?? shared?.initialSharedVersion ?? input.initialSharedVersion;
+              if (initial === undefined || initial === null) throw new Error(`Object is not shared: ${objectId}`);
+              return {
+                kind: 'shared',
+                argument: (tx) => tx.object(Inputs.SharedObjectRef({
+                  objectId,
+                  initialSharedVersion: String(initial),
+                  mutable: Boolean(input.mutable),
+                })),
+                meta: { originalId, objectId, type: data.type, owner: data.owner, version: data.version, mutable: Boolean(input.mutable) },
+              };
+            }
+            if (objectType === 'receiving') {
+              return {
+                kind: 'receiving',
+                argument: (tx) => tx.object(Inputs.ReceivingRef({ objectId, version: String(data.version), digest: data.digest })),
+                meta: { originalId, objectId, type: data.type, owner: data.owner, version: data.version },
+              };
+            }
+            return {
+              kind: 'owned',
+              argument: (tx) => tx.object(Inputs.ObjectRef({ objectId, version: String(data.version), digest: data.digest })),
+              meta: { originalId, objectId, type: data.type, owner: data.owner, version: data.version },
+            };
+          }
+
+          function pureArgument(tx, input) {
+            const type = input.valueType;
+            const value = input.value;
+            if (type === 'u8') return tx.pure.u8(value);
+            if (type === 'u16') return tx.pure.u16(value);
+            if (type === 'u32') return tx.pure.u32(value);
+            if (type === 'u64') return tx.pure.u64(value);
+            if (type === 'u128') return tx.pure.u128(value);
+            if (type === 'u256') return tx.pure.u256(value);
+            if (type === 'bool') return tx.pure.bool(value);
+            if (type === 'address') return tx.pure.address(value);
+            if (type === '0x1::string::String' || type === '0x1::ascii::String') return tx.pure.string(value);
+            if (type === 'vector<u8>') return tx.pure(bcs.vector(bcs.U8).serialize(value));
+            if (type === 'vector<address>') return tx.pure.vector('address', value);
+            if (type && type.startsWith('vector<') && Array.isArray(value)) {
+              const inner = type.slice(7, -1);
+              return tx.pure.vector(inner, value);
+            }
+            throw new Error(`Unsupported pure input ${type}: ${JSON.stringify(value)}`);
+          }
+
+          function resolveArgument(argument, builtInputs, commandResults, tx) {
+            if (argument === 'GasCoin' || argument?.GasCoin !== undefined) return tx.gas;
+            if (argument?.Input !== undefined) return builtInputs[Number(argument.Input)];
+            if (argument?.Result !== undefined) return commandResults[Number(argument.Result)];
+            if (argument?.NestedResult !== undefined) {
+              const [command, result] = argument.NestedResult;
+              return commandResults[Number(command)][Number(result)];
+            }
+            throw new Error(`Unsupported argument ${JSON.stringify(argument)}`);
+          }
+
+          async function rebuild(source, substitution = {}) {
+            const tx = new Transaction();
+            const sender = source.transaction.data.sender;
+            tx.setSender(sender);
+            const programmable = source.transaction.data.transaction;
+            const sourceInputs = programmable.inputs ?? [];
+            const builtInputs = [];
+            const inputMeta = [];
+            for (const input of sourceInputs) {
+              if (input.type === 'pure') {
+                builtInputs.push(pureArgument(tx, input));
+                inputMeta.push({ kind: 'pure', valueType: input.valueType, value: input.value });
+              } else {
+                const current = await currentInput(input, substitution);
+                builtInputs.push(current.argument(tx));
+                inputMeta.push({ kind: current.kind, ...current.meta });
+              }
+            }
+            const commandResults = [];
+            const commandKinds = [];
+            for (const command of programmable.transactions ?? []) {
+              if (command.MoveCall) {
+                const call = command.MoveCall;
+                const result = tx.moveCall({
+                  target: `${call.package}::${call.module}::${call.function}`,
+                  typeArguments: call.type_arguments ?? call.typeArguments ?? [],
+                  arguments: (call.arguments ?? []).map((arg) => resolveArgument(arg, builtInputs, commandResults, tx)),
+                });
+                commandResults.push(result);
+                commandKinds.push(`MoveCall:${call.package}::${call.module}::${call.function}`);
+                continue;
+              }
+              if (command.TransferObjects) {
+                const [objects, address] = command.TransferObjects;
+                const result = tx.transferObjects(
+                  objects.map((arg) => resolveArgument(arg, builtInputs, commandResults, tx)),
+                  resolveArgument(address, builtInputs, commandResults, tx),
+                );
+                commandResults.push(result);
+                commandKinds.push('TransferObjects');
+                continue;
+              }
+              if (command.SplitCoins) {
+                const [coin, amounts] = command.SplitCoins;
+                const result = tx.splitCoins(
+                  resolveArgument(coin, builtInputs, commandResults, tx),
+                  amounts.map((arg) => resolveArgument(arg, builtInputs, commandResults, tx)),
+                );
+                commandResults.push(result);
+                commandKinds.push('SplitCoins');
+                continue;
+              }
+              if (command.MergeCoins) {
+                const [destination, sources] = command.MergeCoins;
+                const result = tx.mergeCoins(
+                  resolveArgument(destination, builtInputs, commandResults, tx),
+                  sources.map((arg) => resolveArgument(arg, builtInputs, commandResults, tx)),
+                );
+                commandResults.push(result);
+                commandKinds.push('MergeCoins');
+                continue;
+              }
+              if (command.MakeMoveVec) {
+                const vector = command.MakeMoveVec;
+                const result = tx.makeMoveVec({
+                  type: vector.type ?? null,
+                  elements: (vector.objects ?? vector.elements ?? []).map((arg) => resolveArgument(arg, builtInputs, commandResults, tx)),
+                });
+                commandResults.push(result);
+                commandKinds.push('MakeMoveVec');
+                continue;
+              }
+              throw new Error(`Unsupported programmable command: ${JSON.stringify(command)}`);
+            }
+            return { tx, sender, inputMeta, commandKinds };
+          }
+
+          function classify(result) {
+            if (result?.$kind === 'Transaction') return { success: true, payload: result.Transaction, error: null };
+            if (result?.$kind === 'FailedTransaction') {
+              const payload = result.FailedTransaction;
+              return { success: false, payload, error: payload?.status?.error ?? payload?.effects?.status?.error ?? null };
+            }
+            if (result?.Transaction) return { success: true, payload: result.Transaction, error: null };
+            if (result?.FailedTransaction) {
+              const payload = result.FailedTransaction;
+              return { success: false, payload, error: payload?.status?.error ?? payload?.effects?.status?.error ?? null };
+            }
+            return { success: false, payload: result, error: result?.thrown ?? { message: 'unknown result shape' } };
+          }
+
+          async function simulate(source, substitution, label) {
+            let built;
+            let result;
+            try {
+              built = await rebuild(source, substitution);
+              result = await client.core.simulateTransaction({
+                transaction: built.tx,
+                checksEnabled: true,
+                include: { commandResults: true, effects: true, balanceChanges: true, objectTypes: true },
+              });
+            } catch (error) {
+              result = { thrown: { name: error?.name, message: error?.message, stack: error?.stack, cause: error?.cause } };
+            }
+            fs.writeFileSync(`${OUT}/${label}.json`, JSON.stringify(result, null, 2));
+            const parsed = classify(result);
+            const error = parsed.error;
+            const balanceChanges = parsed.payload?.balanceChanges ?? [];
+            const sender = built?.sender ?? source.transaction.data.sender;
+            const senderChanges = balanceChanges.filter((row) => String(ownerAddress(row.owner)).toLowerCase() === String(sender).toLowerCase());
+            const balanceMap = {};
+            for (const row of senderChanges) {
+              balanceMap[row.coinType] = String(BigInt(balanceMap[row.coinType] ?? '0') + BigInt(row.amount ?? 0));
+            }
+            return {
+              label,
+              success: parsed.success,
+              sender,
+              errorKind: error?.$kind ?? error?.name ?? null,
+              errorMessage: error?.message ?? JSON.stringify(error),
+              abortCode: error?.MoveAbort?.abortCode ?? null,
+              abortLocation: error?.MoveAbort?.location ?? null,
+              inputMeta: built?.inputMeta ?? null,
+              commandKinds: built?.commandKinds ?? null,
+              senderBalanceMap: balanceMap,
+              balanceChanges,
+              effects: parsed.payload?.effects ?? null,
+            };
+          }
+
+          function psmCall(source) {
+            const commands = source?.transaction?.data?.transaction?.transactions ?? [];
+            for (const command of commands) {
+              const call = command?.MoveCall;
+              if (call && call.module === 'pool' && (call.function === 'swap_in' || call.function === 'swap_out')) return call;
+            }
+            return null;
+          }
+
+          async function sourceIsViable(source, canonicalPriceInfo) {
+            if (source?.effects?.status?.status !== 'success') return false;
+            const inputs = source?.transaction?.data?.transaction?.inputs ?? [];
+            if (!inputs.some((input) => inputObjectId(input) === canonicalPriceInfo)) return false;
+            for (const input of inputs) {
+              if (input.type === 'pure') continue;
+              const objectId = inputObjectId(input);
+              if (!objectId) return false;
+              const data = await objectData(objectId);
+              if (!data) return false;
+              if (input.objectType === 'immOrOwnedObject') {
+                const owner = ownerAddress(data.owner);
+                if (owner && owner.toLowerCase() !== source.transaction.data.sender.toLowerCase()) return false;
+              }
+            }
+            return true;
+          }
+
+          async function findViableSources(target, maxCount = 3) {
+            const seed = await rpc('sui_getTransactionBlock', [target.sourceDigest, {
+              showInput: true, showRawInput: true, showEffects: true, showEvents: true,
+              showObjectChanges: true, showBalanceChanges: true,
+            }]);
+            const call = psmCall(seed);
+            if (!call) return { sources: [], error: 'PSM call missing from seed transaction' };
+            const candidates = [seed];
+            let cursor = null;
+            for (let pageNumber = 0; pageNumber < 20 && candidates.length < 250; pageNumber += 1) {
+              const page = await rpc('suix_queryTransactionBlocks', [{
+                filter: { MoveFunction: { package: call.package, module: call.module, function: call.function } },
+                options: {
+                  showInput: true, showRawInput: true, showEffects: true, showEvents: true,
+                  showObjectChanges: true, showBalanceChanges: true,
+                },
+              }, cursor, 50, true]);
+              candidates.push(...(page?.data ?? []));
+              if (!page?.hasNextPage) break;
+              cursor = page.nextCursor;
+            }
+            const unique = new Map();
+            for (const row of candidates) if (row?.digest) unique.set(row.digest, row);
+            const viable = [];
+            for (const row of unique.values()) {
+              try {
+                if (await sourceIsViable(row, target.canonical.objectId)) viable.push(row);
+              } catch {}
+              if (viable.length >= maxCount) break;
+            }
+            return { sources: viable, psmCall: call, candidateCount: unique.size };
+          }
+
+          function compareBalances(baseline, alternate) {
+            const coinTypes = new Set([
+              ...Object.keys(baseline.senderBalanceMap ?? {}),
+              ...Object.keys(alternate.senderBalanceMap ?? {}),
+            ]);
+            const rows = [];
+            for (const coinType of coinTypes) {
+              const base = BigInt(baseline.senderBalanceMap?.[coinType] ?? '0');
+              const alt = BigInt(alternate.senderBalanceMap?.[coinType] ?? '0');
+              rows.push({ coinType, baseline: base.toString(), alternate: alt.toString(), advantage: (alt - base).toString() });
+            }
+            const positiveOutputs = rows.filter((row) => BigInt(row.baseline) > 0n);
+            const maxOutputAdvantage = positiveOutputs.reduce((best, row) => BigInt(row.advantage) > best ? BigInt(row.advantage) : best, 0n);
+            const inputCostsNotWorse = rows.filter((row) => BigInt(row.baseline) < 0n).every((row) => BigInt(row.alternate) >= BigInt(row.baseline));
+            const bestOutput = positiveOutputs.reduce((best, row) => BigInt(row.baseline) > best ? BigInt(row.baseline) : best, 0n);
+            const advantageBps = bestOutput > 0n ? Number(maxOutputAdvantage * 1000000n / bestOutput) / 100 : 0;
+            return {
+              rows,
+              maxOutputAdvantageRaw: maxOutputAdvantage.toString(),
+              inputCostsNotWorse,
+              baselineBestOutputRaw: bestOutput.toString(),
+              advantageBps,
+              positiveEconomicDifference: maxOutputAdvantage > 0n && inputCostsNotWorse,
+            };
+          }
+
+          const prerequisite = fs.existsSync(r19Path) ? JSON.parse(fs.readFileSync(r19Path, 'utf8')) : null;
+          if (!prerequisite) {
+            const summary = {
+              schema: 'bucket-pyth-psm-economic-r20/v1',
+              verdict: 'R19_PREREQUISITE_MISSING',
+              readOnly: true,
+              exploitConfirmed: false,
+              economicImpactProven: false,
+              submissionReady: false,
+              productionTransactionsSubmitted: 0,
+            };
+            fs.writeFileSync('SUMMARY.json', JSON.stringify(summary, null, 2));
+            console.log(JSON.stringify(summary, null, 2));
+            process.exit(0);
+          }
+
+          const exactCandidates = prerequisite.exactCandidates ?? [];
+          const targetIndex = new Map((prerequisite.targets ?? []).map((row) => [row.name, row]));
+          const wrongFeedByTarget = {};
+          const canonicalByTarget = {};
+          for (const row of prerequisite.targets ?? []) {
+            if (row.canonical?.objectId) canonicalByTarget[row.name] = row.canonical.objectId;
+          }
+          const names = Object.keys(canonicalByTarget);
+          for (const name of names) wrongFeedByTarget[name] = canonicalByTarget[names.find((other) => other !== name)] ?? null;
+
+          const candidateRows = [];
+          for (const candidate of exactCandidates.slice(0, 20)) {
+            const target = targetIndex.get(candidate.target);
+            if (!target?.canonical?.objectId || !target?.sourceDigest) {
+              candidateRows.push({ candidate, error: 'target metadata incomplete' });
+              continue;
+            }
+            const sourceSearch = await findViableSources(target, 3);
+            const sourceRows = [];
+            for (const source of sourceSearch.sources ?? []) {
+              const canonicalId = target.canonical.objectId;
+              const baseline = await simulate(source, {}, `${candidate.target}_${source.digest}_canonical`);
+              const alternate = await simulate(source, { [canonicalId]: candidate.objectId }, `${candidate.target}_${source.digest}_alternate`);
+              const wrongFeedId = wrongFeedByTarget[candidate.target];
+              const wrongFeed = wrongFeedId
+                ? await simulate(source, { [canonicalId]: wrongFeedId }, `${candidate.target}_${source.digest}_wrong_feed`)
+                : null;
+              const comparison = baseline.success && alternate.success
+                ? compareBalances(baseline, alternate)
+                : null;
+              sourceRows.push({
+                digest: source.digest,
+                sender: source.transaction.data.sender,
+                timestampMs: source.timestampMs,
+                psmCall: psmCall(source),
+                baseline,
+                alternate,
+                wrongFeed,
+                comparison,
+                controlPass: baseline.success && (!wrongFeed || !wrongFeed.success),
+                positiveEconomicDifference: Boolean(comparison?.positiveEconomicDifference),
+              });
+            }
+            const positive = sourceRows.filter((row) => row.controlPass && row.positiveEconomicDifference);
+            const distinctSenders = new Set(positive.map((row) => row.sender));
+            candidateRows.push({
+              candidate,
+              canonicalPriceInfo: target.canonical.objectId,
+              wrongFeedPriceInfo: wrongFeedByTarget[candidate.target],
+              sourceSearch: {
+                candidateCount: sourceSearch.candidateCount,
+                viableCount: (sourceSearch.sources ?? []).length,
+                psmCall: sourceSearch.psmCall,
+              },
+              sources: sourceRows,
+              positiveControlledCaseCount: positive.length,
+              distinctPositiveSenderCount: distinctSenders.size,
+              repeatablePositiveEconomicDifference: positive.length >= 2,
+              maxAdvantageBps: Math.max(0, ...positive.map((row) => row.comparison?.advantageBps ?? 0)),
+            });
+          }
+
+          const promoted = candidateRows.filter((row) => row.repeatablePositiveEconomicDifference);
+          const controlledPositiveCases = candidateRows.reduce((count, row) => count + (row.positiveControlledCaseCount ?? 0), 0);
+          const maxAdvantageBps = Math.max(0, ...candidateRows.map((row) => row.maxAdvantageBps ?? 0));
+          const summary = {
+            schema: 'bucket-pyth-psm-economic-r20/v1',
+            network: 'sui-mainnet',
+            readOnly: true,
+            r19Schema: prerequisite.schema,
+            r19ExactCandidateCount: exactCandidates.length,
+            candidates: candidateRows,
+            gates: {
+              prerequisiteExactCandidatesPresent: exactCandidates.length > 0,
+              anyViableCurrentSourceTransaction: candidateRows.some((row) => (row.sourceSearch?.viableCount ?? 0) > 0),
+              anyCanonicalBaselineSuccess: candidateRows.some((row) => row.sources?.some((source) => source.baseline?.success)),
+              wrongFeedNegativeControlPass: candidateRows.some((row) => row.sources?.some((source) => source.wrongFeed && !source.wrongFeed.success)),
+              controlledPositiveCaseCount: controlledPositiveCases,
+              repeatablePositiveCandidateCount: promoted.length,
+              maxAdvantageBps,
+            },
+            promotedCandidates: promoted.map((row) => ({
+              target: row.candidate?.target,
+              objectId: row.candidate?.objectId,
+              positiveControlledCaseCount: row.positiveControlledCaseCount,
+              distinctPositiveSenderCount: row.distinctPositiveSenderCount,
+              maxAdvantageBps: row.maxAdvantageBps,
+            })),
+            exploitConfirmed: promoted.length > 0,
+            economicImpactProven: promoted.length > 0 && maxAdvantageBps > 0,
+            materialHighOrCriticalImpactProven: false,
+            duplicateAndScopeGatePassed: false,
+            submissionReady: false,
+            productionTransactionsSubmitted: 0,
+            generatedUnix: Math.floor(Date.now() / 1000),
+          };
+          fs.writeFileSync('SUMMARY.json', JSON.stringify(summary, null, 2));
+          console.log(JSON.stringify({
+            r19ExactCandidateCount: summary.r19ExactCandidateCount,
+            gates: summary.gates,
+            promotedCandidates: summary.promotedCandidates,
+            exploitConfirmed: summary.exploitConfirmed,
+            economicImpactProven: summary.economicImpactProven,
+            materialHighOrCriticalImpactProven: summary.materialHighOrCriticalImpactProven,
+            submissionReady: summary.submissionReady,
+            candidates: candidateRows.map((row) => ({
+              candidate: row.candidate,
+              sourceSearch: row.sourceSearch,
+              positiveControlledCaseCount: row.positiveControlledCaseCount,
+              distinctPositiveSenderCount: row.distinctPositiveSenderCount,
+              repeatablePositiveEconomicDifference: row.repeatablePositiveEconomicDifference,
+              maxAdvantageBps: row.maxAdvantageBps,
+              sources: (row.sources ?? []).map((source) => ({
+                digest: source.digest,
+                sender: source.sender,
+                baselineSuccess: source.baseline?.success,
+                alternateSuccess: source.alternate?.success,
+                wrongFeedSuccess: source.wrongFeed?.success,
+                controlPass: source.controlPass,
+                comparison: source.comparison,
+              })),
+            })),
+          }, null, 2));
+          JS
+          cd bucket-pyth-psm-economic-r20
+          node probe.mjs | tee run.log
+          find . -type f ! -path './node_modules/*' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-pyth-psm-economic-r20/probe.mjs bucket-pyth-psm-economic-r20/SUMMARY.json && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary=json.load(open('bucket-pyth-psm-economic-r20/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['productionTransactionsSubmitted']==0
+          assert summary['submissionReady'] is False
+          print('BUCKET_PYTH_PSM_ECONOMIC_R20_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-pyth-psm-economic-r20
+          path: |
+            bucket-pyth-psm-economic-r20/SUMMARY.json
+            bucket-pyth-psm-economic-r20/SDK_VERSION.txt
+            bucket-pyth-psm-economic-r20/probe.mjs
+            bucket-pyth-psm-economic-r20/run.log
+            bucket-pyth-psm-economic-r20/SHA256SUMS.txt
+            bucket-pyth-psm-economic-r20/raw
+          if-no-files-found: error
+          retention-days: 7

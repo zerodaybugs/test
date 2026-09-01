@@ -1,0 +1,333 @@
+name: Bucket Momentum and Bluefin Live Provider Census R6
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enumerate live provider state, managers, positions, pools, and transaction calls
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-momentum-bluefin-census-r6
+          mkdir -p bucket-momentum-bluefin-census-r6/raw
+          cat > bucket-momentum-bluefin-census-r6/census.py <<'PY'
+          import json
+          import pathlib
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-momentum-bluefin-census-r6')
+          RAW = OUT / 'raw'
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+          RPCS = [
+              'https://fullnode.mainnet.sui.io:443',
+              'https://sui-mainnet-endpoint.blockvision.org',
+          ]
+          PROVIDERS = {
+              'momentum': {
+                  'package': '0x42df76466b4df87f875e044dea3f011f3c0824ded63f77abbb41deb5aa8eb351',
+                  'module': 'mmt_lp_provider',
+                  'struct': 'MomentumLpProvider',
+              },
+              'bluefin': {
+                  'package': '0x266588b4ade88033ebe61e158ca25504b772fb7c1cdb89294a2c25c9073c3ecf',
+                  'module': 'bluefin_lp_provider',
+                  'struct': 'BluefinLpProvider',
+              },
+          }
+
+          def post(url, payload, retries=6, timeout=180):
+              body = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      request = urllib.request.Request(
+                          url,
+                          data=body,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-momentum-bluefin-census-r6/1',
+                          },
+                      )
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2 ** attempt)
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def gql(query, variables=None):
+              body = post(GQL, {'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': str(exc)})
+              return {'failures': failures}
+
+          def result(wrapper):
+              return wrapper.get('result') if isinstance(wrapper, dict) else None
+
+          def dump(name, value):
+              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def recurse(value, path=()):
+              rows = []
+              if isinstance(value, dict):
+                  for key, child in value.items():
+                      rows.extend(recurse(child, path + (str(key),)))
+              elif isinstance(value, list):
+                  for index, child in enumerate(value):
+                      rows.extend(recurse(child, path + (str(index),)))
+              else:
+                  rows.append(('.'.join(path), value))
+              return rows
+
+          def addresses(value):
+              found = set()
+              for _, scalar in recurse(value):
+                  if isinstance(scalar, str) and scalar.startswith('0x') and len(scalar) == 66:
+                      found.add(scalar)
+              return found
+
+          def field(value, name):
+              if isinstance(value, dict):
+                  if name in value:
+                      return value[name]
+                  for child in value.values():
+                      answer = field(child, name)
+                      if answer is not None:
+                          return answer
+              elif isinstance(value, list):
+                  for child in value:
+                      answer = field(child, name)
+                      if answer is not None:
+                          return answer
+              return None
+
+          object_query = '''query Objects($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+
+          def objects(type_name):
+              rows = []
+              cursor = None
+              while True:
+                  connection = gql(object_query, {'type': type_name, 'after': cursor})['objects']
+                  rows.extend(connection.get('nodes') or [])
+                  page = connection.get('pageInfo') or {}
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('endCursor')
+              return rows
+
+          checkpoint = gql('query { checkpoint { sequenceNumber timestamp } }')['checkpoint']
+          summaries = {}
+          all_objects = {}
+
+          tx_options = {
+              'showInput': True,
+              'showRawInput': True,
+              'showEffects': True,
+              'showEvents': True,
+              'showObjectChanges': True,
+              'showBalanceChanges': True,
+          }
+
+          for label, spec in PROVIDERS.items():
+              type_name = f"{spec['package']}::{spec['module']}::{spec['struct']}"
+              provider_objects = objects(type_name)
+              dump(f'{label}_providers_graphql.json', provider_objects)
+              provider_rows = []
+
+              for provider in provider_objects:
+                  provider_id = provider.get('address')
+                  contents = ((provider.get('asMoveObject') or {}).get('contents') or {})
+                  state = contents.get('json') or {}
+                  a_positions = field(state, 'usdb_a_positions')
+                  b_positions = field(state, 'usdb_b_positions')
+                  manager_field = field(state, 'managers')
+                  state_addresses = addresses(state)
+
+                  txs = []
+                  cursor = None
+                  failures = []
+                  for _ in range(30):
+                      wrapper = rpc('suix_queryTransactionBlocks', [
+                          {'filter': {'InputObject': provider_id}, 'options': tx_options},
+                          cursor,
+                          50,
+                          True,
+                      ])
+                      page = result(wrapper)
+                      if not isinstance(page, dict):
+                          failures.append(wrapper)
+                          break
+                      txs.extend(page.get('data') or [])
+                      if not page.get('hasNextPage'):
+                          break
+                      cursor = page.get('nextCursor')
+
+                  calls = []
+                  surfaced = set(state_addresses)
+                  for tx in txs:
+                      try:
+                          commands = tx['transaction']['data']['transaction']['transactions']
+                          inputs = tx['transaction']['data']['transaction'].get('inputs') or []
+                      except Exception:
+                          commands = []
+                          inputs = []
+                      for index, command in enumerate(commands or []):
+                          move = command.get('MoveCall') if isinstance(command, dict) else None
+                          if not move or move.get('package') != spec['package']:
+                              continue
+                          resolved = []
+                          for argument in move.get('arguments') or []:
+                              item = {'argument': argument}
+                              if isinstance(argument, dict) and 'Input' in argument:
+                                  input_index = argument['Input']
+                                  if input_index < len(inputs):
+                                      item['input'] = inputs[input_index]
+                                      if isinstance(inputs[input_index], dict):
+                                          object_id = inputs[input_index].get('objectId')
+                                          if object_id:
+                                              surfaced.add(object_id)
+                              resolved.append(item)
+                          calls.append({
+                              'digest': tx.get('digest'),
+                              'timestampMs': tx.get('timestampMs'),
+                              'sender': ((tx.get('transaction') or {}).get('data') or {}).get('sender'),
+                              'status': (tx.get('effects') or {}).get('status'),
+                              'index': index,
+                              'module': move.get('module'),
+                              'function': move.get('function'),
+                              'type_arguments': move.get('type_arguments'),
+                              'resolved_arguments': resolved,
+                              'balance_changes': tx.get('balanceChanges'),
+                              'object_changes': tx.get('objectChanges'),
+                          })
+
+                  queried = {}
+                  for object_id in sorted(surfaced):
+                      queried[object_id] = rpc('sui_getObject', [object_id, {
+                          'showType': True,
+                          'showOwner': True,
+                          'showPreviousTransaction': True,
+                          'showDisplay': False,
+                          'showContent': True,
+                          'showBcs': True,
+                      }])
+                      all_objects[object_id] = queried[object_id]
+
+                  counts = {}
+                  for call in calls:
+                      key = f"{call['module']}::{call['function']}"
+                      counts[key] = counts.get(key, 0) + 1
+
+                  provider_rows.append({
+                      'id': provider_id,
+                      'version': provider.get('version'),
+                      'digest': provider.get('digest'),
+                      'owner': provider.get('owner'),
+                      'state': state,
+                      'manager_field': manager_field,
+                      'manager_addresses': sorted(addresses(manager_field)),
+                      'a_positions': a_positions,
+                      'b_positions': b_positions,
+                      'a_position_count': len(a_positions) if isinstance(a_positions, list) else None,
+                      'b_position_count': len(b_positions) if isinstance(b_positions, list) else None,
+                      'transaction_count': len(txs),
+                      'function_counts': counts,
+                      'calls': calls,
+                      'query_failures': failures,
+                      'queried_objects': queried,
+                  })
+
+              summaries[label] = {
+                  'package': spec['package'],
+                  'provider_type': type_name,
+                  'provider_count': len(provider_rows),
+                  'providers': provider_rows,
+              }
+
+          dump('all_objects.json', all_objects)
+          summary = {
+              'schema': 'bucket-momentum-bluefin-live-census-r6/v1',
+              'network': 'sui-mainnet',
+              'checkpoint': checkpoint,
+              'readOnly': True,
+              'providers': summaries,
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              label: {
+                  'package': data['package'],
+                  'provider_count': data['provider_count'],
+                  'providers': [
+                      {
+                          'id': row['id'],
+                          'manager_addresses': row['manager_addresses'],
+                          'a_position_count': row['a_position_count'],
+                          'b_position_count': row['b_position_count'],
+                          'function_counts': row['function_counts'],
+                          'state': row['state'],
+                      }
+                      for row in data['providers']
+                  ],
+              }
+              for label, data in summaries.items()
+          }, indent=2))
+          PY
+          python3 bucket-momentum-bluefin-census-r6/census.py | tee bucket-momentum-bluefin-census-r6/run.log
+          find bucket-momentum-bluefin-census-r6 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-momentum-bluefin-census-r6/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-momentum-bluefin-census-r6 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-momentum-bluefin-census-r6/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          print('BUCKET_MOMENTUM_BLUEFIN_CENSUS_R6_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-momentum-bluefin-census-r6
+          path: bucket-momentum-bluefin-census-r6
+          if-no-files-found: error
+          retention-days: 7

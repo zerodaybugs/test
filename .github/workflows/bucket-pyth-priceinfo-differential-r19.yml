@@ -1,0 +1,448 @@
+name: Bucket Pyth PriceInfo Differential R19
+
+on:
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  differential:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install official Mysten SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-pyth-priceinfo-differential-r19
+          mkdir -p bucket-pyth-priceinfo-differential-r19/raw
+          cd bucket-pyth-priceinfo-differential-r19
+          npm init -y >/dev/null
+          npm pkg set type=module >/dev/null
+          npm install --no-audit --no-fund @mysten/sui@2.23.2
+          npm list @mysten/sui | tee SDK_VERSION.txt
+
+      - name: Enumerate same-feed PriceInfo objects and run exact oracle control pairs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > bucket-pyth-priceinfo-differential-r19/probe.mjs <<'JS'
+          import fs from 'node:fs';
+          import { Transaction, Inputs } from '@mysten/sui/transactions';
+          import { SuiGrpcClient } from '@mysten/sui/grpc';
+
+          const RPCS = [
+            'https://sui-mainnet-endpoint.blockvision.org',
+            'https://fullnode.mainnet.sui.io:443',
+          ];
+          const client = new SuiGrpcClient({ network: 'mainnet', baseUrl: 'https://fullnode.mainnet.sui.io:443' });
+          const CONFIG = '0x00aea60b799575ae4203bcc80c16844c4d514d5af661200c4565f6d5a6deac1f';
+          const STATE = '0x1f9310238ee9298fb703c3419030b35b22bb1cc37113e3bb5007c99aec79e5b8';
+          const CLOCK = '0x0000000000000000000000000000000000000000000000000000000000000006';
+          const TARGETS = {
+            USDC: {
+              priceInfo: '0x5dec622733a204ca27f5a90d8c2fad453cc6665186fd5dff13a83d0b6c9027ab',
+              pool: '0x37721762186721fb6eaf053f249aaf594503a6ad98dbcc998916be78d20a2df4',
+            },
+            BUCK: {
+              priceInfo: '0x3ef821a5d9b14683a5edf3752d06f608b20c23cdf846fe6b9da68dde53bc9a56',
+              pool: '0x4fef507f41f5b141625f0f193283820fbee26e883f24212d149e4220320ae321',
+            },
+          };
+
+          async function rpc(method, params) {
+            const errors = [];
+            for (const endpoint of RPCS) {
+              try {
+                const response = await fetch(endpoint, {
+                  method: 'POST',
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+                });
+                const body = await response.json();
+                if (body.error) throw new Error(JSON.stringify(body.error));
+                return body.result;
+              } catch (error) {
+                errors.push({ endpoint, message: error?.message });
+              }
+            }
+            throw new Error(`RPC ${method} failed: ${JSON.stringify(errors)}`);
+          }
+
+          function walk(value, path = []) {
+            const rows = [];
+            if (Array.isArray(value)) {
+              value.forEach((child, index) => rows.push(...walk(child, [...path, String(index)])));
+            } else if (value && typeof value === 'object') {
+              Object.entries(value).forEach(([key, child]) => rows.push(...walk(child, [...path, key])));
+            } else {
+              rows.push({ path: path.join('.'), value });
+            }
+            return rows;
+          }
+
+          function integer(value) {
+            if (typeof value === 'number') return value;
+            if (typeof value === 'string' && /^-?\d+$/.test(value)) return Number(value);
+            if (value && typeof value === 'object') {
+              if ('value' in value) return integer(value.value);
+              if ('magnitude' in value) return (value.negative || value.is_negative ? -1 : 1) * integer(value.magnitude);
+              if (value.fields) return integer(value.fields);
+            }
+            return null;
+          }
+
+          function priceMeta(data) {
+            const fields = data?.content?.fields ?? {};
+            const rows = walk(fields);
+            let feedId = null;
+            let publishTime = null;
+            let rawPrice = null;
+            let expo = null;
+            for (const row of rows) {
+              const path = row.path.toLowerCase();
+              const value = row.value;
+              if (!feedId && typeof value === 'string' && value.replace(/^0x/, '').length === 64 && (path.includes('price_feed') || path.includes('price_identifier') || path.includes('feed_id'))) {
+                feedId = value.replace(/^0x/, '');
+              }
+              if (publishTime === null && path.includes('publish_time')) publishTime = integer(value);
+              if (rawPrice === null && path.endsWith('.price') && path.includes('price_feed') && !path.includes('ema')) rawPrice = integer(value);
+              if (expo === null && (path.endsWith('.expo') || path.endsWith('.exponent')) && !path.includes('ema')) expo = integer(value);
+            }
+            return {
+              feedId,
+              publishTime,
+              rawPrice,
+              expo,
+              computedPrice: rawPrice !== null && expo !== null ? rawPrice * 10 ** expo : null,
+            };
+          }
+
+          async function objectData(objectId) {
+            const result = await rpc('sui_getObject', [objectId, {
+              showType: true,
+              showOwner: true,
+              showPreviousTransaction: true,
+              showContent: true,
+              showBcs: true,
+            }]);
+            return result?.data ?? null;
+          }
+
+          function sharedRef(data, mutable) {
+            const shared = data?.owner?.Shared;
+            const initial = shared?.initial_shared_version ?? shared?.initialSharedVersion;
+            if (initial === undefined || initial === null) throw new Error(`Object ${data?.objectId} is not shared`);
+            return {
+              objectId: data.objectId,
+              initialSharedVersion: String(initial),
+              mutable,
+            };
+          }
+
+          async function inventory(type, feedId) {
+            const rows = [];
+            let cursor = null;
+            for (let pageNumber = 0; pageNumber < 100; pageNumber += 1) {
+              const page = await rpc('suix_queryObjects', [{
+                filter: { StructType: type },
+                options: {
+                  showType: true,
+                  showOwner: true,
+                  showPreviousTransaction: true,
+                  showContent: true,
+                  showBcs: true,
+                },
+              }, cursor, 50]);
+              for (const data of page?.data ?? []) {
+                const meta = priceMeta(data);
+                if (meta.feedId === feedId) rows.push({ data, meta });
+              }
+              if (!page?.hasNextPage) break;
+              cursor = page.nextCursor;
+            }
+            return rows;
+          }
+
+          async function findSource(target) {
+            const poolData = await objectData(target.pool);
+            const packageId = poolData?.type?.split('::')?.[0];
+            if (!packageId) throw new Error(`Cannot derive PSM package from ${target.pool}`);
+            for (const fn of ['swap_in', 'swap_out']) {
+              let cursor = null;
+              for (let pageNumber = 0; pageNumber < 20; pageNumber += 1) {
+                const page = await rpc('suix_queryTransactionBlocks', [{
+                  filter: { MoveFunction: { package: packageId, module: 'pool', function: fn } },
+                  options: {
+                    showInput: true,
+                    showRawInput: true,
+                    showEffects: true,
+                    showEvents: true,
+                    showObjectChanges: true,
+                    showBalanceChanges: true,
+                  },
+                }, cursor, 50, true]);
+                for (const tx of page?.data ?? []) {
+                  if (tx?.effects?.status?.status !== 'success') continue;
+                  const inputs = tx?.transaction?.data?.transaction?.inputs ?? [];
+                  if (inputs.some((input) => input?.objectId === target.priceInfo)) return { tx, function: fn, packageId };
+                }
+                if (!page?.hasNextPage) break;
+                cursor = page.nextCursor;
+              }
+            }
+            return null;
+          }
+
+          function moveCalls(tx) {
+            const commands = tx?.transaction?.data?.transaction?.transactions ?? [];
+            return commands.map((command, index) => ({ index, call: command?.MoveCall ?? null })).filter((row) => row.call);
+          }
+
+          function inputIndex(argument) {
+            return argument && typeof argument === 'object' && argument.Input !== undefined ? Number(argument.Input) : null;
+          }
+
+          function classify(result) {
+            if (result?.$kind === 'Transaction') return { success: true, payload: result.Transaction, error: null };
+            if (result?.$kind === 'FailedTransaction') {
+              const payload = result.FailedTransaction;
+              return { success: false, payload, error: payload?.status?.error ?? payload?.effects?.status?.error ?? null };
+            }
+            if (result?.Transaction) return { success: true, payload: result.Transaction, error: null };
+            if (result?.FailedTransaction) {
+              const payload = result.FailedTransaction;
+              return { success: false, payload, error: payload?.status?.error ?? payload?.effects?.status?.error ?? null };
+            }
+            return { success: false, payload: result, error: result?.thrown ?? { message: 'unknown result shape' } };
+          }
+
+          function commandReturnFingerprint(payload) {
+            const results = payload?.commandResults ?? payload?.results ?? [];
+            return JSON.stringify(results);
+          }
+
+          async function simulatePipeline(source, candidateData, label) {
+            const calls = moveCalls(source.tx);
+            const feedRow = calls.find((row) => row.call.module === 'pyth_rule' && row.call.function === 'feed');
+            const aggregateRow = calls.find((row) => row.call.module === 'aggregator' && row.call.function === 'aggregate');
+            const newRow = calls.find((row) => row.call.module === 'collector' && row.call.function === 'new');
+            if (!feedRow || !aggregateRow || !newRow) throw new Error(`Oracle prelude missing for ${label}`);
+            const txInputs = source.tx.transaction.data.transaction.inputs;
+            const configIndex = inputIndex(feedRow.call.arguments[1]);
+            const clockIndex = inputIndex(feedRow.call.arguments[2]);
+            const stateIndex = inputIndex(feedRow.call.arguments[3]);
+            const canonicalPriceIndex = inputIndex(feedRow.call.arguments[4]);
+            const aggregatorIndex = inputIndex(aggregateRow.call.arguments[0]);
+            if ([configIndex, clockIndex, stateIndex, canonicalPriceIndex, aggregatorIndex].some((value) => value === null)) {
+              throw new Error(`Unexpected oracle argument shape for ${label}`);
+            }
+            const configData = await objectData(txInputs[configIndex].objectId);
+            const clockData = await objectData(txInputs[clockIndex].objectId);
+            const stateData = await objectData(txInputs[stateIndex].objectId);
+            const aggregatorData = await objectData(txInputs[aggregatorIndex].objectId);
+            const tx = new Transaction();
+            tx.setSender(source.tx.transaction.data.sender);
+            const collector = tx.moveCall({
+              target: `${newRow.call.package}::${newRow.call.module}::${newRow.call.function}`,
+              typeArguments: newRow.call.type_arguments ?? [],
+            });
+            tx.moveCall({
+              target: `${feedRow.call.package}::${feedRow.call.module}::${feedRow.call.function}`,
+              typeArguments: feedRow.call.type_arguments ?? [],
+              arguments: [
+                collector,
+                tx.object(Inputs.SharedObjectRef(sharedRef(configData, false))),
+                tx.object(Inputs.SharedObjectRef(sharedRef(clockData, false))),
+                tx.object(Inputs.SharedObjectRef(sharedRef(stateData, false))),
+                tx.object(Inputs.SharedObjectRef(sharedRef(candidateData, true))),
+              ],
+            });
+            tx.moveCall({
+              target: `${aggregateRow.call.package}::${aggregateRow.call.module}::${aggregateRow.call.function}`,
+              typeArguments: aggregateRow.call.type_arguments ?? [],
+              arguments: [tx.object(Inputs.SharedObjectRef(sharedRef(aggregatorData, false))), collector],
+            });
+            let result;
+            try {
+              result = await client.core.simulateTransaction({
+                transaction: tx,
+                checksEnabled: true,
+                include: { commandResults: true, effects: true, balanceChanges: true, objectTypes: true },
+              });
+            } catch (error) {
+              result = { thrown: { name: error?.name, message: error?.message, stack: error?.stack, cause: error?.cause } };
+            }
+            fs.writeFileSync(`raw/${label}.json`, JSON.stringify(result, null, 2));
+            const parsed = classify(result);
+            const error = parsed.error;
+            return {
+              label,
+              success: parsed.success,
+              errorKind: error?.$kind ?? error?.name ?? null,
+              errorMessage: error?.message ?? JSON.stringify(error),
+              abortCode: error?.MoveAbort?.abortCode ?? null,
+              abortLocation: error?.MoveAbort?.location ?? null,
+              commandResults: parsed.payload?.commandResults ?? parsed.payload?.results ?? null,
+              returnFingerprint: commandReturnFingerprint(parsed.payload),
+              effects: parsed.payload?.effects ?? null,
+              oracle: {
+                collector: newRow.call,
+                feed: feedRow.call,
+                aggregate: aggregateRow.call,
+                config: configData.objectId,
+                state: stateData.objectId,
+                clock: clockData.objectId,
+                aggregator: aggregatorData.objectId,
+              },
+            };
+          }
+
+          const latestCheckpoint = await rpc('sui_getLatestCheckpointSequenceNumber', []);
+          const checkpoint = await rpc('sui_getCheckpoint', [latestCheckpoint]);
+          const nowSec = Number(checkpoint.timestampMs) / 1000;
+          const targetRows = [];
+
+          for (const [name, target] of Object.entries(TARGETS)) {
+            const canonicalData = await objectData(target.priceInfo);
+            if (!canonicalData) {
+              targetRows.push({ name, error: 'canonical PriceInfo missing' });
+              continue;
+            }
+            const canonicalMeta = priceMeta(canonicalData);
+            const candidates = await inventory(canonicalData.type, canonicalMeta.feedId);
+            const sharedCandidates = candidates
+              .filter((row) => row.data?.owner?.Shared)
+              .sort((a, b) => (a.meta.publishTime ?? 0) - (b.meta.publishTime ?? 0));
+            const source = await findSource(target);
+            if (!source) {
+              targetRows.push({ name, canonicalMeta, candidateCount: sharedCandidates.length, error: 'no successful PSM source transaction' });
+              continue;
+            }
+            fs.writeFileSync(`raw/${name}_source.json`, JSON.stringify(source, null, 2));
+            const baseline = await simulatePipeline(source, canonicalData, `${name}_canonical`);
+            const alternates = [];
+            for (const row of sharedCandidates.slice(0, 30)) {
+              if (row.data.objectId === canonicalData.objectId) continue;
+              const ageSec = row.meta.publishTime !== null ? nowSec - row.meta.publishTime : null;
+              const simulation = await simulatePipeline(source, row.data, `${name}_${row.data.objectId.slice(2, 14)}`);
+              alternates.push({
+                objectId: row.data.objectId,
+                version: row.data.version,
+                owner: row.data.owner,
+                meta: row.meta,
+                ageSec,
+                simulation,
+                acceptedWithDifferentReturn: simulation.success && baseline.success && simulation.returnFingerprint !== baseline.returnFingerprint,
+              });
+            }
+            targetRows.push({
+              name,
+              sourceDigest: source.tx.digest,
+              sourceFunction: source.function,
+              sourceSender: source.tx.transaction.data.sender,
+              canonical: {
+                objectId: canonicalData.objectId,
+                version: canonicalData.version,
+                owner: canonicalData.owner,
+                meta: canonicalMeta,
+                ageSec: canonicalMeta.publishTime !== null ? nowSec - canonicalMeta.publishTime : null,
+                simulation: baseline,
+              },
+              sameFeedSharedCandidateCount: sharedCandidates.length,
+              alternates,
+              acceptedAlternateCount: alternates.filter((row) => row.simulation.success).length,
+              acceptedDifferentReturnCount: alternates.filter((row) => row.acceptedWithDifferentReturn).length,
+            });
+          }
+
+          const exactCandidates = targetRows.flatMap((target) =>
+            (target.alternates ?? [])
+              .filter((row) => row.acceptedWithDifferentReturn)
+              .map((row) => ({ target: target.name, objectId: row.objectId, ageSec: row.ageSec, meta: row.meta }))
+          );
+          const summary = {
+            schema: 'bucket-pyth-priceinfo-differential-r19/v1',
+            network: 'sui-mainnet',
+            readOnly: true,
+            checkpoint: { sequenceNumber: latestCheckpoint, timestampMs: checkpoint.timestampMs },
+            targets: targetRows,
+            gates: {
+              targetCount: targetRows.length,
+              anySameFeedSharedAlternate: targetRows.some((row) => (row.sameFeedSharedCandidateCount ?? 0) > 1),
+              anyAlternateAccepted: targetRows.some((row) => (row.acceptedAlternateCount ?? 0) > 0),
+              anyAlternateAcceptedWithDifferentReturn: exactCandidates.length > 0,
+              exactCandidateCount: exactCandidates.length,
+            },
+            exactCandidates,
+            economicImpactProven: false,
+            exploitConfirmed: false,
+            productionTransactionsSubmitted: 0,
+            generatedUnix: Math.floor(Date.now() / 1000),
+          };
+          fs.writeFileSync('SUMMARY.json', JSON.stringify(summary, null, 2));
+          console.log(JSON.stringify({
+            gates: summary.gates,
+            exactCandidates,
+            targets: targetRows.map((row) => ({
+              name: row.name,
+              error: row.error,
+              sourceDigest: row.sourceDigest,
+              canonical: row.canonical ? {
+                objectId: row.canonical.objectId,
+                meta: row.canonical.meta,
+                ageSec: row.canonical.ageSec,
+                success: row.canonical.simulation?.success,
+                errorMessage: row.canonical.simulation?.errorMessage,
+                returnFingerprint: row.canonical.simulation?.returnFingerprint,
+              } : null,
+              sameFeedSharedCandidateCount: row.sameFeedSharedCandidateCount,
+              acceptedAlternateCount: row.acceptedAlternateCount,
+              acceptedDifferentReturnCount: row.acceptedDifferentReturnCount,
+              alternates: (row.alternates ?? []).map((alt) => ({
+                objectId: alt.objectId,
+                meta: alt.meta,
+                ageSec: alt.ageSec,
+                success: alt.simulation.success,
+                errorMessage: alt.simulation.errorMessage,
+                returnFingerprint: alt.simulation.returnFingerprint,
+                acceptedWithDifferentReturn: alt.acceptedWithDifferentReturn,
+              })),
+            })),
+          }, null, 2));
+          JS
+          cd bucket-pyth-priceinfo-differential-r19
+          node probe.mjs | tee run.log
+          find . -type f ! -path './node_modules/*' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-pyth-priceinfo-differential-r19/probe.mjs bucket-pyth-priceinfo-differential-r19/SUMMARY.json && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary=json.load(open('bucket-pyth-priceinfo-differential-r19/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['productionTransactionsSubmitted']==0
+          print('BUCKET_PYTH_PRICEINFO_R19_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-pyth-priceinfo-differential-r19
+          path: |
+            bucket-pyth-priceinfo-differential-r19/SUMMARY.json
+            bucket-pyth-priceinfo-differential-r19/SDK_VERSION.txt
+            bucket-pyth-priceinfo-differential-r19/probe.mjs
+            bucket-pyth-priceinfo-differential-r19/run.log
+            bucket-pyth-priceinfo-differential-r19/SHA256SUMS.txt
+            bucket-pyth-priceinfo-differential-r19/raw
+          if-no-files-found: error
+          retention-days: 7

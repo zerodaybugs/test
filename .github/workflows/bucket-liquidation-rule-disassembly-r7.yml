@@ -1,0 +1,156 @@
+name: Bucket Liquidation Rule Authorization Disassembly R7
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  disassemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch deployed disassembly and extract authorization call paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-liquidation-rule-disassembly-r7
+          mkdir -p bucket-liquidation-rule-disassembly-r7/raw bucket-liquidation-rule-disassembly-r7/functions
+          cat > bucket-liquidation-rule-disassembly-r7/probe.py <<'PY'
+          import json
+          import pathlib
+          import re
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-liquidation-rule-disassembly-r7')
+          RAW = OUT / 'raw'
+          FUNCTIONS = OUT / 'functions'
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+          PACKAGE = '0xbe1457c92f8e8c39e85fa4f77bfcd8cfbda30d1861286ba64c76a94773138b5d'
+
+          def post(payload, retries=6, timeout=180):
+              body = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      request = urllib.request.Request(
+                          GQL,
+                          data=body,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-liquidation-rule-disassembly-r7/1',
+                          },
+                      )
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2 ** attempt, 30))
+              raise RuntimeError(f'GraphQL failed: {last}')
+
+          query = '''query Package($address:SuiAddress!){object(address:$address){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}modules{nodes{name disassembly}}}}}'''
+          body = post({'query': query, 'variables': {'address': PACKAGE}})
+          (RAW / 'package.json').write_text(json.dumps(body, indent=2, sort_keys=True) + '\n')
+          if body.get('errors'):
+              raise RuntimeError(json.dumps(body['errors']))
+          obj = ((body.get('data') or {}).get('object') or {})
+          package = obj.get('asMovePackage') or {}
+          modules = (package.get('modules') or {}).get('nodes') or []
+          target = next((row for row in modules if row.get('name') == 'liquidation_rule'), None)
+          if not target:
+              raise RuntimeError('liquidation_rule disassembly missing')
+          asm = target.get('disassembly') or ''
+          (OUT / 'liquidation_rule.asm').write_text(asm)
+
+          headers = list(re.finditer(r'(?m)^public\s+([^\n{]+)\{', asm))
+          rows = []
+          for index, match in enumerate(headers):
+              end = headers[index + 1].start() if index + 1 < len(headers) else len(asm)
+              block = asm[match.start():end]
+              header = match.group(1).strip()
+              name_match = re.match(r'([A-Za-z_][A-Za-z0-9_]*)', header)
+              name = name_match.group(1) if name_match else header
+              (FUNCTIONS / f'{index:03d}_{name}.asm').write_text(block)
+              rows.append({
+                  'function': name,
+                  'header': header,
+                  'contains_tx_sender': 'tx_context::sender' in block or 'TxContext::sender' in block,
+                  'contains_liquidators': 'liquidators' in block,
+                  'contains_protected_debtors': 'protected_debtors' in block,
+                  'contains_vec_set_contains': 'vec_set::contains' in block,
+                  'contains_liquidation_rule_construction': 'LiquidationRule' in block,
+                  'calls_vault_liquidate': 'vault::liquidate' in block,
+                  'calls_flash_mint': 'flash_mint' in block,
+                  'calls_flash_burn': 'flash_burn' in block,
+                  'body': block,
+              })
+
+          by_name = {row['function']: row for row in rows}
+          critical = {name: by_name.get(name) for name in ('liquidate', 'liquidate_unswappable')}
+          summary = {
+              'schema': 'bucket-liquidation-rule-authorization-disassembly-r7/v1',
+              'network': 'sui-mainnet',
+              'readOnly': True,
+              'package': PACKAGE,
+              'object_version': obj.get('version'),
+              'package_version': package.get('version'),
+              'previous_transaction': obj.get('previousTransaction'),
+              'linkage': package.get('linkage'),
+              'functions': rows,
+              'critical_functions': critical,
+              'liquidate_sender_guard_present': bool(
+                  critical.get('liquidate')
+                  and critical['liquidate']['contains_tx_sender']
+                  and critical['liquidate']['contains_liquidators']
+                  and critical['liquidate']['contains_vec_set_contains']
+              ),
+              'unswappable_sender_guard_present': bool(
+                  critical.get('liquidate_unswappable')
+                  and critical['liquidate_unswappable']['contains_tx_sender']
+                  and critical['liquidate_unswappable']['contains_liquidators']
+                  and critical['liquidate_unswappable']['contains_vec_set_contains']
+              ),
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'liquidate_sender_guard_present': summary['liquidate_sender_guard_present'],
+              'unswappable_sender_guard_present': summary['unswappable_sender_guard_present'],
+              'critical_functions': critical,
+          }, indent=2))
+          PY
+          python3 bucket-liquidation-rule-disassembly-r7/probe.py | tee bucket-liquidation-rule-disassembly-r7/run.log
+          find bucket-liquidation-rule-disassembly-r7 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-liquidation-rule-disassembly-r7/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-liquidation-rule-disassembly-r7 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-liquidation-rule-disassembly-r7/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          print('BUCKET_LIQUIDATION_RULE_DISASSEMBLY_R7_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-liquidation-rule-disassembly-r7
+          path: bucket-liquidation-rule-disassembly-r7
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,203 @@
+name: Bucket Cetus LP Provider Upgrade Diff R6
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch and compare every deployed Cetus provider package revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-cetus-upgrade-diff-r6
+          mkdir -p bucket-cetus-upgrade-diff-r6/{raw,asm,analysis}
+          cat > bucket-cetus-upgrade-diff-r6/diff.py <<'PY'
+          import difflib
+          import json
+          import pathlib
+          import re
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-cetus-upgrade-diff-r6')
+          RAW = OUT / 'raw'
+          ASM = OUT / 'asm'
+          ANALYSIS = OUT / 'analysis'
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+          PACKAGES = [
+              ('origin_v1', '0xb9204c991f982e4ec53dd9161ed56ff837716c81861929853e894d77eec71bea'),
+              ('upgrade_e33d', '0xe33d2f68536a2d2e33262b321355daf8845780b24a1748e6b2ecd8e8f3a2a08b'),
+              ('upgrade_4284', '0x4284cc3ecd694814c560164906c4ddd275c88c48f8b4791c0810ffaab2be4dbf'),
+              ('upgrade_46bc', '0x46bc4d88371dcf78640c1b46cf5df7a5fe422ee561d1430d376cac265aff3cae'),
+              ('latest_2aa4', '0x2aa4b78126f4f838e330fa29efab2d2720185f7036cbbc4b5b0ab9815d80a302'),
+          ]
+
+          def post(payload, retries=6, timeout=180):
+              data = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      request = urllib.request.Request(
+                          GQL,
+                          data=data,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-cetus-upgrade-diff-r6/1',
+                          },
+                      )
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2 ** attempt)
+              raise RuntimeError(f'GraphQL failed: {last}')
+
+          def gql(query, variables=None):
+              body = post({'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          def dump(path, value):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          query = '''query Package($address:SuiAddress!) { object(address:$address) { address version digest previousTransaction { digest sender { address } } asMovePackage { address version linkage { originalId upgradedId version } typeOrigins { module struct definingId } modules { nodes { name disassembly } } } } }'''
+          checkpoint = gql('query { checkpoint { sequenceNumber timestamp } }')['checkpoint']
+
+          rows = []
+          module_texts = {}
+          for label, package_id in PACKAGES:
+              graph = gql(query, {'address': package_id})['object']
+              dump(RAW / f'{label}.json', graph)
+              package = (graph or {}).get('asMovePackage')
+              modules = {}
+              if package:
+                  directory = ASM / label
+                  directory.mkdir(parents=True, exist_ok=True)
+                  for module in (package.get('modules') or {}).get('nodes', []):
+                      name = module.get('name')
+                      text = module.get('disassembly') or ''
+                      modules[name] = text
+                      (directory / f'{name}.asm').write_text(text)
+              provider = modules.get('cetus_lp_provider', '')
+              module_texts[label] = provider
+
+              function_rows = []
+              headers = list(re.finditer(r'(?m)^public\s+([^\n{]+)\{', provider))
+              for index, match in enumerate(headers):
+                  end = headers[index + 1].start() if index + 1 < len(headers) else len(provider)
+                  block = provider[match.start():end]
+                  header = match.group(1).strip()
+                  name_match = re.match(r'([A-Za-z_][A-Za-z0-9_]*)', header)
+                  function_name = name_match.group(1) if name_match else header
+                  function_rows.append({
+                      'function': function_name,
+                      'header': header,
+                      'assert_sender_is_manager': 'assert_sender_is_manager' in block,
+                      'uses_usdb_a_positions': 'usdb_a_positions' in block,
+                      'uses_usdb_b_positions': 'usdb_b_positions' in block,
+                      'mint_calls': len(re.findall(r'usdb::mint', block)),
+                      'burn_calls': len(re.findall(r'usdb::burn', block)),
+                      'body': block,
+                  })
+              rows.append({
+                  'label': label,
+                  'package': package_id,
+                  'exists': package is not None,
+                  'object_version': (graph or {}).get('version'),
+                  'package_version': (package or {}).get('version'),
+                  'previous_transaction': (graph or {}).get('previousTransaction'),
+                  'linkage': (package or {}).get('linkage'),
+                  'functions': function_rows,
+              })
+
+          for (left_label, _), (right_label, _) in zip(PACKAGES, PACKAGES[1:]):
+              left = module_texts.get(left_label, '').splitlines(keepends=True)
+              right = module_texts.get(right_label, '').splitlines(keepends=True)
+              diff = ''.join(difflib.unified_diff(
+                  left,
+                  right,
+                  fromfile=left_label,
+                  tofile=right_label,
+                  n=5,
+              ))
+              (ANALYSIS / f'{left_label}_to_{right_label}.diff').write_text(diff)
+
+          key_functions = (
+              'add_usdb_a_liquidity',
+              'remove_usdb_a_liquidity',
+              'add_usdb_b_liquidity',
+              'remove_usdb_b_liquidity',
+              'claim_fees',
+              'claim_fees_and_rewards',
+          )
+          matrix = []
+          for row in rows:
+              by_name = {function['function']: function for function in row['functions']}
+              matrix.append({
+                  'label': row['label'],
+                  'package': row['package'],
+                  'functions': {
+                      name: {
+                          'present': name in by_name,
+                          'manager_check': by_name.get(name, {}).get('assert_sender_is_manager'),
+                          'uses_a': by_name.get(name, {}).get('uses_usdb_a_positions'),
+                          'uses_b': by_name.get(name, {}).get('uses_usdb_b_positions'),
+                          'mint_calls': by_name.get(name, {}).get('mint_calls'),
+                          'burn_calls': by_name.get(name, {}).get('burn_calls'),
+                      }
+                      for name in key_functions
+                  },
+              })
+
+          dump(ANALYSIS / 'rows.json', rows)
+          dump(ANALYSIS / 'key_function_matrix.json', matrix)
+          latest = matrix[-1]
+          latest_remove_a = latest['functions']['remove_usdb_a_liquidity']
+          latest_remove_b = latest['functions']['remove_usdb_b_liquidity']
+          latest_add_b = latest['functions']['add_usdb_b_liquidity']
+          summary = {
+              'schema': 'bucket-cetus-upgrade-diff-r6/v1',
+              'network': 'sui-mainnet',
+              'checkpoint': checkpoint,
+              'packages': rows,
+              'key_function_matrix': matrix,
+              'latest_package': latest['package'],
+              'latest_remove_a_missing_manager_check': latest_remove_a['present'] and not latest_remove_a['manager_check'],
+              'latest_remove_b_missing_manager_check': latest_remove_b['present'] and not latest_remove_b['manager_check'],
+              'latest_add_b_uses_wrong_vector': latest_add_b['present'] and latest_add_b['uses_a'] and not latest_add_b['uses_b'],
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'latest_package': summary['latest_package'],
+              'latest_remove_a_missing_manager_check': summary['latest_remove_a_missing_manager_check'],
+              'latest_remove_b_missing_manager_check': summary['latest_remove_b_missing_manager_check'],
+              'latest_add_b_uses_wrong_vector': summary['latest_add_b_uses_wrong_vector'],
+              'matrix': matrix,
+          }, indent=2))
+          PY
+          python3 bucket-cetus-upgrade-diff-r6/diff.py | tee bucket-cetus-upgrade-diff-r6/run.log
+          find bucket-cetus-upgrade-diff-r6 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-cetus-upgrade-diff-r6/SHA256SUMS.txt
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-cetus-upgrade-diff-r6
+          path: bucket-cetus-upgrade-diff-r6
+          if-no-files-found: error
+          retention-days: 7

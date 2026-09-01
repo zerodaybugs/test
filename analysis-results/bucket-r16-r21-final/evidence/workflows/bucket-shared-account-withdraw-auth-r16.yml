@@ -1,0 +1,371 @@
+name: Bucket Shared Account Withdraw Authorization R16
+
+on:
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  authorize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve exact withdraw inputs, signatures, sender checks, and recipients
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-shared-account-withdraw-auth-r16
+          mkdir -p bucket-shared-account-withdraw-auth-r16/{raw,asm,analysis}
+          cat > bucket-shared-account-withdraw-auth-r16/audit.py <<'PY'
+          import json
+          import pathlib
+          import re
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-shared-account-withdraw-auth-r16')
+          RAW = OUT / 'raw'
+          ASM = OUT / 'asm'
+          ANALYSIS = OUT / 'analysis'
+          RPCS = [
+              'https://fullnode.mainnet.sui.io:443',
+              'https://sui-mainnet-endpoint.blockvision.org',
+          ]
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+
+          TARGETS = {
+              'vault_a': {
+                  'package': '0x16136081deb1652e889911c6a97ceaa94a3a7ed67f29260d6f2a0d56c0679aa8',
+                  'vault': '0x5ee16dbdf0fde4c0699db409957f5e1b0c7cc4e1b0b28921728b9251fab169b0',
+                  'account': '0x0bd4c9887129746355e0b44552fc2c92787a4fa418249ce1f92e84ab47e28b54',
+                  'withdrawTx': '6C8J9PRtkpt8HoJQtqojcN2xwgTFjhiAdoJ4v1H71cHR',
+                  'depositTx': '8hhVLQVmzpUnTV5uhxzC43iNUDumxXUtKH1DxBMmqnwr',
+              },
+              'vault_b': {
+                  'package': '0x2f567f02e37a7e97cf603a7118e3b44f58401d4970cac2dda04d6bc71a25d9f5',
+                  'vault': '0xa8d05be9b464568dce0dd5fb947c7581179fa8c8770086ae0c4504af46b6c706',
+                  'account': '0x3d3ea407522b697303737f6fd736ef71672af6fdbac6e8a2478245082145d712',
+                  'withdrawTx': '35mjLeDwGu6ksJXUkc4teTZ31Sk96PH2XjWFwG69hpsH',
+                  'depositTx': '4LSzdrk9vZpqtazD7CHJY94Vkt4EM7pqGkvxM2sc5EQx',
+              },
+              'vault_c': {
+                  'package': '0x6ff4dc407e25a940b345dceca99fc50e8ba27d4de5eec5050100b8036bb0eced',
+                  'vault': '0x51ef46c1dfacd3cb3b7b0e2faa426d4aabcfd0a285c1c42953db7bf0431dde27',
+                  'account': '0xb4ec04eacb8e070cf372796f2f311d16105dc15a2ecda547acd5e5b7465b69ed',
+                  'withdrawTx': None,
+                  'depositTx': None,
+              },
+          }
+
+          def post(url, payload, retries=6, timeout=180):
+              data = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      request = urllib.request.Request(
+                          url,
+                          data=data,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-shared-account-withdraw-auth-r16/1',
+                          },
+                      )
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2 ** attempt, 30))
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {'jsonrpc':'2.0','id':1,'method':method,'params':params})
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': str(exc)})
+              return {'failures': failures}
+
+          def gql(query, variables=None):
+              body = post(GQL, {'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body.get('data')
+
+          def dump(path, value):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def tx_data(digest):
+              wrapper = rpc('sui_getTransactionBlock', [digest, {
+                  'showInput': True,
+                  'showRawInput': True,
+                  'showEffects': True,
+                  'showEvents': True,
+                  'showObjectChanges': True,
+                  'showBalanceChanges': True,
+              }])
+              result = wrapper.get('result') if isinstance(wrapper, dict) else None
+              return wrapper, result
+
+          def object_data(object_id):
+              wrapper = rpc('sui_getObject', [object_id, {
+                  'showType': True,
+                  'showOwner': True,
+                  'showPreviousTransaction': True,
+                  'showDisplay': True,
+                  'showContent': True,
+                  'showBcs': True,
+              }])
+              result = wrapper.get('result') if isinstance(wrapper, dict) else None
+              data = (result or {}).get('data') if isinstance(result, dict) else None
+              return wrapper, data
+
+          def commands(tx):
+              try:
+                  return tx['transaction']['data']['transaction']['transactions'] or []
+              except Exception:
+                  return []
+
+          def inputs(tx):
+              try:
+                  return tx['transaction']['data']['transaction']['inputs'] or []
+              except Exception:
+                  return []
+
+          def resolve(arg, tx_inputs):
+              if not isinstance(arg, dict):
+                  return {'kind':'unknown','raw':arg}
+              if 'Input' in arg:
+                  index = int(arg['Input'])
+                  return {'kind':'Input','index':index,'value':tx_inputs[index] if index < len(tx_inputs) else None}
+              if 'Result' in arg:
+                  return {'kind':'Result','command':arg['Result']}
+              if 'NestedResult' in arg:
+                  return {'kind':'NestedResult','commandResult':arg['NestedResult']}
+              return {'kind':'unknown','raw':arg}
+
+          def object_id_from_input(value):
+              if not isinstance(value, dict):
+                  return None
+              return value.get('objectId') or ((value.get('Shared') or {}).get('objectId'))
+
+          def input_kind(value):
+              if not isinstance(value, dict):
+                  return 'unknown'
+              if value.get('type') == 'pure':
+                  return 'pure'
+              return value.get('objectType') or value.get('type') or 'unknown'
+
+          package_query = '''query Package($address:SuiAddress!){object(address:$address){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}modules{nodes{name disassembly}}}}}'''
+
+          package_rows = []
+          function_rows = []
+          contexts = []
+          patterns = re.compile(r'withdraw|deposit|borrow_protocol_cap|return_protocol_cap|borrow_all_for_strategy|repay_withdraw|request_with_account|tx_context::sender|ManagerCap|OwnerCap|AdminCap|share|burn|recipient|transfer', re.I)
+
+          for label, target in TARGETS.items():
+              package_id = target['package']
+              graph = gql(package_query, {'address': package_id})
+              graph_obj = (graph or {}).get('object')
+              normalized_wrapper = rpc('sui_getNormalizedMoveModulesByPackage', [package_id])
+              normalized = normalized_wrapper.get('result') if isinstance(normalized_wrapper, dict) else None
+              dump(RAW / f'{label}_package.json', graph_obj)
+              dump(RAW / f'{label}_normalized.json', normalized_wrapper)
+              move_package = (graph_obj or {}).get('asMovePackage') or {}
+              modules = []
+              for module in (move_package.get('modules') or {}).get('nodes', []):
+                  name = module.get('name')
+                  text = module.get('disassembly') or ''
+                  modules.append(name)
+                  (ASM / label).mkdir(parents=True, exist_ok=True)
+                  (ASM / label / f'{name}.asm').write_text(text)
+                  lines = text.splitlines()
+                  for index, line in enumerate(lines):
+                      if patterns.search(line):
+                          contexts.append({
+                              'label': label,
+                              'module': name,
+                              'line': index + 1,
+                              'text': line.strip(),
+                              'context': '\n'.join(lines[max(0,index-16):min(len(lines),index+34)]),
+                          })
+              if isinstance(normalized, dict):
+                  for module_name, module in normalized.items():
+                      for function_name, function in (module.get('exposedFunctions') or {}).items():
+                          if not re.search(r'withdraw|deposit|borrow|return|strategy|repay|claim|harvest|fee|cap', function_name, re.I):
+                              continue
+                          function_rows.append({
+                              'label': label,
+                              'package': package_id,
+                              'module': module_name,
+                              'function': function_name,
+                              'visibility': function.get('visibility'),
+                              'isEntry': function.get('isEntry'),
+                              'parameters': function.get('parameters') or [],
+                              'returns': function.get('return') or [],
+                              'typeParameters': function.get('typeParameters') or [],
+                          })
+              package_rows.append({
+                  'label': label,
+                  'package': package_id,
+                  'version': move_package.get('version'),
+                  'modules': modules,
+              })
+
+          dump(ANALYSIS / 'functions.json', function_rows)
+          dump(ANALYSIS / 'contexts.json', contexts)
+
+          tx_rows = []
+          input_object_cache = {}
+          for label, target in TARGETS.items():
+              for operation in ('withdraw','deposit'):
+                  digest = target.get(operation + 'Tx')
+                  if not digest:
+                      continue
+                  wrapper, tx = tx_data(digest)
+                  dump(RAW / f'{label}_{operation}_{digest}.json', wrapper)
+                  tx_inputs = inputs(tx or {})
+                  enriched_inputs = []
+                  for index, value in enumerate(tx_inputs):
+                      row = {'index': index, 'kind': input_kind(value), 'raw': value}
+                      object_id = object_id_from_input(value)
+                      if object_id:
+                          if object_id not in input_object_cache:
+                              object_wrapper, object_row = object_data(object_id)
+                              input_object_cache[object_id] = {'wrapper': object_wrapper, 'data': object_row}
+                          object_row = input_object_cache[object_id]['data']
+                          row.update({
+                              'objectId': object_id,
+                              'currentType': object_row.get('type') if object_row else None,
+                              'currentOwner': object_row.get('owner') if object_row else None,
+                              'currentVersion': object_row.get('version') if object_row else None,
+                          })
+                      enriched_inputs.append(row)
+
+                  call_rows = []
+                  for command_index, command in enumerate(commands(tx or {})):
+                      call = command.get('MoveCall') if isinstance(command, dict) else None
+                      if not call:
+                          continue
+                      call_rows.append({
+                          'index': command_index,
+                          'package': call.get('package'),
+                          'module': call.get('module'),
+                          'function': call.get('function'),
+                          'typeArguments': call.get('type_arguments') or call.get('typeArguments'),
+                          'resolvedArguments': [resolve(arg, tx_inputs) for arg in call.get('arguments') or []],
+                      })
+                  sender = (((tx or {}).get('transaction') or {}).get('data') or {}).get('sender')
+                  owned_inputs = [row for row in enriched_inputs if row['kind'] == 'immOrOwnedObject']
+                  shared_inputs = [row for row in enriched_inputs if row['kind'] == 'sharedObject']
+                  balance_changes = (tx or {}).get('balanceChanges') or []
+                  sender_balance_changes = [row for row in balance_changes if str((row.get('owner') or {})).find(str(sender)) >= 0]
+                  tx_rows.append({
+                      'label': label,
+                      'operation': operation,
+                      'digest': digest,
+                      'sender': sender,
+                      'timestampMs': (tx or {}).get('timestampMs'),
+                      'status': ((tx or {}).get('effects') or {}).get('status'),
+                      'inputs': enriched_inputs,
+                      'ownedInputCount': len(owned_inputs),
+                      'ownedInputs': owned_inputs,
+                      'sharedInputCount': len(shared_inputs),
+                      'sharedInputs': shared_inputs,
+                      'calls': call_rows,
+                      'balanceChanges': balance_changes,
+                      'senderBalanceChanges': sender_balance_changes,
+                      'objectChanges': (tx or {}).get('objectChanges'),
+                  })
+
+          dump(ANALYSIS / 'transaction_auth_map.json', tx_rows)
+          dump(RAW / 'input_objects.json', input_object_cache)
+
+          withdraw_rows = [row for row in tx_rows if row['operation'] == 'withdraw']
+          public_withdraws = [row for row in function_rows if row['function'] == 'withdraw' and (str(row['visibility']).lower() == 'public' or row['isEntry'])]
+          public_borrow_caps = [row for row in function_rows if row['function'] == 'borrow_protocol_cap' and (str(row['visibility']).lower() == 'public' or row['isEntry'])]
+          auth_terms = re.compile(r'ManagerCap|OwnerCap|AdminCap|tx_context::sender|assert.*sender|authorized|whitelist|share|burn', re.I)
+          withdraw_contexts = [row for row in contexts if re.search(r'withdraw', row['text'], re.I)]
+          auth_contexts = [row for row in contexts if auth_terms.search(row['context']) and re.search(r'withdraw|borrow_protocol_cap', row['context'], re.I)]
+
+          summary = {
+              'schema': 'bucket-shared-account-withdraw-auth-r16/v1',
+              'network': 'sui-mainnet',
+              'readOnly': True,
+              'packages': package_rows,
+              'relevantFunctions': function_rows,
+              'publicWithdrawFunctions': public_withdraws,
+              'publicBorrowProtocolCapFunctions': public_borrow_caps,
+              'withdrawTransactions': withdraw_rows,
+              'withdrawContextCount': len(withdraw_contexts),
+              'withdrawContexts': withdraw_contexts[:80],
+              'authContextCount': len(auth_contexts),
+              'authContexts': auth_contexts[:80],
+              'gates': {
+                  'withdrawSeenOnMainnet': len(withdraw_rows) >= 2,
+                  'withdrawHasNoOwnedObjectInput': any(row['ownedInputCount'] == 0 for row in withdraw_rows),
+                  'allWithdrawsHaveNoOwnedObjectInput': bool(withdraw_rows) and all(row['ownedInputCount'] == 0 for row in withdraw_rows),
+                  'publicWithdrawExposed': bool(public_withdraws),
+                  'publicBorrowProtocolCapExposed': bool(public_borrow_caps),
+                  'senderReceivesBalanceChange': any(bool(row['senderBalanceChanges']) for row in withdraw_rows),
+                  'staticAuthorizationSignalFound': bool(auth_contexts),
+              },
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'productionTransactionsSubmitted': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'publicWithdrawFunctions': public_withdraws,
+              'publicBorrowProtocolCapFunctions': public_borrow_caps,
+              'withdraws': [{
+                  'label': row['label'],
+                  'digest': row['digest'],
+                  'sender': row['sender'],
+                  'ownedInputCount': row['ownedInputCount'],
+                  'ownedInputs': row['ownedInputs'],
+                  'sharedInputCount': row['sharedInputCount'],
+                  'senderBalanceChanges': row['senderBalanceChanges'],
+                  'callSequence': [f"{c['package']}::{c['module']}::{c['function']}" for c in row['calls']],
+              } for row in withdraw_rows],
+              'authContextCount': len(auth_contexts),
+              'authContexts': auth_contexts[:20],
+              'gates': summary['gates'],
+          }, indent=2))
+          PY
+          python3 bucket-shared-account-withdraw-auth-r16/audit.py | tee bucket-shared-account-withdraw-auth-r16/run.log
+          find bucket-shared-account-withdraw-auth-r16 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-shared-account-withdraw-auth-r16/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-shared-account-withdraw-auth-r16 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-shared-account-withdraw-auth-r16/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          assert summary['productionTransactionsSubmitted'] == 0
+          print('BUCKET_SHARED_ACCOUNT_WITHDRAW_AUTH_R16_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-shared-account-withdraw-auth-r16
+          path: bucket-shared-account-withdraw-auth-r16
+          if-no-files-found: error
+          retention-days: 7

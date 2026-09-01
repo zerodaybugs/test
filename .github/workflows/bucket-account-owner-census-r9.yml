@@ -1,0 +1,249 @@
+name: Bucket Account Owner Census R9
+
+on:
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enumerate all Account objects and ownership classes
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-account-owner-census-r9
+          mkdir -p bucket-account-owner-census-r9/raw
+          cat > bucket-account-owner-census-r9/census.py <<'PY'
+          import json
+          import pathlib
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-account-owner-census-r9')
+          RAW = OUT / 'raw'
+          RPCS = [
+              'https://fullnode.mainnet.sui.io:443',
+              'https://sui-mainnet-endpoint.blockvision.org',
+          ]
+          ORIGIN = '0x665188033384920a5bb5dcfb2ef21f54b4568d08b431718b97e02e5c184b92cc'
+          CURRENT = '0xe2d49d67ff42dc500275f2d84841bf35632aa6c1abdb70af66a10e1de93a4400'
+          TYPES = [
+              f'{ORIGIN}::account::Account',
+              f'{CURRENT}::account::Account',
+          ]
+          CLAIM_PACKAGE = '0xef9719a3392d3742ae09c42ebf01030d88b1a75651430932be1eb017b79fb372'
+
+          def post(url, payload, retries=6, timeout=180):
+              body = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      request = urllib.request.Request(
+                          url,
+                          data=body,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-account-owner-census-r9/1',
+                          },
+                      )
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2 ** attempt, 30))
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': str(exc)})
+              return {'failures': failures}
+
+          def dump(name, value):
+              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def owner_class(owner):
+              if not isinstance(owner, dict):
+                  return 'Unknown'
+              for key in ('Shared', 'Immutable', 'AddressOwner', 'ObjectOwner', 'ConsensusAddressOwner'):
+                  if key in owner:
+                      return key
+              return next(iter(owner), 'Unknown')
+
+          options = {
+              'showType': True,
+              'showOwner': True,
+              'showPreviousTransaction': True,
+              'showDisplay': False,
+              'showContent': True,
+              'showBcs': True,
+          }
+
+          indexed = {}
+          by_id = {}
+          for type_name in TYPES:
+              rows = []
+              cursor = None
+              for page_index in range(200):
+                  wrapper = rpc('suix_queryObjects', [{
+                      'filter': {'StructType': type_name},
+                      'options': options,
+                  }, cursor, 50])
+                  result = wrapper.get('result') if isinstance(wrapper, dict) else None
+                  if not isinstance(result, dict):
+                      rows.append({'queryFailure': wrapper})
+                      break
+                  page = result.get('data') or []
+                  rows.extend(page)
+                  for item in page:
+                      data = item.get('data') if isinstance(item, dict) else None
+                      if not data:
+                          continue
+                      object_id = data.get('objectId')
+                      if object_id:
+                          by_id[object_id] = {
+                              'id': object_id,
+                              'type': data.get('type'),
+                              'owner': data.get('owner'),
+                              'ownerClass': owner_class(data.get('owner')),
+                              'version': data.get('version'),
+                              'digest': data.get('digest'),
+                              'previousTransaction': data.get('previousTransaction'),
+                              'content': data.get('content'),
+                          }
+                  if not result.get('hasNextPage'):
+                      break
+                  cursor = result.get('nextCursor')
+              indexed[type_name] = rows
+              dump(f'query_{type_name.split("::")[0]}.json', rows)
+
+          accounts = sorted(by_id.values(), key=lambda row: row['id'])
+          shared = [row for row in accounts if row['ownerClass'] in ('Shared', 'Immutable')]
+          object_owned = [row for row in accounts if row['ownerClass'] == 'ObjectOwner']
+          address_owned = [row for row in accounts if row['ownerClass'] == 'AddressOwner']
+
+          tx_options = {
+              'showInput': True,
+              'showRawInput': False,
+              'showEffects': True,
+              'showEvents': True,
+              'showObjectChanges': True,
+              'showBalanceChanges': True,
+          }
+          shared_usage = []
+          for account in shared:
+              cursor = None
+              txs = []
+              for page_index in range(50):
+                  wrapper = rpc('suix_queryTransactionBlocks', [{
+                      'filter': {'InputObject': account['id']},
+                      'options': tx_options,
+                  }, cursor, 50, True])
+                  result = wrapper.get('result') if isinstance(wrapper, dict) else None
+                  if not isinstance(result, dict):
+                      txs.append({'queryFailure': wrapper})
+                      break
+                  txs.extend(result.get('data') or [])
+                  if not result.get('hasNextPage'):
+                      break
+                  cursor = result.get('nextCursor')
+              dump(f'shared_usage_{account["id"]}.json', txs)
+              claim_calls = []
+              for tx in txs:
+                  programmable = ((((tx.get('transaction') or {}).get('data') or {}).get('transaction') or {}))
+                  commands = programmable.get('transactions') or []
+                  for index, command in enumerate(commands):
+                      call = command.get('MoveCall') if isinstance(command, dict) else None
+                      if not call:
+                          continue
+                      if call.get('package') == CLAIM_PACKAGE and call.get('module') == 'borrow_incentive':
+                          claim_calls.append({
+                              'digest': tx.get('digest'),
+                              'timestampMs': tx.get('timestampMs'),
+                              'sender': (((tx.get('transaction') or {}).get('data') or {}).get('sender')),
+                              'index': index,
+                              'function': call.get('function'),
+                              'type_arguments': call.get('type_arguments'),
+                          })
+              shared_usage.append({
+                  'account': account,
+                  'transactionCount': len([tx for tx in txs if tx.get('digest')]),
+                  'borrowIncentiveCalls': claim_calls,
+              })
+
+          summary = {
+              'schema': 'bucket-account-owner-census-r9/v1',
+              'network': 'sui-mainnet',
+              'readOnly': True,
+              'types': TYPES,
+              'indexedCounts': {key: len(value) for key, value in indexed.items()},
+              'accountCount': len(accounts),
+              'accounts': accounts,
+              'ownerCounts': {
+                  'SharedOrImmutable': len(shared),
+                  'ObjectOwner': len(object_owned),
+                  'AddressOwner': len(address_owned),
+              },
+              'sharedOrImmutableAccounts': shared,
+              'sharedUsage': shared_usage,
+              'sharedAccountClaimTheftCandidate': bool(shared),
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'indexedCounts': summary['indexedCounts'],
+              'accountCount': len(accounts),
+              'ownerCounts': summary['ownerCounts'],
+              'sharedOrImmutableAccounts': shared,
+              'sharedUsage': shared_usage,
+              'sharedAccountClaimTheftCandidate': summary['sharedAccountClaimTheftCandidate'],
+          }, indent=2))
+          PY
+          python3 bucket-account-owner-census-r9/census.py | tee bucket-account-owner-census-r9/run.log
+          find bucket-account-owner-census-r9 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-account-owner-census-r9/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-account-owner-census-r9 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-account-owner-census-r9/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          print('BUCKET_ACCOUNT_OWNER_CENSUS_R9_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-account-owner-census-r9
+          path: bucket-account-owner-census-r9
+          if-no-files-found: error
+          retention-days: 7

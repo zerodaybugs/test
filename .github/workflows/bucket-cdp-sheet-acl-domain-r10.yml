@@ -1,0 +1,289 @@
+name: Bucket CDP Sheet ACL Domain R10
+
+on:
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enumerate all CDP AccessControl objects and manager history
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-cdp-sheet-acl-domain-r10
+          mkdir -p bucket-cdp-sheet-acl-domain-r10/raw
+          cat > bucket-cdp-sheet-acl-domain-r10/census.py <<'PY'
+          import json
+          import pathlib
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-cdp-sheet-acl-domain-r10')
+          RAW = OUT / 'raw'
+          RPCS = [
+              'https://fullnode.mainnet.sui.io:443',
+              'https://sui-mainnet-endpoint.blockvision.org',
+          ]
+          CURRENT = '0xc1dd29778f3fccd19a4ac79d1c35a14bf9d65a0b48f1c5bba98a949cacc53e26'
+          ORIGIN = '0x9f835c21d21f8ce519fec17d679cd38243ef2643ad879e7048ba77374be4036e'
+          TYPES = [
+              f'{ORIGIN}::vault::AccessControl',
+              f'{CURRENT}::vault::AccessControl',
+          ]
+
+          def post(url, payload, retries=6, timeout=180):
+              body = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      request = urllib.request.Request(
+                          url,
+                          data=body,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-cdp-sheet-acl-domain-r10/1',
+                          },
+                      )
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2 ** attempt, 30))
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': str(exc)})
+              return {'failures': failures}
+
+          def dump(name, value):
+              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def walk(value, path=()):
+              if isinstance(value, dict):
+                  for key, child in value.items():
+                      yield from walk(child, path + (str(key),))
+              elif isinstance(value, list):
+                  for index, child in enumerate(value):
+                      yield from walk(child, path + (str(index),))
+              else:
+                  yield '.'.join(path), value
+
+          def addresses(value):
+              found = set()
+              for _, scalar in walk(value):
+                  if isinstance(scalar, str) and scalar.startswith('0x') and len(scalar) == 66:
+                      found.add(scalar)
+              return sorted(found)
+
+          options = {
+              'showType': True,
+              'showOwner': True,
+              'showPreviousTransaction': True,
+              'showDisplay': False,
+              'showContent': True,
+              'showBcs': True,
+          }
+
+          indexed = {}
+          discovered = set()
+          rows_by_id = {}
+          for type_name in TYPES:
+              rows = []
+              cursor = None
+              for page_index in range(100):
+                  wrapper = rpc('suix_queryObjects', [{
+                      'filter': {'StructType': type_name},
+                      'options': options,
+                  }, cursor, 50])
+                  result = wrapper.get('result') if isinstance(wrapper, dict) else None
+                  if not isinstance(result, dict):
+                      rows.append({'queryFailure': wrapper})
+                      break
+                  page = result.get('data') or []
+                  rows.extend(page)
+                  for item in page:
+                      data = item.get('data') if isinstance(item, dict) else None
+                      if not data:
+                          continue
+                      object_id = data.get('objectId')
+                      if object_id:
+                          discovered.add(object_id)
+                          rows_by_id[object_id] = data
+                  if not result.get('hasNextPage'):
+                      break
+                  cursor = result.get('nextCursor')
+              indexed[type_name] = rows
+              dump(f'query_{type_name.split("::")[0]}.json', rows)
+
+          tx_options = {
+              'showInput': True,
+              'showRawInput': False,
+              'showEffects': True,
+              'showEvents': True,
+              'showObjectChanges': True,
+              'showBalanceChanges': False,
+          }
+          history = []
+          for package in (CURRENT, ORIGIN):
+              for function in ('create_acl', 'add_manager', 'remove_manager', 'loan', 'request_repayment'):
+                  cursor = None
+                  for page_index in range(100):
+                      wrapper = rpc('suix_queryTransactionBlocks', [{
+                          'filter': {
+                              'MoveFunction': {
+                                  'package': package,
+                                  'module': 'vault',
+                                  'function': function,
+                              }
+                          },
+                          'options': tx_options,
+                      }, cursor, 50, False])
+                      result = wrapper.get('result') if isinstance(wrapper, dict) else None
+                      if not isinstance(result, dict):
+                          history.append({'package': package, 'function': function, 'queryFailure': wrapper})
+                          break
+                      for tx in result.get('data') or []:
+                          row = {
+                              'package': package,
+                              'function': function,
+                              'digest': tx.get('digest'),
+                              'timestampMs': tx.get('timestampMs'),
+                              'sender': (((tx.get('transaction') or {}).get('data') or {}).get('sender')),
+                              'transaction': tx.get('transaction'),
+                              'effects': tx.get('effects'),
+                              'events': tx.get('events'),
+                              'objectChanges': tx.get('objectChanges'),
+                          }
+                          history.append(row)
+                          for change in tx.get('objectChanges') or []:
+                              if not isinstance(change, dict):
+                                  continue
+                              object_type = change.get('objectType')
+                              object_id = change.get('objectId')
+                              if object_id and isinstance(object_type, str) and object_type.endswith('::vault::AccessControl'):
+                                  discovered.add(object_id)
+                      if not result.get('hasNextPage'):
+                          break
+                      cursor = result.get('nextCursor')
+          dump('history.json', history)
+
+          for object_id in sorted(discovered):
+              wrapper = rpc('sui_getObject', [object_id, options])
+              dump(f'object_{object_id}.json', wrapper)
+              result = wrapper.get('result') if isinstance(wrapper, dict) else None
+              data = (result or {}).get('data') if isinstance(result, dict) else None
+              if data:
+                  rows_by_id[object_id] = data
+
+          acls = []
+          for object_id, data in sorted(rows_by_id.items()):
+              object_type = data.get('type')
+              if not (isinstance(object_type, str) and object_type.endswith('::vault::AccessControl')):
+                  continue
+              state = ((data.get('content') or {}).get('fields') or {})
+              acls.append({
+                  'id': object_id,
+                  'type': object_type,
+                  'owner': data.get('owner'),
+                  'version': data.get('version'),
+                  'digest': data.get('digest'),
+                  'previousTransaction': data.get('previousTransaction'),
+                  'managers': addresses(state),
+                  'state': state,
+              })
+
+          manager_sets = {tuple(row['managers']) for row in acls}
+          differences = []
+          for left_index, left in enumerate(acls):
+              for right in acls[left_index + 1:]:
+                  left_set = set(left['managers'])
+                  right_set = set(right['managers'])
+                  if left_set != right_set:
+                      differences.append({
+                          'leftAcl': left['id'],
+                          'rightAcl': right['id'],
+                          'leftOnlyManagers': sorted(left_set - right_set),
+                          'rightOnlyManagers': sorted(right_set - left_set),
+                          'sharedManagers': sorted(left_set & right_set),
+                      })
+
+          loan_history = [row for row in history if row.get('function') == 'loan' and row.get('digest')]
+          summary = {
+              'schema': 'bucket-cdp-sheet-acl-domain-r10/v1',
+              'network': 'sui-mainnet',
+              'readOnly': True,
+              'currentPackage': CURRENT,
+              'originPackage': ORIGIN,
+              'candidateTypes': TYPES,
+              'indexedCounts': {key: len(value) for key, value in indexed.items()},
+              'discoveredIds': sorted(discovered),
+              'aclCount': len(acls),
+              'acls': acls,
+              'managerSetCount': len(manager_sets),
+              'managerSetDifferences': differences,
+              'loanHistoryCount': len(loan_history),
+              'loanHistory': loan_history,
+              'crossAclPrivilegeCandidate': bool(len(acls) > 1 and differences),
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'indexedCounts': summary['indexedCounts'],
+              'aclCount': summary['aclCount'],
+              'acls': acls,
+              'managerSetDifferences': differences,
+              'loanHistoryCount': summary['loanHistoryCount'],
+              'crossAclPrivilegeCandidate': summary['crossAclPrivilegeCandidate'],
+          }, indent=2))
+          PY
+          python3 bucket-cdp-sheet-acl-domain-r10/census.py | tee bucket-cdp-sheet-acl-domain-r10/run.log
+          find bucket-cdp-sheet-acl-domain-r10 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-cdp-sheet-acl-domain-r10/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-cdp-sheet-acl-domain-r10 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-cdp-sheet-acl-domain-r10/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          print('BUCKET_CDP_SHEET_ACL_DOMAIN_R10_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-cdp-sheet-acl-domain-r10
+          path: bucket-cdp-sheet-acl-domain-r10
+          if-no-files-found: error
+          retention-days: 7

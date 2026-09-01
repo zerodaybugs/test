@@ -1,0 +1,331 @@
+name: Bucket Saving Incentive Live State R7
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enumerate the live saving pool, reward manager, rewarders and recent calls
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-saving-incentive-live-state-r7
+          mkdir -p bucket-saving-incentive-live-state-r7/raw
+          cat > bucket-saving-incentive-live-state-r7/census.py <<'PY'
+          import json
+          import pathlib
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-saving-incentive-live-state-r7')
+          RAW = OUT / 'raw'
+          RPCS = [
+              'https://fullnode.mainnet.sui.io:443',
+              'https://sui-mainnet-endpoint.blockvision.org',
+          ]
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+
+          SAVING_ORIGIN = '0x872d08a70db3db498aa7853276acea8091fdd9871b2d86bc8dcb8524526df622'
+          SAVING_CURRENT = '0x5b60c3cdbb9ee31b856f7f8a6d4d6c8b91e3c0036a138fb9927529b05fd00373'
+          INCENTIVE_ORIGIN = '0x39692320d6fc01c27315a7972ed4717e4fd32eed43531ad6f55fd7f24b74e207'
+          INCENTIVE_CURRENT = '0xd419027a4b92b1916c62c08da27520576bcf34d0a8c40884491dca2f5d992719'
+          SUSDB = '0x38f61c75fa8407140294c84167dd57684580b55c3066883b48dedc344b1cde1e::susdb::SUSDB'
+          REWARD_MANAGER = '0x79c753c1512a0eaeae0aedc623e620c599915e5855e27ee5d292d5bf95192578'
+          GLOBAL_CONFIG = '0x50ffe3535b157841e9ff0470fff722192c90b86b4dee521de0b27b03b44b20f5'
+          REGISTRY = '0x95d518095d7b44f45941e3d980224e9b7d0df00bf2151c4f48bb541c860003c9'
+          POOL_TYPE = f'{SAVING_ORIGIN}::saving::SavingPool<{SUSDB}>'
+          MANAGER_TYPE = f'{INCENTIVE_ORIGIN}::saving_incentive::RewardManager<{SUSDB}>'
+
+          def post(url, payload, retries=6, timeout=180):
+              data = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      request = urllib.request.Request(
+                          url,
+                          data=data,
+                          method='POST',
+                          headers={
+                              'content-type': 'application/json',
+                              'user-agent': 'bucket-saving-incentive-live-state-r7/1',
+                          },
+                      )
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2 ** attempt)
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': str(exc)})
+              return {'failures': failures}
+
+          def gql(query, variables=None):
+              body = post(GQL, {'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          def dump(name, value):
+              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          object_query = '''query Objects($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+
+          def objects(type_name):
+              rows = []
+              cursor = None
+              while True:
+                  connection = gql(object_query, {'type': type_name, 'after': cursor})['objects']
+                  rows.extend(connection.get('nodes') or [])
+                  page = connection.get('pageInfo') or {}
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('endCursor')
+              return rows
+
+          def get_object(object_id):
+              return rpc('sui_getObject', [object_id, {
+                  'showType': True,
+                  'showOwner': True,
+                  'showPreviousTransaction': True,
+                  'showDisplay': False,
+                  'showContent': True,
+                  'showBcs': True,
+              }])
+
+          def dynamic_fields(parent):
+              rows = []
+              cursor = None
+              for _ in range(100):
+                  wrapper = rpc('suix_getDynamicFields', [parent, cursor, 50])
+                  page = wrapper.get('result') if isinstance(wrapper, dict) else None
+                  if not isinstance(page, dict):
+                      return {'rows': rows, 'failure': wrapper}
+                  rows.extend(page.get('data') or [])
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('nextCursor')
+              return {'rows': rows}
+
+          def transactions(input_object, pages=40):
+              rows = []
+              cursor = None
+              failures = []
+              options = {
+                  'showInput': True,
+                  'showRawInput': False,
+                  'showEffects': True,
+                  'showEvents': True,
+                  'showObjectChanges': True,
+                  'showBalanceChanges': True,
+              }
+              for _ in range(pages):
+                  wrapper = rpc('suix_queryTransactionBlocks', [
+                      {'filter': {'InputObject': input_object}, 'options': options},
+                      cursor,
+                      50,
+                      True,
+                  ])
+                  page = wrapper.get('result') if isinstance(wrapper, dict) else None
+                  if not isinstance(page, dict):
+                      failures.append(wrapper)
+                      break
+                  rows.extend(page.get('data') or [])
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('nextCursor')
+              return {'rows': rows, 'failures': failures}
+
+          def move_calls(tx):
+              try:
+                  commands = tx['transaction']['data']['transaction']['transactions']
+                  inputs = tx['transaction']['data']['transaction'].get('inputs') or []
+              except Exception:
+                  return []
+              output = []
+              for index, command in enumerate(commands or []):
+                  move = command.get('MoveCall') if isinstance(command, dict) else None
+                  if not move:
+                      continue
+                  resolved = []
+                  for argument in move.get('arguments') or []:
+                      item = {'argument': argument}
+                      if isinstance(argument, dict) and 'Input' in argument:
+                          input_index = int(argument['Input'])
+                          if input_index < len(inputs):
+                              item['input'] = inputs[input_index]
+                      resolved.append(item)
+                  output.append({
+                      'index': index,
+                      'package': move.get('package'),
+                      'module': move.get('module'),
+                      'function': move.get('function'),
+                      'type_arguments': move.get('type_arguments'),
+                      'arguments': resolved,
+                  })
+              return output
+
+          checkpoint = gql('query { checkpoint { sequenceNumber timestamp } }')['checkpoint']
+          pools = objects(POOL_TYPE)
+          managers = objects(MANAGER_TYPE)
+          dump('pools_graphql.json', pools)
+          dump('managers_graphql.json', managers)
+
+          exact_objects = {
+              REWARD_MANAGER: get_object(REWARD_MANAGER),
+              GLOBAL_CONFIG: get_object(GLOBAL_CONFIG),
+              REGISTRY: get_object(REGISTRY),
+          }
+          for pool in pools:
+              exact_objects[pool['address']] = get_object(pool['address'])
+          dump('exact_objects.json', exact_objects)
+
+          dynamic = {}
+          dynamic_objects = {}
+          queue = [REWARD_MANAGER]
+          visited = set()
+          for _ in range(5):
+              next_queue = []
+              for parent in queue:
+                  if parent in visited:
+                      continue
+                  visited.add(parent)
+                  result = dynamic_fields(parent)
+                  dynamic[parent] = result
+                  for field in result.get('rows') or []:
+                      child = field.get('objectId')
+                      if child and child not in dynamic_objects:
+                          dynamic_objects[child] = get_object(child)
+                          next_queue.append(child)
+              queue = next_queue
+          dump('dynamic_fields.json', dynamic)
+          dump('dynamic_objects.json', dynamic_objects)
+
+          transaction_targets = [REWARD_MANAGER] + [pool['address'] for pool in pools]
+          tx_by_object = {}
+          relevant_calls = []
+          caller_counts = {}
+          for target in transaction_targets:
+              result = transactions(target)
+              tx_by_object[target] = result
+              for tx in result.get('rows') or []:
+                  sender = (((tx.get('transaction') or {}).get('data') or {}).get('sender'))
+                  if sender:
+                      caller_counts[sender] = caller_counts.get(sender, 0) + 1
+                  calls = move_calls(tx)
+                  for call in calls:
+                      if call['package'] in {SAVING_ORIGIN, SAVING_CURRENT, INCENTIVE_ORIGIN, INCENTIVE_CURRENT}:
+                          relevant_calls.append({
+                              'digest': tx.get('digest'),
+                              'timestampMs': tx.get('timestampMs'),
+                              'sender': sender,
+                              'status': (tx.get('effects') or {}).get('status'),
+                              'targetObject': target,
+                              'call': call,
+                              'objectChanges': tx.get('objectChanges'),
+                              'balanceChanges': tx.get('balanceChanges'),
+                          })
+          dump('transactions.json', tx_by_object)
+          dump('relevant_calls.json', relevant_calls)
+
+          function_counts = {}
+          package_counts = {}
+          for row in relevant_calls:
+              call = row['call']
+              fn = f"{call['package']}::{call['module']}::{call['function']}"
+              function_counts[fn] = function_counts.get(fn, 0) + 1
+              package_counts[call['package']] = package_counts.get(call['package'], 0) + 1
+
+          summary = {
+              'schema': 'bucket-saving-incentive-live-state-r7/v1',
+              'network': 'sui-mainnet',
+              'checkpoint': checkpoint,
+              'types': {'pool': POOL_TYPE, 'rewardManager': MANAGER_TYPE},
+              'packages': {
+                  'savingOrigin': SAVING_ORIGIN,
+                  'savingCurrent': SAVING_CURRENT,
+                  'incentiveOrigin': INCENTIVE_ORIGIN,
+                  'incentiveCurrent': INCENTIVE_CURRENT,
+              },
+              'known': {
+                  'rewardManager': REWARD_MANAGER,
+                  'globalConfig': GLOBAL_CONFIG,
+                  'registry': REGISTRY,
+              },
+              'pools': pools,
+              'managers': managers,
+              'exactObjects': exact_objects,
+              'dynamicFields': dynamic,
+              'dynamicObjects': dynamic_objects,
+              'relevantCalls': relevant_calls,
+              'functionCounts': function_counts,
+              'packageCounts': package_counts,
+              'callerCounts': caller_counts,
+              'readOnly': True,
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'checkpoint': checkpoint,
+              'pool_count': len(pools),
+              'pools': pools,
+              'manager_count': len(managers),
+              'managers': managers,
+              'dynamic_parent_count': len(dynamic),
+              'dynamic_object_count': len(dynamic_objects),
+              'function_counts': function_counts,
+              'package_counts': package_counts,
+              'top_callers': sorted(caller_counts.items(), key=lambda item: item[1], reverse=True)[:20],
+              'sample_calls': relevant_calls[:30],
+          }, indent=2))
+          PY
+          python3 bucket-saving-incentive-live-state-r7/census.py | tee bucket-saving-incentive-live-state-r7/run.log
+          find bucket-saving-incentive-live-state-r7 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-saving-incentive-live-state-r7/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-saving-incentive-live-state-r7 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-saving-incentive-live-state-r7/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          print('BUCKET_SAVING_INCENTIVE_LIVE_STATE_R7_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-saving-incentive-live-state-r7
+          path: bucket-saving-incentive-live-state-r7
+          if-no-files-found: error
+          retention-days: 7

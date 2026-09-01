@@ -1,0 +1,217 @@
+name: Bucket Bluefin Full-Close Source Reference Extraction R6
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-pyth-revival-gate-20260809]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the known successful B-position removal and resolve inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-bluefin-source-refs-r6
+          mkdir -p bucket-bluefin-source-refs-r6/raw
+          cat > bucket-bluefin-source-refs-r6/extract.py <<'PY'
+          import json
+          import pathlib
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-bluefin-source-refs-r6')
+          RAW = OUT / 'raw'
+          RPCS = [
+              'https://sui-mainnet-endpoint.blockvision.org',
+              'https://fullnode.mainnet.sui.io:443',
+          ]
+          DIGEST = 'EVq3gRwx2uMpjYEbF88kbJWQ66sEhxiqx7yzpiMqGhw3'
+          PACKAGE = '0x266588b4ade88033ebe61e158ca25504b772fb7c1cdb89294a2c25c9073c3ecf'
+
+          def post(url, payload, retries=6, timeout=120):
+              data = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      request = urllib.request.Request(
+                          url,
+                          data=data,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-bluefin-source-refs-r6/1',
+                          },
+                      )
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2 ** attempt)
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      if body.get('result') is None:
+                          raise RuntimeError('null result')
+                      return {'endpoint': endpoint, 'result': body['result']}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': str(exc)})
+              return {'failures': failures}
+
+          def result(wrapper):
+              return wrapper.get('result') if isinstance(wrapper, dict) else None
+
+          def dump(name, value):
+              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          wrapper = rpc('sui_getTransactionBlock', [DIGEST, {
+              'showInput': True,
+              'showEffects': True,
+              'showEvents': True,
+              'showObjectChanges': True,
+              'showBalanceChanges': True,
+          }])
+          dump('source_transaction.json', wrapper)
+          transaction = result(wrapper)
+          if not isinstance(transaction, dict):
+              raise RuntimeError(f'transaction fetch failed: {json.dumps(wrapper)}')
+
+          tx_data = ((transaction.get('transaction') or {}).get('data') or {})
+          programmable = tx_data.get('transaction') or {}
+          inputs = programmable.get('inputs') or []
+          commands = programmable.get('transactions') or []
+
+          def resolve_argument(argument):
+              row = {'argument': argument}
+              if isinstance(argument, dict) and 'Input' in argument:
+                  index = int(argument['Input'])
+                  row['input_index'] = index
+                  row['input'] = inputs[index] if index < len(inputs) else None
+              return row
+
+          calls = []
+          target = None
+          target_index = None
+          for index, command in enumerate(commands):
+              move = command.get('MoveCall') if isinstance(command, dict) else None
+              if not move:
+                  continue
+              row = {
+                  'command_index': index,
+                  'package': move.get('package'),
+                  'module': move.get('module'),
+                  'function': move.get('function'),
+                  'type_arguments': move.get('type_arguments'),
+                  'arguments': [resolve_argument(argument) for argument in move.get('arguments') or []],
+              }
+              calls.append(row)
+              if (
+                  move.get('package') == PACKAGE
+                  and move.get('module') == 'bluefin_lp_provider'
+                  and move.get('function') == 'remove_usdb_b_liquidity'
+              ):
+                  target = row
+                  target_index = index
+
+          if target is None:
+              raise RuntimeError('target Bluefin call not found')
+
+          oracle_prelude = [
+              call for call in calls
+              if call['command_index'] < target_index
+              and (
+                  (call['module'] == 'collector' and call['function'] == 'new')
+                  or (call['module'] == 'pyth_rule' and call['function'] == 'feed')
+                  or (call['module'] == 'aggregator' and call['function'] == 'aggregate')
+              )
+          ]
+
+          object_ids = set()
+          for call in oracle_prelude + [target]:
+              for argument in call['arguments']:
+                  value = argument.get('input')
+                  if isinstance(value, dict):
+                      object_id = value.get('objectId')
+                      if object_id:
+                          object_ids.add(object_id)
+
+          objects = {}
+          for object_id in sorted(object_ids):
+              objects[object_id] = rpc('sui_getObject', [object_id, {
+                  'showType': True,
+                  'showOwner': True,
+                  'showPreviousTransaction': True,
+                  'showContent': True,
+                  'showBcs': True,
+              }])
+          dump('objects.json', objects)
+
+          summary = {
+              'schema': 'bucket-bluefin-full-close-source-refs-r6/v1',
+              'network': 'sui-mainnet',
+              'source_digest': DIGEST,
+              'source_endpoint': wrapper.get('endpoint'),
+              'sender': tx_data.get('sender'),
+              'status': (transaction.get('effects') or {}).get('status'),
+              'inputs': inputs,
+              'calls': calls,
+              'oracle_prelude': oracle_prelude,
+              'target_call': target,
+              'objects': objects,
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'source_endpoint': summary['source_endpoint'],
+              'sender': summary['sender'],
+              'status': summary['status'],
+              'oracle_prelude': summary['oracle_prelude'],
+              'target_call': summary['target_call'],
+              'object_ids': sorted(object_ids),
+          }, indent=2))
+          PY
+          python3 bucket-bluefin-source-refs-r6/extract.py | tee bucket-bluefin-source-refs-r6/run.log
+          find bucket-bluefin-source-refs-r6 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-bluefin-source-refs-r6/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|signAndExecute|private.?key|mnemonic' bucket-bluefin-source-refs-r6 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-bluefin-source-refs-r6/SUMMARY.json'))
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          print('BUCKET_BLUEFIN_SOURCE_REFS_R6_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-bluefin-source-refs-r6
+          path: bucket-bluefin-source-refs-r6
+          if-no-files-found: error
+          retention-days: 7
