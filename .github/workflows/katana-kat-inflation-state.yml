@@ -1,0 +1,117 @@
+name: Katana KAT inflation rounding state
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-kat-inflation-state.yml'
+      - 'katana-kat-inflation/**'
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Read current KAT state and quantify frequent-settlement truncation
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          import json,time,urllib.request
+          from pathlib import Path
+
+          RPCS=['https://rpc.katana.network/','https://rpc.katanarpc.com/','https://katana.gateway.tenderly.co/']
+          TOKEN='0x7f1f4b4b29f5058fa32cc7a97141b8d7e5abdc2d'
+          req_id=0
+          def rpc(method,params,tries=5):
+            global req_id
+            last=None
+            for attempt in range(tries):
+              for url in RPCS:
+                req_id+=1
+                body=json.dumps({'jsonrpc':'2.0','id':req_id,'method':method,'params':params}).encode()
+                req=urllib.request.Request(url,data=body,headers={'content-type':'application/json','user-agent':'Katana-KAT-rounding/1.0'})
+                try:
+                  with urllib.request.urlopen(req,timeout=35) as resp: obj=json.loads(resp.read())
+                  if 'error' in obj: last=RuntimeError(obj['error']); continue
+                  return obj['result']
+                except Exception as exc: last=exc
+              time.sleep(min(2**attempt,8))
+            raise RuntimeError(f'{method}: {last!r}')
+          def sel(sig): return rpc('web3_sha3',['0x'+sig.encode().hex()])[:10]
+          def call(sig): return rpc('eth_call',[{'to':TOKEN,'data':sel(sig)},'latest'])
+          def uint(sig): return int(call(sig),16)
+          def addr_arg(sig,arg):
+            data=sel(sig)+arg[2:].lower().rjust(64,'0')
+            return rpc('eth_call',[{'to':TOKEN,'data':data},'latest'])
+          def addr(sig,arg): return '0x'+addr_arg(sig,arg)[-40:]
+          def role_hash(name): return rpc('web3_sha3',['0x'+name.encode().hex()])
+
+          latest_hex=rpc('eth_blockNumber',[])
+          latest=int(latest_hex,16)
+          block=rpc('eth_getBlockByNumber',[latest_hex,False])
+          ts=int(block['timestamp'],16)
+          state={
+            'chain_id':int(rpc('eth_chainId',[]),16),
+            'latest_block':latest,
+            'latest_timestamp':ts,
+            'token':TOKEN,
+            'totalSupply':uint('totalSupply()(uint256)'),
+            'distributedSupplyCap':uint('distributedSupplyCap()(uint256)'),
+            'lastMintCapacityIncrease':uint('lastMintCapacityIncrease()(uint256)'),
+            'inflationFactor':uint('inflationFactor()(uint256)'),
+            'cap':uint('cap()(uint256)'),
+            'unlockTime':uint('unlockTime()(uint256)'),
+            'locked':bool(uint('locked()(bool)')),
+          }
+          roles={}
+          for name in ['INFLATION_ADMIN','INFLATION_BENEFICIARY','UNLOCKER','LOCK_EXEMPTION_ADMIN']:
+            h=role_hash(name)
+            data=sel('roleHolder(bytes32)')+h[2:]
+            raw=rpc('eth_call',[{'to':TOKEN,'data':data},'latest'])
+            roles[name]={'hash':h,'holder':'0x'+raw[-40:]}
+          state['roles']=roles
+          state['unrealizedInflation']=state['cap']-state['distributedSupplyCap']
+          state['secondsSinceSettlement']=ts-state['lastMintCapacityIncrease']
+
+          # High-precision economic comparison. This upper-bounds the loss from settling at fixed intervals;
+          # exact Solidity fixed-point error can only be smaller than a few output wei per settlement at current scale.
+          from decimal import Decimal,getcontext
+          getcontext().prec=80
+          one=Decimal(10)**18
+          year=Decimal(365*24*60*60)
+          factor=Decimal(state['inflationFactor'])/one
+          cap0=Decimal(state['distributedSupplyCap'])
+          def ideal(dt): return cap0*((Decimal(2) ** (factor*Decimal(dt)/year))-Decimal(1))
+          intervals=[1,2,12,30,60,300,3600,86400]
+          rows=[]
+          for dt in intervals:
+            amount=ideal(dt)
+            rows.append({
+              'interval_seconds':dt,
+              'ideal_inflation_token_wei':str(int(amount)),
+              'ideal_inflation_KAT':str(amount/one),
+              'max_truncation_wei_per_year_if_at_most_one_wei_per_settlement':str((365*24*60*60)//dt),
+            })
+          state['interval_analysis']=rows
+          Path('evidence/kat_inflation_state.json').write_text(json.dumps(state,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(state,indent=2,sort_keys=True))
+          PY
+          (cd evidence && sha256sum * > SHA256SUMS)
+
+      - name: Upload KAT inflation analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-kat-inflation-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1

@@ -1,0 +1,218 @@
+name: Katana OFT adapter production profile
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-oft-adapter-profile.yml'
+      - 'katana-oft-profile/**'
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Read exact Katana OFT adapter and token state
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          import json, time, urllib.request, urllib.error
+          from pathlib import Path
+
+          RPC='https://rpc.katana.network/'
+          OUT=Path('evidence')
+          ADAPTERS={
+            'vbUSDC': {'adapter':'0x807275727Dd3E640c5F2b5DE7d1eC72B4Dd293C0','token':'0x203A662b0BD271A6ed5a60EdFbd04bFce608FD36','converter':'0x97a3500083348A147F419b8a65717909762c389f'},
+            'vbUSDT': {'adapter':'0x4690f346337eD8737BeA462ac71Ff16Ef95B985E','token':'0x2DCa96907fde857dd3D816880A0df407eeB2D2F2','converter':'0x053FA9b934b83E1E0ffc7e98a41aAdc3640bB462'},
+            'vbWBTC': {'adapter':'0x8169e532Bc781985e155037db1F96c267a520DFC','token':'0x0913DA6Da4b42f538B445599b46Bb4622342Cf52','converter':'0xb00aa68b87256E2F22058fB2Ba3246EEc54A44fc'},
+            'vbUSDS': {'adapter':'0xB42ab636ac69f073970a94d1ACE13379E7621665','token':'0x62D6A123E8D19d06d68cf0d2294F9A3A0362c6b3','converter':'0x639f13D5f30B47c792b6851238c05D0b623C77DE'},
+            'vbETH':  {'adapter':'0x694d1697F6909361775139357d99fb60b5caB683','token':'0xEE7D8BCFb72bC1880D0Cf19822eB0A2e6577aB62','converter':'0xa6b0db1293144ebe9478b6a84f75dd651e45914a'},
+          }
+          IMPL_SLOT='0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
+          ADMIN_SLOT='0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103'
+          ETH_EID=30101
+
+          counter=0
+          def rpc(method, params):
+              global counter
+              counter += 1
+              body=json.dumps({'jsonrpc':'2.0','id':counter,'method':method,'params':params}).encode()
+              req=urllib.request.Request(RPC,data=body,headers={'content-type':'application/json','user-agent':'katana-read-only-profile/1.0'})
+              last=None
+              for attempt in range(5):
+                  try:
+                      with urllib.request.urlopen(req,timeout=45) as r:
+                          x=json.loads(r.read())
+                      if 'error' in x:
+                          raise RuntimeError(x['error'])
+                      return x['result']
+                  except Exception as exc:
+                      last=exc
+                      time.sleep(1.5*(attempt+1))
+              raise last
+
+          def sig(text):
+              return rpc('web3_sha3',['0x'+text.encode().hex()])[:10]
+          def word_int(n): return hex(n)[2:].rjust(64,'0')
+          def calldata(signature, args=()):
+              out=sig(signature)
+              for typ,val in args:
+                  if typ=='uint32' or typ=='uint16' or typ=='uint256': out += word_int(int(val))
+                  elif typ=='address': out += val.lower().replace('0x','').rjust(64,'0')
+                  elif typ=='bytes32': out += val.lower().replace('0x','').rjust(64,'0')
+                  else: raise ValueError(typ)
+              return out
+          def call(to, signature, args=(), block='latest'):
+              data=calldata(signature,args)
+              try:
+                  return {'ok':True,'data':rpc('eth_call',[{'to':to,'data':data},block]),'selector':data[:10]}
+              except Exception as exc:
+                  return {'ok':False,'error':repr(exc),'selector':data[:10]}
+          def addr_from_word(x):
+              if not isinstance(x,str) or len(x)<42: return None
+              return '0x'+x[-40:]
+          def int_from_word(x):
+              try: return int(x,16)
+              except: return None
+          def code_at(a,block='latest'):
+              return rpc('eth_getCode',[a,block])
+          def storage(a,slot,block='latest'):
+              return rpc('eth_getStorageAt',[a,slot,block])
+          def deployed_block(addr, latest):
+              lo,hi=0,latest
+              if code_at(addr,hex(hi))=='0x': return None
+              while lo<hi:
+                  mid=(lo+hi)//2
+                  if code_at(addr,hex(mid))=='0x': lo=mid+1
+                  else: hi=mid
+              return lo
+          def decode(name,res):
+              if not res.get('ok'): return res
+              d=res.get('data','0x')
+              out=dict(res)
+              if name in {'token','owner','delegate','endpoint','msgInspector','preCrime','bridge','nativeConverter'}:
+                  out['decoded']=addr_from_word(d)
+              elif name in {'approvalRequired','hasPeer','paused'}:
+                  out['decoded']=bool(int_from_word(d)) if int_from_word(d) is not None else None
+              elif name in {'secondaryChainBalance','sharedDecimals','decimalConversionRate','globalInitializationCounter','totalSupply','totalNetAdditional','balanceOfAdapter','backingOnLayerY','nonMigratableBackingPercentage','migratableBacking'}:
+                  out['decoded']=int_from_word(d)
+              elif name in {'peers','getPeer'}:
+                  out['decoded']=d[-64:] if len(d)>=66 else None
+              else:
+                  out['decoded_raw']=d
+              return out
+
+          latest=int(rpc('eth_blockNumber',[]),16)
+          block=rpc('eth_getBlockByNumber',[hex(latest),False])
+          topics={s:rpc('web3_sha3',['0x'+s.encode().hex()]) for s in [
+              'Upgraded(address)','Initialized(uint64)','OwnershipTransferred(address,address)','PeerSet(uint32,bytes32)'
+          ]}
+          functions={
+            'token':('token()',()),
+            'approvalRequired':('approvalRequired()',()),
+            'secondaryChainBalance':('secondaryChainBalance()',()),
+            'owner':('owner()',()),
+            'delegate':('delegate()',()),
+            'endpoint':('endpoint()',()),
+            'sharedDecimals':('sharedDecimals()',()),
+            'decimalConversionRate':('decimalConversionRate()',()),
+            'globalInitializationCounter':('globalInitializationCounter()',()),
+            'oftVersion':('oftVersion()',()),
+            'oAppVersion':('oAppVersion()',()),
+            'version':('version()',()),
+            'paused':('paused()',()),
+            'msgInspector':('msgInspector()',()),
+            'preCrime':('preCrime()',()),
+            'peers':('peers(uint32)',(('uint32',ETH_EID),)),
+            'getPeer':('getPeer(uint32)',(('uint32',ETH_EID),)),
+            'hasPeer':('hasPeer(uint32)',(('uint32',ETH_EID),)),
+            'enforcedOptions_msg1':('enforcedOptions(uint32,uint16)',(('uint32',ETH_EID),('uint16',1))),
+            'enforcedOptions_msg2':('enforcedOptions(uint32,uint16)',(('uint32',ETH_EID),('uint16',2))),
+          }
+          token_functions={
+            'totalSupply':('totalSupply()',()),
+            'totalNetAdditional':('totalNetMintedByAdditionalMintersBurners()',()),
+            'bridge':('lxlyBridge()',()),
+            'nativeConverter':('nativeConverter()',()),
+          }
+          converter_functions={
+            'backingOnLayerY':('backingOnLayerY()',()),
+            'nonMigratableBackingPercentage':('nonMigratableBackingPercentage()',()),
+            'migratableBacking':('migratableBacking()',()),
+          }
+
+          result={'rpc':RPC,'latest_block':latest,'latest_timestamp':int(block['timestamp'],16),'topics':topics,'adapters':{}}
+          for label,cfg in ADAPTERS.items():
+              a,t,nc=cfg['adapter'],cfg['token'],cfg['converter']
+              impl=addr_from_word(storage(a,IMPL_SLOT))
+              admin=addr_from_word(storage(a,ADMIN_SLOT))
+              entry={
+                'addresses':cfg,
+                'proxy_deploy_block':deployed_block(a,latest),
+                'proxy_code_bytes':(len(code_at(a))-2)//2,
+                'implementation':impl,
+                'implementation_code_bytes':(len(code_at(impl))-2)//2 if impl else None,
+                'proxy_admin':admin,
+                'calls':{},'token_state':{},'converter_state':{},'upgrade_logs':{},
+              }
+              entry['proxy_codehash']=rpc('web3_sha3',[code_at(a)])
+              if impl: entry['implementation_codehash']=rpc('web3_sha3',[code_at(impl)])
+              for name,(fs,args) in functions.items(): entry['calls'][name]=decode(name,call(a,fs,args))
+              for name,(fs,args) in token_functions.items(): entry['token_state'][name]=decode(name,call(t,fs,args))
+              entry['token_state']['balanceOfAdapter']=decode('balanceOfAdapter',call(t,'balanceOf(address)',(('address',a),)))
+              for name,(fs,args) in converter_functions.items(): entry['converter_state'][name]=decode(name,call(nc,fs,args))
+              start=entry['proxy_deploy_block'] or 0
+              for ev,topic in topics.items():
+                  try:
+                      entry['upgrade_logs'][ev]=rpc('eth_getLogs',[{'address':a,'fromBlock':hex(start),'toBlock':'latest','topics':[topic]}])
+                  except Exception as exc:
+                      entry['upgrade_logs'][ev]={'error':repr(exc)}
+              # Strong consistency checks without mutating state.
+              sb=entry['calls']['secondaryChainBalance'].get('decoded')
+              tn=entry['token_state']['totalNetAdditional'].get('decoded')
+              tok=entry['calls']['token'].get('decoded')
+              entry['checks']={
+                'adapter_token_matches_scoped_token': tok is not None and tok.lower()==t.lower(),
+                'secondary_balance_equals_total_net_additional': sb is not None and tn is not None and sb==tn,
+                'has_ethereum_peer': entry['calls']['hasPeer'].get('decoded') is True,
+              }
+              result['adapters'][label]=entry
+
+          (OUT/'katana_oft_adapter_profile.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          compact={
+            'latest_block':latest,
+            'adapters':{
+              k:{
+                'addresses':v['addresses'],'implementation':v['implementation'],'implementation_codehash':v.get('implementation_codehash'),
+                'proxy_admin':v['proxy_admin'],'proxy_deploy_block':v['proxy_deploy_block'],
+                'calls':{n:x.get('decoded',x.get('data',x.get('error'))) for n,x in v['calls'].items()},
+                'token_state':{n:x.get('decoded',x.get('data',x.get('error'))) for n,x in v['token_state'].items()},
+                'converter_state':{n:x.get('decoded',x.get('data',x.get('error'))) for n,x in v['converter_state'].items()},
+                'checks':v['checks'],
+                'upgrade_counts':{n:(len(x) if isinstance(x,list) else x) for n,x in v['upgrade_logs'].items()},
+              } for k,v in result['adapters'].items()
+            }
+          }
+          (OUT/'katana_oft_adapter_profile_compact.json').write_text(json.dumps(compact,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(compact,indent=2,sort_keys=True))
+          PY
+          sha256sum evidence/* > evidence/SHA256SUMS
+
+      - name: Upload read-only OFT adapter profile
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-oft-adapter-profile-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9

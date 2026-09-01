@@ -1,0 +1,120 @@
+name: Katana Vault Bridge deployed-version history lookup
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-vaultbridge-history-source.yml'
+      - 'katana-vb-history/**'
+
+permissions:
+  contents: read
+
+jobs:
+  lookup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Locate public source revisions declaring version 0.5.1
+        shell: bash
+        run: |
+          set -u
+          E="$GITHUB_WORKSPACE/evidence"
+          mkdir -p "$E" /tmp/work
+          status=0
+
+          git clone --quiet https://github.com/agglayer/vault-bridge.git /tmp/work/vault-bridge \
+            >"$E/clone.stdout" 2>"$E/clone.stderr" || status=$?
+          if test "$status" -eq 0; then
+            git -C /tmp/work/vault-bridge fetch --quiet --all --tags --force \
+              >"$E/fetch.stdout" 2>"$E/fetch.stderr" || status=$?
+          fi
+
+          if test "$status" -eq 0; then
+            {
+              echo '=== refs ==='
+              git -C /tmp/work/vault-bridge show-ref --heads --tags || true
+              echo '=== log -S 0.5.1 ==='
+              git -C /tmp/work/vault-bridge log --all --date=iso-strict --format='%H %ad %D %s' -S '0.5.1' -- . || true
+              echo '=== log -G version ==='
+              git -C /tmp/work/vault-bridge log --all --date=iso-strict --format='%H %ad %D %s' -G '0[.]5[.]1' -- . || true
+            } > "$E/history.txt" 2>"$E/history.stderr"
+
+            python3 - <<'PY' >"$E/python.stdout" 2>"$E/python.stderr" || status=$?
+          import json, subprocess
+          from pathlib import Path
+          repo=Path('/tmp/work/vault-bridge')
+          out=Path.cwd()/'evidence'
+          candidate_commits=[]
+          for pattern in ('0.5.1','return "0.5.1"'):
+              p=subprocess.run(
+                  ['git','-C',str(repo),'log','--all','--format=%H','-S',pattern,'--','.'],
+                  text=True,capture_output=True
+              )
+              candidate_commits.extend(p.stdout.splitlines())
+          candidate_commits=list(dict.fromkeys(candidate_commits))
+          hits=[]
+          for commit in candidate_commits:
+              tree=subprocess.run(['git','-C',str(repo),'ls-tree','-r','--name-only',commit],text=True,capture_output=True)
+              paths=[p for p in tree.stdout.splitlines() if p.endswith('.sol')]
+              matched=[]
+              excerpts={}
+              for path in paths:
+                  p=subprocess.run(['git','-C',str(repo),'show',f'{commit}:{path}'],text=True,capture_output=True,errors='replace')
+                  if p.returncode==0 and '0.5.1' in p.stdout:
+                      matched.append(path)
+                      excerpts[path]=p.stdout
+              if matched:
+                  meta=subprocess.check_output(
+                      ['git','-C',str(repo),'show','-s','--format=%H%n%aI%n%D%n%s',commit],text=True
+                  ).splitlines()
+                  hits.append({
+                      'commit':commit,
+                      'date':meta[1] if len(meta)>1 else None,
+                      'refs':meta[2] if len(meta)>2 else None,
+                      'subject':meta[3] if len(meta)>3 else None,
+                      'paths':matched,
+                  })
+                  for path,text in excerpts.items():
+                      safe=path.replace('/','__')
+                      (out/f'{commit[:12]}__{safe}').write_text(text)
+          (out/'version_hits.json').write_text(json.dumps(hits,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(hits,indent=2,sort_keys=True))
+          PY
+
+            hit=$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          path=Path.cwd()/'evidence/version_hits.json'
+          hits=json.loads(path.read_text()) if path.exists() else []
+          print(hits[0]['commit'] if hits else '')
+          PY
+            )
+            if test -n "$hit"; then
+              git -C /tmp/work/vault-bridge archive --format=tar.gz \
+                --output="$E/vault-bridge-0.5.1-source.tar.gz" "$hit" \
+                >"$E/archive.stdout" 2>"$E/archive.stderr" || status=$?
+              git -C /tmp/work/vault-bridge show -s --format=fuller "$hit" > "$E/source-commit.txt" 2>&1 || true
+              git -C /tmp/work/vault-bridge ls-tree -r "$hit" > "$E/source-tree.txt" 2>&1 || true
+            fi
+          fi
+
+          printf 'exit_status=%s\n' "$status" > "$E/STATUS.txt"
+          find "$E" -maxdepth 1 -type f -printf '%f\t%s bytes\n' | sort > "$E/INDEX.txt"
+          (cd "$E" && sha256sum * > SHA256SUMS) || true
+          exit "$status"
+
+      - name: Upload public history evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-vaultbridge-history-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9

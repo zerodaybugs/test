@@ -1,0 +1,209 @@
+name: Katana CustomToken role ledger v2
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-customtoken-role-ledger-v2.yml'
+      - 'katana-customtoken-roles/**'
+
+permissions:
+  contents: read
+
+jobs:
+  roles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Scan exact CustomToken proxies and resolve current role members
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          import json, time, urllib.request
+          from pathlib import Path
+
+          RPCS = [
+              'https://rpc.katana.network/',
+              'https://rpc.katanarpc.com/',
+              'https://katana.gateway.tenderly.co/',
+          ]
+          TOKENS = {
+              'USDC_CUSTOM': '0x203A662b0BD271A6ed5a60EdFbd04bFce608FD36',
+              'USDT_CUSTOM': '0x2DCa96907fde857dd3D816880A0df407eeB2D2F2',
+              'WBTC_CUSTOM': '0x0913DA6Da4b42f538B445599b46Bb4622342Cf52',
+              'USDS_CUSTOM': '0x62D6A123E8D19d06d68cf0d2294F9A3A0362c6b3',
+              'WETH_CUSTOM': '0xEE7D8BCFb72bC1880D0Cf19822eB0A2e6577aB62',
+          }
+          PEERS = {
+              'USDC_CONVERTER': '0x97a3500083348a147f419b8a65717909762c389f',
+              'USDT_CONVERTER': '0x053fa9b934b83e1e0ffc7e98a41aadc3640bb462',
+              'WBTC_CONVERTER': '0xb00aa68b87256e2f22058fb2ba3246eec54a44fc',
+              'USDS_CONVERTER': '0x639f13d5f30b47c792b6851238c05d0b623c77de',
+              'WETH_CONVERTER': '0xa6b0db1293144ebe9478b6a84f75dd651e45914a',
+              'AGGLAYER_BRIDGE': '0x2a3dd3eb832af982ec71669e178424b10dca2ede',
+              'MIGRATION_MANAGER': '0x417d01B64Ea30C4E163873f3a1f77b727c689e02',
+          }
+          ROLE_GRANTED = '0x2f8788117e7eff1d82a5fba9f469ac78ca822fbd37d5d7e9f6fcf16a0f21e5b0'
+          ROLE_REVOKED = '0xf6391f5c32d9c2d3a7fc30d9b01c8c3a8a7529fe5e48c24c2f22f78b9b0b24a2'
+          req_id = 0
+
+          def rpc(method, params, tries=6):
+              global req_id
+              last = None
+              for attempt in range(tries):
+                  for url in RPCS:
+                      req_id += 1
+                      payload = json.dumps({'jsonrpc':'2.0','id':req_id,'method':method,'params':params}).encode()
+                      request = urllib.request.Request(url, data=payload, headers={'content-type':'application/json'})
+                      try:
+                          with urllib.request.urlopen(request, timeout=45) as response:
+                              obj = json.loads(response.read())
+                          if 'error' in obj:
+                              last = RuntimeError(f'{url} {obj["error"]}')
+                              continue
+                          return obj['result']
+                      except Exception as exc:
+                          last = exc
+                  time.sleep(min(2 ** attempt, 8))
+              raise RuntimeError(f'{method} failed: {last!r}')
+
+          def web3_keccak(text):
+              return rpc('web3_sha3', ['0x' + text.encode().hex()])
+
+          ROLE_HASHES = {
+              'DEFAULT_ADMIN_ROLE': '0x' + '00' * 32,
+              'PAUSER_ROLE': web3_keccak('PAUSER_ROLE'),
+              'MINTER_BURNER_ROLE': web3_keccak('MINTER_BURNER_ROLE'),
+          }
+
+          latest = int(rpc('eth_blockNumber', []), 16)
+
+          def first_code_block(address):
+              lo, hi = 0, latest
+              if rpc('eth_getCode', [address, hex(hi)]) in ('0x','0x0'):
+                  return None
+              while lo < hi:
+                  mid = (lo + hi) // 2
+                  if rpc('eth_getCode', [address, hex(mid)]) in ('0x','0x0'):
+                      lo = mid + 1
+                  else:
+                      hi = mid
+              return lo
+
+          def logs_chunked(address, start, end, topic0):
+              rows = []
+              cursor = start
+              chunk = 250_000
+              while cursor <= end:
+                  stop = min(cursor + chunk - 1, end)
+                  try:
+                      part = rpc('eth_getLogs', [{
+                          'address': address,
+                          'fromBlock': hex(cursor),
+                          'toBlock': hex(stop),
+                          'topics': [topic0],
+                      }], tries=3)
+                      rows.extend(part)
+                      cursor = stop + 1
+                  except Exception:
+                      if chunk <= 2_000:
+                          raise
+                      chunk //= 2
+              return rows
+
+          def topic_address(topic):
+              return '0x' + topic[-40:].lower()
+
+          def encode_has_role(role, account):
+              return '0x91d14854' + role[2:] + account[2:].lower().rjust(64, '0')
+
+          def has_role(token, role, account):
+              out = rpc('eth_call', [{'to': token, 'data': encode_has_role(role, account)}, 'latest'])
+              return int(out, 16) != 0
+
+          report = {
+              'latest_block': latest,
+              'role_hashes': ROLE_HASHES,
+              'tokens': {},
+          }
+          all_event_accounts = {address.lower() for address in PEERS.values()}
+
+          for label, token in TOKENS.items():
+              start = first_code_block(token)
+              events = []
+              for topic0, kind in ((ROLE_GRANTED, 'grant'), (ROLE_REVOKED, 'revoke')):
+                  for log in logs_chunked(token, start, latest, topic0):
+                      topics = log.get('topics', [])
+                      if len(topics) < 4:
+                          continue
+                      row = {
+                          'kind': kind,
+                          'role': topics[1].lower(),
+                          'account': topic_address(topics[2]),
+                          'sender': topic_address(topics[3]),
+                          'block': int(log['blockNumber'], 16),
+                          'transactionHash': log['transactionHash'],
+                          'logIndex': int(log['logIndex'], 16),
+                      }
+                      events.append(row)
+                      all_event_accounts.add(row['account'])
+                      all_event_accounts.add(row['sender'])
+              events.sort(key=lambda x: (x['block'], x['logIndex']))
+              report['tokens'][label] = {
+                  'address': token.lower(),
+                  'deployment_block': start,
+                  'events': events,
+              }
+
+          memberships = []
+          for label, token_data in report['tokens'].items():
+              token = token_data['address']
+              candidates = set(all_event_accounts)
+              candidates.add(token)
+              for role_name, role in ROLE_HASHES.items():
+                  members = []
+                  for account in sorted(candidates):
+                      try:
+                          if has_role(token, role, account):
+                              members.append(account)
+                      except Exception:
+                          pass
+                  memberships.append({
+                      'token': label,
+                      'address': token,
+                      'role_name': role_name,
+                      'role': role,
+                      'members': members,
+                  })
+
+          report['current_memberships'] = memberships
+          report['minter_burner_memberships'] = [
+              row for row in memberships
+              if row['role_name'] == 'MINTER_BURNER_ROLE' and row['members']
+          ]
+          Path('evidence/customtoken_role_ledger_v2.json').write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
+          Path('evidence/customtoken_role_memberships_v2.json').write_text(json.dumps(memberships, indent=2, sort_keys=True) + '\n')
+          verdict = {
+              'minter_burner_open': bool(report['minter_burner_memberships']),
+              'minter_burner_memberships': report['minter_burner_memberships'],
+          }
+          Path('evidence/verdict.json').write_text(json.dumps(verdict, indent=2, sort_keys=True) + '\n')
+          print(json.dumps(verdict, indent=2, sort_keys=True))
+          PY
+          (cd evidence && sha256sum * > SHA256SUMS)
+
+      - name: Upload corrected role ledger
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-customtoken-role-ledger-v2-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9

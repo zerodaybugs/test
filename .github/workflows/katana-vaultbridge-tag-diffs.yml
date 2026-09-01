@@ -1,0 +1,94 @@
+name: Katana Vault Bridge security-relevant tag diffs
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/katana-vaultbridge-tag-diffs.yml'
+      - 'katana-vb-diffs/**'
+
+permissions:
+  contents: read
+
+jobs:
+  diff:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Build exact tag-to-tag source and history diffs
+        shell: bash
+        run: |
+          set -euo pipefail
+          E="$GITHUB_WORKSPACE/evidence"
+          mkdir -p "$E" /tmp/work
+          git clone --quiet https://github.com/agglayer/vault-bridge.git /tmp/work/vault-bridge
+          git -C /tmp/work/vault-bridge fetch --quiet --all --tags --force
+
+          tags=(v0.5.1 v1.0.0 v1.0.1 v1.1.0 v1.1.1)
+          for tag in "${tags[@]}"; do
+            git -C /tmp/work/vault-bridge rev-parse "$tag" > "$E/${tag}.commit"
+            git -C /tmp/work/vault-bridge show -s --format=fuller "$tag" > "$E/${tag}.metadata"
+            git -C /tmp/work/vault-bridge archive --format=tar.gz \
+              --output="$E/${tag}-source.tar.gz" "$tag" src
+          done
+
+          pairs=(
+            'v0.5.1 v1.0.0'
+            'v1.0.0 v1.0.1'
+            'v1.0.1 v1.1.0'
+            'v1.1.0 v1.1.1'
+            'v0.5.1 v1.1.1'
+          )
+          for pair in "${pairs[@]}"; do
+            read -r old new <<< "$pair"
+            stem="${old}_to_${new}"
+            git -C /tmp/work/vault-bridge diff --stat "$old" "$new" -- src > "$E/${stem}.stat"
+            git -C /tmp/work/vault-bridge diff --find-renames --find-copies "$old" "$new" -- src > "$E/${stem}.patch"
+            git -C /tmp/work/vault-bridge log --reverse --date=iso-strict \
+              --format='%H %aI %an %s' "$old..$new" > "$E/${stem}.commits"
+          done
+
+          python3 - <<'PY'
+          import json,re
+          from pathlib import Path
+          root=Path('evidence')
+          terms={
+            'authorization': r'role|auth|owner|admin|only[A-Z]|permission|unauthor',
+            'accounting': r'backing|reserve|supply|mint|burn|migration|yield|assets|shares|balance',
+            'bridge': r'bridge|claim|message|network|wrapped|mintable|address\(0\)',
+            'token_behavior': r'fee|rebasing|transfer|received|slippage|decimals',
+            'initialization': r'initializ|upgrade|proxy|implementation|delegatecall',
+            'dos': r'pause|freeze|revert|underflow|overflow|limit',
+          }
+          summary={}
+          for patch in sorted(root.glob('*.patch')):
+              text=patch.read_text(errors='replace')
+              added='\n'.join(line[1:] for line in text.splitlines() if line.startswith('+') and not line.startswith('+++'))
+              removed='\n'.join(line[1:] for line in text.splitlines() if line.startswith('-') and not line.startswith('---'))
+              files=re.findall(r'^diff --git a/(.*?) b/',text,re.M)
+              row={'bytes':len(text.encode()),'files':files,'categories':{}}
+              for name,pattern in terms.items():
+                  row['categories'][name]={
+                    'added_hits':len(re.findall(pattern,added,re.I)),
+                    'removed_hits':len(re.findall(pattern,removed,re.I)),
+                  }
+              summary[patch.name]=row
+          (root/'diff_summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(summary,indent=2,sort_keys=True))
+          PY
+
+          (cd "$E" && sha256sum * > SHA256SUMS)
+
+      - name: Upload exact public diffs
+        uses: actions/upload-artifact@v4
+        with:
+          name: katana-vaultbridge-diffs-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
