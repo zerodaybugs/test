@@ -1,0 +1,73 @@
+name: Hermetica staking cooldown capture
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-staking-cooldowns.yml'
+      - 'public-data/hermetica-staking-cooldowns-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install read-only decoder
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/hermetica-staking-cooldowns
+          cd /tmp/hermetica-staking-cooldowns
+          npm init -y >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund @stacks/transactions@7.2.0
+      - name: Capture production staking cooldowns
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/hermetica-staking-cooldowns
+          cat > capture.cjs <<'NODE'
+          const fs = require('fs');
+          const {principalCV, cvToHex, hexToCV, cvToJSON} = require('@stacks/transactions');
+          const API='https://api.hiro.so';
+          const DEP='SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG';
+          const NAME='staking-state-v1';
+          const CID=`${DEP}.${NAME}`;
+
+          async function fetchRetry(url,options={},attempts=8){let last;for(let i=0;i<attempts;i++){try{const r=await fetch(url,options);if(r.ok)return r;const t=await r.text();last=new Error(`${r.status} ${r.statusText}: ${t}`);if(r.status<500&&r.status!==429)throw last;}catch(e){last=e;}await new Promise(r=>setTimeout(r,900*(i+1)));}throw last;}
+          async function history(max=2000){const all=[];for(let offset=0;offset<max;offset+=50){const r=await fetchRetry(`${API}/extended/v1/address/${encodeURIComponent(CID)}/transactions?limit=50&offset=${offset}`);const b=await r.json();const rows=b.results||[];all.push(...rows);if(rows.length<50||all.length>=(b.total||max))break;}return all.slice(0,max);}
+          async function callRead(fn,args=[]){const r=await fetchRetry(`${API}/v2/contracts/call-read/${DEP}/${NAME}/${fn}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({sender:DEP,arguments:args.map(cvToHex)})});const b=await r.json();let decoded=null;if(b.result){try{decoded=cvToJSON(hexToCV(b.result));}catch(e){decoded={error:String(e),raw:b.result};}}return {okay:b.okay,cause:b.cause,result_raw:b.result,decoded};}
+          async function sourceMeta(p){if(!p.includes('.'))return {type:'standard'};const [a,...rest]=p.split('.');const n=rest.join('.');const r=await fetch(`${API}/v2/contracts/source/${a}/${n}?proof=0`);if(!r.ok)return {type:'contract',exists:false,status:r.status};const b=await r.json();return {type:'contract',exists:true,source_length:(b.source||'').length,publish_height:b.publish_height};}
+          function principalsFrom(v){const s=typeof v==='string'?v:JSON.stringify(v);const out=new Set();const re=/'?((?:SP|SM)[0-9A-HJKMNP-TV-Z]{20,50}(?:\.[a-zA-Z0-9-]{1,50})?)/g;let m;while((m=re.exec(s)))out.add(m[1]);return [...out];}
+
+          (async()=>{
+            const txs=await history();
+            const direct=txs.filter(t=>t.tx_type==='contract_call'&&t.contract_call?.contract_id===CID).map(t=>({tx_id:t.tx_id,status:t.tx_status,time:t.burn_block_time_iso,height:t.block_height,sender:t.sender_address,function:t.contract_call.function_name,args:Object.fromEntries((t.contract_call.function_args||[]).map((a,i)=>[a.name||`arg${i}`,a.repr])),result:t.tx_result?.repr}));
+            const relevant=direct.filter(x=>['set-custom-cooldown','set-cooldown-window','set-staking-enabled'].includes(x.function));
+            const principals=new Set();for(const row of relevant)for(const p of principalsFrom(row))principals.add(p);
+            const current=[];
+            for(const p of [...principals].sort()){
+              current.push({principal:p,source:await sourceMeta(p),cooldown:await callRead('get-custom-cooldown',[principalCV(p)])});
+            }
+            const out={generated_at:new Date().toISOString(),source:'Hiro public read-only APIs',address_tx_count:txs.length,direct_call_count:direct.length,default_cooldown:await callRead('get-cooldown-window'),staking_enabled:await callRead('get-staking-enabled'),relevant_calls:relevant,current};
+            fs.writeFileSync('staking-cooldowns.json',JSON.stringify(out,null,2));
+            fs.writeFileSync('summary.json',JSON.stringify({default_cooldown:out.default_cooldown,staking_enabled:out.staking_enabled,current},null,2));
+            console.log(fs.readFileSync('summary.json','utf8'));
+          })().catch(e=>{console.error(e);process.exit(1);});
+          NODE
+          node capture.cjs
+          sha256sum staking-cooldowns.json summary.json > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-staking-cooldowns
+          path: |
+            /tmp/hermetica-staking-cooldowns/staking-cooldowns.json
+            /tmp/hermetica-staking-cooldowns/summary.json
+            /tmp/hermetica-staking-cooldowns/SHA256SUMS
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0

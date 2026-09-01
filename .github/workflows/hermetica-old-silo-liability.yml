@@ -1,0 +1,114 @@
+name: Hermetica old silo liability reconstruction
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-old-silo-liability.yml'
+      - 'public-data/hermetica-old-silo-liability-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reconstruct:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install read-only decoder
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/hermetica-old-silo
+          cd /tmp/hermetica-old-silo
+          npm init -y >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund @stacks/transactions@7.2.0
+      - name: Reconstruct outstanding old silo claims
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/hermetica-old-silo
+          cat > reconstruct.cjs <<'NODE'
+          const fs = require('fs');
+          const {uintCV, cvToHex, hexToCV, cvToJSON} = require('@stacks/transactions');
+          const API='https://api.hiro.so';
+          const DEP='SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG';
+          const NAME='staking-silo-v1';
+          const CID=`${DEP}.${NAME}`;
+
+          async function fetchRetry(url, options={}, attempts=8){let last;for(let i=0;i<attempts;i++){try{const r=await fetch(url,options);if(r.ok)return r;const t=await r.text();last=new Error(`${r.status} ${r.statusText}: ${t}`);if(r.status<500&&r.status!==429)throw last;}catch(e){last=e;}await new Promise(r=>setTimeout(r,1000*(i+1)));}throw last;}
+          async function callRead(fn,args=[]){const r=await fetchRetry(`${API}/v2/contracts/call-read/${DEP}/${NAME}/${fn}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({sender:DEP,arguments:args.map(cvToHex)})});const b=await r.json();let decoded=null;if(b.result){try{decoded=cvToJSON(hexToCV(b.result));}catch(e){decoded={error:String(e),raw:b.result};}}return {okay:b.okay,cause:b.cause,result_raw:b.result,decoded};}
+          async function history(){const all=[];for(let offset=0;offset<3000;offset+=50){const r=await fetchRetry(`${API}/extended/v1/address/${encodeURIComponent(CID)}/transactions?limit=50&offset=${offset}`);const b=await r.json();const rows=b.results||[];all.push(...rows);if(rows.length<50||all.length>=(b.total||3000))break;}return all;}
+          function idsFromArg(repr){return [...String(repr||'').matchAll(/u(\d+)/g)].map(m=>Number(m[1]));}
+          function outcomes(repr){return [...String(repr||'').matchAll(/\((ok true|err u\d+)\)/g)].map(m=>m[1]);}
+          function unwrapValue(node){
+            if(node==null)return null;
+            if(typeof node!=='object')return node;
+            if('value' in node){
+              const v=node.value;
+              if(v&&typeof v==='object'&&!Array.isArray(v)){
+                const o={};for(const [k,x] of Object.entries(v))o[k]=unwrapValue(x);return o;
+              }
+              return unwrapValue(v);
+            }
+            const o={};for(const [k,x] of Object.entries(node))o[k]=unwrapValue(x);return o;
+          }
+
+          (async()=>{
+            const txs=await history();
+            const claimed=new Set();
+            const attempts=[];
+            for(const t of txs){
+              const cc=t.contract_call||{};
+              if(cc.contract_id!==CID||!['claim','claim-many'].includes(cc.function_name))continue;
+              const ids=idsFromArg((cc.function_args||[])[0]?.repr);
+              const repr=t.tx_result?.repr||'';
+              let successIds=[];
+              if(t.tx_status==='success'){
+                if(cc.function_name==='claim'){
+                  if(/^\(ok true\)$/.test(repr.trim()))successIds=ids.slice(0,1);
+                }else{
+                  const outs=outcomes(repr);
+                  for(let i=0;i<Math.min(ids.length,outs.length);i++)if(outs[i]==='ok true')successIds.push(ids[i]);
+                }
+              }
+              for(const id of successIds)claimed.add(id);
+              attempts.push({tx_id:t.tx_id,status:t.tx_status,time:t.burn_block_time_iso,function:cc.function_name,ids,result:repr,success_ids:successIds,vm_error:t.vm_error});
+            }
+            const idState=await callRead('get-current-claim-id');
+            const currentId=Number(unwrapValue(idState.decoded));
+            const candidates=[];for(let i=1;i<=currentId;i++)if(!claimed.has(i))candidates.push(i);
+            const open=[];const closedOrMissing=[];
+            for(let idx=0;idx<candidates.length;idx++){
+              const id=candidates[idx];
+              const row=await callRead('get-claim',[uintCV(id)]);
+              const val=unwrapValue(row.decoded);
+              if(row.okay && row.decoded?.success===true){open.push({claim_id:id,claim:val.value??val,raw:row});}
+              else closedOrMissing.push({claim_id:id,raw:row});
+              if(idx%20===19)await new Promise(r=>setTimeout(r,250));
+            }
+            let liability=0n;
+            for(const r of open){const c=r.claim;const amt=c?.amount; if(amt!==undefined&&amt!==null)liability+=BigInt(amt);}
+            const br=await fetchRetry(`${API}/extended/v1/address/${encodeURIComponent(CID)}/balances`);const balances=await br.json();
+            const token=`${DEP}.usdh-token-v1::usdh`;
+            const balance=BigInt(balances.fungible_tokens?.[token]?.balance||'0');
+            const out={generated_at:new Date().toISOString(),source:'Hiro public read-only APIs',current_claim_id:currentId,successful_claim_ids:[...claimed].sort((a,b)=>a-b),successful_claim_count:claimed.size,candidate_unclaimed_count:candidates.length,open_claims:open,open_claim_count:open.length,total_open_liability:liability.toString(),silo_usdh_balance:balance.toString(),surplus_or_deficit:(balance-liability).toString(),closed_or_missing:closedOrMissing,claim_attempts:attempts,balances};
+            fs.writeFileSync('old-silo-liability.json',JSON.stringify(out,null,2));
+            fs.writeFileSync('summary.json',JSON.stringify({current_claim_id:currentId,successful_claim_count:claimed.size,candidate_unclaimed_count:candidates.length,open_claim_count:open.length,total_open_liability:liability.toString(),silo_usdh_balance:balance.toString(),surplus_or_deficit:(balance-liability).toString(),open_claims:open.map(x=>({claim_id:x.claim_id,claim:x.claim}))},null,2));
+            console.log(fs.readFileSync('summary.json','utf8'));
+          })().catch(e=>{console.error(e);process.exit(1);});
+          NODE
+          node reconstruct.cjs
+          sha256sum old-silo-liability.json summary.json > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-old-silo-liability
+          path: |
+            /tmp/hermetica-old-silo/old-silo-liability.json
+            /tmp/hermetica-old-silo/summary.json
+            /tmp/hermetica-old-silo/SHA256SUMS
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0

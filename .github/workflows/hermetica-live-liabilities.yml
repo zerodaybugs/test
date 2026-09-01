@@ -1,0 +1,57 @@
+name: Hermetica current silo liability reconstruction
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/hermetica-live-liabilities.yml'
+      - 'public-data/hermetica-live-liabilities-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reconstruct:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install read-only decoder
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/current-silo && cd /tmp/current-silo
+          npm init -y >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund @stacks/transactions@7.2.0
+      - name: Reconstruct claims
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/current-silo
+          cat > run.cjs <<'NODE'
+          const fs=require('fs');
+          const {uintCV,cvToHex,hexToCV,cvToJSON}=require('@stacks/transactions');
+          const API='https://api.hiro.so', DEP='SPN5AKG35QZSK2M8GAMR4AFX45659RJHDW353HSG';
+          const NAME='staking-silo-v1-1', CID=`${DEP}.${NAME}`, START=1234;
+          async function get(url,opt={},n=8){let e;for(let i=0;i<n;i++){try{const r=await fetch(url,opt);if(r.ok)return r;e=new Error(`${r.status}: ${await r.text()}`);if(r.status<500&&r.status!==429)throw e;}catch(x){e=x}await new Promise(r=>setTimeout(r,800*(i+1)))}throw e}
+          async function read(fn,args=[]){const r=await get(`${API}/v2/contracts/call-read/${DEP}/${NAME}/${fn}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({sender:DEP,arguments:args.map(cvToHex)})});const b=await r.json();let d=null;try{d=b.result?cvToJSON(hexToCV(b.result)):null}catch(e){d={error:String(e)}}return {...b,decoded:d}}
+          async function hist(){const a=[];for(let o=0;o<4000;o+=50){const r=await get(`${API}/extended/v1/address/${encodeURIComponent(CID)}/transactions?limit=50&offset=${o}`),b=await r.json(),x=b.results||[];a.push(...x);if(x.length<50||a.length>=(b.total||4000))break}return a}
+          function unwrap(x){if(x==null||typeof x!=='object')return x;if('value'in x)return unwrap(x.value);const o={};for(const[k,v]of Object.entries(x))o[k]=unwrap(v);return o}
+          function ids(s){return[...String(s||'').matchAll(/u(\d+)/g)].map(m=>+m[1])}
+          function outs(s){return[...String(s||'').matchAll(/\((ok true|err u\d+)\)/g)].map(m=>m[1])}
+          (async()=>{const tx=await hist(),done=new Set();for(const t of tx){const c=t.contract_call||{};if(c.contract_id!==CID||!['withdraw','withdraw-many'].includes(c.function_name)||t.tx_status!=='success')continue;const a=ids((c.function_args||[])[0]?.repr),r=t.tx_result?.repr||'';if(c.function_name==='withdraw'&&/^\(ok true\)$/.test(r.trim()))done.add(a[0]);else{const z=outs(r);a.forEach((id,i)=>{if(z[i]==='ok true')done.add(id)})}}
+          const cur=Number(unwrap((await read('get-current-claim-id')).decoded)),cand=[];for(let i=START+1;i<=cur;i++)if(!done.has(i))cand.push(i);const open=[];for(let i=0;i<cand.length;i++){const id=cand[i],row=await read('get-claim',[uintCV(id)]),v=unwrap(row.decoded);if(row.okay&&row.decoded?.success===true)open.push({id,claim:v});if(i%15===14)await new Promise(r=>setTimeout(r,120))}
+          let liability=0n;for(const x of open)liability+=BigInt(x.claim.amount);const br=await get(`${API}/extended/v1/address/${encodeURIComponent(CID)}/balances`),bal=await br.json(),key=`${DEP}.usdh-token-v1::usdh`,cash=BigInt(bal.fungible_tokens?.[key]?.balance||0);const out={current_claim_id:cur,withdrawn_count:done.size,candidate_count:cand.length,open_claims:open,open_claim_count:open.length,liability:liability.toString(),balance:cash.toString(),surplus_or_deficit:(cash-liability).toString()};fs.writeFileSync('current-silo.json',JSON.stringify(out,null,2));console.log(JSON.stringify(out,null,2))})().catch(e=>{console.error(e);process.exit(1)})
+          NODE
+          node run.cjs
+          sha256sum current-silo.json > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermetica-current-silo-liability
+          path: |
+            /tmp/current-silo/current-silo.json
+            /tmp/current-silo/SHA256SUMS
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
