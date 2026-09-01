@@ -1,0 +1,188 @@
+name: Sui new VM security census 20260808
+
+on:
+  push:
+    branches:
+      - research/sui-vm-bounty-20260808
+    paths:
+      - '.github/workflows/sui-vm-security-census-20260808.yml'
+      - 'research/sui_vm_security_census.py'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/sui-vm-security-census-20260808.yml'
+      - 'research/sui_vm_security_census.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SUI_COMMIT: 5a9f37431c473fa2f6d49abecbcc6a6d7190f533
+  CARGO_INCREMENTAL: '0'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  semantic-census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout research harness
+        uses: actions/checkout@v4
+
+      - name: Clone exact public Sui source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init sui
+          git -C sui remote add origin https://github.com/MystenLabs/sui.git
+          git -C sui fetch --depth=1 origin "${SUI_COMMIT}"
+          git -C sui checkout --detach FETCH_HEAD
+          test "$(git -C sui rev-parse HEAD)" = "${SUI_COMMIT}"
+          git -C sui rev-parse HEAD | tee SUI_SOURCE_COMMIT.txt
+
+      - name: Run semantic security census
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p census
+          python3 research/sui_vm_security_census.py \
+            --repo sui \
+            --out census \
+            --top-diffs 140 \
+            2>&1 | tee census/CENSUS_RUN.log
+          sha256sum research/sui_vm_security_census.py > census/HARNESS_SHA256.txt
+          find census -type f -print0 | sort -z | xargs -0 sha256sum > census/EVIDENCE_SHA256SUMS.txt
+
+      - name: Capture exact package and protocol inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd sui
+            cargo metadata --no-deps --format-version 1 > ../census/CARGO_METADATA.json
+            git grep -n -E 'protocol version 118|ProtocolVersion::new\(118\)|MOVE_BINARY_FORMAT_V' \
+              -- ':!target' > ../census/PROTOCOL_AND_BINARY_FORMAT_HITS.txt || true
+            git grep -n -E 'unsafe\s*\{|debug_assert|unreachable!|panic!|\.unwrap\(\)|\.expect\(' \
+              -- external-crates/move/crates/move-vm-runtime \
+                 external-crates/move/crates/move-bytecode-verifier \
+                 sui-execution/latest/sui-adapter \
+                 sui-execution/latest/sui-verifier \
+              > ../census/RAW_RISK_SURFACE_HITS.txt || true
+          )
+
+      - name: Upload semantic census evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sui-new-vm-security-census-20260808
+          path: |
+            SUI_SOURCE_COMMIT.txt
+            census/
+          retention-days: 2
+
+  targeted-build-gates:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    steps:
+      - name: Checkout research harness
+        uses: actions/checkout@v4
+
+      - name: Clone exact public Sui source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init sui
+          git -C sui remote add origin https://github.com/MystenLabs/sui.git
+          git -C sui fetch --depth=1 origin "${SUI_COMMIT}"
+          git -C sui checkout --detach FETCH_HEAD
+          test "$(git -C sui rev-parse HEAD)" = "${SUI_COMMIT}"
+          git -C sui rev-parse HEAD | tee SUI_SOURCE_COMMIT.txt
+
+      - name: Record toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          rustc --version --verbose | tee test-results/RUSTC_VERSION.txt
+          cargo --version --verbose | tee test-results/CARGO_VERSION.txt
+          cat sui/rust-toolchain.toml | tee test-results/RUST_TOOLCHAIN.toml
+
+      - name: Run latest Move runtime argument and type-safety tests
+        shell: bash
+        run: |
+          set +e
+          cd sui
+          timeout 3000 cargo test -p move-vm-runtime --lib function_arg_tests -- --nocapture \
+            2>&1 | tee ../test-results/MOVE_VM_FUNCTION_ARG_TESTS.log
+          rc=${PIPESTATUS[0]}
+          echo "${rc}" > ../test-results/MOVE_VM_FUNCTION_ARG_TESTS.exit_code
+          exit 0
+
+      - name: Compile latest bytecode verifier test surface
+        shell: bash
+        run: |
+          set +e
+          cd sui
+          timeout 1800 cargo test -p move-bytecode-verifier --lib --no-run \
+            2>&1 | tee ../test-results/MOVE_BYTECODE_VERIFIER_BUILD.log
+          rc=${PIPESTATUS[0]}
+          echo "${rc}" > ../test-results/MOVE_BYTECODE_VERIFIER_BUILD.exit_code
+          exit 0
+
+      - name: Compile Sui verifier and adapter test surfaces
+        shell: bash
+        run: |
+          set +e
+          cd sui
+          timeout 1800 cargo test -p sui-verifier-latest --lib --no-run \
+            2>&1 | tee ../test-results/SUI_VERIFIER_LATEST_BUILD.log
+          rc1=${PIPESTATUS[0]}
+          echo "${rc1}" > ../test-results/SUI_VERIFIER_LATEST_BUILD.exit_code
+          timeout 1800 cargo test -p sui-adapter-latest --lib --no-run \
+            2>&1 | tee ../test-results/SUI_ADAPTER_LATEST_BUILD.log
+          rc2=${PIPESTATUS[0]}
+          echo "${rc2}" > ../test-results/SUI_ADAPTER_LATEST_BUILD.exit_code
+          exit 0
+
+      - name: Summarize targeted gates
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path('test-results')
+          gates = {}
+          for path in sorted(root.glob('*.exit_code')):
+              try:
+                  code = int(path.read_text().strip())
+              except Exception:
+                  code = None
+              gates[path.stem.removesuffix('.exit_code')] = {
+                  'exit_code': code,
+                  'pass': code == 0,
+              }
+          payload = {
+              'source_commit': Path('SUI_SOURCE_COMMIT.txt').read_text().strip(),
+              'gates': gates,
+              'all_pass': bool(gates) and all(item['pass'] for item in gates.values()),
+          }
+          (root / 'TARGETED_BUILD_GATES.json').write_text(json.dumps(payload, indent=2))
+          print(json.dumps(payload, indent=2))
+          PY
+          find test-results -type f -print0 | sort -z | xargs -0 sha256sum \
+            > test-results/EVIDENCE_SHA256SUMS.txt
+
+      - name: Upload targeted build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sui-new-vm-targeted-build-gates-20260808
+          path: |
+            SUI_SOURCE_COMMIT.txt
+            test-results/
+          retention-days: 2

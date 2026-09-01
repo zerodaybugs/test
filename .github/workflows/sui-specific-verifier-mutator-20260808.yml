@@ -1,0 +1,138 @@
+name: Sui-specific verifier mutator 20260808
+
+on:
+  push:
+    branches:
+      - research/sui-vm-bounty-20260808
+    paths:
+      - '.github/workflows/sui-specific-verifier-mutator-20260808.yml'
+      - 'research/sui_specific_verifier_mutator.rs'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/sui-specific-verifier-mutator-20260808.yml'
+      - 'research/sui_specific_verifier_mutator.rs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SUI_COMMIT: 5a9f37431c473fa2f6d49abecbcc6a6d7190f533
+  CARGO_INCREMENTAL: '0'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  exact-mainnet-config-matrix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - name: Checkout research harness
+        uses: actions/checkout@v4
+
+      - name: Clone exact public Sui source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init sui
+          git -C sui remote add origin https://github.com/MystenLabs/sui.git
+          git -C sui fetch --depth=1 origin "${SUI_COMMIT}"
+          git -C sui checkout --detach FETCH_HEAD
+          test "$(git -C sui rev-parse HEAD)" = "${SUI_COMMIT}"
+          git -C sui rev-parse HEAD | tee SUI_SOURCE_COMMIT.txt
+
+      - name: Construct isolated exact-source harness crate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p sui-verifier-mutator/src sui-verifier-results
+          cp research/sui_specific_verifier_mutator.rs sui-verifier-mutator/src/main.rs
+          cat > sui-verifier-mutator/Cargo.toml <<'TOML'
+          [package]
+          name = "zdb-sui-specific-verifier-mutator"
+          version = "0.1.0"
+          edition = "2024"
+          publish = false
+
+          [dependencies]
+          move-binary-format = { path = "../sui/external-crates/move/crates/move-binary-format" }
+          move-bytecode-verifier = { path = "../sui/external-crates/move/crates/move-bytecode-verifier" }
+          move-core-types = { path = "../sui/external-crates/move/crates/move-core-types" }
+          move-vm-config = { path = "../sui/external-crates/move/crates/move-vm-config" }
+          move-vm-runtime = { path = "../sui/external-crates/move/crates/move-vm-runtime" }
+          sui-protocol-config = { path = "../sui/crates/sui-protocol-config" }
+          sui-types = { path = "../sui/crates/sui-types" }
+          sui-verifier-latest = { path = "../sui/sui-execution/latest/sui-verifier" }
+          serde = { version = "1", features = ["derive"] }
+          serde_json = "1"
+          TOML
+          sha256sum research/sui_specific_verifier_mutator.rs \
+            sui-verifier-mutator/src/main.rs \
+            > sui-verifier-results/HARNESS_SHA256.txt
+
+      - name: Compile and execute exact mainnet protocol matrix
+        shell: bash
+        run: |
+          set +e
+          cd sui
+          timeout 5700 cargo run --release \
+            --manifest-path ../sui-verifier-mutator/Cargo.toml -- \
+            --out ../sui-verifier-results \
+            --random-cases 60000 \
+            --seed 0x5a175a1120260808 \
+            2>&1 | tee ../sui-verifier-results/SUI_VERIFIER_MUTATOR_RUN.log
+          rc=${PIPESTATUS[0]}
+          echo "${rc}" > ../sui-verifier-results/SUI_VERIFIER_MUTATOR_RUN.exit_code
+          exit 0
+
+      - name: Apply fail-closed candidate gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path('sui-verifier-results')
+          result_path = root / 'SUI_VERIFIER_MUTATOR_RESULT.json'
+          exit_path = root / 'SUI_VERIFIER_MUTATOR_RUN.exit_code'
+          run_exit = int(exit_path.read_text().strip()) if exit_path.exists() else None
+          if not result_path.exists():
+              payload = {'gate': 'INFRA_FAILURE_NO_RESULT', 'run_exit_code': run_exit}
+          else:
+              result = json.loads(result_path.read_text())
+              candidates = result.get('candidates') or []
+              baseline_ok = bool(result.get('corpus')) and all(
+                  item.get('accepted_versions') for item in result['corpus']
+              )
+              payload = {
+                  'gate': (
+                      'CANDIDATE_REQUIRES_EXACT_TRANSACTIONAL_PUBLICATION_REPLAY'
+                      if candidates
+                      else ('PASS_NO_CANDIDATE' if baseline_ok else 'INFRA_BASELINE_FAILURE')
+                  ),
+                  'baseline_ok': baseline_ok,
+                  'candidate_count': len(candidates),
+                  'candidate_classes': sorted({c['outcome']['class'] for c in candidates}),
+                  'candidate_versions': sorted({c['outcome']['version'] for c in candidates}),
+                  'counters': result.get('counters'),
+                  'run_exit_code': run_exit,
+              }
+          (root / 'RELEASE_GATE.json').write_text(json.dumps(payload, indent=2))
+          print(json.dumps(payload, indent=2))
+          PY
+          find sui-verifier-results -type f -print0 | sort -z | xargs -0 sha256sum \
+            > sui-verifier-results/EVIDENCE_SHA256SUMS.txt
+
+      - name: Upload exact Sui-verifier evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sui-specific-verifier-mutator-20260808
+          path: |
+            SUI_SOURCE_COMMIT.txt
+            sui-verifier-mutator/Cargo.toml
+            sui-verifier-results/
+          retention-days: 2
