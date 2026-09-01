@@ -1,0 +1,63 @@
+name: StackingDAO aggregate current withdrawal liability reconciliation
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/stackingdao-current-liability-aggregate.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Reconcile all current-origin liabilities against escrow read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence && cd evidence
+          npm init -y >/dev/null 2>&1
+          npm install --no-save --package-lock=false @stacks/transactions@6.17.0 >/dev/null 2>&1
+          cat > query.mjs <<'NODE'
+          import {contractPrincipalCV,cvToHex,cvToString,hexToCV} from '@stacks/transactions';
+          import {writeFile} from 'node:fs/promises';
+          const O='SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG',A='https://api.mainnet.hiro.so';
+          const P={stCore:`${O}.stacking-dao-core-v6`,btcCore:`${O}.stacking-dao-core-btc-v3`,stToken:`${O}.ststx-token`,btcToken:`${O}.ststxbtc-token-v2`};
+          const S=ms=>new Promise(r=>setTimeout(r,ms));
+          async function J(u,o={},n=10){let e;for(let i=1;i<=n;i++){try{let r=await fetch(u,o),t=await r.text();if(!r.ok)throw Error(`${r.status}:${t.slice(0,300)}`);return JSON.parse(t)}catch(x){e=x;if(i<n)await S(i*900)}}throw e}
+          function Q(p){let i=p.indexOf('.');return[p.slice(0,i),p.slice(i+1)]}
+          async function C(p,f,a=[]){let[x,n]=Q(p),j=await J(`${A}/v2/contracts/call-read/${x}/${n}/${f}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({sender:O,arguments:a.map(cvToHex)})});return j.result?cvToString(hexToCV(j.result)):null}
+          async function mapLimit(items,limit,fn){let out=new Array(items.length),next=0;async function worker(){while(true){let i=next++;if(i>=items.length)return;out[i]=await fn(items[i],i)}}await Promise.all(Array.from({length:Math.min(limit,items.length)},worker));return out}
+          async function allTx(p){let first=await J(`${A}/extended/v1/address/${p}/transactions?limit=50&offset=0`),total=Number(first.total??first.results?.length??0),offsets=[];for(let o=50;o<total;o+=50)offsets.push(o);let pages=await mapLimit(offsets,8,async o=>{let j=await J(`${A}/extended/v1/address/${p}/transactions?limit=50&offset=${o}`);await S(60);return j.results??[]});return{total,rows:[...(first.results??[]),...pages.flat()]}}
+          const tx=r=>r.tx??r,cc=r=>tx(r).contract_call??r.contract_call,ok=r=>(tx(r).tx_status??r.tx_status)==='success';
+          const ur=s=>{let m=String(s??'').match(/^\(ok u(\d+)\)$/)||String(s??'').match(/^u(\d+)$/);return m?.[1]??null};
+          const ua=(c,i)=>String(c?.function_args?.[i]?.repr??'').match(/^u(\d+)$/)?.[1]??null;
+          async function reconcile(core,token,legacyMax,label){let h=await allTx(core),inits=new Map(),withdrawals=new Set(),duplicateInits=[];for(let r of h.rows){let c=cc(r);if(!c||c.contract_id!==core||!ok(r))continue;if(c.function_name==='init-withdraw'){let id=ur(tx(r).tx_result?.repr??r.tx_result?.repr),amount=ua(c,2);if(id&&amount&&Number(id)>legacyMax){if(inits.has(id))duplicateInits.push(id);inits.set(id,{nft_id:id,burn_amount:amount,tx_id:tx(r).tx_id??r.tx_id,sender:tx(r).sender_address??r.sender_address,time:tx(r).burn_block_time_iso??r.burn_block_time_iso})}}else if(c.function_name==='withdraw'){let id=ua(c,3);if(id)withdrawals.add(id)}}let live=[...inits.values()].filter(x=>!withdrawals.has(x.nft_id)),liability=live.reduce((s,x)=>s+BigInt(x.burn_amount),0n),escrow=BigInt(ur(await C(token,'get-balance',[contractPrincipalCV(...Q(core))]))??0);return{label,transaction_total:h.total,transaction_rows:h.rows.length,current_init_count:inits.size,current_withdraw_id_count:[...withdrawals].filter(id=>Number(id)>legacyMax).length,current_live_count:live.length,current_live_liability_micro:liability.toString(),current_escrow_micro:escrow.toString(),escrow_minus_liability_micro:(escrow-liability).toString(),duplicate_init_ids:duplicateInits,live}}
+          let st=await reconcile(P.stCore,P.stToken,102731,'stSTX'),bt=await reconcile(P.btcCore,P.btcToken,232,'stSTXbtc');
+          let summary={captured_at:new Date().toISOString(),st_transaction_total:st.transaction_total,st_current_init_count:st.current_init_count,st_current_withdraw_count:st.current_withdraw_id_count,st_current_live_count:st.current_live_count,st_current_liability_micro:st.current_live_liability_micro,st_current_escrow_micro:st.current_escrow_micro,st_escrow_minus_liability_micro:st.escrow_minus_liability_micro,btc_transaction_total:bt.transaction_total,btc_current_init_count:bt.current_init_count,btc_current_withdraw_count:bt.current_withdraw_id_count,btc_current_live_count:bt.current_live_count,btc_current_liability_micro:bt.current_live_liability_micro,btc_current_escrow_micro:bt.current_escrow_micro,btc_escrow_minus_liability_micro:bt.escrow_minus_liability_micro};
+          let out={summary,principals:P,st:{...st,live:st.live},btc:{...bt,live:bt.live}};await writeFile('snapshot.json',JSON.stringify(out,null,2)+'\n');let text=Object.entries(summary).map(([k,v])=>`${k}=${v}`).join('\n')+'\n';await writeFile('summary.txt',text);console.log(text)
+          NODE
+          node query.mjs
+          sha256sum snapshot.json summary.txt query.mjs > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stackingdao-current-liability-aggregate-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 3
+      - name: Enforce integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd evidence && sha256sum -c SHA256SUMS)
+          grep -F 'st_escrow_minus_liability_micro=' evidence/summary.txt
+          grep -F 'btc_escrow_minus_liability_micro=' evidence/summary.txt
