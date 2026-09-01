@@ -1,0 +1,169 @@
+name: Monad v0.16.0 cross-build differential 20260823
+
+on:
+  push:
+    branches:
+      - tooling/monad-v0160-cross-build-differential-20260823
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  differential:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - name: Checkout tooling branch
+        uses: actions/checkout@v4
+
+      - name: Clone exact public execution source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global submodule.fetchJobs "$(nproc)"
+          git clone --recurse-submodules https://github.com/category-labs/monad.git monad-execution
+          cd monad-execution
+          git checkout e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+          git submodule update --init --recursive
+          test "$(git rev-parse HEAD)" = "e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0"
+          git status --porcelain=v1 > ../SOURCE_STATUS.txt
+          test ! -s ../SOURCE_STATUS.txt
+          git submodule status --recursive > ../SUBMODULES.txt
+
+      - name: Build official dependency image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --target base -t monad-v0160-base -f monad-execution/docker/Dockerfile monad-execution
+
+      - name: Build GCC and Clang release fuzzers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/bin out/meta out/logs out/rc out/focus
+          docker run --name monad-v0160-crossbuild \
+            -v "$PWD/monad-execution:/src" \
+            -v "$PWD/out:/out" \
+            monad-v0160-base bash -lc '
+              set -euo pipefail
+              cd /src
+              build_one() {
+                name="$1" cc="$2" cxx="$3" extra="$4"
+                dir="build-${name}"
+                rm -rf "$dir"
+                CC="$cc" CXX="$cxx" cmake -S . -B "$dir" -GNinja \
+                  -DCMAKE_BUILD_TYPE=Release \
+                  -DCMAKE_TOOLCHAIN_FILE=category/core/toolchains/gcc-avx2.cmake \
+                  -DMONAD_COMPILER_TESTING=On \
+                  -DCMAKE_C_FLAGS_RELEASE="$extra -DNDEBUG" \
+                  -DCMAKE_CXX_FLAGS_RELEASE="$extra -DNDEBUG"
+                cmake --build "$dir" -t monad-compiler-fuzzer --parallel "$(nproc)"
+                cp "$dir/test/vm/fuzzer/monad-compiler-fuzzer" "/out/bin/${name}"
+              }
+              build_one gcc_o2 gcc-15 g++-15 "-O2"
+              build_one clang_o2 clang-19 clang++-19 "-O2"
+              build_one gcc_o1 gcc-15 g++-15 "-O1"
+              build_one clang_o1 clang-19 clang++-19 "-O1"
+              sha256sum /out/bin/* > /out/meta/BINARY_SHA256.txt
+              gcc-15 --version > /out/meta/GCC_VERSION.txt
+              g++-15 --version > /out/meta/GXX_VERSION.txt
+              clang-19 --version > /out/meta/CLANG_VERSION.txt
+              clang++-19 --version > /out/meta/CLANGXX_VERSION.txt
+              for f in /out/bin/*; do ldd "$f" > "/out/meta/$(basename "$f").ldd"; done
+            '
+
+      - name: Run matched seed matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > out/focus/pow2.json <<'JSON'
+          {
+            "power_of_two_constant_prob": 0.25,
+            "power_of_32_constant_prob": 0.25,
+            "negated_power_of_32_constant_prob": 0.15,
+            "negated_power_of_two_constant_prob": 0.15,
+            "valid_jump_prob": 1.0
+          }
+          JSON
+          docker start monad-v0160-crossbuild >/dev/null
+          docker exec monad-v0160-crossbuild bash -lc '
+            set -euo pipefail
+            run_lane() {
+              build="$1" family="$2" seed="$3" focus="$4"
+              name="${build}_${family}"
+              args=(--implementation compiler --revision OSAKA --seed "$seed" --iterations-per-run 75 --messages 4 --runs 100000000 --print-stats)
+              if [[ -n "$focus" ]]; then args+=(--focus "$focus"); fi
+              set +e
+              MONAD_COMPILER_FUZZING=1 timeout --signal=TERM --kill-after=20s 720s \
+                stdbuf -oL -eL "/out/bin/${build}" "${args[@]}" >"/out/logs/${name}.log" 2>&1
+              rc=$?
+              set -e
+              printf "%s\n" "$rc" >"/out/rc/${name}.rc"
+            }
+            export -f run_lane
+            for family in generic pow2; do
+              if [[ "$family" == generic ]]; then seed=930001; focus=""; else seed=930031; focus=/out/focus/pow2.json; fi
+              run_lane gcc_o2 "$family" "$seed" "$focus" &
+              run_lane clang_o2 "$family" "$seed" "$focus" &
+              run_lane gcc_o1 "$family" "$seed" "$focus" &
+              run_lane clang_o1 "$family" "$seed" "$focus" &
+              wait
+            done
+          '
+
+      - name: Analyze matched cross-build evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp SOURCE_STATUS.txt SUBMODULES.txt out/meta/
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json,re
+          root=Path('out')
+          terms=['Assertion','assertion','terminate called','Aborted','Segmentation fault','MONAD_ASSERT','state root','mismatch','FAILED','Illegal instruction']
+          lanes=[]
+          for log in sorted((root/'logs').glob('*.log')):
+              name=log.stem
+              text=log.read_text(errors='replace')
+              rc=int((root/'rc'/f'{name}.rc').read_text().strip())
+              seeds=re.findall(r'Fuzzing with seed @ [^:]+: ([0-9]+)',text)
+              hits=sorted({t for t in terms if t.lower() in text.lower()})
+              normal=rc in (0,124,137,143)
+              lanes.append({'name':name,'return_code':rc,'normal_timeout_or_success':normal,'hits':hits,'seed_count':len(seeds),'first_seed':seeds[0] if seeds else None,'last_seed':seeds[-1] if seeds else None,'log_sha256':hashlib.sha256(log.read_bytes()).hexdigest(),'log_bytes':log.stat().st_size})
+          by={x['name']:x for x in lanes}
+          pairs=[]; candidates=[]
+          for family in ['generic','pow2']:
+              members=[by[f'{b}_{family}'] for b in ['gcc_o2','clang_o2','gcc_o1','clang_o1']]
+              statuses={(m['return_code'],tuple(m['hits'])) for m in members}
+              all_normal=all(m['normal_timeout_or_success'] and not m['hits'] for m in members)
+              seed_progress={m['seed_count'] for m in members}
+              signal=(not all_normal) or len(statuses)>1
+              item={'family':family,'members':members,'status_shapes':len(statuses),'seed_progress_counts':sorted(seed_progress),'differential_signal':signal}
+              pairs.append(item)
+              if signal: candidates.append(item)
+          decision='CANDIDATE_REQUIRES_EXACT_SEED_REPLAY_AND_MINIMIZATION' if candidates else 'NO_CROSS_BUILD_DIFFERENTIAL_SIGNAL'
+          result={'source_commit':'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0','builds':['gcc_o2','clang_o2','gcc_o1','clang_o1'],'matched_families':pairs,'candidate_count':len(candidates),'submission_ready':False,'high_proven':False,'critical_proven':False,'decision':decision,'release_rule':'A build-dependent signal must reproduce from the same exact seed, minimize to one valid transaction, differ in accepted output/state root or crash only one production-relevant build, pass a matched source fix, and then demonstrate normal monad-bft admission and repeated finality impact.'}
+          (root/'CROSS_BUILD_RESULT.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({'decision':decision,'candidate_count':len(candidates)}))
+          PY
+          sha256sum out/bin/* out/logs/* out/rc/* out/focus/* out/meta/* out/CROSS_BUILD_RESULT.json > out/SHA256SUMS
+          tar --sort=name --mtime='UTC 2026-08-23' --owner=0 --group=0 --numeric-owner \
+            -C out -czf monad-v0160-cross-build-differential-20260823.tar.gz \
+            CROSS_BUILD_RESULT.json SHA256SUMS bin logs rc focus meta
+          sha256sum monad-v0160-cross-build-differential-20260823.tar.gz > monad-v0160-cross-build-differential-20260823.tar.gz.sha256
+
+      - name: Upload cross-build evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: monad-v0160-cross-build-differential-20260823
+          path: |
+            monad-v0160-cross-build-differential-20260823.tar.gz
+            monad-v0160-cross-build-differential-20260823.tar.gz.sha256
+            out/CROSS_BUILD_RESULT.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
