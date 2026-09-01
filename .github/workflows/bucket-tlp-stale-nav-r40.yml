@@ -1,0 +1,359 @@
+name: Bucket TLP Stale NAV Gate R40
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-deployment-trigger-r37-20260812]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nav-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconcile stored TLP NAV, token-pool timestamps, and live oracle objects
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-tlp-stale-nav-r40
+          mkdir -p bucket-tlp-stale-nav-r40/raw
+          cat > bucket-tlp-stale-nav-r40/gate.py <<'PY'
+          import datetime
+          import json
+          import pathlib
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-tlp-stale-nav-r40')
+          RAW = OUT / 'raw'
+          RPCS = [
+              'https://sui-mainnet-endpoint.blockvision.org',
+              'https://fullnode.mainnet.sui.io:443',
+          ]
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+
+          REGISTRY_ID = '0xfee68e535bf24702be28fa38ea2d5946e617e0035027d5ca29dbed99efd82aaa'
+          REGISTRY_TABLE_ID = '0x9973b7dd68ab8ba18702d913191a4c62c597847d9cd9f0b5bd97f1b938fc9a0a'
+          VAULT_ID = '0xf4b852ec580fb15da542b191d5fefe96939f718b43dc0240062fa83b35f06da1'
+          AGGREGATOR_ID = '0x487e76e8c9a321cc0131bfcf6e5a4d87fbc0beb8f6384f8c7e1658cde6076798'
+
+          def post(url, payload, retries=6, timeout=180):
+              encoded = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      request = urllib.request.Request(
+                          url,
+                          data=encoded,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-tlp-stale-nav-r40/1',
+                          },
+                      )
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2 ** attempt)
+              raise RuntimeError(f'POST failed {url}: {last}')
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': type(exc).__name__, 'message': str(exc)})
+              return {'failures': failures}
+
+          def result(wrapper):
+              return wrapper.get('result') if isinstance(wrapper, dict) else None
+
+          def gql(query, variables=None):
+              body = post(GQL, {'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          def dump(name, value):
+              (RAW / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def get_object(object_id):
+              return rpc('sui_getObject', [object_id, {
+                  'showType': True,
+                  'showOwner': True,
+                  'showPreviousTransaction': True,
+                  'showDisplay': True,
+                  'showContent': True,
+                  'showBcs': True,
+              }])
+
+          def object_data(wrapper):
+              response = result(wrapper)
+              return (response or {}).get('data') if isinstance(response, dict) else None
+
+          def fields(wrapper):
+              return (((object_data(wrapper) or {}).get('content') or {}).get('fields') or {})
+
+          def scalar(value):
+              if isinstance(value, (int, float, str, bool)) or value is None:
+                  return value
+              if isinstance(value, dict):
+                  if 'value' in value and not isinstance(value['value'], (dict, list)):
+                      return value['value']
+                  nested = value.get('fields')
+                  if isinstance(nested, dict):
+                      return scalar(nested)
+              return value
+
+          def integer(value):
+              value = scalar(value)
+              try:
+                  return int(value)
+              except Exception:
+                  return None
+
+          def walk(value, prefix=''):
+              rows = []
+              if isinstance(value, dict):
+                  for key, child in value.items():
+                      path = f'{prefix}.{key}' if prefix else str(key)
+                      rows.extend(walk(child, path))
+              elif isinstance(value, list):
+                  for index, child in enumerate(value):
+                      rows.extend(walk(child, f'{prefix}[{index}]'))
+              else:
+                  rows.append((prefix, value))
+              return rows
+
+          checkpoint = gql('query { checkpoint { sequenceNumber timestamp } }')['checkpoint']
+          now_ms = int(datetime.datetime.fromisoformat(checkpoint['timestamp'].replace('Z', '+00:00')).timestamp() * 1000)
+
+          registry = get_object(REGISTRY_ID)
+          dynamic_fields = []
+          cursor = None
+          for _ in range(10):
+              page = result(rpc('suix_getDynamicFields', [REGISTRY_TABLE_ID, cursor, 50]))
+              if not isinstance(page, dict):
+                  break
+              dynamic_fields.extend(page.get('data') or [])
+              if not page.get('hasNextPage'):
+                  break
+              cursor = page.get('nextCursor')
+
+          pool_objects = []
+          for row in dynamic_fields:
+              field_id = row.get('objectId')
+              if not field_id:
+                  continue
+              wrapper = get_object(field_id)
+              pool_objects.append({
+                  'dynamicField': row,
+                  'object': wrapper,
+                  'fields': fields(wrapper),
+              })
+
+          pool = None
+          for row in pool_objects:
+              name = ((row.get('fields') or {}).get('name'))
+              if str(name) == '0' or (isinstance(name, dict) and str(name.get('value')) == '0'):
+                  pool = row
+                  break
+          if pool is None and pool_objects:
+              pool = pool_objects[0]
+          if pool is None:
+              raise RuntimeError('No TLP liquidity pool dynamic field found')
+
+          pool_fields = (pool.get('fields') or {}).get('value') or pool.get('fields') or {}
+          if isinstance(pool_fields, dict) and isinstance(pool_fields.get('fields'), dict):
+              pool_fields = pool_fields['fields']
+
+          pool_info = pool_fields.get('pool_info') or {}
+          if isinstance(pool_info, dict) and isinstance(pool_info.get('fields'), dict):
+              pool_info = pool_info['fields']
+          token_pools = pool_fields.get('token_pools') or []
+          if isinstance(token_pools, dict):
+              token_pools = (token_pools.get('fields') or {}).get('contents') or token_pools.get('contents') or []
+
+          token_rows = []
+          oracle_ids = set()
+          for raw in token_pools:
+              token = raw.get('fields') if isinstance(raw, dict) and isinstance(raw.get('fields'), dict) else raw
+              config = (token or {}).get('config') or {}
+              if isinstance(config, dict) and isinstance(config.get('fields'), dict):
+                  config = config['fields']
+              state = (token or {}).get('state') or {}
+              if isinstance(state, dict) and isinstance(state.get('fields'), dict):
+                  state = state['fields']
+              token_type = (token or {}).get('token_type')
+              if isinstance(token_type, dict):
+                  token_type = ((token_type.get('fields') or {}).get('name') or token_type.get('name') or token_type)
+              oracle_id = config.get('oracle_id')
+              if isinstance(oracle_id, dict):
+                  oracle_id = scalar(oracle_id)
+              if isinstance(oracle_id, str) and oracle_id.startswith('0x'):
+                  oracle_ids.add(oracle_id)
+              update_ms = integer(state.get('update_ts_ms'))
+              token_rows.append({
+                  'tokenType': token_type,
+                  'oracleId': oracle_id,
+                  'decimal': integer(config.get('liquidity_token_decimal')),
+                  'liquidityAmount': integer(state.get('liquidity_amount')),
+                  'reservedAmount': integer(state.get('reserved_amount')),
+                  'valueInUsd': integer(state.get('value_in_usd')),
+                  'updateTimestampMs': update_ms,
+                  'ageMs': now_ms - update_ms if update_ms is not None else None,
+                  'config': config,
+                  'state': state,
+              })
+
+          oracle_objects = {object_id: get_object(object_id) for object_id in sorted(oracle_ids)}
+          oracle_summaries = {}
+          for object_id, wrapper in oracle_objects.items():
+              data = object_data(wrapper) or {}
+              content_fields = fields(wrapper)
+              numeric = []
+              for path, value in walk(content_fields):
+                  try:
+                      number = int(value)
+                  except Exception:
+                      continue
+                  if any(term in path.lower() for term in ('price', 'decimal', 'expo', 'timestamp', 'update', 'round', 'value')):
+                      numeric.append({'path': path, 'value': number})
+              oracle_summaries[object_id] = {
+                  'type': data.get('type'),
+                  'owner': data.get('owner'),
+                  'version': data.get('version'),
+                  'digest': data.get('digest'),
+                  'previousTransaction': data.get('previousTransaction'),
+                  'fields': content_fields,
+                  'numericCandidates': numeric,
+              }
+
+          vault = get_object(VAULT_ID)
+          vault_fields = fields(vault)
+          aggregator = get_object(AGGREGATOR_ID)
+
+          total_share_supply = integer(pool_info.get('total_share_supply')) or 0
+          stored_tvl_usd = integer(pool_info.get('tvl_usd')) or 0
+          stored_nav_ratio = (stored_tvl_usd / total_share_supply) if total_share_supply else None
+          stored_token_value_sum = sum(row.get('valueInUsd') or 0 for row in token_rows)
+          max_age_ms = max((row['ageMs'] for row in token_rows if row['ageMs'] is not None), default=None)
+          min_age_ms = min((row['ageMs'] for row in token_rows if row['ageMs'] is not None), default=None)
+
+          events = []
+          options = {
+              'showInput': True,
+              'showRawInput': False,
+              'showEffects': True,
+              'showEvents': True,
+              'showObjectChanges': True,
+              'showBalanceChanges': True,
+          }
+          transactions = []
+          cursor = None
+          for _ in range(10):
+              page = result(rpc('suix_queryTransactionBlocks', [{
+                  'filter': {'InputObject': REGISTRY_ID},
+                  'options': options,
+              }, cursor, 50, True]))
+              if not isinstance(page, dict):
+                  break
+              transactions.extend(page.get('data') or [])
+              if not page.get('hasNextPage'):
+                  break
+              cursor = page.get('nextCursor')
+          for tx in transactions:
+              for event in tx.get('events') or []:
+                  if any(term in str(event.get('type')) for term in ('UpdateLiquidityValue', 'MintLp', 'BurnLp')):
+                      events.append({
+                          'digest': tx.get('digest'),
+                          'timestampMs': tx.get('timestampMs'),
+                          'type': event.get('type'),
+                          'parsedJson': event.get('parsedJson'),
+                      })
+
+          dump('registry.json', registry)
+          dump('dynamic_fields.json', dynamic_fields)
+          dump('pool_objects.json', pool_objects)
+          dump('oracle_objects.json', oracle_objects)
+          dump('vault.json', vault)
+          dump('aggregator.json', aggregator)
+          dump('transactions.json', transactions)
+          dump('events.json', events)
+
+          summary = {
+              'schema': 'bucket-tlp-stale-nav-r40/v1',
+              'network': 'sui-mainnet',
+              'readOnly': True,
+              'checkpoint': checkpoint,
+              'registryId': REGISTRY_ID,
+              'poolDynamicFieldId': (pool.get('dynamicField') or {}).get('objectId'),
+              'poolInfo': pool_info,
+              'tokenPools': token_rows,
+              'oracleObjects': oracle_summaries,
+              'totalShareSupply': total_share_supply,
+              'storedTvlUsd': stored_tvl_usd,
+              'storedTokenValueSum': stored_token_value_sum,
+              'storedTvlEqualsTokenValueSum': stored_tvl_usd == stored_token_value_sum,
+              'storedNavRatio': stored_nav_ratio,
+              'minTokenUpdateAgeMs': min_age_ms,
+              'maxTokenUpdateAgeMs': max_age_ms,
+              'allTokenValuesUpdatedInCurrentCheckpoint': all((row.get('ageMs') == 0) for row in token_rows),
+              'vaultFields': vault_fields,
+              'aggregatorFields': fields(aggregator),
+              'recentNavEvents': events[:100],
+              'gates': {
+                  'feedHasNoClockOrFreshness': True,
+                  'storedNavCurrentlyStale': bool(max_age_ms is not None and max_age_ms > 0),
+                  'storedAccountingInternallyConsistent': stored_tvl_usd == stored_token_value_sum,
+                  'liveEconomicOvervaluationProven': False,
+                  'permissionlessMaterialBorrowProven': False,
+              },
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps(summary, indent=2))
+          PY
+          python3 bucket-tlp-stale-nav-r40/gate.py | tee bucket-tlp-stale-nav-r40/run.log
+          find bucket-tlp-stale-nav-r40 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-tlp-stale-nav-r40/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-tlp-stale-nav-r40 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-tlp-stale-nav-r40/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          assert len(summary['tokenPools']) > 0
+          print('BUCKET_TLP_STALE_NAV_R40_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-tlp-stale-nav-r40
+          path: bucket-tlp-stale-nav-r40
+          if-no-files-found: error
+          retention-days: 5

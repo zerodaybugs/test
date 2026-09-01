@@ -1,0 +1,420 @@
+name: Bucket TLP Vault Targeted Audit R38
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [agent/bucket-deployment-trigger-r37-20260812]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect live TLP Vault, oracle, pool, position, and capability evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bucket-tlp-vault-r38
+          mkdir -p bucket-tlp-vault-r38/{raw,asm,analysis}
+          cat > bucket-tlp-vault-r38/audit.py <<'PY'
+          import json
+          import pathlib
+          import re
+          import time
+          import urllib.request
+
+          OUT = pathlib.Path('bucket-tlp-vault-r38')
+          RAW = OUT / 'raw'
+          ASM = OUT / 'asm'
+          ANALYSIS = OUT / 'analysis'
+          GQL = 'https://graphql.mainnet.sui.io/graphql'
+          RPCS = [
+              'https://sui-mainnet-endpoint.blockvision.org',
+              'https://fullnode.mainnet.sui.io:443',
+          ]
+
+          VAULT_ID = '0xf4b852ec580fb15da542b191d5fefe96939f718b43dc0240062fa83b35f06da1'
+          TLP_TYPE = '0xe27969a70f93034de9ce16e6ad661b480324574e68d15a64b513fd90eb2423e5::tlp::TLP'
+          AGGREGATOR_ID = '0x487e76e8c9a321cc0131bfcf6e5a4d87fbc0beb8f6384f8c7e1658cde6076798'
+          TLP_RULE_PACKAGE = '0x499b930751ecbbfbbc3b76cde04486787a6e99752df3b5d765bd5f1f441934b8'
+          TLP_PACKAGE = '0xe27969a70f93034de9ce16e6ad661b480324574e68d15a64b513fd90eb2423e5'
+          LIQUIDATION_PACKAGE = '0xbe1457c92f8e8c39e85fa4f77bfcd8cfbda30d1861286ba64c76a94773138b5d'
+          ORACLE_PACKAGE = '0xf2ab9aa60c5e879675351a1a89f47131de9dea7cc927327dd0e7282e295c7f5e'
+          INDEX_MAP_TYPE = TLP_RULE_PACKAGE + '::tlp_rule::IndexMap'
+          LISTING_CAP_TYPE = ORACLE_PACKAGE + '::listing::ListingCap'
+
+          def post(url, payload, retries=6, timeout=180):
+              encoded = json.dumps(payload).encode()
+              last = None
+              for attempt in range(retries):
+                  try:
+                      request = urllib.request.Request(
+                          url,
+                          data=encoded,
+                          method='POST',
+                          headers={
+                              'Content-Type': 'application/json',
+                              'User-Agent': 'bucket-tlp-vault-r38/1',
+                          },
+                      )
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return json.loads(response.read().decode())
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(2 ** attempt)
+              raise RuntimeError(f'POST failed {url}: {last}')
+
+          def rpc(method, params):
+              failures = []
+              for endpoint in RPCS:
+                  try:
+                      body = post(endpoint, {
+                          'jsonrpc': '2.0',
+                          'id': 1,
+                          'method': method,
+                          'params': params,
+                      })
+                      if body.get('error'):
+                          raise RuntimeError(json.dumps(body['error']))
+                      return {'endpoint': endpoint, 'result': body.get('result')}
+                  except Exception as exc:
+                      failures.append({'endpoint': endpoint, 'error': type(exc).__name__, 'message': str(exc)})
+              return {'failures': failures}
+
+          def result(wrapper):
+              return wrapper.get('result') if isinstance(wrapper, dict) else None
+
+          def gql(query, variables=None):
+              body = post(GQL, {'query': query, 'variables': variables or {}})
+              if body.get('errors'):
+                  raise RuntimeError(json.dumps(body['errors']))
+              return body['data']
+
+          def dump(path, value):
+              path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def get_object(object_id):
+              return rpc('sui_getObject', [object_id, {
+                  'showType': True,
+                  'showOwner': True,
+                  'showPreviousTransaction': True,
+                  'showDisplay': True,
+                  'showContent': True,
+                  'showBcs': True,
+              }])
+
+          def object_data(wrapper):
+              response = result(wrapper)
+              return (response or {}).get('data') if isinstance(response, dict) else None
+
+          def object_fields(wrapper):
+              data = object_data(wrapper) or {}
+              return ((data.get('content') or {}).get('fields') or {})
+
+          def object_type(wrapper):
+              data = object_data(wrapper) or {}
+              return data.get('type')
+
+          def object_id_from_input(value):
+              if not isinstance(value, dict):
+                  return None
+              return value.get('objectId') or (value.get('Shared') or {}).get('objectId')
+
+          def objects_by_type(type_name):
+              query = '''query Objects($type:String!,$after:String){objects(first:50,after:$after,filter:{type:$type}){pageInfo{hasNextPage endCursor}nodes{address version digest owner{__typename ... on AddressOwner{address{address}} ... on ObjectOwner{address{address}}}previousTransaction{digest sender{address}}asMoveObject{hasPublicTransfer contents{type{repr}json bcs}}}}}'''
+              rows = []
+              cursor = None
+              for _ in range(20):
+                  connection = gql(query, {'type': type_name, 'after': cursor})['objects']
+                  rows.extend(connection.get('nodes') or [])
+                  page = connection.get('pageInfo') or {}
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('endCursor')
+              return rows
+
+          def tx_pages(object_id, pages=20):
+              options = {
+                  'showInput': True,
+                  'showRawInput': False,
+                  'showEffects': True,
+                  'showEvents': True,
+                  'showObjectChanges': True,
+                  'showBalanceChanges': True,
+              }
+              rows = []
+              cursor = None
+              for _ in range(pages):
+                  wrapper = rpc('suix_queryTransactionBlocks', [{
+                      'filter': {'InputObject': object_id},
+                      'options': options,
+                  }, cursor, 50, True])
+                  page = result(wrapper)
+                  if not isinstance(page, dict):
+                      break
+                  rows.extend(page.get('data') or [])
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('nextCursor')
+              return rows
+
+          package_query = '''query Package($address:SuiAddress!){object(address:$address){address version digest previousTransaction{digest sender{address}}asMovePackage{address version linkage{originalId upgradedId version}typeOrigins{module struct definingId}modules{nodes{name fileFormatVersion disassembly functions(first:200){nodes{name visibility isEntry parameters{repr}return{repr}typeParameters{constraints}}}structs(first:200){nodes{name abilities fields{name type{repr}}typeParameters{constraints}}}}}}}}'''
+
+          package_results = {}
+          public_functions = []
+          for label, package_id in {
+              'tlp': TLP_PACKAGE,
+              'tlp_rule': TLP_RULE_PACKAGE,
+              'liquidation_rule': LIQUIDATION_PACKAGE,
+              'oracle': ORACLE_PACKAGE,
+          }.items():
+              response = gql(package_query, {'address': package_id})
+              package_results[label] = response
+              package = ((response.get('object') or {}).get('asMovePackage'))
+              target = ASM / label
+              target.mkdir(parents=True, exist_ok=True)
+              if not package:
+                  continue
+              for module in package.get('modules', {}).get('nodes', []):
+                  name = module.get('name')
+                  (target / f'{name}.asm').write_text(module.get('disassembly') or '')
+                  for function in (module.get('functions') or {}).get('nodes', []):
+                      if str(function.get('visibility')).upper() == 'PUBLIC' or function.get('isEntry'):
+                          public_functions.append({
+                              'packageLabel': label,
+                              'packageId': package_id,
+                              'module': name,
+                              'name': function.get('name'),
+                              'visibility': function.get('visibility'),
+                              'isEntry': function.get('isEntry'),
+                              'parameters': [row.get('repr') for row in function.get('parameters') or []],
+                              'returns': [row.get('repr') for row in function.get('return') or []],
+                          })
+
+          vault = get_object(VAULT_ID)
+          aggregator = get_object(AGGREGATOR_ID)
+          index_maps = objects_by_type(INDEX_MAP_TYPE)
+          listing_caps = objects_by_type(LISTING_CAP_TYPE)
+          metadata = rpc('suix_getCoinMetadata', [TLP_TYPE])
+
+          vault_fields = object_fields(vault)
+          position_table = vault_fields.get('position_table') or {}
+          position_table_id = position_table.get('id') if isinstance(position_table, dict) else None
+          dynamic_fields = []
+          cursor = None
+          if position_table_id:
+              for _ in range(20):
+                  wrapper = rpc('suix_getDynamicFields', [position_table_id, cursor, 50])
+                  page = result(wrapper)
+                  if not isinstance(page, dict):
+                      break
+                  dynamic_fields.extend(page.get('data') or [])
+                  if not page.get('hasNextPage'):
+                      break
+                  cursor = page.get('nextCursor')
+
+          position_objects = {}
+          for row in dynamic_fields:
+              field_id = row.get('objectId')
+              if field_id:
+                  position_objects[field_id] = get_object(field_id)
+
+          vault_txs = tx_pages(VAULT_ID)
+          aggregator_txs = tx_pages(AGGREGATOR_ID)
+          relevant_txs = {}
+          input_object_ids = set()
+          call_rows = []
+          for label, txs in [('vault', vault_txs), ('aggregator', aggregator_txs)]:
+              for tx in txs:
+                  digest = tx.get('digest')
+                  relevant_txs[digest] = tx
+                  try:
+                      transaction_data = tx['transaction']['data']['transaction']
+                      inputs = transaction_data.get('inputs') or []
+                      commands = transaction_data.get('transactions') or []
+                  except Exception:
+                      inputs = []
+                      commands = []
+                  for value in inputs:
+                      object_id = object_id_from_input(value)
+                      if object_id:
+                          input_object_ids.add(object_id)
+                  for index, command in enumerate(commands):
+                      move = command.get('MoveCall') if isinstance(command, dict) else None
+                      if not move:
+                          continue
+                      resolved = []
+                      for argument in move.get('arguments') or []:
+                          item = {'argument': argument}
+                          if isinstance(argument, dict) and 'Input' in argument:
+                              input_index = int(argument['Input'])
+                              if input_index < len(inputs):
+                                  item['input'] = inputs[input_index]
+                          resolved.append(item)
+                      call_rows.append({
+                          'source': label,
+                          'digest': digest,
+                          'timestampMs': tx.get('timestampMs'),
+                          'sender': (((tx.get('transaction') or {}).get('data') or {}).get('sender')),
+                          'status': ((tx.get('effects') or {}).get('status')),
+                          'commandIndex': index,
+                          'package': move.get('package'),
+                          'module': move.get('module'),
+                          'function': move.get('function'),
+                          'typeArguments': move.get('type_arguments'),
+                          'resolvedArguments': resolved,
+                      })
+
+          input_objects = {object_id: get_object(object_id) for object_id in sorted(input_object_ids)}
+
+          index_map_entries = []
+          for row in index_maps:
+              json_value = (((row.get('asMoveObject') or {}).get('contents') or {}).get('json') or {})
+              for item in ((json_value.get('inner') or {}).get('contents') or []):
+                  index_map_entries.append({
+                      'indexMapId': row.get('address'),
+                      'owner': row.get('owner'),
+                      'key': item.get('key'),
+                      'value': item.get('value'),
+                  })
+
+          tlp_index_entries = [
+              row for row in index_map_entries
+              if '::tlp::TLP' in str(row.get('key'))
+          ]
+
+          capability_risks = []
+          for row in public_functions:
+              name = str(row.get('name') or '').lower()
+              serialized = json.dumps(row)
+              mutator = any(term in name for term in ('set', 'remove', 'add', 'mint', 'burn', 'withdraw', 'deposit', 'swap', 'liquidat'))
+              capability_parameter = any(term in serialized for term in ('Cap', 'Admin', 'Manager', 'Witness', 'Version'))
+              if mutator and not capability_parameter:
+                  capability_risks.append(row)
+
+          liquidity_functions = [
+              row for row in public_functions
+              if row['packageLabel'] == 'tlp'
+              and any(term in str(row['name']).lower() for term in ('liquidity', 'deposit', 'withdraw', 'mint', 'burn', 'swap', 'pool'))
+          ]
+          liquidation_functions = [
+              row for row in public_functions
+              if row['packageLabel'] == 'liquidation_rule'
+          ]
+
+          dump(RAW / 'packages.json', package_results)
+          dump(RAW / 'vault.json', vault)
+          dump(RAW / 'aggregator.json', aggregator)
+          dump(RAW / 'index_maps.json', index_maps)
+          dump(RAW / 'listing_caps.json', listing_caps)
+          dump(RAW / 'metadata.json', metadata)
+          dump(RAW / 'dynamic_fields.json', dynamic_fields)
+          dump(RAW / 'position_objects.json', position_objects)
+          dump(RAW / 'vault_transactions.json', vault_txs)
+          dump(RAW / 'aggregator_transactions.json', aggregator_txs)
+          dump(RAW / 'input_objects.json', input_objects)
+          dump(ANALYSIS / 'public_functions.json', public_functions)
+          dump(ANALYSIS / 'call_rows.json', call_rows)
+          dump(ANALYSIS / 'capability_risks.json', capability_risks)
+
+          position_rows = []
+          for field_id, wrapper in position_objects.items():
+              data = object_data(wrapper) or {}
+              fields = object_fields(wrapper)
+              value = fields.get('value') or fields
+              position_rows.append({
+                  'fieldObjectId': field_id,
+                  'type': data.get('type'),
+                  'owner': data.get('owner'),
+                  'fields': fields,
+                  'value': value,
+              })
+
+          listing_cap_owner_kinds = {}
+          for cap in listing_caps:
+              kind = (cap.get('owner') or {}).get('__typename') or 'unknown'
+              listing_cap_owner_kinds[kind] = listing_cap_owner_kinds.get(kind, 0) + 1
+
+          summary = {
+              'schema': 'bucket-tlp-vault-r38/v1',
+              'network': 'sui-mainnet',
+              'readOnly': True,
+              'vaultId': VAULT_ID,
+              'vaultType': object_type(vault),
+              'vaultFields': vault_fields,
+              'positionCountEnumerated': len(position_rows),
+              'positions': position_rows,
+              'tlpMetadata': result(metadata),
+              'aggregatorId': AGGREGATOR_ID,
+              'aggregatorType': object_type(aggregator),
+              'aggregatorFields': object_fields(aggregator),
+              'indexMapObjectCount': len(index_maps),
+              'tlpIndexEntries': tlp_index_entries,
+              'listingCapCount': len(listing_caps),
+              'listingCapOwnerKinds': listing_cap_owner_kinds,
+              'publicFunctionCount': len(public_functions),
+              'tlpLiquidityFunctions': liquidity_functions,
+              'liquidationFunctions': liquidation_functions,
+              'capabilityRiskCandidates': capability_risks,
+              'vaultTransactionCount': len(vault_txs),
+              'aggregatorTransactionCount': len(aggregator_txs),
+              'moveCallCount': len(call_rows),
+              'inputObjectCount': len(input_objects),
+              'gates': {
+                  'listingCapSharedOrImmutable': any(kind in listing_cap_owner_kinds for kind in ('Shared', 'Immutable')),
+                  'tlpIndexMapped': bool(tlp_index_entries),
+                  'unprotectedMutatorCandidate': bool(capability_risks),
+                  'activeDebtPresent': int(vault_fields.get('total_debt_amount') or 0) > 0,
+                  'positionsPresent': len(position_rows) > 0,
+              },
+              'writes': 0,
+              'transactionsConstructed': 0,
+              'generatedUnix': int(time.time()),
+          }
+          (OUT / 'SUMMARY.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({
+              'vaultId': summary['vaultId'],
+              'vaultType': summary['vaultType'],
+              'positionCountEnumerated': summary['positionCountEnumerated'],
+              'tlpMetadata': summary['tlpMetadata'],
+              'aggregatorFields': summary['aggregatorFields'],
+              'tlpIndexEntries': summary['tlpIndexEntries'],
+              'listingCapOwnerKinds': summary['listingCapOwnerKinds'],
+              'tlpLiquidityFunctions': summary['tlpLiquidityFunctions'],
+              'liquidationFunctions': summary['liquidationFunctions'],
+              'capabilityRiskCandidates': summary['capabilityRiskCandidates'],
+              'gates': summary['gates'],
+          }, indent=2))
+          PY
+          python3 bucket-tlp-vault-r38/audit.py | tee bucket-tlp-vault-r38/run.log
+          find bucket-tlp-vault-r38 -type f -print0 | sort -z | xargs -0 sha256sum > bucket-tlp-vault-r38/SHA256SUMS.txt
+
+      - name: Validate read-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RniE 'executeTransaction|dryRunTransaction|devInspectTransaction|signAndExecute|private.?key|mnemonic' bucket-tlp-vault-r38 && exit 1 || true
+          python3 - <<'PY'
+          import json
+          summary = json.load(open('bucket-tlp-vault-r38/SUMMARY.json'))
+          assert summary['readOnly'] is True
+          assert summary['writes'] == 0
+          assert summary['transactionsConstructed'] == 0
+          assert summary['gates']['activeDebtPresent'] is True
+          print('BUCKET_TLP_VAULT_R38_READ_ONLY_PASS')
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-tlp-vault-r38
+          path: bucket-tlp-vault-r38
+          if-no-files-found: error
+          retention-days: 5
