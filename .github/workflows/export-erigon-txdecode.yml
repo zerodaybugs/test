@@ -1,0 +1,148 @@
+name: export-erigon-txdecode
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/export-erigon-txdecode.yml'
+      - 'erigon-txdecode-trigger.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.0'
+
+      - name: Build generic Erigon transaction decoder
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch v3.5.4 https://github.com/erigontech/erigon.git /tmp/erigon
+          cd /tmp/erigon
+          test "$(git describe --tags --exact-match)" = "v3.5.4"
+          mkdir -p cmd/zdb-txdecode "$GITHUB_WORKSPACE/export"
+          cat > cmd/zdb-txdecode/main.go <<'EOF'
+          package main
+
+          import (
+              "bufio"
+              "bytes"
+              "encoding/hex"
+              "encoding/json"
+              "fmt"
+              "os"
+              "strings"
+
+              "github.com/erigontech/erigon/execution/types"
+          )
+
+          type result struct {
+              Input               string `json:"input"`
+              Accepted            bool   `json:"accepted"`
+              Stage               string `json:"stage,omitempty"`
+              Error               string `json:"error,omitempty"`
+              Type                byte   `json:"tx_type,omitempty"`
+              ChainID             string `json:"chain_id,omitempty"`
+              Nonce               uint64 `json:"nonce,omitempty"`
+              Gas                 uint64 `json:"gas_limit,omitempty"`
+              TipCap              string `json:"tip_cap,omitempty"`
+              FeeCap              string `json:"fee_cap,omitempty"`
+              Value               string `json:"value,omitempty"`
+              Protected           bool   `json:"protected,omitempty"`
+              SignatureRecoveryOK bool   `json:"signature_recovery_ok,omitempty"`
+              RecoveredSigner     string `json:"recovered_signer,omitempty"`
+              Hash                string `json:"hash,omitempty"`
+              Canonical           string `json:"canonical,omitempty"`
+          }
+
+          func emit(r result) {
+              b, err := json.Marshal(r)
+              if err != nil {
+                  fmt.Printf("{\"accepted\":false,\"stage\":\"json\",\"error\":%q}\n", err.Error())
+                  return
+              }
+              fmt.Println(string(b))
+          }
+
+          func main() {
+              scanner := bufio.NewScanner(os.Stdin)
+              scanner.Buffer(make([]byte, 1024), 16*1024*1024)
+              for scanner.Scan() {
+                  input := strings.TrimSpace(scanner.Text())
+                  if input == "" { continue }
+                  raw := strings.TrimPrefix(input, "0x")
+                  payload, err := hex.DecodeString(raw)
+                  if err != nil {
+                      emit(result{Input: input, Accepted: false, Stage: "hex", Error: err.Error()})
+                      continue
+                  }
+                  tx, err := types.DecodeTransaction(payload)
+                  if err != nil {
+                      emit(result{Input: input, Accepted: false, Stage: "decode_transaction", Error: err.Error()})
+                      continue
+                  }
+
+                  chainID := tx.GetChainID()
+                  chainText := "0"
+                  if chainID != nil { chainText = chainID.String() }
+                  signer := types.LatestSignerForChainID(chainID)
+                  recovered, senderErr := signer.Sender(tx)
+                  sender := ""
+                  if senderErr == nil { sender = fmt.Sprintf("0x%x", recovered) }
+
+                  var canonical bytes.Buffer
+                  marshalErr := tx.MarshalBinary(&canonical)
+                  r := result{
+                      Input: input,
+                      Accepted: true,
+                      Type: tx.Type(),
+                      ChainID: chainText,
+                      Nonce: tx.GetNonce(),
+                      Gas: tx.GetGasLimit(),
+                      TipCap: tx.GetTipCap().String(),
+                      FeeCap: tx.GetFeeCap().String(),
+                      Value: tx.GetValue().String(),
+                      Protected: tx.Protected(),
+                      SignatureRecoveryOK: senderErr == nil,
+                      RecoveredSigner: sender,
+                      Hash: tx.Hash().Hex(),
+                  }
+                  if marshalErr == nil {
+                      r.Canonical = "0x" + hex.EncodeToString(canonical.Bytes())
+                  } else {
+                      r.Stage = "marshal_binary"
+                      r.Error = marshalErr.Error()
+                  }
+                  if senderErr != nil {
+                      r.Stage = "sender_recovery"
+                      r.Error = senderErr.Error()
+                  }
+                  emit(r)
+              }
+              if err := scanner.Err(); err != nil {
+                  emit(result{Accepted:false, Stage:"stdin", Error:err.Error()})
+              }
+          }
+          EOF
+          go build -trimpath -ldflags='-s -w' -o "$GITHUB_WORKSPACE/export/erigon-txdecode" ./cmd/zdb-txdecode
+          printf '' | "$GITHUB_WORKSPACE/export/erigon-txdecode"
+          go version > "$GITHUB_WORKSPACE/export/GO_VERSION.txt"
+          git rev-parse HEAD > "$GITHUB_WORKSPACE/export/ERIGON_COMMIT.txt"
+          printf 'erigon=v3.5.4\n' > "$GITHUB_WORKSPACE/export/DEPENDENCY_VERSIONS.txt"
+          cd "$GITHUB_WORKSPACE"
+          sha256sum export/erigon-txdecode | sort > export/SHA256SUMS.txt
+
+      - name: Upload generic decoder
+        uses: actions/upload-artifact@v4
+        with:
+          name: erigon-txdecode-3.5.4-linux-amd64
+          path: export/
+          if-no-files-found: error
+          retention-days: 1
