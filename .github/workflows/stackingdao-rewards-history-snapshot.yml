@@ -1,0 +1,154 @@
+name: StackingDAO rewards history snapshot
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/stackingdao-rewards-history-snapshot.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  history:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout workflow
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Query public rewards history read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p history
+          cd history
+          npm init -y >/dev/null 2>&1
+          npm install --no-save --package-lock=false @stacks/transactions@6.17.0 >/dev/null 2>&1
+
+          cat > query-history.mjs <<'NODE'
+          import { cvToHex, cvToString, hexToCV, uintCV } from '@stacks/transactions';
+          import { writeFile } from 'node:fs/promises';
+
+          const address = 'SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG';
+          const contract = 'rewards-v7';
+          const principal = `${address}.${contract}`;
+          const api = 'https://api.mainnet.hiro.so';
+          const sender = address;
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+          async function request(url, options = {}, attempts = 8) {
+            let last;
+            for (let i = 1; i <= attempts; i += 1) {
+              try {
+                const response = await fetch(url, options);
+                const text = await response.text();
+                if (!response.ok) {
+                  const retryAfter = Number(response.headers.get('retry-after') ?? 0);
+                  if (response.status === 429 && i < attempts) {
+                    await sleep(Math.max(3000, retryAfter * 1000, i * 3000));
+                    continue;
+                  }
+                  throw new Error(`${response.status} ${response.statusText}: ${text}`);
+                }
+                return JSON.parse(text);
+              } catch (error) {
+                last = error;
+                if (i < attempts) await sleep(i * 2500);
+              }
+            }
+            throw last;
+          }
+
+          async function call(fn, args = []) {
+            const body = JSON.stringify({ sender, arguments: args.map(cvToHex) });
+            const json = await request(
+              `${api}/v2/contracts/call-read/${address}/${contract}/${fn}`,
+              { method: 'POST', headers: { 'content-type': 'application/json' }, body },
+            );
+            if (!json.result) throw new Error(`${fn}: missing result: ${JSON.stringify(json)}`);
+            await sleep(1150);
+            return cvToString(hexToCV(json.result));
+          }
+
+          const cycleText = await call('get-pox-cycle');
+          const match = cycleText.match(/u(\d+)/);
+          if (!match) throw new Error(`Unable to parse cycle: ${cycleText}`);
+          const currentCycle = Number(match[1]);
+          const startCycle = Math.max(0, currentCycle - 80);
+          const cycles = [];
+
+          for (let cycle = startCycle; cycle <= currentCycle; cycle += 1) {
+            const stx = await call('get-cycle-rewards-ststx', [uintCV(cycle)]);
+            const sbtc = await call('get-cycle-rewards-ststxbtc', [uintCV(cycle)]);
+            const nonzero = !(
+              stx.includes('(total-stx u0)') &&
+              stx.includes('(protocol-stx u0)') &&
+              stx.includes('(commission-stx u0)') &&
+              sbtc.includes('(total-sbtc u0)') &&
+              sbtc.includes('(protocol-sbtc u0)') &&
+              sbtc.includes('(commission-sbtc u0)')
+            );
+            if (nonzero) cycles.push({ cycle, stx, sbtc });
+          }
+
+          for (const entry of cycles) {
+            entry.shouldProcess = await call('should-process-rewards', [uintCV(entry.cycle)]);
+          }
+
+          const transactions = {};
+          for (const [name, url] of [
+            ['v2', `${api}/extended/v2/addresses/${principal}/transactions?limit=50`],
+            ['v1', `${api}/extended/v1/address/${principal}/transactions?limit=50&unanchored=false`],
+          ]) {
+            try {
+              transactions[name] = await request(url);
+            } catch (error) {
+              transactions[name] = { error: String(error) };
+            }
+          }
+
+          const output = {
+            captured_at: new Date().toISOString(),
+            currentCycle,
+            startCycle,
+            nonzeroCycles: cycles,
+            transactions,
+          };
+          await writeFile('history.json', `${JSON.stringify(output, null, 2)}\n`);
+
+          const txs = transactions.v2?.results ?? transactions.v1?.results ?? [];
+          const lines = [
+            `captured_at=${output.captured_at}`,
+            `range=${startCycle}-${currentCycle}`,
+            `nonzero_cycle_count=${cycles.length}`,
+            ...cycles.map(entry =>
+              `cycle=${entry.cycle} stx=${entry.stx} sbtc=${entry.sbtc} should=${entry.shouldProcess}`,
+            ),
+            `transaction_count_returned=${txs.length}`,
+            ...txs.map(tx =>
+              `tx=${tx.tx_id} time=${tx.burn_block_time_iso ?? tx.block_time_iso ?? tx.receipt_time_iso ?? ''} ` +
+              `status=${tx.tx_status ?? ''} function=${tx.contract_call?.function_name ?? tx.tx?.contract_call?.function_name ?? ''}`,
+            ),
+          ];
+          await writeFile('history.txt', `${lines.join('\n')}\n`);
+          console.log(lines.join('\n'));
+          NODE
+
+          node query-history.mjs
+          sha256sum history.json history.txt query-history.mjs > SHA256SUMS
+
+      - name: Upload public rewards history
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackingdao-rewards-history-${{ github.run_id }}
+          path: |
+            history/history.json
+            history/history.txt
+            history/query-history.mjs
+            history/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
