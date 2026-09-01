@@ -1,0 +1,221 @@
+name: Monad exact cross-layer boundary matrix 20260824
+
+on:
+  push:
+    branches:
+      - tooling/monad-round9-crosslayer-boundary-20260824
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  boundary-matrix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    steps:
+      - name: Checkout tooling
+        uses: actions/checkout@v4
+
+      - name: Clone exact public scoped sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global submodule.fetchJobs "$(nproc)"
+          git clone --filter=blob:none --no-recurse-submodules \
+            https://github.com/category-labs/monad-bft.git monad-bft
+          git -C monad-bft checkout c616743d1358186605e1c1b74a3d6c4fdd9dd48c
+          git -C monad-bft submodule update --init monad-execution
+          test "$(git -C monad-bft rev-parse HEAD)" = \
+            "c616743d1358186605e1c1b74a3d6c4fdd9dd48c"
+          test "$(git -C monad-bft/monad-execution rev-parse HEAD)" = \
+            "e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0"
+          test -z "$(git -C monad-bft status --porcelain=v1)"
+          mkdir -p out/raw out/meta out/summary
+          printf '%s\n' c616743d1358186605e1c1b74a3d6c4fdd9dd48c > out/meta/BFT_COMMIT.txt
+          printf '%s\n' e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0 > out/meta/EXECUTION_COMMIT.txt
+
+      - name: Build cross-layer source inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$PWD/monad-bft"
+          EXEC="$ROOT/monad-execution"
+          rg -n --hidden --glob '!target/**' \
+            '(revision|fork|activation|timestamp|block_number|block_num|round|epoch|beneficiary|base_fee|gas_limit|blob|nonce|authorization|EIP|MIP)' \
+            "$ROOT/monad-chain-config" \
+            "$ROOT/monad-eth-block-validator" \
+            "$ROOT/monad-eth-block-policy" \
+            "$ROOT/monad-consensus-types" \
+            "$ROOT/monad-consensus" \
+            > out/raw/RUST_BOUNDARY_INDEX.txt || true
+          rg -n --hidden --glob '!build/**' --glob '!third_party/**' \
+            '(revision|fork|activation|timestamp|block_number|block_num|beneficiary|base_fee|gas_limit|blob|nonce|authorization|EIP|MIP|first_block|start_block)' \
+            "$EXEC/category/execution" "$EXEC/category/vm" \
+            > out/raw/EXECUTION_BOUNDARY_INDEX.txt || true
+
+          find "$ROOT/monad-chain-config" "$ROOT/monad-eth-block-validator" \
+            "$ROOT/monad-eth-block-policy" -type f -print0 \
+            | LC_ALL=C sort -z | xargs -0 sha256sum > out/meta/RUST_SOURCE_SHA256SUMS.txt
+          find "$EXEC/category/execution" "$EXEC/category/vm" -type f -print0 \
+            | LC_ALL=C sort -z | xargs -0 sha256sum > out/meta/EXECUTION_SOURCE_SHA256SUMS.txt
+
+      - name: Run exact Rust admission baselines
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd monad-bft
+          packages=(monad-chain-config monad-eth-block-validator monad-eth-block-policy)
+          : > ../out/raw/RUST_TEST_RESULTS.tsv
+          for package in "${packages[@]}"; do
+            set +e
+            timeout --signal=TERM --kill-after=15s 1500s \
+              cargo test -p "$package" --all-features -- --nocapture \
+              > "../out/raw/${package}.log" 2>&1
+            rc=$?
+            set -e
+            printf '%s\t%s\n' "$package" "$rc" >> ../out/raw/RUST_TEST_RESULTS.tsv
+          done
+          rustc --version --verbose > ../out/meta/RUSTC_VERSION.txt
+          cargo --version --verbose > ../out/meta/CARGO_VERSION.txt
+
+      - name: Build official execution test environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --target base -t monad-r9-base \
+            -f monad-bft/monad-execution/docker/Dockerfile \
+            monad-bft/monad-execution
+          docker run --name monad-r9-exec \
+            -v "$PWD/monad-bft/monad-execution:/src" \
+            -v "$PWD/out:/out" \
+            monad-r9-base bash -lc '
+              set -euo pipefail
+              cd /src
+              rm -rf build-r9
+              CC=clang-19 CXX=clang++-19 cmake -S . -B build-r9 -GNinja \
+                -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DCMAKE_TOOLCHAIN_FILE=category/core/toolchains/gcc-avx2.cmake \
+                -DMONAD_COMPILER_TESTING=On
+              ninja -C build-r9 -t targets all > /out/raw/NINJA_TARGETS.txt
+              cmake --build build-r9 --parallel "$(nproc)"
+              ctest --test-dir build-r9 -N > /out/raw/CTEST_INVENTORY.txt
+              set +e
+              timeout --signal=TERM --kill-after=20s 2400s \
+                ctest --test-dir build-r9 --output-on-failure \
+                  -R "(validation|validate|block|transaction|chain|revision|fork|authorization|eip7702|7702)" \
+                  > /out/raw/EXECUTION_CTEST.log 2>&1
+              rc=$?
+              set -e
+              printf "%s\n" "$rc" > /out/raw/EXECUTION_CTEST.rc
+              clang-19 --version > /out/meta/CLANG_VERSION.txt
+              cmake --version > /out/meta/CMAKE_VERSION.txt
+              ninja --version > /out/meta/NINJA_VERSION.txt
+            '
+
+      - name: Derive fail-closed cross-layer candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, pathlib, re
+
+          root = pathlib.Path('out')
+          rust_text = (root/'raw/RUST_BOUNDARY_INDEX.txt').read_text(errors='replace')
+          exec_text = (root/'raw/EXECUTION_BOUNDARY_INDEX.txt').read_text(errors='replace')
+          fields = [
+              'timestamp', 'block_number', 'block_num', 'beneficiary', 'base_fee',
+              'gas_limit', 'blob', 'nonce', 'authorization', 'revision', 'fork',
+              'first_block', 'start_block',
+          ]
+          aliases = {
+              'block_number': ('block_number', 'block_num', 'number'),
+              'block_num': ('block_number', 'block_num', 'number'),
+              'first_block': ('first_block', 'is_first_block', 'start_block'),
+              'start_block': ('first_block', 'is_first_block', 'start_block'),
+          }
+          matrix = {}
+          for field in fields:
+              terms = aliases.get(field, (field,))
+              rust_count = sum(len(re.findall(rf'\b{re.escape(t)}\b', rust_text, re.I)) for t in terms)
+              exec_count = sum(len(re.findall(rf'\b{re.escape(t)}\b', exec_text, re.I)) for t in terms)
+              matrix[field] = {'rust_mentions': rust_count, 'execution_mentions': exec_count}
+
+          rust_results = {}
+          for line in (root/'raw/RUST_TEST_RESULTS.tsv').read_text().splitlines():
+              package, rc = line.split('\t')
+              rust_results[package] = int(rc)
+          execution_rc = int((root/'raw/EXECUTION_CTEST.rc').read_text().strip())
+
+          # Candidate generation is intentionally conservative. A source asymmetry is
+          # only a lead, never a finding. Baseline failures are infrastructure signals.
+          asymmetries = []
+          for field, counts in matrix.items():
+              r, e = counts['rust_mentions'], counts['execution_mentions']
+              if (r == 0) != (e == 0):
+                  asymmetries.append(field)
+              elif min(r, e) > 0 and max(r, e) >= 8 * min(r, e):
+                  asymmetries.append(field)
+
+          baseline_ok = all(rc == 0 for rc in rust_results.values()) and execution_rc == 0
+          result = {
+              'source': {
+                  'monad_bft': 'c616743d1358186605e1c1b74a3d6c4fdd9dd48c',
+                  'monad_execution': 'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0',
+              },
+              'baseline_ok': baseline_ok,
+              'rust_test_return_codes': rust_results,
+              'execution_ctest_return_code': execution_rc,
+              'field_matrix': matrix,
+              'static_asymmetry_leads': sorted(set(asymmetries)),
+              'candidate_signal': bool(asymmetries) and baseline_ok,
+              'submission_ready': False,
+              'decision': (
+                  'STATIC_LEADS_REQUIRE_VALID_BLOCK_DYNAMIC_PROOF'
+                  if asymmetries and baseline_ok else
+                  'INFRASTRUCTURE_OR_BASELINE_FAILURE'
+                  if not baseline_ok else
+                  'NO_CROSS_LAYER_STATIC_LEAD'
+              ),
+              'mandatory_next_gate': (
+                  'construct one valid boundary block; prove Rust admission PASS, '
+                  'execution rejection or divergent accepted state root, 3/3; then matched fix'
+              ),
+          }
+          canonical = json.dumps(result, indent=2, sort_keys=True) + '\n'
+          (root/'summary/ADJUDICATION.json').write_text(canonical)
+          digest = hashlib.sha256(canonical.encode()).hexdigest()
+          (root/'summary/ADJUDICATION.sha256').write_text(digest + '  ADJUDICATION.json\n')
+          print(json.dumps({
+              'decision': result['decision'],
+              'baseline_ok': baseline_ok,
+              'lead_count': len(asymmetries),
+              'submission_ready': False,
+          }, sort_keys=True))
+          PY
+
+      - name: Package bounded research evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum out/raw/* out/meta/* out/summary/* > out/SHA256SUMS
+          tar --sort=name --mtime='UTC 2026-08-24' --owner=0 --group=0 --numeric-owner \
+            -C out -czf monad-round9-crosslayer-boundary-20260824.tar.gz \
+            SHA256SUMS meta raw summary
+          sha256sum monad-round9-crosslayer-boundary-20260824.tar.gz \
+            > monad-round9-crosslayer-boundary-20260824.tar.gz.sha256
+
+      - name: Upload bounded evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: monad-round9-crosslayer-boundary-20260824
+          path: |
+            monad-round9-crosslayer-boundary-20260824.tar.gz
+            monad-round9-crosslayer-boundary-20260824.tar.gz.sha256
+            out/summary/ADJUDICATION.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
