@@ -1,0 +1,229 @@
+name: TermMax Router read-only production binding
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/termmax-production-binding-20260726.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  binding:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install pinned Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      - name: Clone exact public source and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          HEAD='e314f3f849577dfecd4614f148c4df81fdf8c72d'
+          git clone https://github.com/term-structure/termmax-contract-v2.git termmax-contract-v2
+          git -C termmax-contract-v2 checkout --detach "$HEAD"
+          test "$(git -C termmax-contract-v2 rev-parse HEAD)" = "$HEAD"
+          (
+            cd termmax-contract-v2
+            forge soldeer install
+          )
+
+      - name: Capture current public-chain proxy and implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          PROXY='0x324596C1682a5675008f6e58F9C4E0A894b079c7'
+          SLOT='0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
+          selected=''
+          index=0
+          for rpc in \
+            https://ethereum-rpc.publicnode.com \
+            https://eth.llamarpc.com \
+            https://eth.drpc.org \
+            https://1rpc.io/eth \
+            https://rpc.flashbots.net
+          do
+            index=$((index + 1))
+            out="evidence/rpc-${index}.txt"
+            set +e
+            head=$(cast block-number --rpc-url "$rpc" 2>/dev/null)
+            rc=$?
+            set -e
+            if [ "$rc" != 0 ] || [ -z "$head" ]; then
+              printf 'rpc=%s\nhead_error=1\n' "$rpc" > "$out"
+              continue
+            fi
+            chain=$(cast chain-id --rpc-url "$rpc")
+            block_hash=$(cast block "$head" --field hash --rpc-url "$rpc")
+            slot=$(cast storage "$PROXY" "$SLOT" --block "$head" --rpc-url "$rpc")
+            impl="0x${slot:26}"
+            proxy_code=$(cast code "$PROXY" --block "$head" --rpc-url "$rpc")
+            impl_code=$(cast code "$impl" --block "$head" --rpc-url "$rpc")
+            paused=$(cast call "$PROXY" 'paused()(bool)' --block "$head" --rpc-url "$rpc")
+            owner=$(cast call "$PROXY" 'owner()(address)' --block "$head" --rpc-url "$rpc")
+            {
+              echo "rpc=${rpc}"
+              echo "chain_id=${chain}"
+              echo "block_number=${head}"
+              echo "block_hash=${block_hash}"
+              echo "proxy=${PROXY}"
+              echo "implementation_slot=${slot}"
+              echo "implementation=${impl}"
+              echo "paused=${paused}"
+              echo "owner=${owner}"
+              echo "proxy_code=${proxy_code}"
+              echo "implementation_code=${impl_code}"
+              echo "public_chain_transactions_sent=0"
+            } > "$out"
+            cp "$out" evidence/SELECTED_RPC_STATE.txt
+            selected="$rpc"
+            break
+          done
+          test -n "$selected"
+
+      - name: Build and locally deploy exact source for runtime comparison
+        shell: bash
+        run: |
+          set -euo pipefail
+          WHITELIST='0xB84f2a39b271D92586c61232a73ee1F7adFBf317'
+          RPC='http://127.0.0.1:8545'
+          PK='0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80'
+          cd termmax-contract-v2
+          forge build \
+            --use 0.8.30 \
+            contracts/v2/router/TermMaxRouterV2.sol \
+            > ../evidence/local-build.log 2>&1
+          anvil --silent --port 8545 > ../evidence/anvil.log 2>&1 &
+          ANVIL_PID=$!
+          trap 'kill "$ANVIL_PID" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            cast block-number --rpc-url "$RPC" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          forge create \
+            contracts/v2/router/TermMaxRouterV2.sol:TermMaxRouterV2 \
+            --constructor-args "$WHITELIST" \
+            --rpc-url "$RPC" \
+            --private-key "$PK" \
+            --broadcast \
+            --use 0.8.30 \
+            --json > ../evidence/local-deploy.json
+          DEPLOYED=$(python3 - <<'PY'
+          import json
+          d=json.load(open('../evidence/local-deploy.json'))
+          print(d.get('deployedTo') or d.get('deployed_to') or d.get('contractAddress'))
+          PY
+          )
+          test -n "$DEPLOYED" && test "$DEPLOYED" != None
+          cast code "$DEPLOYED" --rpc-url "$RPC" > ../evidence/local-runtime.hex
+          echo "local_deployed_implementation=${DEPLOYED}" > ../evidence/LOCAL_DEPLOYMENT.txt
+          forge --version > ../evidence/forge-version.txt
+          forge inspect contracts/v2/router/TermMaxRouterV2.sol:TermMaxRouterV2 deployedBytecode \
+            --use 0.8.30 > ../evidence/artifact-deployed-bytecode.hex
+          cp out/TermMaxRouterV2.sol/TermMaxRouterV2.json ../evidence/TermMaxRouterV2.artifact.json
+
+      - name: Compare production and exact-source runtimes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+
+          state = {}
+          for line in Path('evidence/SELECTED_RPC_STATE.txt').read_text().splitlines():
+              if '=' in line:
+                  k,v=line.split('=',1); state[k]=v
+
+          def raw(hexstr):
+              assert hexstr.startswith('0x'), hexstr[:80]
+              return bytes.fromhex(hexstr[2:].strip())
+
+          prod = raw(state['implementation_code'])
+          local = raw(Path('evidence/local-runtime.hex').read_text().strip())
+          artifact = json.loads(Path('evidence/TermMaxRouterV2.artifact.json').read_text())
+
+          def strip_metadata(code):
+              if len(code) < 2: return code, b''
+              n=int.from_bytes(code[-2:],'big')
+              if n+2 > len(code): return code, b''
+              return code[:-(n+2)], code[-(n+2):]
+
+          prod_logic, prod_meta = strip_metadata(prod)
+          local_logic, local_meta = strip_metadata(local)
+
+          immutable_ranges=[]
+          deployed = artifact.get('deployedBytecode', {})
+          refs = deployed.get('immutableReferences', {}) if isinstance(deployed, dict) else {}
+          for entries in refs.values():
+              for entry in entries:
+                  immutable_ranges.append((int(entry['start']), int(entry['length'])))
+
+          def mask(code):
+              b=bytearray(code)
+              for start,length in immutable_ranges:
+                  if start+length <= len(b):
+                      b[start:start+length]=b'\x00'*length
+              return bytes(b)
+
+          pm=mask(prod_logic)
+          lm=mask(local_logic)
+          result={
+              'production_bytes': len(prod),
+              'local_bytes': len(local),
+              'production_logic_bytes': len(prod_logic),
+              'local_logic_bytes': len(local_logic),
+              'production_sha256': hashlib.sha256(prod).hexdigest(),
+              'local_sha256': hashlib.sha256(local).hexdigest(),
+              'production_logic_sha256': hashlib.sha256(prod_logic).hexdigest(),
+              'local_logic_sha256': hashlib.sha256(local_logic).hexdigest(),
+              'immutable_ranges': immutable_ranges,
+              'exact_runtime_equal': prod == local,
+              'metadata_stripped_equal': prod_logic == local_logic,
+              'metadata_and_immutables_normalized_equal': pm == lm,
+              'normalized_production_sha256': hashlib.sha256(pm).hexdigest(),
+              'normalized_local_sha256': hashlib.sha256(lm).hexdigest(),
+              'production_metadata_bytes': len(prod_meta),
+              'local_metadata_bytes': len(local_meta),
+          }
+          Path('evidence/RUNTIME_COMPARISON.json').write_text(json.dumps(result, indent=2))
+          print(json.dumps(result, indent=2))
+          PY
+
+      - name: Record checksums
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find evidence -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0 \
+            | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS.txt
+
+      - name: Upload binding evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: termmax-router-production-binding
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Enforce read-only binding gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fx 'chain_id=1' evidence/SELECTED_RPC_STATE.txt
+          grep -Fx 'paused=false' evidence/SELECTED_RPC_STATE.txt
+          grep -Fx 'public_chain_transactions_sent=0' evidence/SELECTED_RPC_STATE.txt
+          test -s evidence/RUNTIME_COMPARISON.json
