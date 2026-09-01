@@ -1,0 +1,180 @@
+name: StackingDAO all reward ledgers snapshot
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/stackingdao-all-reward-ledgers.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - name: Checkout workflow
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Query public mainnet state read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cd evidence
+          npm init -y >/dev/null 2>&1
+          npm install --no-save --package-lock=false @stacks/transactions@6.17.0 >/dev/null 2>&1
+
+          cat > query.mjs <<'NODE'
+          import { cvToHex, cvToString, hexToCV, principalCV, uintCV } from '@stacks/transactions';
+          import { writeFile } from 'node:fs/promises';
+
+          const owner='SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG';
+          const api='https://api.mainnet.hiro.so';
+          const sbtc='SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token';
+          const names=['rewards-v2','rewards-v3','rewards-v7','rewards-v8','commission-v1','commission-v2','commission-btc-v1','ststxbtc-tracking','ststxbtc-tracking-v2'];
+          const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
+          async function fetchJson(url, options={}, attempts=10){
+            let last;
+            for(let i=1;i<=attempts;i+=1){
+              try{
+                const r=await fetch(url,options); const text=await r.text();
+                if(!r.ok){
+                  const retry=Number(r.headers.get('retry-after')??0);
+                  if((r.status===429||r.status>=500)&&i<attempts){await sleep(Math.max(retry*1000,i*1300));continue;}
+                  throw new Error(`${r.status} ${r.statusText}: ${text.slice(0,500)}`);
+                }
+                return JSON.parse(text);
+              }catch(e){last=e;if(i<attempts)await sleep(i*1300);}
+            }
+            throw last;
+          }
+          function split(id){const i=id.indexOf('.');return [id.slice(0,i),id.slice(i+1)];}
+          async function call(id,fn,args=[]){
+            const [a,n]=split(id);const body=JSON.stringify({sender:owner,arguments:args.map(cvToHex)});
+            const j=await fetchJson(`${api}/v2/contracts/call-read/${a}/${n}/${fn}`,{method:'POST',headers:{'content-type':'application/json'},body});
+            return {okay:Boolean(j.okay),decoded:j.result?cvToString(hexToCV(j.result)):null,raw:j};
+          }
+          async function account(id){return fetchJson(`${api}/extended/v1/address/${id}/stx`);}
+          async function sbtcBalance(id){return call(sbtc,'get-balance',[principalCV(id)]);}
+          function field(s,k){const m=String(s??'').match(new RegExp(`\\(${k} u(\\d+)\\)`));return m?BigInt(m[1]):null;}
+          function boolField(s,k){const m=String(s??'').match(new RegExp(`\\(${k} (true|false)\\)`));return m?m[1]==='true':null;}
+          function topUint(s){const m=String(s??'').match(/^(?:\(ok )?u(\d+)\)?$/);return m?BigInt(m[1]):null;}
+
+          const ids=Object.fromEntries(names.map(n=>[n,`${owner}.${n}`]));
+          const info=await fetchJson(`${api}/v2/info`);
+          const cycle=Number(String((await call(ids['rewards-v8'],'get-pox-cycle')).decoded).match(/u(\d+)/)?.[1]);
+          if(!Number.isSafeInteger(cycle))throw new Error('cycle decode');
+          const out={captured_at:new Date().toISOString(),chain:{stacks_tip_height:info.stacks_tip_height,burn_block_height:info.burn_block_height},current_cycle:cycle,contracts:{},v3_cycles:[],v7_cycles:[],v8_cycles:[]};
+
+          for(const name of names){
+            const id=ids[name];
+            const row={id,stx_account:await account(id),sbtc_balance:await sbtcBalance(id)};
+            if(name.startsWith('commission-'))row.staking_basispoints=await call(id,'get-staking-basispoints');
+            if(name==='rewards-v2'){
+              row.total_commission=await call(id,'get-total-commission');
+              row.total_rewards_left=await call(id,'get-total-rewards-left');
+              row.rewards_unlock=await call(id,'get-rewards-unlock');
+              row.next_rewards_unlock=await call(id,'next-rewards-unlock');
+              row.pox_cycle=await call(id,'get-pox-cycle');
+            }
+            if(name==='rewards-v3'){
+              row.rewards_cycle=await call(id,'get-rewards-cycle');
+              row.pox_cycle=await call(id,'get-pox-cycle');
+              row.ststx_commission=await call(id,'get-ststx-commission-contract');
+              row.ststxbtc_commission=await call(id,'get-ststxbtc-commission-contract');
+            }
+            if(name==='rewards-v7'||name==='rewards-v8'){
+              row.pox_cycle=await call(id,'get-pox-cycle');
+              row.interval=await call(id,'get-rewards-interval-length');
+              row.ststx_commission=await call(id,'get-ststx-commission-contract');
+              row.ststxbtc_commission=await call(id,'get-ststxbtc-commission-contract');
+              row.staking=await call(id,'get-staking-contract-address');
+            }
+            if(name.startsWith('ststxbtc-tracking')){
+              row.claims_enabled=await call(id,'get-claims-enabled');
+            }
+            out.contracts[name]=row;
+            await sleep(100);
+          }
+
+          const v3Balance=BigInt(out.contracts['rewards-v3'].stx_account.balance??'0');
+          const v3Sbtc=topUint(out.contracts['rewards-v3'].sbtc_balance.decoded)??0n;
+          const v7Balance=BigInt(out.contracts['rewards-v7'].stx_account.balance??'0');
+          const v7Sbtc=topUint(out.contracts['rewards-v7'].sbtc_balance.decoded)??0n;
+
+          const startV3=(v3Balance>0n||v3Sbtc>0n)?0:Math.max(0,cycle-12);
+          for(let c=startV3;c<=cycle+1;c+=1){
+            const stx=await call(ids['rewards-v3'],'get-cycle-rewards-ststx',[uintCV(c)]);
+            const btc=await call(ids['rewards-v3'],'get-cycle-rewards-ststxbtc',[uintCV(c)]);
+            const parsed={
+              processed_stx:boolField(stx.decoded,'processed'),total_stx:field(stx.decoded,'total-stx')?.toString()??null,
+              commission_stx:field(stx.decoded,'commission-stx')?.toString()??null,protocol_stx:field(stx.decoded,'protocol-stx')?.toString()??null,
+              processed_sbtc:boolField(btc.decoded,'processed'),total_sbtc:field(btc.decoded,'total-sbtc')?.toString()??null,
+              commission_sbtc:field(btc.decoded,'commission-sbtc')?.toString()??null,protocol_sbtc:field(btc.decoded,'protocol-sbtc')?.toString()??null,
+            };
+            if(Object.values(parsed).some(v=>v!==null&&v!==false&&v!=='0'))out.v3_cycles.push({cycle:c,stx:stx.decoded,sbtc:btc.decoded,parsed});
+            if(c%10===0)await sleep(250);else await sleep(65);
+          }
+
+          const startV7=(v7Balance>0n||v7Sbtc>0n)?0:Math.max(0,cycle-12);
+          for(const [name,key,start] of [['rewards-v7','v7_cycles',startV7],['rewards-v8','v8_cycles',Math.max(0,cycle-4)]]){
+            for(let c=start;c<=cycle;c+=1){
+              const stx=await call(ids[name],'get-cycle-rewards-ststx',[uintCV(c)]);
+              const btc=await call(ids[name],'get-cycle-rewards-ststxbtc',[uintCV(c)]);
+              const should=await call(ids[name],'should-process-rewards',[uintCV(c)]);
+              const parsed={
+                total_stx:field(stx.decoded,'total-stx')?.toString()??null,commission_stx:field(stx.decoded,'commission-stx')?.toString()??null,
+                protocol_stx:field(stx.decoded,'protocol-stx')?.toString()??null,processed_commission_stx:field(stx.decoded,'processed-commission-stx')?.toString()??null,
+                processed_protocol_stx:field(stx.decoded,'processed-protocol-stx')?.toString()??null,total_sbtc:field(btc.decoded,'total-sbtc')?.toString()??null,
+                protocol_sbtc:field(btc.decoded,'protocol-sbtc')?.toString()??null,processed_protocol_sbtc:field(btc.decoded,'processed-protocol-sbtc')?.toString()??null,
+                processable_stx:field(should.decoded,'protocol-stx')?.toString()??null,processable_sbtc:field(should.decoded,'protocol-sbtc')?.toString()??null,
+                past:field(should.decoded,'past-intervals')?.toString()??null,total_intervals:field(should.decoded,'total-intervals')?.toString()??null,
+              };
+              if(Object.values(parsed).some(v=>v!==null&&v!=='0'))out[key].push({cycle:c,stx:stx.decoded,sbtc:btc.decoded,should:should.decoded,parsed});
+              await sleep(70);
+            }
+          }
+
+          out.summary={};
+          for(const [name,row] of Object.entries(out.contracts)){
+            out.summary[name]={stx_balance:row.stx_account.balance??null,stx_locked:row.stx_account.locked??null,sbtc_balance:topUint(row.sbtc_balance.decoded)?.toString()??row.sbtc_balance.decoded};
+          }
+          out.summary.v3_unprocessed=out.v3_cycles.filter(x=>x.parsed.processed_stx===false&&BigInt(x.parsed.protocol_stx??'0')>0n||x.parsed.processed_sbtc===false&&BigInt(x.parsed.protocol_sbtc??'0')>0n);
+          out.summary.v7_nonzero=out.v7_cycles;
+          out.summary.v8_nonzero=out.v8_cycles;
+
+          await writeFile('snapshot.json',`${JSON.stringify(out,null,2)}\n`);
+          const lines=[`captured_at=${out.captured_at}`,`current_cycle=${cycle}`];
+          for(const [name,row] of Object.entries(out.summary)){
+            if(['v3_unprocessed','v7_nonzero','v8_nonzero'].includes(name))continue;
+            lines.push(`${name}_stx=${row.stx_balance}`,`${name}_sbtc=${row.sbtc_balance}`);
+          }
+          lines.push(`v3_unprocessed_count=${out.summary.v3_unprocessed.length}`,`v7_nonzero_count=${out.v7_cycles.length}`,`v8_nonzero_count=${out.v8_cycles.length}`);
+          for(const x of out.summary.v3_unprocessed)lines.push(`v3_unprocessed_cycle_${x.cycle}=${JSON.stringify(x.parsed)}`);
+          await writeFile('snapshot.txt',`${lines.join('\n')}\n`);
+          console.log(lines.join('\n'));
+          NODE
+
+          node query.mjs
+          sha256sum snapshot.json snapshot.txt query.mjs > SHA256SUMS
+
+      - name: Upload reward ledger evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackingdao-all-reward-ledgers-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Enforce integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd evidence && sha256sum -c SHA256SUMS)
+          grep -F 'v3_unprocessed_count=' evidence/snapshot.txt
