@@ -1,0 +1,274 @@
+name: Pyth Cardano public governance VAA inventory
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [infra/pyth-cardano-vaa-inventory-20260723]
+    paths:
+      - '.github/workflows/pyth-cardano-vaa-inventory.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/pyth-cardano-vaa-inventory.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      EMITTER_HEX: 5635979a221c34931e32620b9293a463065555ea71fe97cd6237ade875b12e9e
+      MAX_SEQUENCE: '738'
+      TARGET_CHAIN: '60097'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Fetch and decode public governance VAAs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cat > /tmp/inventory.py <<'PY'
+          import base64
+          import concurrent.futures
+          import csv
+          import hashlib
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          emitter = os.environ['EMITTER_HEX'].lower()
+          max_sequence = int(os.environ['MAX_SEQUENCE'])
+          target_chain = int(os.environ['TARGET_CHAIN'])
+          out = Path('out')
+
+          endpoints = (
+              'https://api.wormholescan.io/v1/signed_vaa/{chain}/{emitter}/{sequence}',
+              'https://api.wormholescan.io/api/v1/vaas/{chain}/{emitter}/{sequence}',
+              'https://wormhole-v2-mainnet-api.certus.one/v1/signed_vaa/{chain}/{emitter}/{sequence}',
+          )
+
+          def u16(value: bytes) -> int:
+              return int.from_bytes(value, 'big')
+
+          def u32(value: bytes) -> int:
+              return int.from_bytes(value, 'big')
+
+          def u64(value: bytes) -> int:
+              return int.from_bytes(value, 'big')
+
+          def extract_raw(body: bytes) -> bytes:
+              try:
+                  obj = json.loads(body)
+              except json.JSONDecodeError:
+                  return body
+              candidates = []
+              if isinstance(obj, dict):
+                  for key in ('vaaBytes', 'vaa', 'signedVAA', 'bytes'):
+                      if key in obj:
+                          candidates.append(obj[key])
+                  data = obj.get('data')
+                  if isinstance(data, dict):
+                      for key in ('vaaBytes', 'vaa', 'signedVAA', 'bytes'):
+                          if key in data:
+                              candidates.append(data[key])
+              for candidate in candidates:
+                  if isinstance(candidate, str):
+                      text = candidate.removeprefix('0x')
+                      try:
+                          return base64.b64decode(text, validate=True)
+                      except Exception:
+                          try:
+                              return bytes.fromhex(text)
+                          except ValueError:
+                              pass
+              raise ValueError(f'VAA bytes absent from response keys: {list(obj) if isinstance(obj, dict) else type(obj)}')
+
+          def decode_vaa(raw: bytes) -> dict:
+              if len(raw) < 6 or raw[0] != 1:
+                  raise ValueError(f'unsupported VAA header: len={len(raw)} version={raw[0] if raw else None}')
+              sig_count = raw[5]
+              body_offset = 6 + sig_count * 66
+              body = raw[body_offset:]
+              if len(body) < 51:
+                  raise ValueError(f'short VAA body: {len(body)}')
+              payload = body[51:]
+              item = {
+                  'version': raw[0],
+                  'guardian_set_index': u32(raw[1:5]),
+                  'signature_count': sig_count,
+                  'timestamp': u32(body[0:4]),
+                  'nonce': u32(body[4:8]),
+                  'emitter_chain': u16(body[8:10]),
+                  'emitter_address': body[10:42].hex(),
+                  'sequence': u64(body[42:50]),
+                  'consistency_level': body[50],
+                  'payload_hex': payload.hex(),
+                  'payload_length': len(payload),
+              }
+              if len(payload) >= 8 and payload[:4] == b'PTGM':
+                  item.update({
+                      'magic': 'PTGM',
+                      'module': payload[4],
+                      'action': payload[5],
+                      'target_chain': u16(payload[6:8]),
+                  })
+                  rest = payload[8:]
+                  if payload[5] == 1 and len(rest) == 40:
+                      item['action_name'] = 'UpdateTrustedSigner'
+                      item['signer'] = rest[:32].hex()
+                      item['expires_at'] = u64(rest[32:40])
+                  elif payload[5] == 2 and len(rest) == 28:
+                      item['action_name'] = 'UpgradeSpendScript'
+                      item['script_hash'] = rest.hex()
+                  elif payload[5] == 3 and len(rest) == 36:
+                      item['action_name'] = 'UpgradeWithdrawScript'
+                      item['script_hash'] = rest[:28].hex()
+                      item['previous_expires_at'] = u64(rest[28:36])
+                  else:
+                      item['action_name'] = f'UnknownAction{payload[5]}'
+              return item
+
+          def fetch(sequence: int) -> dict:
+              saw_not_found = False
+              errors = []
+              for endpoint in endpoints:
+                  url = endpoint.format(chain=1, emitter=emitter, sequence=sequence)
+                  for attempt in range(4):
+                      req = urllib.request.Request(
+                          url,
+                          headers={'Accept': 'application/json', 'User-Agent': 'read-only-governance-inventory/1.0'},
+                      )
+                      try:
+                          with urllib.request.urlopen(req, timeout=25) as response:
+                              body = response.read()
+                          raw = extract_raw(body)
+                          decoded = decode_vaa(raw)
+                          decoded['requested_sequence'] = sequence
+                          decoded['source_url_template'] = endpoint
+                          decoded['vaa_sha256'] = hashlib.sha256(raw).hexdigest()
+                          decoded['vaa_hex'] = raw.hex()
+                          return {'status': 'ok', 'item': decoded}
+                      except urllib.error.HTTPError as exc:
+                          if exc.code == 404:
+                              saw_not_found = True
+                              break
+                          errors.append({'endpoint': endpoint, 'attempt': attempt + 1, 'http': exc.code, 'error': str(exc)})
+                          if exc.code in (408, 425, 429, 500, 502, 503, 504) and attempt < 3:
+                              time.sleep(1.0 + attempt * 1.5)
+                              continue
+                          break
+                      except Exception as exc:
+                          errors.append({'endpoint': endpoint, 'attempt': attempt + 1, 'error': repr(exc)})
+                          if attempt < 3:
+                              time.sleep(1.0 + attempt * 1.5)
+                              continue
+                          break
+              if saw_not_found and not errors:
+                  return {'status': 'not_found', 'sequence': sequence}
+              if saw_not_found and all('http' in error and error['http'] == 404 for error in errors):
+                  return {'status': 'not_found', 'sequence': sequence}
+              return {'status': 'error', 'sequence': sequence, 'errors': errors}
+
+          results = []
+          with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+              for result in pool.map(fetch, range(max_sequence + 1)):
+                  results.append(result)
+
+          all_items = sorted(
+              (result['item'] for result in results if result['status'] == 'ok'),
+              key=lambda item: item['sequence'],
+          )
+          cardano = [
+              item for item in all_items
+              if item.get('magic') == 'PTGM' and item.get('target_chain') == target_chain
+          ]
+          errors = [result for result in results if result['status'] == 'error']
+          missing = [result['sequence'] for result in results if result['status'] == 'not_found']
+
+          actions = [
+              {
+                  'sequence': item['sequence'],
+                  'timestamp': item['timestamp'],
+                  'action': item.get('action_name'),
+                  'signer': item.get('signer'),
+                  'expires_at': item.get('expires_at'),
+                  'script_hash': item.get('script_hash'),
+                  'vaa_sha256': item['vaa_sha256'],
+              }
+              for item in cardano
+          ]
+          consecutive_pairs = [
+              [left['sequence'], right['sequence']]
+              for left, right in zip(cardano, cardano[1:])
+              if right['sequence'] == left['sequence'] + 1
+          ]
+          update_signers = [item for item in cardano if item.get('action_name') == 'UpdateTrustedSigner']
+          distinct_update_pairs = [
+              [left['sequence'], right['sequence']]
+              for index, left in enumerate(update_signers)
+              for right in update_signers[index + 1:]
+              if left.get('signer') != right.get('signer')
+          ]
+
+          summary = {
+              'mode': 'public_read_only',
+              'emitter_hex': emitter,
+              'max_sequence_scanned': max_sequence,
+              'target_chain': target_chain,
+              'found_total_vaas': len(all_items),
+              'found_cardano_targeted': len(cardano),
+              'found_cardano_update_signer': len(update_signers),
+              'not_found_count': len(missing),
+              'error_count': len(errors),
+              'cardano_sequences': [item['sequence'] for item in cardano],
+              'consecutive_cardano_pairs': consecutive_pairs,
+              'distinct_update_signer_pairs': distinct_update_pairs,
+              'cardano_actions': actions,
+          }
+
+          (out / 'SUMMARY.json').write_text(json.dumps(summary, indent=2) + '\n')
+          (out / 'ALL_FOUND_VAAS.json').write_text(json.dumps(all_items, indent=2) + '\n')
+          (out / 'CARDANO_TARGETED_VAAS.json').write_text(json.dumps(cardano, indent=2) + '\n')
+          (out / 'ERRORS.json').write_text(json.dumps(errors, indent=2) + '\n')
+          (out / 'NOT_FOUND_SEQUENCES.json').write_text(json.dumps(missing, indent=2) + '\n')
+          with (out / 'CARDANO_TARGETED_VAAS.csv').open('w', newline='') as handle:
+              fields = [
+                  'sequence', 'timestamp', 'action_name', 'signer', 'expires_at',
+                  'script_hash', 'vaa_sha256', 'vaa_hex',
+              ]
+              writer = csv.DictWriter(handle, fieldnames=fields, extrasaction='ignore')
+              writer.writeheader()
+              writer.writerows(cardano)
+
+          print(json.dumps(summary, indent=2))
+          if errors:
+              raise SystemExit(f'fetch errors: {len(errors)}')
+          if not cardano:
+              raise SystemExit('no Cardano-targeted PTGM VAA was found')
+          PY
+
+          python /tmp/inventory.py | tee out/console.log
+          {
+            echo 'CARDANO_VAA_INVENTORY_PASS'
+            jq -r '"CARDANO_TARGETED_COUNT=" + (.found_cardano_targeted|tostring)' out/SUMMARY.json
+            jq -r '"CARDANO_UPDATE_SIGNER_COUNT=" + (.found_cardano_update_signer|tostring)' out/SUMMARY.json
+            jq -r '"CARDANO_SEQUENCES=" + (.cardano_sequences|map(tostring)|join(","))' out/SUMMARY.json
+          } | tee out/PASS_MARKERS.txt
+          find out -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > out/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pyth-cardano-public-vaa-inventory-${{ github.run_id }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
