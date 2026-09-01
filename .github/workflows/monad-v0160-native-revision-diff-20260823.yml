@@ -1,0 +1,319 @@
+name: Monad v0.16.0 native revision differential 20260824
+
+on:
+  push:
+    branches:
+      - tooling/monad-v0160-native-revision-diff-20260823
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  differential:
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - name: Checkout tooling branch
+        uses: actions/checkout@v4
+
+      - name: Clone exact public execution source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global submodule.fetchJobs "$(nproc)"
+          git clone --recurse-submodules https://github.com/category-labs/monad.git monad-execution
+          cd monad-execution
+          git checkout e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0
+          git submodule update --init --recursive
+          test "$(git rev-parse HEAD)" = "e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0"
+          git status --porcelain=v1 > ../SOURCE_STATUS.txt
+          test ! -s ../SOURCE_STATUS.txt
+          git submodule status --recursive > ../SUBMODULES.txt
+
+      - name: Build official dependency image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --target base -t monad-v0160-base -f monad-execution/docker/Dockerfile monad-execution
+
+      - name: Build MONAD_NINE and MONAD_TEN differential binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/bin out/meta out/logs out/rc out/focus
+          docker run --name monad-v0160-native-diff \
+            -v "$PWD/monad-execution:/src" \
+            -v "$PWD/out:/out" \
+            monad-v0160-base bash -lc '
+              set -euo pipefail
+              cd /src
+              cp test/vm/fuzzer/fuzzer.cpp /tmp/fuzzer.original.cpp
+              python3 - <<"PY"
+          from pathlib import Path
+
+          original = Path("/tmp/fuzzer.original.cpp").read_text()
+
+          def render(revision: str) -> str:
+              page = "true" if revision == "MONAD_TEN" else "false"
+              s = original
+              s = s.replace(
+                  "#include <category/execution/ethereum/chain/ethereum_mainnet.hpp>",
+                  "#include <category/execution/monad/chain/monad_mainnet.hpp>\n"
+                  "#include <category/vm/evm/monad/revision.h>\n"
+                  "#include <category/vm/evm/traits.hpp>",
+              )
+              marker = "using monad::vm::compiler::native::CompilerConfig;\n"
+              insert = marker + (
+                  f"\nstatic constexpr monad_revision MONAD_FUZZ_REVISION = {revision};\n"
+                  f"static constexpr bool MONAD_FUZZ_PAGE_ENCODED = {page};\n"
+              )
+              if marker not in s:
+                  raise SystemExit("compiler config marker missing")
+              s = s.replace(marker, insert, 1)
+              s = s.replace(
+                  "monad::test::TestState<false> test_state = {};",
+                  "monad::test::TestState<MONAD_FUZZ_PAGE_ENCODED> test_state = {};",
+                  1,
+              )
+              s = s.replace("EthereumMainnet const chain{};", "MonadMainnet const chain{};", 1)
+              old = (
+                  "    MONAD_ASSERT(rev == MONAD_ETH_OSAKA); // TODO switch to monad revisions\n"
+                  "    using traits = EvmTraits<MONAD_ETH_OSAKA>;"
+              )
+              new = (
+                  "    MONAD_ASSERT(rev == MonadTraits<MONAD_FUZZ_REVISION>::evm_rev());\n"
+                  "    using traits = MonadTraits<MONAD_FUZZ_REVISION>;"
+              )
+              if old not in s:
+                  raise SystemExit("transition marker missing")
+              s = s.replace(old, new, 1)
+
+              start = s.index("    auto evmone_vm = evmc::VM(evmc_create_evmone());")
+              end = s.index("    auto monad_state = [&] {", start)
+              s = s[:start] + (
+                  "    auto evmone_state =\n"
+                  "        std::make_shared<FuzzerTestState>(vm::VM::InterpreterOnly);\n\n"
+              ) + s[end:]
+
+              old_config = "            s->vm.set_compiler_config(create_compiler_config(engine));"
+              new_config = (
+                  "            if (std::getenv(\"MONAD_FUZZ_NO_HOOK\") != nullptr) {\n"
+                  "                s->vm.set_compiler_config(CompilerConfig{\n"
+                  "                    .runtime_debug_trace =\n"
+                  "                        vm::utils::is_compiler_runtime_debug_trace_enabled,\n"
+                  "                    .max_code_size_offset =\n"
+                  "                        vm::interpreter::code_size_t::max(),\n"
+                  "                    .post_instruction_emit_hook = {},\n"
+                  "                });\n"
+                  "            }\n"
+                  "            else {\n"
+                  "                s->vm.set_compiler_config(create_compiler_config(engine));\n"
+                  "            }"
+              )
+              if old_config not in s:
+                  raise SystemExit("compiler setup marker missing")
+              s = s.replace(old_config, new_config, 1)
+              return s
+
+          Path("/tmp/fuzzer.MONAD_NINE.cpp").write_text(render("MONAD_NINE"))
+          Path("/tmp/fuzzer.MONAD_TEN.cpp").write_text(render("MONAD_TEN"))
+          PY
+
+              cp /tmp/fuzzer.MONAD_NINE.cpp test/vm/fuzzer/fuzzer.cpp
+              rm -rf build-native
+              CC=clang-19 CXX=clang++-19 cmake -S . -B build-native -GNinja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_TOOLCHAIN_FILE=category/core/toolchains/gcc-avx2.cmake \
+                -DMONAD_COMPILER_TESTING=On
+              cmake --build build-native -t monad-compiler-fuzzer --parallel "$(nproc)"
+              cp build-native/test/vm/fuzzer/monad-compiler-fuzzer /out/bin/monad-nine-differential-fuzzer
+
+              cp /tmp/fuzzer.MONAD_TEN.cpp test/vm/fuzzer/fuzzer.cpp
+              cmake --build build-native -t monad-compiler-fuzzer --parallel "$(nproc)"
+              cp build-native/test/vm/fuzzer/monad-compiler-fuzzer /out/bin/monad-ten-differential-fuzzer
+
+              cp /tmp/fuzzer.original.cpp test/vm/fuzzer/fuzzer.cpp
+              sha256sum /out/bin/* > /out/meta/BINARY_SHA256.txt
+              clang-19 --version > /out/meta/CLANG_VERSION.txt
+              clang++-19 --version > /out/meta/CLANGXX_VERSION.txt
+              cmake --version > /out/meta/CMAKE_VERSION.txt
+              ninja --version > /out/meta/NINJA_VERSION.txt
+              ldd /out/bin/monad-nine-differential-fuzzer > /out/meta/NINE_LDD.txt
+              ldd /out/bin/monad-ten-differential-fuzzer > /out/meta/TEN_LDD.txt
+              printf "%s\n" MONAD_NINE > /out/meta/NINE_REVISION.txt
+              printf "%s\n" MONAD_TEN > /out/meta/TEN_REVISION.txt
+            '
+
+      - name: Execute native-revision lanes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > out/focus/stateheavy.json <<'JSON'
+          {
+            "valid_address_prob": 0.70,
+            "random_constant_with_cleared_words_prob": 0.20,
+            "meaningful_constant_prob": 0.20,
+            "small_constant_prob": 0.20,
+            "push_weight": 0.16,
+            "dup_weight": 0.16,
+            "call_weight": 0.02,
+            "returndatacopy_weight": 0.02,
+            "create_weight": 0.02,
+            "uncommon_non_term_weight": 0.42,
+            "valid_jump_prob": 0.95
+          }
+          JSON
+          cat > out/focus/callcreate.json <<'JSON'
+          {
+            "valid_address_prob": 0.90,
+            "meaningful_constant_prob": 0.20,
+            "small_constant_prob": 0.20,
+            "push_weight": 0.18,
+            "dup_weight": 0.18,
+            "call_weight": 0.20,
+            "returndatacopy_weight": 0.10,
+            "create_weight": 0.10,
+            "uncommon_non_term_weight": 0.18,
+            "valid_jump_prob": 0.95
+          }
+          JSON
+
+          docker start monad-v0160-native-diff >/dev/null
+          docker exec monad-v0160-native-diff bash -lc '
+            set -uo pipefail
+            run_lane() {
+              name="$1"; binary="$2"; seed="$3"; focus="$4"; nohook="$5"
+              args=(--implementation compiler --revision OSAKA --seed "$seed" --iterations-per-run 100 --messages 4 --runs 100000000 --print-stats)
+              if [[ -n "$focus" ]]; then args+=(--focus "$focus"); fi
+              if [[ "$nohook" == 1 ]]; then
+                timeout --signal=TERM --kill-after=20s 300s \
+                  env MONAD_COMPILER_FUZZING=1 MONAD_FUZZ_NO_HOOK=1 \
+                  stdbuf -oL -eL "$binary" "${args[@]}" >"/out/logs/${name}.log" 2>&1
+              else
+                timeout --signal=TERM --kill-after=20s 300s \
+                  env MONAD_COMPILER_FUZZING=1 \
+                  stdbuf -oL -eL "$binary" "${args[@]}" >"/out/logs/${name}.log" 2>&1
+              fi
+              rc=$?
+              printf "%s\n" "$rc" >"/out/rc/${name}.rc"
+              return 0
+            }
+            wait_group() {
+              local pid
+              for pid in "$@"; do
+                wait "$pid" || true
+              done
+            }
+
+            for rev in nine ten; do
+              B="/out/bin/monad-${rev}-differential-fuzzer"
+              base=$([[ "$rev" == nine ]] && echo 7100000 || echo 8100000)
+              run_lane "${rev}_nohook_generic" "$B" "$((base + 3))" "" 1 & p1=$!
+              run_lane "${rev}_nohook_stateheavy" "$B" "$((base + 31))" /out/focus/stateheavy.json 1 & p2=$!
+              run_lane "${rev}_hook_generic" "$B" "$((base + 67))" "" 0 & p3=$!
+              run_lane "${rev}_hook_callcreate" "$B" "$((base + 103))" /out/focus/callcreate.json 0 & p4=$!
+              wait_group "$p1" "$p2" "$p3" "$p4"
+            done
+
+            test "$(find /out/rc -maxdepth 1 -type f -name "*.rc" | wc -l)" -eq 8
+            test "$(find /out/logs -maxdepth 1 -type f -name "*.log" | wc -l)" -eq 8
+          '
+
+      - name: Analyze native-revision results fail-closed
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p out/meta out/logs out/rc out/bin
+          cp SOURCE_STATUS.txt SUBMODULES.txt out/meta/ 2>/dev/null || true
+          python3 - <<'PY'
+          import hashlib, json, pathlib, re
+          root = pathlib.Path('out')
+          expected = [
+              'nine_nohook_generic', 'nine_nohook_stateheavy',
+              'nine_hook_generic', 'nine_hook_callcreate',
+              'ten_nohook_generic', 'ten_nohook_stateheavy',
+              'ten_hook_generic', 'ten_hook_callcreate',
+          ]
+          expected_timeout_codes = {124, 137, 143}
+          markers = [
+              'MONAD_ASSERT', 'Assertion `', 'Assertion failed',
+              'terminate called', 'Segmentation fault', 'Illegal instruction',
+              'Aborted (core dumped)', 'AddressSanitizer', 'UndefinedBehaviorSanitizer',
+          ]
+          lanes = []
+          missing = []
+          candidate = False
+          for name in expected:
+              rc_path = root/'rc'/f'{name}.rc'
+              log_path = root/'logs'/f'{name}.log'
+              if not rc_path.is_file() or not log_path.is_file():
+                  missing.append(name)
+                  continue
+              try:
+                  rc = int(rc_path.read_text().strip())
+              except Exception:
+                  missing.append(name)
+                  continue
+              text = log_path.read_text(errors='replace')
+              seeds = re.findall(r'Fuzzing with seed @ [^:]+: ([0-9]+)', text)
+              hits = sorted({term for term in markers if term in text})
+              signal = (rc not in expected_timeout_codes and rc != 0) or bool(hits)
+              candidate |= signal
+              lanes.append({
+                  'name': name,
+                  'return_code': rc,
+                  'expected_timeout_or_success': rc in expected_timeout_codes or rc == 0,
+                  'candidate_signal': signal,
+                  'anomaly_markers': hits,
+                  'seed_count': len(seeds),
+                  'first_seed': seeds[0] if seeds else None,
+                  'last_seed': seeds[-1] if seeds else None,
+                  'log_sha256': hashlib.sha256(log_path.read_bytes()).hexdigest(),
+                  'log_bytes': log_path.stat().st_size,
+              })
+          if missing:
+              decision = 'HARNESS_INCOMPLETE'
+          elif candidate:
+              decision = 'CANDIDATE_REQUIRES_MINIMIZATION'
+          else:
+              decision = 'NO_NATIVE_REVISION_DIFFERENTIAL_SIGNAL'
+          result = {
+              'source_commit': 'e81ffe31cd30fe3455d1233e4ee6c9b3f017bad0',
+              'reference_engine': 'Monad InterpreterOnly',
+              'candidate_engine': 'Monad CompilerOnly',
+              'native_revisions': ['MONAD_NINE', 'MONAD_TEN'],
+              'monad_ten_page_encoded_state': True,
+              'expected_lane_count': len(expected),
+              'completed_lane_count': len(lanes),
+              'missing_lanes': missing,
+              'lanes': lanes,
+              'candidate_signal': candidate,
+              'decision': decision,
+              'submission_ready': False,
+          }
+          (root/'NATIVE_REVISION_RESULT.json').write_text(json.dumps(result, indent=2, sort_keys=True)+'\n')
+          print(json.dumps(result, indent=2))
+          PY
+          find out -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > out/SHA256SUMS
+          tar --sort=name --mtime='UTC 2026-08-24' --owner=0 --group=0 --numeric-owner \
+            -C out -czf monad-v0160-native-revision-differential-20260824.tar.gz \
+            NATIVE_REVISION_RESULT.json SHA256SUMS bin logs rc focus meta
+          sha256sum monad-v0160-native-revision-differential-20260824.tar.gz > monad-v0160-native-revision-differential-20260824.tar.gz.sha256
+
+      - name: Upload native-revision evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: monad-v0160-native-revision-differential-20260824
+          path: |
+            monad-v0160-native-revision-differential-20260824.tar.gz
+            monad-v0160-native-revision-differential-20260824.tar.gz.sha256
+            out/NATIVE_REVISION_RESULT.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
